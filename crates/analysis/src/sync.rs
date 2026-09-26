@@ -69,7 +69,9 @@ pub fn align_envelopes(a_db: &[f32], b_db: &[f32], window: Time, max_offset: Tim
     }
     let max_lag = (max_offset.flicks() / window.flicks()).max(1);
     let (ca, cb) = (decimate(&a), decimate(b));
-    let min_overlap = (cb.len() / 4).max(20);
+    // Angles of one event overlap for most of the shorter one; a short edge
+    // overlap can match by chance (repeated chorus, periodic beats).
+    let min_overlap = (ca.len().min(cb.len()) / 2).max(20);
     let bsc = (bs / COARSE) as i64;
     let coarse = best(&ca, &cb, (-max_lag / COARSE as i64 + bsc)..=(max_lag / COARSE as i64 + bsc), min_overlap);
     let Some(&(lc, r1)) = coarse.iter().max_by(|x, y| x.1.total_cmp(&y.1)) else { return none };
@@ -139,6 +141,44 @@ mod tests {
         b.extend(a.iter().enumerate().map(|(i, v)| (v + if i % 7 == 0 { 4.0 } else { -2.0 }).min(0.0)));
         let r = align_envelopes(&a, &b, Time::from_millis(10), Time::from_secs(10));
         assert_eq!(r.offset, Time::from_millis(-2500));
+    }
+
+    #[test]
+    fn short_clips_with_stepped_sound_sync_confidently() {
+        // Real case: 0.25 s loud/quiet steps, 16 s and 17 s clips overlapping
+        // 13 s; edge lags with little overlap correlate spuriously well.
+        let mut x = 5u64;
+        let mut env = vec![];
+        while env.len() < 2000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let level = if (x >> 40) % 2 == 0 { -26.0 } else { -50.0 };
+            env.extend(std::iter::repeat_n(level, 25));
+        }
+        // AAC priming/padding: digital silence at both ends of every file.
+        let edges = |mut v: Vec<f32>| {
+            let n = v.len();
+            v[..4].fill(-100.0);
+            v[n - 4..].fill(-100.0);
+            v
+        };
+        let a = edges(env[..1600].to_vec());
+        let b = edges(env[300..].to_vec());
+        let r = align_envelopes(&a, &b, Time::from_millis(10), Time::from_secs(600));
+        assert_eq!(r.offset, Time::from_secs(3));
+        assert!(r.confidence > 0.5, "{}", r.confidence);
+    }
+
+    #[test]
+    fn a_short_edge_match_does_not_beat_the_long_true_overlap() {
+        // B's first 5.3 s happen to repeat A's last 5.3 s exactly (periodic
+        // music, a repeated chorus); the true alignment (3 s) matches over
+        // 7.7 s but not perfectly.
+        let a = envelope(1600, 21);
+        let mut b: Vec<f32> = a[300..].to_vec();
+        b.extend(envelope(400, 22));
+        b[..530].copy_from_slice(&a[1070..1600]);
+        let r = align_envelopes(&a, &b, Time::from_millis(10), Time::from_secs(600));
+        assert_eq!(r.offset, Time::from_secs(3));
     }
 
     #[test]

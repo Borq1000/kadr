@@ -193,7 +193,9 @@ impl App {
     pub fn mc_confirm(&mut self, name: &str) {
         let Some(d) = self.mc.dialog.as_ref() else { return };
         let name = if name.trim().is_empty() { t("mc.default_name_short") } else { name.trim().to_string() };
-        let picked: Vec<&McRow> = d.rows.iter().filter(|r| r.checked).collect();
+        let mut picked: Vec<&McRow> = d.rows.iter().filter(|r| r.checked).collect();
+        // Angle order follows the names ("CAM1", "CAM2", … "CAM10"), not the list.
+        picked.sort_by_key(|r| (r.label.len(), r.label.clone()));
         let mut labels: Vec<&str> = picked.iter().map(|r| r.label.as_str()).collect();
         labels.sort();
         labels.dedup();
@@ -277,6 +279,7 @@ impl App {
             return self.mc_refresh_dialog(false);
         }
         self.mc.selected_group = Some(group.id);
+        self.selected_asset = None;
         self.project.multicam_groups.push(group);
         self.meta_dirty = true;
         self.mc_dismiss();
@@ -303,7 +306,7 @@ impl App {
                 let thumb = g.angles.first().and_then(|a| self.assets_rt.get(&a.asset)).and_then(|r| r.thumb.clone());
                 let unsynced = g.angles.iter().skip(1).filter(|a| a.sync_method == SyncMethod::Manual).count();
                 AssetView {
-                    id: g.id.to_string().into(),
+                    id: crate::library::LibItem::Group(g.id).card_id().into(),
                     name: g.name.clone().into(),
                     kind: 3,
                     duration: duration(span.duration().as_secs_f64()).into(),

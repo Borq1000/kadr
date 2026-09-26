@@ -17,8 +17,19 @@ pub enum LibItem {
 }
 
 impl LibItem {
+    /// Both ids are UUIDs, so group cards carry an "mc:" prefix.
     pub fn parse(id: &str) -> Option<Self> {
-        AssetId::parse(id).map(LibItem::Asset).or_else(|| MulticamId::parse(id).map(LibItem::Group))
+        match id.strip_prefix("mc:") {
+            Some(g) => MulticamId::parse(g).map(LibItem::Group),
+            None => AssetId::parse(id).map(LibItem::Asset),
+        }
+    }
+
+    pub fn card_id(&self) -> String {
+        match self {
+            LibItem::Asset(a) => a.to_string(),
+            LibItem::Group(g) => format!("mc:{g}"),
+        }
     }
 }
 
@@ -401,5 +412,19 @@ impl App {
         self.meta_dirty = true;
         self.refresh_library();
         self.refresh_status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_ids_round_trip_without_confusing_groups_with_assets() {
+        let (a, g) = (AssetId::new(), MulticamId::new());
+        assert_eq!(LibItem::parse(&LibItem::Asset(a).card_id()), Some(LibItem::Asset(a)));
+        // Both are UUIDs: a bare group id must never parse as an asset.
+        assert_eq!(LibItem::parse(&LibItem::Group(g).card_id()), Some(LibItem::Group(g)));
+        assert_eq!(LibItem::parse("mc:junk"), None);
     }
 }

@@ -114,12 +114,18 @@ export component Preview inherits Rectangle {
         if root.angles.length > 0: Rectangle {
             height: 96px;
             background: Theme.bg0;
+            clip: true;
             HorizontalLayout {
                 padding: 6px;
                 spacing: 6px;
                 alignment: center;
+                // Sized by the layout only: a width derived from the Preview's own
+                // width would form a binding loop (Slint panics on it).
                 for a[i] in root.angles: Rectangle {
-                    width: min(160px, (root.width - 12px) / root.angles.length - 6px);
+                    min-width: 48px;
+                    preferred-width: 160px;
+                    max-width: 160px;
+                    horizontal-stretch: 1;
                     border-radius: 5px;
                     background: #000000;
                     clip: true;
