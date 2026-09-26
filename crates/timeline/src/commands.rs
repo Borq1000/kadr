@@ -398,9 +398,15 @@ impl EditCommand {
             EditCommand::SwitchAngle { clip, angle, at } => {
                 let mut target = *clip;
                 if let Some(t) = *at {
+                    // Split cuts on a frame; locate the right half by that same
+                    // frame (a playing playhead sits between frames).
+                    let t = fr.snap(t);
                     let (ti, _) = seq.locate_clip(*clip).ok_or(EditError::ClipNotFound)?;
                     let c = seq.clip(*clip).ok_or(EditError::ClipNotFound)?;
-                    if t > c.timeline_in && t < c.timeline_out {
+                    if t >= c.timeline_out {
+                        return Err(EditError::NoOp);
+                    }
+                    if t > c.timeline_in {
                         EditCommand::Split { at: t, clips: Some(vec![*clip]) }.apply(seq, ctx)?;
                         target = seq.tracks[ti].clip_at(t).ok_or(EditError::ClipNotFound)?.id;
                     }

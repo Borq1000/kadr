@@ -62,6 +62,15 @@ pub struct JevEstimate {
     pub total: usize,
 }
 
+/// A run that stopped early: the error plus what was already billed and decided.
+#[derive(Debug)]
+pub struct JevFailure {
+    pub error: AiError,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub partial: Vec<Decided>,
+}
+
 pub struct JevDecisionService {
     transport: Arc<dyn JevTransport>,
     model: String,
@@ -83,9 +92,11 @@ impl JevDecisionService {
         blake3::hash(canon.to_string().as_bytes()).to_hex().to_string()
     }
 
+    /// This subject's own record first; another subject with identical
+    /// features (e.g. two alike shots) only lends its answer.
     fn cached<'c>(&self, item: &JevItem, cache: &'c [StoredDecision]) -> Option<&'c StoredDecision> {
         let key = self.cache_key(item);
-        cache.iter().rev().find(|c| c.key == key)
+        cache.iter().rev().find(|c| c.key == key && c.subject == item.subject).or_else(|| cache.iter().rev().find(|c| c.key == key))
     }
 
     /// Greedy packing of `todo` (indices into `items`) into batches.
@@ -126,23 +137,44 @@ impl JevDecisionService {
         }
     }
 
-    /// Decides every item (cached ones without a call). Returns decisions in
+    /// Decides every item (cached ones without a call).
+    ///
+    /// On failure, [`JevFailure`] still carries the tokens of the calls that
+    /// succeeded and their decisions: they were paid for. Returns decisions in
     /// item order plus the billed input / output tokens.
-    pub async fn run(&self, items: Vec<JevItem>, cache: &[StoredDecision], cancel: CancelToken) -> Result<(Vec<Decided>, u64, u64), AiError> {
+    pub async fn run(&self, items: Vec<JevItem>, cache: &[StoredDecision], cancel: CancelToken) -> Result<(Vec<Decided>, u64, u64), JevFailure> {
         let mut out: Vec<Option<Decided>> = vec![None; items.len()];
         let mut todo = vec![];
         for (i, it) in items.iter().enumerate() {
             match self.cached(it, cache) {
-                Some(c) => out[i] = Some(Decided { stored: c.clone(), from_cache: true, answers: BTreeMap::new() }),
+                Some(c) => {
+                    let mut stored = c.clone();
+                    if stored.subject != it.subject {
+                        // Reuse the answer, not the other subject's identity or verdict.
+                        stored.id = DecisionId::new();
+                        stored.subject = it.subject.clone();
+                        stored.features = it.features.clone();
+                        stored.human = None;
+                        stored.at_ms = now_ms();
+                    }
+                    out[i] = Some(Decided { stored, from_cache: true, answers: BTreeMap::new() })
+                }
                 None => todo.push(i),
             }
         }
+        // Billed calls count even when a later one fails.
+        let fail = |error, used_in, used_out, out: Vec<Option<Decided>>| JevFailure {
+            error,
+            input_tokens: used_in,
+            output_tokens: used_out,
+            partial: out.into_iter().flatten().filter(|d| !d.from_cache).collect(),
+        };
         let (mut used_in, mut used_out) = (0u64, 0u64);
         let mut stack: Vec<Vec<usize>> = Self::pack(&items, &todo);
         stack.reverse();
         while let Some(batch) = stack.pop() {
             if cancel.is_cancelled() {
-                return Err(AiError::Cancelled);
+                return Err(fail(AiError::Cancelled, used_in, used_out, out));
             }
             let (state, questions) = batch_request(&items, &batch);
             match self.call(&state, &questions, &cancel).await {
@@ -165,7 +197,7 @@ impl JevDecisionService {
                     tracing::warn!(subject = %items[batch[0]].subject, "Jev item too large even alone");
                     out[batch[0]] = Some(self.review(&items[batch[0]], "too_large"));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(fail(e, used_in, used_out, out)),
             }
         }
         Ok((out.into_iter().map(|d| d.expect("every item decided")).collect(), used_in, used_out))
@@ -362,6 +394,31 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_hit_from_another_subject_gets_its_own_identity() {
+        // Two shots with identical bucket features share a cache key.
+        let svc = service(Fake::new(keep_all));
+        let (d, ..) = rt().block_on(svc.run(vec![usability_item(1)], &[], CancelToken::new())).unwrap();
+        let mut other = d[0].stored.clone();
+        other.human = Some("DISCARD".into());
+        let twin = JevItem { subject: "s2".into(), ..usability_item(1) };
+        let (d2, ..) = rt().block_on(svc.run(vec![twin], &[other.clone()], CancelToken::new())).unwrap();
+        let s = &d2[0].stored;
+        assert!(d2[0].from_cache);
+        assert_eq!((s.subject.as_str(), s.value.as_str(), s.human.as_deref()), ("s2", "KEEP", None));
+        assert_ne!(s.id, other.id, "a new decision, not the other shot's record");
+    }
+
+    #[test]
+    fn a_failed_later_batch_still_reports_what_was_billed() {
+        let fake = Fake::new(keep_all);
+        let calls = fake.clone();
+        let flaky = Fake::new(move |q| if calls.calls.fetch_add(1, Ordering::SeqCst) == 0 { keep_all(q) } else { Err(AiError::Network("reset".into())) });
+        let Err(f) = rt().block_on(service(flaky).run((0..50).map(usability_item).collect(), &[], CancelToken::new())) else { panic!("second batch fails") };
+        assert!(matches!(f.error, AiError::Network(_)));
+        assert_eq!((f.input_tokens, f.output_tokens, f.partial.len()), (100, 10, 40), "first batch was billed and decided");
+    }
+
+    #[test]
     fn questions_are_scoped_to_their_item() {
         let seen = Arc::new(std::sync::Mutex::new(vec![]));
         let s2 = seen.clone();
@@ -398,7 +455,7 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         let r = rt().block_on(service(fake.clone()).run((0..5).map(usability_item).collect(), &[], cancel));
-        assert_eq!(r.unwrap_err(), AiError::Cancelled);
+        assert_eq!(r.unwrap_err().error, AiError::Cancelled);
         assert_eq!(fake.calls(), 0);
     }
 

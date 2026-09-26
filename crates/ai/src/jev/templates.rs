@@ -13,7 +13,7 @@ use kadr_project::{DecisionKind, ShotSummary};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-pub const USABILITY_V: &str = "shot_usability/v1";
+pub const USABILITY_V: &str = "shot_usability/v2";
 pub const CAMERA_V: &str = "camera_pick/v1";
 
 /// "4 s", "1 min 20 s".
@@ -48,21 +48,13 @@ pub fn shot_item(subject: String, shot: &ShotSummary, speech: &str) -> JevItem {
             ("REVIEW".into(), json!({"what": "mixed or insufficient signals: a human should look at it"})),
         ]),
     };
-    let quality = JevQuestion::Score {
-        instructions: "Rate the technical picture quality of the shot described in `{item}`.".into(),
-        criteria: vec![
-            json!("Unusable: very blurry, black or blown out, or heavy shake"),
-            json!("Usable with visible flaws: soft focus, dark, or slight shake"),
-            json!("Clean: sharp, normal exposure, no shake"),
-        ],
-    };
     JevItem {
         kind: DecisionKind::ShotUsability,
         subject,
         prompt_version: USABILITY_V,
         features: state.clone(),
         state,
-        questions: BTreeMap::from([("usability".into(), usability), ("technical_quality".into(), quality)]),
+        questions: BTreeMap::from([("usability".into(), usability)]),
         primary: "usability".into(),
         extra_ok: shot_is_defective(shot),
     }
@@ -215,8 +207,7 @@ mod tests {
         assert!(it.extra_ok, "the local detector sees a defect");
         assert_eq!(it.state["sharpness"], "very blurry");
         assert!(!shot_item("s".into(), &shot("sharp", "normal", "none"), "speech").extra_ok);
-        let JevQuestion::Score { criteria, .. } = &it.questions["technical_quality"] else { panic!() };
-        assert_eq!(criteria.len(), 3);
+        assert_eq!(it.questions.len(), 1, "only questions something reads are paid for");
     }
 
     #[test]

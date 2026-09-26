@@ -5,7 +5,7 @@
 
 use kadr_project::{CorrectionKind, DecisionKind, EditorPreferenceEvent, StoredDecision};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// One past decision as Jev sees it in `editor_history`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -36,12 +36,11 @@ fn leaves(v: &serde_json::Value, path: String, out: &mut Vec<(String, String)>) 
     }
 }
 
-/// Number of identical leaf values (same path, same value).
-fn similarity(a: &serde_json::Value, b: &serde_json::Value) -> usize {
-    let (mut la, mut lb) = (vec![], vec![]);
+/// Number of `a`'s leaf values (same path, same value) found in `b`.
+fn similarity(a: &serde_json::Value, b: &HashSet<(String, String)>) -> usize {
+    let mut la = vec![];
     leaves(a, String::new(), &mut la);
-    leaves(b, String::new(), &mut lb);
-    la.iter().filter(|x| lb.contains(x)).count()
+    la.iter().filter(|x| b.contains(*x)).count()
 }
 
 /// The `k` most relevant past decisions of `kind` for `current`: human
@@ -67,19 +66,36 @@ pub fn precedents(
         editor_chose: d.value.clone(),
         at_ms: d.at_ms,
     }));
+    let mut cur = vec![];
+    leaves(current, String::new(), &mut cur);
+    let cur: HashSet<(String, String)> = cur.into_iter().collect();
     let score = |p: &Precedent| {
         let age_days = (now_ms - p.at_ms).max(0) as f64 / 86_400_000.0;
         // Relevance leads; age can at most halve it (an old solo still says
         // more about a solo than yesterday's verse).
-        similarity(&p.context, current) as f64 * (0.5 + 0.5 * 0.5f64.powf(age_days / HALF_LIFE_DAYS))
+        similarity(&p.context, &cur) as f64 * (0.5 + 0.5 * 0.5f64.powf(age_days / HALF_LIFE_DAYS))
     };
-    all.sort_by(|a, b| score(b).total_cmp(&score(a)).then(b.at_ms.cmp(&a.at_ms)));
-    all.truncate(k);
-    all.sort_by_key(|p| p.at_ms);
-    all
+    // Scored once each: the history can be long and this runs per interval.
+    let mut ranked: Vec<(f64, Precedent)> = all.into_iter().map(|p| (score(&p), p)).collect();
+    ranked.sort_by(|(sa, a), (sb, b)| sb.total_cmp(sa).then(b.at_ms.cmp(&a.at_ms)));
+    let mut top: Vec<Precedent> = ranked.into_iter().take(k).map(|(_, p)| p).collect();
+    top.sort_by_key(|p| p.at_ms);
+    top
 }
 
 /// P(option) from past picks with Dirichlet(α = 1) smoothing.
+/// Jev's `editor_pick` distribution blended with the editor's past picks;
+/// `None` when Jev itself can't tell (an escape value on top, or the angles
+/// hold under half the mass). Precedents sharpen a pick, never invent one.
+pub fn personal_pick(p_pick: &BTreeMap<String, f32>, labels: &[String], history: &[Precedent]) -> Option<BTreeMap<String, f32>> {
+    let (top, ..) = crate::jev::decided::summarize(p_pick)?;
+    let p_jev: BTreeMap<String, f32> = p_pick.iter().filter(|(k, _)| labels.contains(k)).map(|(k, v)| (k.clone(), *v)).collect();
+    if crate::jev::decided::ESCAPE_VALUES.contains(&top.as_str()) || p_jev.values().sum::<f32>() < 0.5 {
+        return None;
+    }
+    Some(blend(&p_jev, &frequency_prior(history, labels), blend_weight(history.len())))
+}
+
 pub fn frequency_prior(precedents: &[Precedent], options: &[String]) -> BTreeMap<String, f32> {
     let n = precedents.iter().filter(|p| options.contains(&p.editor_chose)).count() as f32;
     let denom = n + options.len() as f32;
@@ -134,6 +150,45 @@ mod tests {
 
     fn p(c: &str) -> Precedent {
         Precedent { context: json!({}), ai_suggested: "CAM3".into(), editor_chose: c.into(), at_ms: 0 }
+    }
+
+    #[test]
+    fn ranking_a_long_history_is_fast() {
+        // One camera pass over a 10-minute clip (150 intervals) with 200 past
+        // corrections, each context four angles wide: this ran on the UI thread.
+        let ctx = |i: usize| {
+            json!({"context": {"audio_activity": "loud"}, "cameras": (0..4).map(|a| json!({"label": format!("CAM{a}"), "shows": "wide stage", "sharpness": if (i + a) % 2 == 0 { "sharp" } else { "soft" }, "exposure": "normal", "loudness": "loud"})).collect::<Vec<_>>()})
+        };
+        let events: Vec<EditorPreferenceEvent> = (0..200)
+            .map(|i| EditorPreferenceEvent {
+                at_ms: i as i64,
+                action: None,
+                kind: CorrectionKind::CameraChanged,
+                context: ctx(i),
+                features: json!({}),
+                ai_choice: "CAM1".into(),
+                ai_confidence: 0.5,
+                human_choice: "CAM2".into(),
+                decision: Some(kadr_core::DecisionId::new()),
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        for i in 0..150 {
+            assert_eq!(precedents(&events, &[], DecisionKind::CameraPick, &ctx(i), 16, 0).len(), 16);
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(1500), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn precedents_never_turn_unsure_into_a_pick() {
+        let labels: Vec<String> = vec!["CAM1".into(), "CAM2".into()];
+        let unsure = BTreeMap::from([("UNSURE".to_string(), 0.9), ("CAM2".to_string(), 0.1), ("CAM1".to_string(), 0.0)]);
+        assert_eq!(personal_pick(&unsure, &labels, &[p("CAM2"), p("CAM2")]), None);
+        let thin = BTreeMap::from([("CAM9".to_string(), 0.35), ("CAM2".to_string(), 0.3), ("UNSURE".to_string(), 0.25), ("CAM1".to_string(), 0.1)]);
+        assert_eq!(personal_pick(&thin, &labels, &[p("CAM2")]), None, "angles hold under half the mass");
+        let sure = BTreeMap::from([("CAM2".to_string(), 0.8), ("CAM1".to_string(), 0.1), ("UNSURE".to_string(), 0.1)]);
+        let b = personal_pick(&sure, &labels, &[p("CAM2"), p("CAM2")]).unwrap();
+        assert!(b["CAM2"] > b["CAM1"] && !b.contains_key("UNSURE"));
     }
 
     #[test]

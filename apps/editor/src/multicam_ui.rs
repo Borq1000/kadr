@@ -207,10 +207,7 @@ impl App {
             let rows: Vec<(AssetId, String, String)> = picked.iter().map(|r| (r.asset, r.label.clone(), r.description.clone())).collect();
             if let Some(g) = self.project.multicam_groups.iter_mut().find(|g| g.id == id) {
                 g.name = name;
-                for (a, (_, label, desc)) in g.angles.iter_mut().zip(rows) {
-                    a.label = label;
-                    a.description = desc;
-                }
+                relabel_angles(&mut g.angles, &rows);
             }
             self.meta_dirty = true;
             self.mc.view_key = None;
@@ -240,6 +237,7 @@ impl App {
             .map(|r| SyncInput {
                 timecode: self.project.asset(r.asset).and_then(|a| a.info.timecode.clone()),
                 levels: self.assets_rt.get(&r.asset).and_then(|x| x.overview.as_ref().map(|o| o.levels_db.clone())),
+                rate: self.project.asset(r.asset).and_then(|a| a.info.video.as_ref().and_then(|v| v.frame_rate)),
             })
             .collect();
         let angles: Vec<(AssetId, String, String, String)> =
@@ -550,6 +548,17 @@ pub fn parse_camera_subject(s: &str) -> Option<(MulticamId, TimeRange)> {
     Some((MulticamId::parse(g)?, TimeRange::new(Time::from_millis(a.parse().ok()?), Time::from_millis(b.parse().ok()?))))
 }
 
+/// New names and descriptions from the dialog rows, matched by media: the
+/// rows are sorted by name, the angle order (keys 1–9, clips) must not move.
+pub fn relabel_angles(angles: &mut [MulticamAngle], rows: &[(AssetId, String, String)]) {
+    for a in angles {
+        if let Some((_, label, desc)) = rows.iter().find(|r| r.0 == a.asset) {
+            a.label = label.clone();
+            a.description = desc.clone();
+        }
+    }
+}
+
 /// Cut to `angle` at `at`: switch the whole clip when `at` is its start,
 /// split and switch the rest otherwise; `None` when already on `angle`.
 pub fn cut_to_angle_command(seq: &Sequence, clip: ClipId, at: Time, angle: u32) -> Option<EditCommand> {
@@ -567,6 +576,8 @@ pub struct SyncInput {
     pub timecode: Option<String>,
     /// 10 ms loudness envelope (dB) from the audio proxy.
     pub levels: Option<Vec<f32>>,
+    /// The camera's own frame rate: timecode frames count at this rate.
+    pub rate: Option<FrameRate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -586,7 +597,9 @@ pub fn plan_sync(inputs: &[SyncInput], rate: FrameRate) -> Vec<SyncOutcome> {
     let Some(first) = inputs.first() else { return vec![] };
     let mut out = vec![SyncOutcome { reliable: true, confidence: 1.0, ..manual }];
     for inp in &inputs[1..] {
-        let by_tc = first.timecode.as_deref().zip(inp.timecode.as_deref()).and_then(|(a, b)| timecode_offset(a, b, rate));
+        // Each clock counts frames at its own camera's rate.
+        let tc_time = |i: &SyncInput| timecode_offset("00:00:00:00", i.timecode.as_deref()?, i.rate.unwrap_or(rate));
+        let by_tc = tc_time(first).zip(tc_time(inp)).map(|(a, b)| b - a);
         let outcome = match (by_tc, first.levels.as_deref(), inp.levels.as_deref()) {
             // B's clock started d later → group time t is B source t − d.
             (Some(d), _, _) => SyncOutcome { offset: Time::ZERO - d, method: SyncMethod::Timecode, confidence: 1.0, reliable: true },
@@ -613,6 +626,25 @@ mod tests {
 
     fn s(x: i64) -> Time {
         Time::from_secs(x)
+    }
+
+    #[test]
+    fn renaming_angles_keeps_each_label_on_its_own_media() {
+        let (a, b) = (AssetId::new(), AssetId::new());
+        let angle = |asset, label: &str| MulticamAngle { asset, label: label.into(), description: String::new(), sync_offset: Time::ZERO, sync_method: kadr_project::SyncMethod::Manual };
+        let mut angles = vec![angle(a, "CAM1"), angle(b, "CAM2")];
+        // The dialog lists rows sorted by the new names: "Wide" (b) before "Close" (a).
+        relabel_angles(&mut angles, &[(b, "Wide".into(), "stage".into()), (a, "Close".into(), "singer".into())]);
+        assert_eq!((angles[0].asset, angles[0].label.as_str(), angles[0].description.as_str()), (a, "Close", "singer"));
+        assert_eq!((angles[1].asset, angles[1].label.as_str(), angles[1].description.as_str()), (b, "Wide", "stage"));
+    }
+
+    #[test]
+    fn timecode_counts_frames_at_the_camera_rate() {
+        // 25 fps cameras in a 30 fps sequence: frame 20 is 0.8 s, not 0.667 s.
+        let tc = |t: &str| SyncInput { timecode: Some(t.to_string()), levels: None, rate: Some(FrameRate::FPS_25) };
+        let got = plan_sync(&[tc("10:00:00:00"), tc("10:00:05:20")], FrameRate::FPS_30);
+        assert_eq!(got[1].offset, Time::ZERO - Time::from_millis(5_800));
     }
 
     #[test]
@@ -648,12 +680,12 @@ mod tests {
         }
         env.truncate(3000);
         let late: Vec<f32> = env[150..].to_vec(); // started 1.5 s later
-        let tc = |t: &str| SyncInput { timecode: Some(t.to_string()), levels: None };
+        let tc = |t: &str| SyncInput { timecode: Some(t.to_string()), levels: None, rate: None };
         let got = plan_sync(&[tc("01:00:00:00"), tc("01:00:02:00")], rate);
         assert_eq!(got[1].offset, s(-2));
         assert_eq!(got[1].method, SyncMethod::Timecode);
 
-        let au = |l: &[f32]| SyncInput { timecode: None, levels: Some(l.to_vec()) };
+        let au = |l: &[f32]| SyncInput { timecode: None, levels: Some(l.to_vec()), rate: None };
         let got = plan_sync(&[au(&env), au(&late)], rate);
         assert_eq!(got[0].offset, Time::ZERO);
         assert_eq!(got[1].offset, Time::from_millis(-1500), "source = group + offset");

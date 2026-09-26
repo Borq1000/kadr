@@ -374,6 +374,33 @@ fn switch_at_a_time_is_a_live_cut() {
 }
 
 #[test]
+fn an_off_frame_live_cut_switches_the_part_after_the_cut() {
+    // During playback the playhead follows the audio clock, between frames.
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(4_030)) }).unwrap();
+    let v1: Vec<_> = p.sequence().tracks[0].clips.iter().map(|c| (c.name.clone(), c.timeline_in.as_millis())).collect();
+    assert_eq!(v1, vec![("CAM1".to_string(), 0), ("CAM2".to_string(), 4_040)]);
+}
+
+#[test]
+fn a_live_cut_within_half_a_frame_of_the_clip_end_does_nothing_quietly() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    assert_eq!(e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(9_990)) }), Err(EditError::NoOp));
+    // …and half a frame after the start switches the whole clip.
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(10)) }).unwrap();
+    let v1 = &p.sequence().tracks[0].clips;
+    assert_eq!((v1.len(), v1[0].name.as_str()), (1, "CAM2"));
+}
+
+#[test]
+fn no_group_clip_for_an_angle_whose_media_is_gone() {
+    let (mut p, _, _, group) = multicam_project(10, 20);
+    let cam1 = group.angles[0].asset;
+    p.assets.retain(|a| a.id != cam1);
+    assert!(multicam::group_clip(&group, 0, &p.assets, s(0)).is_none());
+}
+
+#[test]
 fn group_span_and_clip_cover_all_angles() {
     let (p, _, _, group) = multicam_project(10, 20);
     // CAM1 covers group 0..60, CAM2 covers group 2..62.

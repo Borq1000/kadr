@@ -668,5 +668,6 @@
   "jev.cams.all_unsure": "Jev couldn't choose a camera anywhere: it has too little to go on. Describe what each camera shows (right-click the group → Edit angles…), or switch angles by hand with keys 1–9: Jev learns from those picks.",
   "jev.cams.agree_some_unsure": "Nothing to change: where Jev was sure, it agrees with the current cut. In {n} intervals it couldn't choose — describe the cameras in the group to help it.",
   "settings.jev_personalize": "Learn from my edits",
-  "settings.jev_personalize_hint": "When Jev picks cameras, your past corrections in similar moments are sent along as examples. They stay in the project file; turn this off to get Jev's general judgement only."
+  "settings.jev_personalize_hint": "When Jev picks cameras, your past corrections in similar moments are sent along as examples. They stay in the project file; turn this off to get Jev's general judgement only.",
+  "toast.media_in_group": "This clip is an angle of the multicam group “{group}”. Remove the group first."
 }

@@ -10,7 +10,7 @@ use kadr_ai::cost::{check_budget, BudgetDecision, CostEstimate, Pricing};
 use kadr_ai::jev::decided::summarize;
 use kadr_ai::jev::prefs::{self, Precedent};
 use kadr_ai::jev::templates::{camera_item, shot_item, AngleFeatures, CameraInterval, UNSURE};
-use kadr_ai::jev::{decide_gate, Decided, JevDecisionService, JevEstimate, JevItem};
+use kadr_ai::jev::{decide_gate, Decided, JevDecisionService, JevEstimate, JevFailure, JevItem};
 use kadr_ai::privacy::{gate, DataKind, GateDecision};
 use kadr_ai::providers::jev::{JevProvider, JevQuestion, JevResponse, JevTransport};
 use kadr_ai::providers::{AiError, BoxFuture};
@@ -133,6 +133,45 @@ fn no_change_key(unsure: usize, total: usize) -> &'static str {
     }
 }
 
+/// The best other angle Jev rated at least "good" (score 2 of 0–3) for a slot.
+fn good_alternative(answers: &BTreeMap<String, kadr_ai::providers::jev::JevAnswer>, labels: &[String], current: &str) -> Option<String> {
+    labels
+        .iter()
+        .filter(|l| l.as_str() != current)
+        .filter_map(|l| {
+            let a = answers.get(&format!("fit_{l}"))?;
+            let p: BTreeMap<String, f32> = a.probabilities.iter().map(|(k, v)| (k.clone(), *v as f32)).collect();
+            let (top, p_top, _) = summarize(&p)?;
+            let score: usize = top.parse().ok()?;
+            (score >= 2).then(|| (score, p_top, l.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .map(|x| x.2)
+}
+
+/// Longest time one angle may hold while another is rated at least "good".
+const MAX_HOLD: Time = Time::from_secs(20);
+
+/// Per-slot picks with each slot's best other angle (fit ≥ "good"): a hold
+/// longer than `max` cuts away to that angle for one slot.
+pub fn cap_holds(picks: Vec<Pick>, alternatives: &[Option<String>], max: Time) -> Vec<Pick> {
+    let mut out: Vec<Pick> = Vec::with_capacity(picks.len());
+    let mut held_since = picks.first().map_or(Time::ZERO, |p| p.range.start);
+    for (i, mut p) in picks.into_iter().enumerate() {
+        if out.last().is_some_and(|l| l.label != p.label) {
+            held_since = p.range.start;
+        }
+        if p.range.end - held_since > max {
+            if let Some(a) = alternatives.get(i).cloned().flatten().filter(|a| *a != p.label) {
+                p.label = a;
+                held_since = p.range.start;
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
 /// What a Jev card is for, with what's needed to use its answers.
 pub enum JevPurpose {
     Grade,
@@ -229,28 +268,38 @@ impl App {
         self.refresh_ai();
     }
 
-    fn on_jev_result(&mut self, i: usize, r: Result<(Vec<Decided>, u64, u64), AiError>) {
-        let Some(o) = self.ai.offers.get_mut(i) else { return };
-        if o.state == 3 {
-            return;
-        }
-        let (decided, input, output) = match r {
-            Ok(x) => x,
-            Err(e) => {
-                o.state = 4;
-                self.ai.say(4, tf("ai.msg.error", &[("error", &crate::ai_ui::ai_error_text(&e))]));
-                return self.refresh_ai();
-            }
-        };
-        o.state = 2;
+    fn on_jev_result(&mut self, i: usize, r: Result<(Vec<Decided>, u64, u64), JevFailure>) {
+        let Some(o) = self.ai.offers.get(i) else { return };
         let OfferKind::Jev(req) = &o.kind else { return };
+        let cancelled = o.state == 3;
+        let (decided, input, output, error) = match r {
+            Ok((d, input, output)) => (d, input, output, None),
+            Err(f) => (f.partial, f.input_tokens, f.output_tokens, Some(f.error)),
+        };
         let cost = req.pricing.cost(input, output);
         let (model, purpose_is_grade) = (req.model.clone(), matches!(req.purpose, JevPurpose::Grade));
+        // Calls that went through are paid for, whatever happens next.
         if input > 0 {
             self.ai.assistant.ledger.lock().unwrap().record(cost, input, output);
             self.project.ai_cost_usd += cost;
             self.record_month_spend(cost);
+            self.meta_dirty = true;
         }
+        if cancelled || error.is_some() {
+            // Keep paid-for verdicts; a camera plan needs every interval.
+            if purpose_is_grade && !decided.is_empty() {
+                self.upsert_decisions(decided.into_iter().map(|d| d.stored).collect());
+                self.refresh_library();
+                self.refresh_timeline();
+                self.refresh_inspector();
+            }
+            if let (false, Some(e)) = (cancelled, error) {
+                self.ai.offers[i].state = 4;
+                self.ai.say(4, tf("ai.msg.error", &[("error", &crate::ai_ui::ai_error_text(&e))]));
+            }
+            return self.refresh_ai();
+        }
+        self.ai.offers[i].state = 2;
         let cached = decided.iter().filter(|d| d.from_cache).count();
         tracing::info!(decisions = decided.len(), cached, input, cost, "Jev answered");
         if purpose_is_grade {
@@ -458,16 +507,14 @@ impl App {
         let mut stored = vec![];
         let mut personal_n = 0;
         let mut unsure_n = 0;
+        let mut alternatives = vec![];
         for (slot, mut d) in slots.into_iter().zip(decided) {
             if !d.from_cache {
                 // Personal pick when the history has precedents for this moment.
                 let precedent = d.answers.get("has_precedent").and_then(|a| a.noul).unwrap_or(0.0);
                 if let (Some(pick), true) = (d.answers.get("editor_pick"), precedent >= 0.5) {
-                    let p_jev: BTreeMap<String, f32> =
-                        pick.probabilities.iter().filter(|(k, _)| slot.labels.contains(k)).map(|(k, v)| (k.clone(), *v as f32)).collect();
-                    if !p_jev.is_empty() {
-                        let p_freq = prefs::frequency_prior(&slot.history, &slot.labels);
-                        let p = prefs::blend(&p_jev, &p_freq, prefs::blend_weight(slot.history.len()));
+                    let p_pick: BTreeMap<String, f32> = pick.probabilities.iter().map(|(k, v)| (k.clone(), *v as f32)).collect();
+                    if let Some(p) = prefs::personal_pick(&p_pick, &slot.labels, &slot.history) {
                         if let Some((value, p_max, margin)) = summarize(&p) {
                             d.stored.gate = decide_gate(DecisionKind::CameraPick, &value, p_max, margin, false);
                             d.stored.value = value;
@@ -484,13 +531,14 @@ impl App {
             let usable = d.stored.value != UNSURE && d.stored.gate != kadr_project::Gate::Review && slot.labels.contains(&d.stored.value);
             unsure_n += !usable as usize;
             let label = if usable { d.stored.effective().to_string() } else { slot.current.clone() };
+            alternatives.push(good_alternative(&d.answers, &slot.labels, &label));
             picks.push((Pick { range: slot.range, label, p: d.stored.p_max }, personal, slot.current));
             stored.push(d.stored);
         }
         self.upsert_decisions(stored);
         let personal_of = |r: TimeRange| picks.iter().any(|(p, personal, _)| *personal && p.range.intersect(&r).is_some());
         let current_of = |r: TimeRange| picks.iter().find(|(p, ..)| p.range.contains(r.start)).map(|x| x.2.clone()).unwrap_or_default();
-        let merged = merge_picks(picks.iter().map(|x| x.0.clone()).collect(), MIN_CAMERA_SHOT);
+        let merged = merge_picks(cap_holds(picks.iter().map(|x| x.0.clone()).collect(), &alternatives, MAX_HOLD), MIN_CAMERA_SHOT);
         let items: Vec<PlanItem> = merged
             .iter()
             .filter(|p| p.label != current_of(p.range))
@@ -703,6 +751,21 @@ mod tests {
         // Equal neighbours merge; the 1.5 s CAM2 blip joins its stronger neighbour.
         let summary: Vec<_> = got.iter().map(|p| (p.range.start.as_millis(), p.range.end.as_millis(), p.label.as_str())).collect();
         assert_eq!(summary, vec![(0, 8000, "CAM1"), (8000, 13500, "CAM3")]);
+    }
+
+    #[test]
+    fn a_long_hold_cuts_away_to_a_good_alternative() {
+        // Seven 4 s slots all on CAM1; CAM2 fits "good" from slot 3 on.
+        let slots: Vec<Pick> = (0..7).map(|i| Pick { range: TimeRange::new(Time::from_secs(4 * i), Time::from_secs(4 * i + 4)), label: "CAM1".into(), p: 0.9 }).collect();
+        let alts: Vec<Option<String>> = (0..7).map(|i| (i >= 3).then(|| "CAM2".to_string())).collect();
+        let got = cap_holds(slots, &alts, Time::from_secs(20));
+        let labels: Vec<&str> = got.iter().map(|p| p.label.as_str()).collect();
+        // 0–20 s is the longest allowed hold; the slot ending past 20 s cuts away.
+        assert_eq!(labels, ["CAM1", "CAM1", "CAM1", "CAM1", "CAM1", "CAM2", "CAM1"]);
+        // Without a good alternative the hold stays.
+        let none = vec![None; 7];
+        let slots2: Vec<Pick> = got.iter().map(|p| Pick { label: "CAM1".into(), ..p.clone() }).collect();
+        assert!(cap_holds(slots2, &none, Time::from_secs(20)).iter().all(|p| p.label == "CAM1"));
     }
 
     #[test]

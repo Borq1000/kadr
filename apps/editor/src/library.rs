@@ -366,8 +366,12 @@ impl App {
             }
             "remove" => {
                 let used = self.project.sequence().tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.asset == aid).count();
+                let group = self.project.multicam_groups.iter().find(|g| g.angles.iter().any(|a| a.asset == aid)).map(|g| g.name.clone());
                 if used > 0 {
                     self.toast_warn(tn("toast.media_in_use", used as i64, &[]));
+                } else if let Some(g) = group {
+                    // The group would point at missing media.
+                    self.toast_warn(tf("toast.media_in_group", &[("group", &g)]));
                 } else {
                     let name = self.project.asset(aid).map(|a| a.name.clone()).unwrap_or_default();
                     self.ask(&t("dlg.remove_media.title"), &tf("dlg.remove_media.body", &[("name", &name)]), &t("dlg.remove_media.ok"), "", true, Confirm::RemoveAsset(aid));

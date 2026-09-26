@@ -52,7 +52,7 @@ pub fn angle_source(group: &MulticamGroup, angle: u32, clip: &Clip, assets: &[Me
 pub fn group_clip(group: &MulticamGroup, angle: u32, assets: &[MediaAsset], at: Time) -> Option<Clip> {
     let span = group_span(group, assets);
     let a = group.angles.get(angle as usize)?;
-    if span.is_empty() {
+    if span.is_empty() || !assets.iter().any(|x| x.id == a.asset) {
         return None;
     }
     let src = TimeRange::new(span.start + a.sync_offset, span.end + a.sync_offset);
