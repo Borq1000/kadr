@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod silence;
+pub mod sync;
 pub mod video;
 
 pub use audio::{analyze_pcm, AudioOverview, OVERVIEW_VERSION};
