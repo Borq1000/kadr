@@ -112,7 +112,11 @@ impl JevDecisionService {
         let input: u64 = batches
             .iter()
             .map(|b| CALL_OVERHEAD_TOKENS + b.iter().map(|&i| { let (s, q) = items[i].tokens(); s + q }).sum::<u64>())
-            .sum();
+            .sum::<u64>()
+            // JSON tokenizes worse than our chars/3.5 heuristic (live: +16 %);
+            // a budget check must not under-report.
+            * 5
+            / 4;
         JevEstimate {
             calls: batches.len(),
             input_tokens: input,

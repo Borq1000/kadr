@@ -2,7 +2,9 @@
 //! features* (never raw video).
 
 pub mod decided;
+pub mod prefs;
 pub mod service;
+pub mod templates;
 
 pub use decided::{decide_gate, Decided};
 pub use service::{apply_hysteresis, JevDecisionService, JevEstimate, JevItem};

@@ -64,3 +64,68 @@ fn jev_typed_decisions() {
     assert!(r.answers["usable"].noul.unwrap() < 0.5, "a blurred, shaky shot should not be usable");
     assert_ne!(r.answers["action"].choice.as_deref(), Some("KEEP"));
 }
+
+#[test]
+#[ignore = "live network call (Jev)"]
+fn jev_templates_through_the_service() {
+    use kadr_ai::jev::prefs::Precedent;
+    use kadr_ai::jev::templates::{camera_item, shot_item, AngleFeatures, CameraInterval};
+    use kadr_ai::jev::JevDecisionService;
+    use kadr_core::{CancelToken, Time, TimeRange};
+    use kadr_project::{Gate, ShotSummary};
+    use std::sync::Arc;
+
+    let Some(key) = load_key("jev") else { return eprintln!("no jev key stored") };
+    let settings = AiSettings::default();
+    let cfg = settings.provider("jev").unwrap().clone();
+    let pricing = cfg.pricing(&settings.jev_model);
+    let svc = JevDecisionService::new(Arc::new(JevProvider::new(cfg, key)), settings.jev_model.clone(), pricing);
+
+    let shot = |sharp: &str, shake: &str| ShotSummary {
+        range: TimeRange::new(Time::ZERO, Time::from_secs(5)),
+        sharpness: sharp.into(),
+        exposure: "normal".into(),
+        shake: shake.into(),
+        black: false,
+    };
+    let angle = |l: &str, d: &str| AngleFeatures {
+        label: l.into(),
+        description: d.into(),
+        sharpness: "sharp".into(),
+        exposure: "normal".into(),
+        shake: "none".into(),
+        audio_level: "quiet".into(),
+    };
+    let iv = CameraInterval {
+        subject: "solo".into(),
+        time_label: "05:00-05:04".into(),
+        angles: vec![angle("CAM1", "wide shot of the whole stage"), angle("CAM2", "medium shot of the singer"), angle("CAM3", "close-up of the guitarist's hands")],
+        previous: Some(("CAM2".into(), Time::from_secs(12))),
+        context: serde_json::json!({"music_section": "guitar solo", "singer_singing": false}),
+    };
+    let history: Vec<Precedent> = (0..5)
+        .map(|i| Precedent { context: iv.context.clone(), ai_suggested: "CAM3".into(), editor_chose: "CAM1".into(), at_ms: i })
+        .collect();
+    let items = vec![
+        shot_item("bad".into(), &shot("very blurry", "heavy"), "music"),
+        shot_item("good".into(), &shot("sharp", "none"), "speech"),
+        camera_item(&iv, &[]),
+        camera_item(&CameraInterval { subject: "solo-personal".into(), ..iv.clone() }, &history),
+    ];
+    let est = svc.estimate(&items, &[]);
+    let (d, input, _) = rt().block_on(svc.run(items, &[], CancelToken::new())).unwrap();
+    for x in &d {
+        eprintln!("{:>14}: {} p={:.2} m={:.2} {:?} | {:?}", x.stored.subject, x.stored.value, x.stored.p_max, x.stored.margin, x.stored.gate,
+            x.answers.iter().map(|(k, a)| (k.clone(), a.choice.clone(), a.noul, a.score)).collect::<Vec<_>>());
+    }
+    eprintln!("estimated {} tokens / ${:.6}, billed {input} tokens", est.input_tokens, est.usd);
+    assert_eq!(d[0].stored.value, "DISCARD");
+    assert_ne!(d[0].stored.gate, Gate::Review);
+    assert_eq!(d[1].stored.value, "KEEP");
+    for x in &d {
+        assert!((x.stored.probs.values().sum::<f32>() - 1.0).abs() < 0.05, "{:?}", x.stored.probs);
+    }
+    let personal = &d[3].answers["editor_pick"];
+    assert_eq!(personal.choice.as_deref(), Some("CAM1"), "five solos where the editor chose the wide shot");
+    assert!(d[3].answers["has_precedent"].noul.unwrap() > 0.5);
+}
