@@ -2,13 +2,13 @@ import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
 import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
-import { Preview } from "preview.slint";
+import { Preview, AngleView } from "preview.slint";
 import { Timeline, TrackView, ClipView, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
-import { ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
+import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { McAngleRow, AngleView, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -62,6 +62,20 @@ export component AppWindow inherits Window {
     in property <bool> bypass;
     in property <bool> preview-loading;
     in property <float> scrub-fraction;
+    in property <[AngleView]> angles;
+    in property <int> active-angle;
+    callback angle-clicked(int);
+    // Multicam group dialog.
+    in-out property <bool> mc-open;
+    in property <[McAngleRow]> mc-rows;
+    in property <string> mc-name;
+    in property <bool> mc-editing;
+    in property <string> mc-hint;
+    callback mc-toggle(int);
+    callback mc-set-label(int, string);
+    callback mc-set-description(int, string);
+    callback mc-confirm(string);
+    callback mc-dismiss();
 
     // ---- Timeline
     in property <[TrackView]> tracks;
@@ -393,6 +407,9 @@ export component AppWindow inherits Window {
                     bypass: root.bypass;
                     loading: root.preview-loading;
                     scrub-fraction: root.scrub-fraction;
+                    angles: root.angles;
+                    active-angle: root.active-angle;
+                    angle-clicked(i) => { root.angle-clicked(i); root.focus-editor(); }
                     transport(a) => { root.transport(a); root.focus-editor(); }
                     set-quality(q) => { root.set-quality(q); }
                     set-zoom(z) => { root.set-zoom(z); }
@@ -620,6 +637,21 @@ export component AppWindow inherits Window {
         recent: root.recent;
         action(a) => { root.welcome-action(a); }
         open-recent(i) => { root.open-recent(i); }
+    }
+
+    if root.mc-open: MulticamDialog {
+        width: root.width;
+        height: root.height;
+        title: root.mc-editing ? Tr.t("mc.dlg.edit_title") : Tr.t("mc.dlg.title");
+        rows: root.mc-rows;
+        group-name: root.mc-name;
+        editing: root.mc-editing;
+        hint: root.mc-hint;
+        toggle(i) => { root.mc-toggle(i); }
+        set-label(i, s) => { root.mc-set-label(i, s); }
+        set-description(i, s) => { root.mc-set-description(i, s); }
+        confirm(n) => { root.mc-confirm(n); }
+        dismiss => { root.mc-dismiss(); }
     }
 
     if root.export-open: ExportDialog {

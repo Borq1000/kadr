@@ -12,6 +12,7 @@ mod import;
 mod inspector;
 mod keys;
 mod library;
+mod multicam_ui;
 mod persistence;
 mod preview;
 mod settings_ui;

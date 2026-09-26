@@ -342,6 +342,96 @@ export component ConfirmDialog inherits Modal {
 }
 
 // Generic single-line text input (renames).
+export struct McAngleRow {
+    name: string,
+    thumb: image,
+    has-thumb: bool,
+    checked: bool,
+    label: string,
+    description: string,
+    sync: string,
+    sync-warn: bool,
+}
+
+/// Create / edit a multicam group: pick angles, name them, say what each shows.
+export component MulticamDialog inherits Modal {
+    in property <[McAngleRow]> rows;
+    in property <string> group-name;
+    in property <bool> editing;
+    in property <string> hint;
+    callback toggle(int);
+    callback set-label(int, string);
+    callback set-description(int, string);
+    callback confirm(string);
+    card-width: 700px;
+    Text {
+        text: root.editing ? Tr.t("mc.dlg.edit_hint") : Tr.t("mc.dlg.hint");
+        wrap: word-wrap;
+        font-size: Theme.font-sm;
+        color: Theme.text-dim;
+    }
+    HorizontalLayout {
+        spacing: 10px;
+        Text { text: Tr.t("mc.dlg.name"); vertical-alignment: center; color: Theme.text-dim; font-size: Theme.font-sm; }
+        name := LineEdit { text: root.group-name; horizontal-stretch: 1; }
+    }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 10px;
+        if !root.editing: Rectangle { width: 24px; }
+        Rectangle { width: 86px; }
+        Text { horizontal-stretch: 1; text: Tr.t("mc.dlg.col.clip"); font-size: Theme.font-xs; color: Theme.text-faint; }
+        Text { width: 84px; text: Tr.t("mc.dlg.col.label"); font-size: Theme.font-xs; color: Theme.text-faint; }
+        Text { width: 210px; text: Tr.t("mc.dlg.col.shows"); font-size: Theme.font-xs; color: Theme.text-faint; }
+    }
+    ScrollView {
+        height: min(380px, list.preferred-height);
+        list := VerticalLayout {
+            spacing: 6px;
+            for r[i] in root.rows: Rectangle {
+                height: 64px;
+                border-radius: 6px;
+                background: r.checked ? Theme.bg2 : transparent;
+                border-width: 1px;
+                border-color: r.checked ? Theme.border-strong : Theme.border;
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 10px;
+                    if !root.editing: VerticalLayout { alignment: center; width: 24px; CheckBox { checked: r.checked; toggled => { root.toggle(i); } } }
+                    Rectangle {
+                        width: 86px;
+                        border-radius: 4px;
+                        background: #000000;
+                        clip: true;
+                        if r.has-thumb: Image { source: r.thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        Text { text: r.name; overflow: elide; color: r.checked ? Theme.text : Theme.text-dim; font-size: Theme.font-sm; font-weight: 600; }
+                        Text { text: r.sync; overflow: elide; color: r.sync-warn ? Theme.warning : Theme.text-faint; font-size: Theme.font-xs; }
+                    }
+                    VerticalLayout { alignment: center; width: 84px; LineEdit { enabled: r.checked; text: r.label; edited(t) => { root.set-label(i, t); } } }
+                    VerticalLayout {
+                        alignment: center;
+                        width: 210px;
+                        LineEdit { enabled: r.checked; text: r.description; placeholder-text: Tr.t("mc.dlg.shows_placeholder"); edited(t) => { root.set-description(i, t); } }
+                    }
+                }
+            }
+        }
+    }
+    if root.hint != "": Text { text: root.hint; color: Theme.warning; font-size: Theme.font-sm; wrap: word-wrap; }
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+        Button { text: Tr.t("common.cancel"); ghost: true; clicked => { root.dismiss(); } }
+        Button { text: root.editing ? Tr.t("common.ok") : Tr.t("mc.dlg.create"); primary: true; clicked => { root.confirm(name.text); } }
+    }
+}
+
 export component PromptDialog inherits Modal {
     in property <string> label;
     in property <string> value;

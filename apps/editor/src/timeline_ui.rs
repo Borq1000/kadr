@@ -701,6 +701,10 @@ impl App {
                 self.zoom_fit();
                 self.refresh_status();
             }
+            // Show what was just placed instead of "no clip under playhead".
+            if asset.kind() != MediaKind::Audio && kadr_timeline::composition::video_at(self.project.sequence(), self.playhead).is_none() {
+                self.set_playhead(at);
+            }
             self.refresh_timeline();
             self.refresh_inspector();
         }

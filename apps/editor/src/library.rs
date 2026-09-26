@@ -3,14 +3,27 @@
 use crate::app::{App, AssetStatus, Confirm};
 use crate::timeline_ui::{rows, AUDIO_H, VIDEO_H};
 use crate::{AssetView, BinView};
-use kadr_core::{AssetId, BinId, MediaKind};
+use kadr_core::{AssetId, BinId, MediaKind, MulticamId};
 use kadr_i18n::{duration, t, tf, tn};
 use kadr_project::{Bin, TrackKind};
 use kadr_timeline::InsertMode;
-use slint::{ModelRc, VecModel};
+use slint::{Model, ModelRc, VecModel};
+
+/// A library card: a media asset or a multicam group.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LibItem {
+    Asset(AssetId),
+    Group(MulticamId),
+}
+
+impl LibItem {
+    pub fn parse(id: &str) -> Option<Self> {
+        AssetId::parse(id).map(LibItem::Asset).or_else(|| MulticamId::parse(id).map(LibItem::Group))
+    }
+}
 
 pub struct LibDrag {
-    pub asset: AssetId,
+    pub item: LibItem,
     pub start: (f64, f64),
     pub active: bool,
 }
@@ -21,7 +34,8 @@ impl App {
         let used: std::collections::HashSet<AssetId> =
             self.project.sequence().tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.asset)).collect();
         let q = self.media_search.trim().to_lowercase();
-        let views: Vec<AssetView> = self
+        let mut views: Vec<AssetView> = self.mc_cards(&q);
+        let asset_views: Vec<AssetView> = self
             .project
             .assets
             .iter()
@@ -86,7 +100,8 @@ impl App {
                 }
             })
             .collect();
-        let total = self.project.assets.len();
+        views.extend(asset_views);
+        let total = self.project.assets.len() + self.project.multicam_groups.len();
         let mut bins = vec![BinView { id: "".into(), name: t("media.bin.all").into(), count: total as i32, selected: self.bin_filter.is_none(), renaming: false }];
         for b in &self.project.bins {
             let count = self.project.assets.iter().filter(|a| a.bin == Some(b.id)).count();
@@ -183,10 +198,38 @@ impl App {
     }
 
     pub fn asset_pressed(&mut self, id: &str, x: f32, y: f32) {
-        let Some(id) = AssetId::parse(id) else { return };
-        self.selected_asset = Some(id);
-        self.library_drag = Some(LibDrag { asset: id, start: (x as f64, y as f64), active: false });
-        self.refresh_library();
+        let Some(item) = LibItem::parse(id) else { return };
+        match item {
+            LibItem::Asset(a) => {
+                self.selected_asset = Some(a);
+                self.mc.selected_group = None;
+            }
+            LibItem::Group(g) => {
+                self.selected_asset = None;
+                self.mc.selected_group = Some(g);
+            }
+        }
+        self.library_drag = Some(LibDrag { item, start: (x as f64, y as f64), active: false });
+        // Not refresh_library(): replacing the model would recreate the card
+        // whose TouchArea just grabbed the mouse, killing the drag gesture.
+        self.update_library_selection();
+    }
+
+    /// Updates the `selected` flag of the existing cards in place.
+    fn update_library_selection(&self) {
+        let model = self.ui().get_assets();
+        for i in 0..model.row_count() {
+            let Some(mut v) = model.row_data(i) else { continue };
+            let selected = match LibItem::parse(&v.id) {
+                Some(LibItem::Asset(a)) => self.selected_asset == Some(a),
+                Some(LibItem::Group(g)) => self.mc.selected_group == Some(g),
+                None => false,
+            };
+            if v.selected != selected {
+                v.selected = selected;
+                model.set_row_data(i, v);
+            }
+        }
     }
 
     pub fn asset_moved(&mut self, _id: &str, x: f32, y: f32) {
@@ -198,9 +241,18 @@ impl App {
         if !d.active {
             return;
         }
-        let asset = d.asset;
+        let item = d.item;
         let ui = self.ui();
-        let name = self.project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
+        let (name, dur) = match item {
+            LibItem::Asset(a) => self.project.asset(a).map(|a| (a.name.clone(), a.duration().as_secs_f64())).unwrap_or_default(),
+            LibItem::Group(g) => self
+                .project
+                .multicam_groups
+                .iter()
+                .find(|x| x.id == g)
+                .map(|x| (x.name.clone(), kadr_timeline::multicam::group_span(x, &self.project.assets).duration().as_secs_f64()))
+                .unwrap_or_default(),
+        };
         ui.set_drag_active(true);
         ui.set_drag_x(x as f32);
         ui.set_drag_y(y as f32);
@@ -209,7 +261,7 @@ impl App {
                 let seq = self.project.sequence();
                 let t = seq.frame_rate.snap(t);
                 let rs = rows(seq, self.tl.scroll_y);
-                let dur = self.project.asset(asset).map(|a| a.duration().as_secs_f64()).unwrap_or(1.0);
+                let dur = dur.max(0.1);
                 let r = rs.get(row).copied();
                 let x0 = (t.as_secs_f64() - self.tl.scroll) * self.tl.pps;
                 let (gy, gh) = r.map_or((0.0, VIDEO_H), |r| (r.y, if r.kind == TrackKind::Video { VIDEO_H } else { AUDIO_H }));
@@ -231,27 +283,41 @@ impl App {
         let Some(d) = self.library_drag.take() else { return };
         if d.active {
             if let Some((t, row)) = self.drop_target(x as f64, y as f64) {
-                self.place_asset(d.asset, t, InsertMode::Overwrite, Some(row));
+                self.place_item(d.item, t, InsertMode::Overwrite, Some(row));
             }
         }
         self.refresh_timeline();
     }
 
+    fn place_item(&mut self, item: LibItem, at: kadr_core::Time, mode: InsertMode, row: Option<usize>) {
+        match item {
+            LibItem::Asset(a) => self.place_asset(a, at, mode, row),
+            LibItem::Group(g) => self.place_group(g, at, mode, row),
+        }
+    }
+
     pub fn asset_activated(&mut self, id: &str) {
-        if let Some(id) = AssetId::parse(id) {
+        if let Some(item) = LibItem::parse(id) {
             let end = self.project.sequence().duration();
-            self.place_asset(id, end, InsertMode::Insert, None);
+            self.place_item(item, end, InsertMode::Insert, None);
         }
     }
 
     pub fn insert_selected_asset(&mut self, mode: InsertMode) {
-        match self.selected_asset {
-            Some(a) => self.place_asset(a, self.playhead, mode, None),
-            None => self.toast(t("toast.select_media_first")),
+        match (self.selected_asset, self.mc.selected_group) {
+            (Some(a), _) => self.place_asset(a, self.playhead, mode, None),
+            (None, Some(g)) => self.place_group(g, self.playhead, mode, None),
+            (None, None) => self.toast(t("toast.select_media_first")),
         }
     }
 
     pub fn asset_action(&mut self, id: &str, action: &str) {
+        if action == "mc-create" {
+            return self.mc_open_create(AssetId::parse(id));
+        }
+        if let Some(LibItem::Group(g)) = LibItem::parse(id) {
+            return self.group_action(g, action);
+        }
         let Some(aid) = AssetId::parse(id) else { return };
         match action {
             "insert" => self.place_asset(aid, self.playhead, InsertMode::Insert, None),
@@ -291,6 +357,30 @@ impl App {
                 } else {
                     let name = self.project.asset(aid).map(|a| a.name.clone()).unwrap_or_default();
                     self.ask(&t("dlg.remove_media.title"), &tf("dlg.remove_media.body", &[("name", &name)]), &t("dlg.remove_media.ok"), "", true, Confirm::RemoveAsset(aid));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn group_action(&mut self, g: MulticamId, action: &str) {
+        let end = self.project.sequence().duration();
+        match action {
+            "insert" => self.place_group(g, self.playhead, InsertMode::Insert, None),
+            "overwrite" => self.place_group(g, self.playhead, InsertMode::Overwrite, None),
+            "append" => self.place_group(g, end, InsertMode::Insert, None),
+            "mc-edit" => self.mc_open_edit(g),
+            "remove" => {
+                let used = self.project.sequence().tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.multicam.as_ref().is_some_and(|m| m.group == g)).count();
+                if used > 0 {
+                    self.toast_warn(tn("toast.media_in_use", used as i64, &[]));
+                } else {
+                    // A group is only metadata over existing media: nothing to confirm.
+                    self.project.multicam_groups.retain(|x| x.id != g);
+                    self.mc.selected_group = None;
+                    self.meta_dirty = true;
+                    self.refresh_library();
+                    self.refresh_status();
                 }
             }
             _ => {}
