@@ -1,0 +1,575 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { LineEdit } from "std-widgets.slint";
+
+export component Icon inherits Path {
+    in property <string> icon;
+    in property <color> color: Theme.text-dim;
+    in property <bool> filled: false;
+    commands: root.icon;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    width: 16px;
+    height: 16px;
+    stroke: root.filled ? transparent : root.color;
+    stroke-width: root.filled ? 0px : 1.7px;
+    fill: root.filled ? root.color : transparent;
+}
+
+export component Tooltip inherits Rectangle {
+    in property <string> text;
+    width: tip.preferred-width + 14px;
+    height: 24px;
+    background: #050608f0;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    drop-shadow-blur: 8px;
+    drop-shadow-color: #00000080;
+    tip := Text { text: root.text; color: Theme.text; font-size: Theme.font-sm; }
+}
+
+// Square icon button with hover/pressed/active/disabled states and a tooltip.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> filled: false;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    in property <string> tooltip;
+    in property <bool> tooltip-above: false;
+    // Align the tooltip's right edge with the button (for buttons at a panel edge).
+    in property <bool> tooltip-right: false;
+    in property <length> size: 28px;
+    in property <length> icon-size: 16px;
+    in property <color> tint: Theme.text-dim;
+    callback clicked();
+    width: root.size;
+    height: root.size;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled ? transparent
+        : ta.pressed ? Theme.bg4
+        : root.active ? Theme.accent-soft
+        : ta.has-hover ? Theme.bg3 : transparent;
+    animate background { duration: 90ms; }
+    Icon {
+        icon: root.icon;
+        filled: root.filled;
+        width: root.icon-size;
+        height: root.icon-size;
+        color: !root.enabled ? Theme.text-faint : root.active ? Theme.accent : ta.has-hover ? Theme.text : root.tint;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    if ta.has-hover && root.tooltip != "": Tooltip {
+        text: root.tooltip;
+        y: root.tooltip-above ? -self.height - 4px : root.height + 4px;
+        x: root.tooltip-right ? root.width - self.width : (root.width - self.width) / 2;
+    }
+}
+
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    in property <bool> compact: false;
+    in property <bool> ghost: false;
+    callback clicked();
+    horizontal-stretch: 0;
+    height: root.compact ? 24px : 30px;
+    min-width: lbl.preferred-width + (root.icon != "" ? 36px : 24px);
+    border-radius: Theme.radius-sm;
+    border-width: root.primary || root.danger || root.ghost ? 0px : 1px;
+    border-color: ta.has-hover && root.enabled ? Theme.border-strong : Theme.border;
+    background: !root.enabled ? (root.ghost ? transparent : Theme.bg2)
+        : root.primary ? (ta.pressed ? #6272e6 : ta.has-hover ? #8f9dff : Theme.accent)
+        : root.danger ? (ta.pressed ? #c94646 : ta.has-hover ? #f47171 : Theme.danger)
+        : ta.pressed ? Theme.bg4 : ta.has-hover ? Theme.bg3 : (root.ghost ? transparent : Theme.bg2);
+    opacity: root.enabled ? 1 : 0.5;
+    animate background { duration: 90ms; }
+    HorizontalLayout {
+        padding-left: root.compact ? 8px : 12px;
+        padding-right: root.compact ? 8px : 12px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            icon: root.icon;
+            width: 14px;
+            height: 14px;
+            color: root.primary || root.danger ? Theme.text-on-accent : Theme.text;
+        }
+        lbl := Text {
+            text: root.text;
+            vertical-alignment: center;
+            font-size: root.compact ? Theme.font-sm : Theme.font;
+            font-weight: root.primary ? 600 : 500;
+            color: root.primary || root.danger ? Theme.text-on-accent : root.ghost ? Theme.text-dim : Theme.text;
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Small toggle used in track headers (M / S) — text-based for density.
+export component TinyToggle inherits Rectangle {
+    in property <string> text;
+    in property <bool> on;
+    in property <color> on-color: Theme.accent;
+    in property <string> tooltip;
+    callback toggled();
+    width: 20px;
+    height: 18px;
+    border-radius: 3px;
+    background: root.on ? root.on-color : ta.has-hover ? Theme.bg4 : Theme.bg3;
+    animate background { duration: 90ms; }
+    Text {
+        text: root.text;
+        font-size: 10px;
+        font-weight: 700;
+        color: root.on ? Theme.text-on-accent : Theme.text-dim;
+    }
+    ta := TouchArea { clicked => { root.toggled(); } }
+    if ta.has-hover && root.tooltip != "": Tooltip {
+        text: root.tooltip;
+        y: root.height + 4px;
+        x: 0;
+    }
+}
+
+export component PanelHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> icon;
+    height: Theme.panel-header;
+    background: Theme.bg1;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 6px;
+        spacing: 8px;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            icon: root.icon;
+            width: 14px;
+            height: 14px;
+            color: Theme.text-faint;
+        }
+        Text {
+            text: root.title;
+            vertical-alignment: center;
+            font-size: Theme.font-sm;
+            font-weight: 600;
+            letter-spacing: 0.6px;
+            color: Theme.text-dim;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        @children
+    }
+}
+
+// Draggable divider. Reports the pointer delta since press.
+export component Splitter inherits Rectangle {
+    in property <bool> vertical: true; // true = vertical bar (resizes width)
+    callback moved(length);
+    callback pressed();
+    callback released();
+    // Fix only the thin dimension. (Setting the other one to 0px would cap
+    // the parent layout's maximum size — and with it the whole window.)
+    min-width: root.vertical ? 5px : 0px;
+    max-width: root.vertical ? 5px : 100000px;
+    min-height: root.vertical ? 0px : 5px;
+    max-height: root.vertical ? 100000px : 5px;
+    background: ta.pressed ? Theme.accent : ta.has-hover ? Theme.border-strong : Theme.bg0;
+    animate background { duration: 120ms; }
+    ta := TouchArea {
+        mouse-cursor: root.vertical ? ew-resize : ns-resize;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) { root.pressed(); }
+            if (e.kind == PointerEventKind.up) { root.released(); }
+        }
+        moved => {
+            if (self.pressed) {
+                root.moved(root.vertical ? self.mouse-x - self.pressed-x : self.mouse-y - self.pressed-y);
+            }
+        }
+    }
+}
+
+export component Badge inherits Rectangle {
+    in property <string> text;
+    in property <color> fg: Theme.text-dim;
+    in property <color> bg: Theme.bg3;
+    height: 18px;
+    width: t.preferred-width + 12px;
+    border-radius: 9px;
+    background: root.bg;
+    t := Text { text: root.text; font-size: Theme.font-xs; font-weight: 700; color: root.fg; letter-spacing: 0.4px; }
+}
+
+export component ProgressBar inherits Rectangle {
+    in property <float> value; // 0..1
+    in property <color> bar-color: Theme.accent;
+    height: 4px;
+    border-radius: 2px;
+    background: Theme.bg3;
+    clip: true;
+    Rectangle {
+        x: 0;
+        width: parent.width * clamp(root.value, 0, 1);
+        background: root.bar-color;
+        border-radius: 2px;
+        animate width { duration: 150ms; }
+    }
+}
+
+// Labelled numeric slider used by the Inspector. `changed` fires while
+// dragging (live preview), `committed` on release (one undo step).
+// Double-click the value to type an exact number; double-click the track
+// to reset to the default.
+export component PropSlider inherits Rectangle {
+    in property <string> label;
+    in property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> default-value: 0;
+    in property <string> unit;
+    in property <int> decimals: 2;
+    in property <bool> enabled: true;
+    in property <float> display-scale: 1; // e.g. 100 to show 0..1 as percent
+    callback changed(float);
+    callback committed(float);
+    property <bool> editing;
+    height: 26px;
+    property <float> t: (root.value - root.minimum) / (root.maximum - root.minimum);
+    property <float> shown: root.value * root.display-scale;
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            width: 84px;
+            text: root.label;
+            vertical-alignment: center;
+            font-size: Theme.font-sm;
+            color: root.enabled ? (root.value != root.default-value ? Theme.text : Theme.text-dim) : Theme.text-faint;
+            overflow: elide;
+        }
+        track := Rectangle {
+            horizontal-stretch: 1;
+            Rectangle {
+                y: (parent.height - 4px) / 2;
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.bg3;
+            }
+            Rectangle {
+                x: 0;
+                y: (parent.height - 4px) / 2;
+                height: 4px;
+                width: parent.width * clamp(root.t, 0, 1);
+                border-radius: 2px;
+                background: root.enabled ? (ta.pressed ? Theme.accent : #5d6bd6) : Theme.bg4;
+            }
+            Rectangle {
+                x: parent.width * clamp(root.t, 0, 1) - 6px;
+                y: (parent.height - 12px) / 2;
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: root.enabled ? (ta.has-hover || ta.pressed ? #ffffff : #d8dbe0) : Theme.text-faint;
+                drop-shadow-blur: 3px;
+                drop-shadow-color: #00000080;
+            }
+            ta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: ew-resize;
+                property <float> v: root.minimum + clamp(self.mouse-x / self.width, 0, 1) * (root.maximum - root.minimum);
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.changed(self.v); }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) { root.committed(self.v); }
+                }
+                moved => { if (self.pressed) { root.changed(self.v); } }
+                double-clicked => { root.changed(root.default-value); root.committed(root.default-value); }
+            }
+        }
+        Rectangle {
+            width: 62px;
+            if !root.editing: Rectangle {
+                border-radius: 3px;
+                background: va.has-hover && root.enabled ? Theme.bg3 : transparent;
+                Text {
+                    x: parent.width - self.width - 4px;
+                    text: (root.decimals == 0 ? round(root.shown) : round(root.shown * pow(10, root.decimals)) / pow(10, root.decimals)) + root.unit;
+                    font-size: Theme.font-sm;
+                    font-family: Theme.mono;
+                    color: root.enabled ? Theme.text : Theme.text-faint;
+                }
+                va := TouchArea {
+                    enabled: root.enabled;
+                    mouse-cursor: text;
+                    double-clicked => { root.editing = true; }
+                }
+            }
+            if root.editing: le := LineEdit {
+                text: round(root.shown * 1000) / 1000;
+                font-size: Theme.font-sm;
+                horizontal-alignment: right;
+                init => { self.focus(); self.select-all(); }
+                accepted(txt) => {
+                    if (txt.is-float()) {
+                        root.committed(clamp(txt.to-float() / root.display-scale, root.minimum, root.maximum));
+                    }
+                    root.editing = false;
+                }
+                key-pressed(e) => {
+                    if (e.text == Key.Escape) { root.editing = false; return accept; }
+                    reject
+                }
+            }
+        }
+    }
+}
+
+export component SectionTitle inherits Rectangle {
+    in property <string> text;
+    in property <bool> resettable: false;
+    callback reset();
+    height: 30px;
+    Text {
+        x: 0;
+        text: root.text;
+        font-size: Theme.font-xs;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        color: Theme.text-faint;
+        vertical-alignment: center;
+    }
+    if root.resettable: Rectangle {
+        x: parent.width - self.width;
+        width: rt.preferred-width + 10px;
+        height: 20px;
+        y: 5px;
+        border-radius: 3px;
+        background: ra.has-hover ? Theme.bg3 : transparent;
+        rt := Text { text: Tr.t("common.reset"); font-size: Theme.font-xs; color: ra.has-hover ? Theme.text : Theme.text-faint; }
+        ra := TouchArea { clicked => { root.reset(); } }
+    }
+}
+
+export component EmptyState inherits Rectangle {
+    // Don't let the centred content cap the parent's height (window resize).
+    max-height: 100000px;
+    max-width: 100000px;
+    vertical-stretch: 1;
+    in property <string> icon;
+    in property <string> title;
+    in property <string> subtitle;
+    VerticalLayout {
+        alignment: center;
+        spacing: 8px;
+        padding: 16px;
+        HorizontalLayout {
+            alignment: center;
+            Icon { icon: root.icon; width: 34px; height: 34px; color: Theme.text-faint; }
+        }
+        Text { text: root.title; horizontal-alignment: center; color: Theme.text-dim; font-size: Theme.font-md; font-weight: 600; wrap: word-wrap; }
+        Text { text: root.subtitle; horizontal-alignment: center; color: Theme.text-faint; font-size: Theme.font-sm; wrap: word-wrap; }
+        @children
+    }
+}
+
+// ---------------------------------------------------------------- menus
+
+export struct MenuEntry {
+    id: string,
+    label: string,
+    shortcut: string,
+    enabled: bool,
+    checked: bool,
+    separator: bool,
+}
+
+component MenuRow inherits Rectangle {
+    in property <MenuEntry> e;
+    callback activated();
+    height: root.e.separator ? 9px : 28px;
+    if root.e.separator: Rectangle { x: 8px; width: parent.width - 16px; height: 1px; background: Theme.border; }
+    if !root.e.separator: Rectangle {
+        border-radius: 4px;
+        background: ta.has-hover && root.e.enabled ? Theme.accent-soft : transparent;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 10px;
+            spacing: 8px;
+            Rectangle {
+                width: 14px;
+                if root.e.checked: Icon { icon: Icons.check; width: 13px; height: 13px; color: Theme.accent; }
+            }
+            Text {
+                text: root.e.label;
+                vertical-alignment: center;
+                font-size: Theme.font;
+                color: root.e.enabled ? Theme.text : Theme.text-faint;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: root.e.shortcut;
+                vertical-alignment: center;
+                font-size: Theme.font-sm;
+                color: Theme.text-faint;
+            }
+        }
+        ta := TouchArea {
+            enabled: root.e.enabled;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+// Dark, Slint-drawn dropdown (the native Win32 menu can't be themed).
+export component MenuButton inherits Rectangle {
+    in property <string> label;
+    in property <[MenuEntry]> entries;
+    in property <length> menu-width: 300px;
+    callback activated(string);
+    width: lbl.preferred-width + 20px;
+    height: 28px;
+    border-radius: 4px;
+    background: ta.pressed ? Theme.bg4 : ta.has-hover ? Theme.bg3 : transparent;
+    lbl := Text { text: root.label; font-size: Theme.font; color: ta.has-hover ? Theme.text : Theme.text-dim; }
+    ta := TouchArea { clicked => { popup.show(); } }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.menu-width;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.bg2;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #000000a0;
+            VerticalLayout {
+                padding: 5px;
+                for e in root.entries: MenuRow {
+                    e: e;
+                    activated => { popup.close(); root.activated(e.id); }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- tabs
+
+export component Tabs inherits Rectangle {
+    in property <[string]> labels;
+    in-out property <int> current;
+    height: 34px;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+    HorizontalLayout {
+        spacing: 4px;
+        alignment: start;
+        for l[i] in root.labels: Rectangle {
+            width: tl.preferred-width + 24px;
+            tl := Text {
+                text: l;
+                font-size: Theme.font;
+                font-weight: root.current == i ? 600 : 400;
+                color: root.current == i ? Theme.text : tta.has-hover ? Theme.text : Theme.text-dim;
+            }
+            Rectangle {
+                y: parent.height - 2px;
+                height: 2px;
+                background: root.current == i ? Theme.accent : transparent;
+            }
+            tta := TouchArea { clicked => { root.current = i; } }
+        }
+    }
+}
+
+// Segmented choice (e.g. language, quality).
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> current;
+    callback selected(int);
+    height: 28px;
+    border-radius: 5px;
+    background: Theme.bg2;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for o[i] in root.options: Rectangle {
+            border-radius: 4px;
+            min-width: ot.preferred-width + 20px;
+            background: root.current == i ? Theme.bg4 : oa.has-hover ? Theme.bg3 : transparent;
+            ot := Text { text: o; font-size: Theme.font-sm; color: root.current == i ? Theme.text : Theme.text-dim; }
+            oa := TouchArea { clicked => { root.selected(i); } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- toasts
+
+export struct ToastView {
+    id: int,
+    kind: int, // 0 info, 1 success, 2 warning, 3 error
+    text: string,
+}
+
+export component ToastCard inherits Rectangle {
+    in property <ToastView> t;
+    callback dismiss();
+    width: 360px;
+    height: max(40px, msg.preferred-height + 20px);
+    border-radius: 8px;
+    background: Theme.bg2;
+    border-width: 1px;
+    border-color: root.t.kind == 3 ? #ef5b5b88 : root.t.kind == 2 ? #e5a50a88 : Theme.border-strong;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #00000090;
+    Rectangle {
+        x: 0;
+        width: 3px;
+        border-radius: 1.5px;
+        background: root.t.kind == 3 ? Theme.danger : root.t.kind == 2 ? Theme.warning : root.t.kind == 1 ? Theme.success : Theme.accent;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 6px;
+        spacing: 8px;
+        msg := Text {
+            text: root.t.text;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            font-size: Theme.font;
+            color: Theme.text;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton { icon: Icons.close; size: 22px; icon-size: 12px; clicked => { root.dismiss(); } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- keys
+
+export component KeyCap inherits Rectangle {
+    in property <string> text;
+    height: 20px;
+    width: max(22px, kt.preferred-width + 12px);
+    border-radius: 4px;
+    background: Theme.bg3;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    kt := Text { text: root.text; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text; }
+}

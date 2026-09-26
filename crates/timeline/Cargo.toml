@@ -1,0 +1,12 @@
+[package]
+name = "kadr-timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kadr-core = { path = "../core" }
+kadr-project = { path = "../project" }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

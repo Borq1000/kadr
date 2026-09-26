@@ -1,0 +1,5 @@
+/target
+*.kadr.autosave
+testdata/
+mds/api-keys.md
+desktop.ini

@@ -1,0 +1,643 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip } from "widgets.slint";
+import { MediaLibrary, AssetView, BinView } from "media.slint";
+import { Preview } from "preview.slint";
+import { Timeline, TrackView, ClipView, TickView, MarkerView, TransitionView } from "timeline.slint";
+import { Inspector, InspectorData, MarkerRow } from "inspector.slint";
+import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
+import { ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
+
+export { Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+
+export component AppWindow inherits Window {
+    title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
+    preferred-width: 1600px;
+    preferred-height: 960px;
+    min-width: 1024px;
+    min-height: 640px;
+    // Never cap the window: it must maximize and resize freely.
+    max-width: 100000px;
+    max-height: 100000px;
+    background: Theme.bg0;
+    default-font-family: "Segoe UI";
+    default-font-size: 12px;
+    icon: @image-url("icon.png");
+
+    // ---- Project / global state
+    in property <string> project-name: "Untitled";
+    in property <bool> dirty;
+    in property <[ToastView]> toasts;
+    in property <string> save-state;
+    in property <[MenuEntry]> recent-menu;
+    in property <int> language;
+
+    // ---- Media
+    in property <[AssetView]> assets;
+    in property <[BinView]> bins;
+    in property <string> media-summary;
+    in property <int> media-total;
+    in-out property <string> media-search;
+    in property <bool> drag-active;
+    in property <length> drag-x;
+    in property <length> drag-y;
+    in property <string> drag-label;
+
+    // ---- Preview
+    in property <image> preview-frame;
+    in property <bool> preview-has-frame;
+    in property <float> preview-aspect: 16 / 9;
+    in property <bool> playing;
+    in property <string> timecode: "00:00:00:00";
+    in property <string> duration-label;
+    in property <string> preview-info;
+    in property <string> preview-clip;
+    in property <int> preview-empty: 1;
+    in property <int> preview-quality: 1;
+    in property <int> preview-zoom;
+    in property <bool> safe-areas;
+    in property <bool> bypass;
+    in property <bool> preview-loading;
+    in property <float> scrub-fraction;
+
+    // ---- Timeline
+    in property <[TrackView]> tracks;
+    in property <[ClipView]> clips;
+    in property <[TickView]> ticks;
+    in property <[MarkerView]> markers;
+    in property <[TransitionView]> transitions;
+    in property <length> playhead-x;
+    in property <bool> show-playhead;
+    in property <length> snap-x;
+    in property <bool> show-snap;
+    in property <length> in-x;
+    in property <length> out-x;
+    in property <bool> has-in-out;
+    in property <length> ghost-x;
+    in property <length> ghost-y;
+    in property <length> ghost-w;
+    in property <length> ghost-h;
+    in property <bool> show-ghost;
+    in property <int> cursor-kind;
+    in property <bool> snapping: true;
+    in property <bool> ripple-mode;
+    in property <bool> blade-mode;
+    in property <string> zoom-label;
+    in property <bool> can-undo;
+    in property <bool> can-redo;
+    in property <string> undo-label;
+    in property <string> redo-label;
+    in property <bool> timeline-empty: true;
+    in property <bool> has-selection;
+    in property <float> scroll-fraction;
+    in property <float> view-fraction: 1;
+    out property <length> lanes-width: tl.lanes-width;
+    out property <length> lanes-height: tl.lanes-height;
+    out property <length> lanes-abs-x: tl.lanes-abs-x;
+    out property <length> lanes-abs-y: tl.lanes-abs-y;
+
+    // ---- Inspector
+    in property <InspectorData> inspector;
+
+    // ---- AI
+    in-out property <bool> ai-open: true;
+    in property <[ChatMsg]> chat;
+    in property <[PlanView]> plans;
+    in property <[OfferView]> offers;
+    in property <string> ai-mode-label: "AI: LOCAL";
+    in property <string> ai-cost-label;
+    in property <string> session-cost: "$0.000";
+    in property <string> project-cost: "$0.00";
+    in property <bool> ai-busy;
+    in-out property <string> ai-draft;
+    in property <bool> ai-cloud;
+
+    // ---- Status / jobs
+    in property <string> jobs-label;
+    in property <float> jobs-progress;
+    in property <bool> jobs-active;
+    in property <[JobView]> jobs;
+    in-out property <bool> jobs-open;
+    in property <string> seq-info;
+
+    // ---- Dialogs
+    in-out property <bool> export-open;
+    in property <ExportState> export-state;
+    in-out property <bool> settings-open;
+    in property <SettingsState> settings-state;
+    in property <[ShortcutRow]> shortcuts;
+    in-out property <bool> confirm-open;
+    in property <string> confirm-title;
+    in property <string> confirm-message;
+    in property <string> confirm-ok;
+    in property <string> confirm-alt;
+    in property <bool> confirm-danger;
+    in-out property <bool> prompt-open;
+    in property <string> prompt-title;
+    in property <string> prompt-label;
+    in property <string> prompt-value;
+    in-out property <bool> welcome-open;
+    in property <[RecentView]> recent;
+
+    // ---- Layout (persisted by Rust)
+    in-out property <length> library-width: 300px;
+    in-out property <length> inspector-width: 300px;
+    in-out property <length> ai-width: 350px;
+    in-out property <length> timeline-height: 340px;
+
+    // ---- Callbacks
+    callback menu(string);
+    callback key(string, bool, bool, bool) -> bool;
+    callback import-media();
+    callback new-bin();
+    callback select-bin(string);
+    callback bin-action(string, string);
+    callback rename-bin(string, string);
+    callback media-search-changed(string);
+    callback asset-pressed(string, length, length);
+    callback asset-moved(string, length, length);
+    callback asset-released(string, length, length);
+    callback asset-activated(string);
+    callback asset-action(string, string);
+    callback transport(string);
+    callback set-quality(int);
+    callback set-zoom(int);
+    callback scrub(float);
+    callback tl-pointer(int, length, length, int, bool, bool, bool);
+    callback tl-scroll(length, length, bool, bool);
+    callback tl-ruler(int, length);
+    callback tl-track-toggle(int, string);
+    callback tl-track-action(int, string);
+    callback tl-track-rename(int, string);
+    callback tl-context(string);
+    callback tl-tool(string);
+    callback tl-scrollbar(float);
+    callback layout-changed();
+    callback inspector-live(string, float);
+    callback inspector-commit(string, float);
+    callback inspector-toggle-enabled();
+    callback inspector-reset(string);
+    callback inspector-marker(int, string);
+    callback inspector-sequence(string);
+    callback ai-send(string);
+    callback ai-plan-action(int, string);
+    callback ai-plan-toggle(int, int);
+    callback ai-offer-action(int, string);
+    callback ai-clear();
+    callback export-choose-path();
+    callback export-start(int, int);
+    callback export-cancel();
+    callback export-reveal();
+    callback export-open-file();
+    callback export-changed(int, int);
+    callback settings-tab(int);
+    callback settings-language(int);
+    callback settings-autosave(int);
+    callback settings-quality(int);
+    callback settings-clear-cache();
+    callback settings-open-data();
+    callback settings-mode(int);
+    callback settings-save-key(string, string);
+    callback settings-delete-key(string);
+    callback settings-toggle-allowed(string);
+    callback settings-route(string, string);
+    callback settings-limit(string, string);
+    callback settings-test(string);
+    callback confirm-ok-clicked();
+    callback confirm-alt-clicked();
+    callback confirm-dismissed();
+    callback prompt-submit(string);
+    callback prompt-dismissed();
+    callback job-cancel(int);
+    callback job-retry(int);
+    callback jobs-clear();
+    callback toast-dismiss(int);
+    callback welcome-action(string);
+    callback open-recent(int);
+
+    public function focus-editor() { keys.focus(); }
+
+    keys := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(e) => {
+            if (root.key(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt)) { return accept; }
+            reject
+        }
+
+        VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+
+            // ---- Top bar with dark, Slint-drawn menus
+            Rectangle {
+                height: 38px;
+                background: Theme.bg1;
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 2px;
+                    Image { y: 10px; source: @image-url("icon.png"); width: 18px; height: 18px; }
+                    Rectangle { width: 8px; }
+                    VerticalLayout {
+                        alignment: center;
+                        MenuButton {
+                            label: Tr.t("menu.file");
+                            menu-width: 320px;
+                            entries: [
+                                { id: "new", label: Tr.t("menu.file.new"), shortcut: "Ctrl+N", enabled: true },
+                                { id: "open", label: Tr.t("menu.file.open"), shortcut: "Ctrl+O", enabled: true },
+                                { id: "welcome", label: Tr.t("menu.file.recent"), enabled: true },
+                                { separator: true },
+                                { id: "save", label: Tr.t("menu.file.save"), shortcut: "Ctrl+S", enabled: true },
+                                { id: "save-as", label: Tr.t("menu.file.save_as"), shortcut: "Ctrl+Shift+S", enabled: true },
+                                { separator: true },
+                                { id: "import", label: Tr.t("menu.file.import"), shortcut: "Ctrl+I", enabled: true },
+                                { id: "export", label: Tr.t("menu.file.export"), shortcut: "Ctrl+E", enabled: !root.timeline-empty },
+                                { separator: true },
+                                { id: "settings", label: Tr.t("menu.file.settings"), shortcut: "Ctrl+,", enabled: true },
+                                { id: "exit", label: Tr.t("menu.file.exit"), shortcut: "Alt+F4", enabled: true },
+                            ];
+                            activated(id) => { root.menu(id); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        MenuButton {
+                            label: Tr.t("menu.edit");
+                            menu-width: 320px;
+                            entries: [
+                                { id: "undo", label: root.undo-label != "" ? Tr.t1("menu.edit.undo_x", root.undo-label) : Tr.t("menu.edit.undo"), shortcut: "Ctrl+Z", enabled: root.can-undo },
+                                { id: "redo", label: root.redo-label != "" ? Tr.t1("menu.edit.redo_x", root.redo-label) : Tr.t("menu.edit.redo"), shortcut: "Ctrl+Shift+Z", enabled: root.can-redo },
+                                { separator: true },
+                                { id: "split", label: Tr.t("menu.edit.split"), shortcut: "S / Ctrl+B", enabled: !root.timeline-empty },
+                                { id: "delete", label: Tr.t("menu.edit.delete"), shortcut: "Del", enabled: root.has-selection },
+                                { id: "ripple-delete", label: Tr.t("menu.edit.ripple_delete"), shortcut: "Shift+Del", enabled: root.has-selection },
+                                { id: "select-all", label: Tr.t("menu.edit.select_all"), shortcut: "Ctrl+A", enabled: !root.timeline-empty },
+                                { id: "deselect", label: Tr.t("menu.edit.deselect"), shortcut: "Esc", enabled: root.has-selection },
+                                { separator: true },
+                                { id: "marker", label: Tr.t("menu.edit.marker"), shortcut: "M", enabled: true },
+                                { id: "add-video-track", label: Tr.t("menu.edit.add_video_track"), enabled: true },
+                                { id: "add-audio-track", label: Tr.t("menu.edit.add_audio_track"), enabled: true },
+                            ];
+                            activated(id) => { root.menu(id); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        MenuButton {
+                            label: Tr.t("menu.view");
+                            menu-width: 320px;
+                            entries: [
+                                { id: "toggle-ai", label: Tr.t("menu.view.ai"), shortcut: "Ctrl+Shift+A", enabled: true, checked: root.ai-open },
+                                { id: "toggle-jobs", label: Tr.t("menu.view.jobs"), enabled: true, checked: root.jobs-open },
+                                { separator: true },
+                                { id: "zoom-fit", label: Tr.t("menu.view.zoom_fit"), shortcut: "Shift+Z", enabled: true },
+                                { id: "snap", label: Tr.t("menu.view.snapping"), shortcut: "N", enabled: true, checked: root.snapping },
+                                { id: "ripple", label: Tr.t("menu.view.ripple"), shortcut: "R", enabled: true, checked: root.ripple-mode },
+                                { separator: true },
+                                { id: "safe", label: Tr.t("menu.view.safe"), shortcut: "'", enabled: true, checked: root.safe-areas },
+                                { id: "fullscreen", label: Tr.t("menu.view.fullscreen"), shortcut: "F", enabled: true },
+                                { id: "reset-layout", label: Tr.t("menu.view.reset_layout"), enabled: true },
+                                { separator: true },
+                                { id: "lang-ru", label: "Русский", enabled: true, checked: root.language == 0 },
+                                { id: "lang-en", label: "English", enabled: true, checked: root.language == 1 },
+                            ];
+                            activated(id) => { root.menu(id); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        MenuButton {
+                            label: Tr.t("menu.help");
+                            menu-width: 300px;
+                            entries: [
+                                { id: "shortcuts", label: Tr.t("menu.help.shortcuts"), shortcut: "F1", enabled: true },
+                                { id: "logs", label: Tr.t("menu.help.logs"), enabled: true },
+                                { separator: true },
+                                { id: "about", label: Tr.t("menu.help.about"), enabled: true },
+                            ];
+                            activated(id) => { root.menu(id); }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            if root.dirty: Rectangle { width: 7px; height: 7px; y: 5px; border-radius: 3.5px; background: Theme.warning; }
+                            Text { text: root.project-name; font-size: Theme.font; font-weight: 600; color: Theme.text; }
+                            Text { text: root.save-state; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VerticalLayout { alignment: center; IconButton { icon: Icons.undo; tooltip: Tr.t("tl.tip.undo"); enabled: root.can-undo; clicked => { root.menu("undo"); } } }
+                    VerticalLayout { alignment: center; IconButton { icon: Icons.redo; tooltip: Tr.t("tl.tip.redo"); enabled: root.can-redo; clicked => { root.menu("redo"); } } }
+                    Rectangle { width: 6px; }
+                    VerticalLayout { alignment: center; Button { text: Tr.t("top.import"); icon: Icons.import; compact: true; clicked => { root.menu("import"); } } }
+                    Rectangle { width: 4px; }
+                    VerticalLayout { alignment: center; Button { text: Tr.t("top.export"); icon: Icons.export; compact: true; primary: true; enabled: !root.timeline-empty; clicked => { root.menu("export"); } } }
+                }
+            }
+
+            HorizontalLayout {
+                vertical-stretch: 1;
+                max-height: 100000px;
+                MediaLibrary {
+                    width: root.library-width;
+                    max-height: 100000px;
+                    assets: root.assets;
+                    bins: root.bins;
+                    summary: root.media-summary;
+                    total-count: root.media-total;
+                    search <=> root.media-search;
+                    import => { root.import-media(); }
+                    new-bin => { root.new-bin(); }
+                    select-bin(id) => { root.select-bin(id); }
+                    bin-action(id, a) => { root.bin-action(id, a); }
+                    rename-bin(id, n) => { root.rename-bin(id, n); root.focus-editor(); }
+                    search-changed(t) => { root.media-search-changed(t); }
+                    asset-pressed(id, x, y) => { root.asset-pressed(id, x, y); }
+                    asset-moved(id, x, y) => { root.asset-moved(id, x, y); }
+                    asset-released(id, x, y) => { root.asset-released(id, x, y); root.focus-editor(); }
+                    asset-activated(id) => { root.asset-activated(id); }
+                    asset-action(id, a) => { root.asset-action(id, a); }
+                }
+                Splitter {
+                    property <length> start;
+                    pressed => { self.start = root.library-width; }
+                    moved(d) => { root.library-width = clamp(self.start + d, 220px, 560px); }
+                    released => { root.layout-changed(); }
+                }
+                Preview {
+                    horizontal-stretch: 1;
+                    min-width: 380px;
+                    max-height: 100000px;
+                    max-width: 100000px;
+                    frame: root.preview-frame;
+                    has-frame: root.preview-has-frame;
+                    frame-aspect: root.preview-aspect;
+                    playing: root.playing;
+                    timecode: root.timecode;
+                    duration: root.duration-label;
+                    info: root.preview-info;
+                    clip-name: root.preview-clip;
+                    empty-kind: root.preview-empty;
+                    quality: root.preview-quality;
+                    zoom: root.preview-zoom;
+                    safe-areas: root.safe-areas;
+                    bypass: root.bypass;
+                    loading: root.preview-loading;
+                    scrub-fraction: root.scrub-fraction;
+                    transport(a) => { root.transport(a); root.focus-editor(); }
+                    set-quality(q) => { root.set-quality(q); }
+                    set-zoom(z) => { root.set-zoom(z); }
+                    scrub(f) => { root.scrub(f); }
+                }
+                Splitter {
+                    property <length> start;
+                    pressed => { self.start = root.inspector-width; }
+                    moved(d) => { root.inspector-width = clamp(self.start - d, 250px, 520px); }
+                    released => { root.layout-changed(); }
+                }
+                Inspector {
+                    width: root.inspector-width;
+                    max-height: 100000px;
+                    d: root.inspector;
+                    live(p, v) => { root.inspector-live(p, v); }
+                    commit(p, v) => { root.inspector-commit(p, v); root.focus-editor(); }
+                    toggle-enabled => { root.inspector-toggle-enabled(); }
+                    reset(s) => { root.inspector-reset(s); }
+                    marker-action(i, a) => { root.inspector-marker(i, a); }
+                    sequence-action(a) => { root.inspector-sequence(a); }
+                }
+                if root.ai-open: Splitter {
+                    property <length> start;
+                    pressed => { self.start = root.ai-width; }
+                    moved(d) => { root.ai-width = clamp(self.start - d, 290px, 600px); }
+                    released => { root.layout-changed(); }
+                }
+                if root.ai-open: AiPanel {
+                    width: root.ai-width;
+                    max-height: 100000px;
+                    messages: root.chat;
+                    plans: root.plans;
+                    offers: root.offers;
+                    mode-label: root.ai-mode-label;
+                    cost-label: root.ai-cost-label;
+                    busy: root.ai-busy;
+                    draft <=> root.ai-draft;
+                    send(t) => { root.ai-send(t); }
+                    plan-action(i, a) => { root.ai-plan-action(i, a); }
+                    plan-toggle(i, j) => { root.ai-plan-toggle(i, j); }
+                    offer-action(i, a) => { root.ai-offer-action(i, a); }
+                    close => { root.ai-open = false; root.layout-changed(); root.focus-editor(); }
+                    settings => { root.menu("settings-ai"); }
+                    clear => { root.ai-clear(); }
+                }
+                if !root.ai-open: Rectangle {
+                    width: 36px;
+                    background: Theme.bg1;
+                    Rectangle { x: 0; width: 1px; background: Theme.border; }
+                    VerticalLayout {
+                        padding-top: 6px;
+                        alignment: start;
+                        HorizontalLayout {
+                            alignment: center;
+                            IconButton { icon: Icons.sparkle; filled: true; tint: Theme.ai-a; tooltip: Tr.t("ai.expand"); clicked => { root.ai-open = true; root.layout-changed(); } }
+                        }
+                    }
+                }
+            }
+            Splitter {
+                vertical: false;
+                property <length> start;
+                pressed => { self.start = root.timeline-height; }
+                moved(d) => { root.timeline-height = clamp(self.start - d, 200px, root.height - 340px); }
+                released => { root.layout-changed(); }
+            }
+            tl := Timeline {
+                height: root.timeline-height;
+                tracks: root.tracks;
+                clips: root.clips;
+                ticks: root.ticks;
+                markers: root.markers;
+                transitions: root.transitions;
+                playhead-x: root.playhead-x;
+                show-playhead: root.show-playhead;
+                snap-x: root.snap-x;
+                show-snap: root.show-snap;
+                in-x: root.in-x;
+                out-x: root.out-x;
+                has-in-out: root.has-in-out;
+                ghost-x: root.ghost-x;
+                ghost-y: root.ghost-y;
+                ghost-w: root.ghost-w;
+                ghost-h: root.ghost-h;
+                show-ghost: root.show-ghost;
+                cursor-kind: root.cursor-kind;
+                snapping: root.snapping;
+                ripple-mode: root.ripple-mode;
+                blade-mode: root.blade-mode;
+                zoom-label: root.zoom-label;
+                can-undo: root.can-undo;
+                can-redo: root.can-redo;
+                timecode: root.timecode;
+                is-empty: root.timeline-empty;
+                has-selection: root.has-selection;
+                scroll-fraction: root.scroll-fraction;
+                view-fraction: root.view-fraction;
+                lane-pointer(k, x, y, b, s, c, a) => { root.tl-pointer(k, x, y, b, s, c, a); }
+                scroll(dx, dy, c, s) => { root.tl-scroll(dx, dy, c, s); }
+                ruler(k, x) => { root.tl-ruler(k, x); }
+                track-toggle(i, w) => { root.tl-track-toggle(i, w); }
+                track-action(i, a) => { root.tl-track-action(i, a); }
+                track-rename(i, n) => { root.tl-track-rename(i, n); root.focus-editor(); }
+                context-action(a) => { root.tl-context(a); }
+                tool(t) => { root.tl-tool(t); root.focus-editor(); }
+                scrollbar(f) => { root.tl-scrollbar(f); }
+                focus-editor => { root.focus-editor(); }
+                import => { root.import-media(); }
+            }
+            // Status bar
+            Rectangle {
+                height: 26px;
+                background: Theme.bg1;
+                Rectangle { y: 0; height: 1px; background: Theme.border; }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 14px;
+                    Rectangle {
+                        width: 300px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Icon { y: 6px; icon: Icons.jobs; width: 14px; height: 14px; color: root.jobs-active ? Theme.warning : Theme.text-faint; }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                Text { text: root.jobs-label; font-size: Theme.font-xs; color: sta.has-hover ? Theme.text : Theme.text-dim; overflow: elide; }
+                                if root.jobs-active: ProgressBar { value: root.jobs-progress; height: 2px; }
+                            }
+                        }
+                        sta := TouchArea { mouse-cursor: pointer; clicked => { root.jobs-open = !root.jobs-open; } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.seq-info; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                    Rectangle { width: 1px; background: Theme.border; }
+                    Rectangle {
+                        width: aih.preferred-width;
+                        aih := HorizontalLayout {
+                            spacing: 6px;
+                            Rectangle {
+                                width: 7px; height: 7px; y: 9px; border-radius: 3.5px;
+                                background: root.ai-cloud ? Theme.ai-b : Theme.success;
+                            }
+                            Text { text: root.ai-mode-label; font-size: Theme.font-xs; color: root.ai-cloud ? Theme.ai-b : Theme.text-dim; vertical-alignment: center; font-weight: 600; }
+                        }
+                        aita := TouchArea { mouse-cursor: pointer; clicked => { root.menu("settings-ai"); } }
+                        if aita.has-hover: Tooltip { text: Tr.t("status.ai_tip"); y: -self.height - 6px; x: -40px; }
+                    }
+                    Text { text: Tr.t1("status.session", root.session-cost); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                    Text { text: Tr.t1("status.project", root.project-cost); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+
+    // Drag ghost from media library
+    if root.drag-active: Rectangle {
+        x: root.drag-x + 12px;
+        y: root.drag-y + 8px;
+        width: dl.preferred-width + 20px;
+        height: 26px;
+        border-radius: 5px;
+        background: #7c8cffd0;
+        dl := Text { text: root.drag-label; color: Theme.text-on-accent; font-size: Theme.font-sm; font-weight: 600; }
+    }
+
+    // Toasts (bottom-right, above the status bar)
+    VerticalLayout {
+        x: root.width - 380px;
+        y: root.height - self.preferred-height - 36px;
+        width: 360px;
+        spacing: 8px;
+        for t in root.toasts: ToastCard { t: t; dismiss => { root.toast-dismiss(t.id); } }
+    }
+
+    if root.jobs-open: JobsPopup {
+        x: 8px;
+        y: root.height - self.height - 34px;
+        jobs: root.jobs;
+        cancel(id) => { root.job-cancel(id); }
+        retry(id) => { root.job-retry(id); }
+        clear => { root.jobs-clear(); }
+        dismiss => { root.jobs-open = false; }
+    }
+
+    if root.welcome-open: WelcomeScreen {
+        width: root.width;
+        height: root.height;
+        recent: root.recent;
+        action(a) => { root.welcome-action(a); }
+        open-recent(i) => { root.open-recent(i); }
+    }
+
+    if root.export-open: ExportDialog {
+        width: root.width;
+        height: root.height;
+        st: root.export-state;
+        choose-path => { root.export-choose-path(); }
+        start(p, r) => { root.export-start(p, r); }
+        cancel => { root.export-cancel(); }
+        reveal => { root.export-reveal(); }
+        open-file => { root.export-open-file(); }
+        changed(p, r) => { root.export-changed(p, r); }
+        dismiss => { if (!root.export-state.running) { root.export-open = false; root.focus-editor(); } }
+    }
+
+    if root.settings-open: SettingsDialog {
+        width: root.width;
+        height: root.height;
+        st: root.settings-state;
+        shortcuts: root.shortcuts;
+        set-tab(t) => { root.settings-tab(t); }
+        set-language(l) => { root.settings-language(l); }
+        set-autosave(a) => { root.settings-autosave(a); }
+        set-quality(q) => { root.settings-quality(q); }
+        clear-cache => { root.settings-clear-cache(); }
+        open-data-dir => { root.settings-open-data(); }
+        set-mode(m) => { root.settings-mode(m); }
+        save-key(id, k) => { root.settings-save-key(id, k); }
+        delete-key(id) => { root.settings-delete-key(id); }
+        toggle-allowed(id) => { root.settings-toggle-allowed(id); }
+        set-route(t, m) => { root.settings-route(t, m); }
+        set-limit(k, v) => { root.settings-limit(k, v); }
+        test-provider(id) => { root.settings-test(id); }
+        dismiss => { root.settings-open = false; root.focus-editor(); }
+    }
+
+    if root.prompt-open: PromptDialog {
+        width: root.width;
+        height: root.height;
+        title: root.prompt-title;
+        label: root.prompt-label;
+        value: root.prompt-value;
+        submit(t) => { root.prompt-submit(t); root.focus-editor(); }
+        dismiss => { root.prompt-dismissed(); root.focus-editor(); }
+    }
+
+    if root.confirm-open: ConfirmDialog {
+        width: root.width;
+        height: root.height;
+        title: root.confirm-title;
+        message: root.confirm-message;
+        ok-text: root.confirm-ok;
+        alt-text: root.confirm-alt;
+        danger: root.confirm-danger;
+        ok => { root.confirm-ok-clicked(); }
+        alt => { root.confirm-alt-clicked(); }
+        dismiss => { root.confirm-dismissed(); }
+    }
+}

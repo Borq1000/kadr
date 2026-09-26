@@ -1,0 +1,174 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon } from "widgets.slint";
+import { ScrollView, Switch } from "std-widgets.slint";
+
+export struct MarkerRow {
+    index: int,
+    name: string,
+    time: string,
+    color: color,
+}
+
+export struct InspectorData {
+    has-clip: bool,
+    is-audio: bool,
+    has-video-props: bool,
+    name: string,
+    source: string,
+    timing: string,
+    x: float,
+    y: float,
+    scale: float,
+    rotation: float,
+    opacity: float,
+    crop-l: float,
+    crop-r: float,
+    crop-t: float,
+    crop-b: float,
+    speed: float,
+    exposure: float,
+    contrast: float,
+    saturation: float,
+    gain: float,
+    pan: float,
+    fade-in: float,
+    fade-out: float,
+    enabled: bool,
+    effects: [string],
+    multi-count: int,
+    // Sequence (shown when nothing is selected)
+    seq-name: string,
+    seq-format: string,
+    seq-duration: string,
+    seq-stats: string,
+    markers: [MarkerRow],
+}
+
+component InfoRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    padding-top: 3px;
+    padding-bottom: 3px;
+    Text { width: 96px; text: root.label; font-size: Theme.font-sm; color: Theme.text-faint; }
+    Text { text: root.value; font-size: Theme.font-sm; color: Theme.text; wrap: word-wrap; horizontal-stretch: 1; }
+}
+
+export component Inspector inherits Rectangle {
+    in property <InspectorData> d;
+    callback live(string, float);
+    callback commit(string, float);
+    callback toggle-enabled();
+    callback reset(string);
+    callback marker-action(int, string);
+    callback sequence-action(string);
+    background: Theme.bg1;
+
+    VerticalLayout {
+        PanelHeader { title: Tr.t("inspector.title"); icon: Icons.gear; }
+        if !root.d.has-clip: sv1 := ScrollView {
+            VerticalLayout {
+                width: sv1.visible-width;
+                padding: 12px;
+                spacing: 4px;
+                alignment: start;
+                if root.d.multi-count > 1: Rectangle {
+                    height: 44px;
+                    border-radius: 6px;
+                    background: Theme.bg2;
+                    Text {
+                        text: Tr.t1("inspector.multi", root.d.multi-count);
+                        font-size: Theme.font-sm;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                    }
+                }
+                SectionTitle { text: Tr.t("inspector.sequence"); }
+                HorizontalLayout {
+                    Text { text: root.d.seq-name; font-size: Theme.font-md; font-weight: 600; color: Theme.text; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                    IconButton { icon: Icons.gear; tooltip: Tr.t("inspector.seq.rename"); clicked => { root.sequence-action("rename"); } }
+                }
+                InfoRow { label: Tr.t("inspector.seq.format"); value: root.d.seq-format; }
+                InfoRow { label: Tr.t("inspector.seq.duration"); value: root.d.seq-duration; }
+                InfoRow { label: Tr.t("inspector.seq.contents"); value: root.d.seq-stats; }
+                Text { text: Tr.t("inspector.seq.format_hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+
+                SectionTitle { text: Tr.t("inspector.markers"); }
+                if root.d.markers.length == 0: Text { text: Tr.t("inspector.markers.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                for m in root.d.markers: Rectangle {
+                    height: 30px;
+                    border-radius: 4px;
+                    background: ma.has-hover ? Theme.bg3 : transparent;
+                    ma := TouchArea { clicked => { root.marker-action(m.index, "goto"); } double-clicked => { root.marker-action(m.index, "rename"); } }
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        spacing: 8px;
+                        Rectangle { width: 8px; height: 8px; y: 11px; border-radius: 2px; background: m.color; }
+                        Text { text: m.time; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; vertical-alignment: center; width: 78px; }
+                        Text { text: m.name; font-size: Theme.font-sm; color: Theme.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        if ma.has-hover: VerticalLayout { alignment: center; IconButton { size: 22px; icon-size: 12px; icon: Icons.gear; tooltip: Tr.t("inspector.markers.rename"); clicked => { root.marker-action(m.index, "rename"); } } }
+                        if ma.has-hover: VerticalLayout { alignment: center; IconButton { size: 22px; icon-size: 12px; icon: Icons.trash; tooltip: Tr.t("inspector.markers.delete"); clicked => { root.marker-action(m.index, "delete"); } } }
+                    }
+                }
+                SectionTitle { text: Tr.t("inspector.tips"); }
+                Text { text: Tr.t("inspector.tips.body"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+            }
+        }
+        if root.d.has-clip: sv2 := ScrollView {
+            VerticalLayout {
+                width: sv2.visible-width;
+                padding: 12px;
+                padding-top: 10px;
+                spacing: 4px;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: root.d.name; font-size: Theme.font-md; font-weight: 600; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
+                    Badge { text: root.d.is-audio ? Tr.t("inspector.badge.audio") : Tr.t("inspector.badge.video"); fg: Theme.text-on-accent; bg: root.d.is-audio ? Theme.clip-audio-top : Theme.clip-video-top; }
+                }
+                Text { text: root.d.source; font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; }
+                Text { text: root.d.timing; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; }
+                HorizontalLayout {
+                    padding-top: 4px;
+                    Text { text: Tr.t("inspector.enabled"); font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; horizontal-stretch: 1; }
+                    Switch { checked: root.d.enabled; toggled => { root.toggle-enabled(); } }
+                }
+
+                if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.transform"); resettable: true; reset => { root.reset("transform"); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.pos_x"); value: root.d.x; minimum: -1920; maximum: 1920; default-value: 0; decimals: 0; unit: " px"; changed(v) => { root.live("x", v); } committed(v) => { root.commit("x", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.pos_y"); value: root.d.y; minimum: -1080; maximum: 1080; default-value: 0; decimals: 0; unit: " px"; changed(v) => { root.live("y", v); } committed(v) => { root.commit("y", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.scale"); value: root.d.scale; minimum: 0.1; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("scale", v); } committed(v) => { root.commit("scale", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.rotation"); value: root.d.rotation; minimum: -180; maximum: 180; default-value: 0; decimals: 1; unit: "°"; changed(v) => { root.live("rotation", v); } committed(v) => { root.commit("rotation", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.opacity"); value: root.d.opacity; minimum: 0; maximum: 1; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("opacity", v); } committed(v) => { root.commit("opacity", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_l"); value: root.d.crop-l; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-l", v); } committed(v) => { root.commit("crop-l", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_r"); value: root.d.crop-r; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-r", v); } committed(v) => { root.commit("crop-r", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_t"); value: root.d.crop-t; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-t", v); } committed(v) => { root.commit("crop-t", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_b"); value: root.d.crop-b; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-b", v); } committed(v) => { root.commit("crop-b", v); } }
+
+                SectionTitle { text: root.d.has-video-props ? Tr.t("inspector.video") : Tr.t("inspector.timing"); resettable: root.d.has-video-props; reset => { root.reset("color"); } }
+                PropSlider { label: Tr.t("inspector.speed"); value: root.d.speed; minimum: 0.25; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("speed", v); } committed(v) => { root.commit("speed", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.exposure"); value: root.d.exposure; minimum: -2; maximum: 2; default-value: 0; unit: " EV"; changed(v) => { root.live("exposure", v); } committed(v) => { root.commit("exposure", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.contrast"); value: root.d.contrast; minimum: 0.5; maximum: 2; default-value: 1; changed(v) => { root.live("contrast", v); } committed(v) => { root.commit("contrast", v); } }
+                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.saturation"); value: root.d.saturation; minimum: 0; maximum: 2; default-value: 1; changed(v) => { root.live("saturation", v); } committed(v) => { root.commit("saturation", v); } }
+                if root.d.has-video-props: HorizontalLayout {
+                    height: 26px;
+                    Text { text: Tr.t("inspector.stabilization"); width: 92px; font-size: Theme.font-sm; color: Theme.text-faint; vertical-alignment: center; }
+                    Text { text: Tr.t("inspector.planned"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; horizontal-stretch: 1; }
+                    Switch { enabled: false; }
+                }
+
+                if root.d.is-audio: SectionTitle { text: Tr.t("inspector.audio"); resettable: true; reset => { root.reset("audio"); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.gain"); value: root.d.gain; minimum: -40; maximum: 12; default-value: 0; decimals: 1; unit: " dB"; changed(v) => { root.live("gain", v); } committed(v) => { root.commit("gain", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.pan"); value: root.d.pan; minimum: -1; maximum: 1; default-value: 0; changed(v) => { root.live("pan", v); } committed(v) => { root.commit("pan", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
+
+                SectionTitle { text: Tr.t("inspector.effects"); }
+                if root.d.effects.length == 0: Text { text: Tr.t("inspector.effects.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                for e in root.d.effects: Text { text: e; font-size: Theme.font-sm; color: Theme.text-dim; }
+                Text { text: Tr.t("inspector.hint.values"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+            }
+        }
+    }
+}

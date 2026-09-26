@@ -1,0 +1,13 @@
+// Translation bridge. Strings come from crates/i18n/locales/*.json via Rust.
+// Every lookup reads `rev`, so bumping it on a language switch re-evaluates
+// all bound texts instantly — no restart.
+
+export global Tr {
+    in property <int> rev;
+    pure callback lookup(int, string) -> string;
+    pure callback lookup1(int, string, string) -> string;
+    pure callback lookup2(int, string, string, string) -> string;
+    public pure function t(key: string) -> string { return self.lookup(self.rev, key); }
+    public pure function t1(key: string, a: string) -> string { return self.lookup1(self.rev, key, a); }
+    public pure function t2(key: string, a: string, b: string) -> string { return self.lookup2(self.rev, key, a, b); }
+}

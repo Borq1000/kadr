@@ -1,0 +1,261 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, PanelHeader, EmptyState, Button, ProgressBar, Badge } from "widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
+
+export struct AssetView {
+    id: string,
+    name: string,
+    kind: int, // 0 video, 1 audio, 2 image
+    duration: string,
+    resolution: string,
+    fps: string,
+    codec: string,
+    audio: string,
+    thumb: image,
+    has-thumb: bool,
+    status: string,
+    status-kind: int,    // 0 working, 1 ready, 2 error / offline
+    progress: float,
+    proxy: string,
+    selected: bool,
+    in-use: bool,
+}
+
+export struct BinView {
+    id: string,
+    name: string,
+    count: int,
+    selected: bool,
+    renaming: bool,
+}
+
+component AssetCard inherits Rectangle {
+    in property <AssetView> a;
+    callback pressed(length, length);
+    callback moved(length, length);
+    callback released(length, length);
+    callback activated();
+    height: 76px;
+    border-radius: Theme.radius;
+    background: root.a.selected ? Theme.accent-soft : ta.has-hover ? Theme.bg3 : transparent;
+    border-width: root.a.selected ? 1px : 0px;
+    border-color: #7c8cff66;
+    animate background { duration: 90ms; }
+    HorizontalLayout {
+        padding: 6px;
+        spacing: 10px;
+        Rectangle {
+            width: 96px;
+            border-radius: 4px;
+            background: #000000;
+            clip: true;
+            if root.a.has-thumb: Image { width: parent.width; height: parent.height; source: root.a.thumb; image-fit: cover; opacity: root.a.status-kind == 2 ? 0.35 : 1; }
+            if !root.a.has-thumb: Icon {
+                icon: root.a.kind == 1 ? Icons.audio : root.a.kind == 2 ? Icons.image : Icons.film;
+                width: 22px; height: 22px;
+                color: root.a.kind == 1 ? Theme.clip-audio-top : Theme.text-faint;
+            }
+            Rectangle {
+                x: parent.width - self.width - 3px;
+                y: parent.height - self.height - 3px;
+                width: dur.preferred-width + 8px;
+                height: 15px;
+                border-radius: 3px;
+                background: #000000b0;
+                dur := Text { text: root.a.duration; font-size: 9px; font-family: Theme.mono; color: #ffffff; }
+            }
+            if root.a.in-use: Rectangle {
+                x: 4px; y: 4px; width: 7px; height: 7px; border-radius: 3.5px; background: Theme.accent;
+                border-width: 1px; border-color: #00000080;
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            Text { text: root.a.name; font-size: Theme.font; font-weight: 600; color: root.a.status-kind == 2 ? Theme.text-dim : Theme.text; overflow: elide; }
+            Text {
+                text: root.a.kind == 1 ? root.a.audio : root.a.resolution + (root.a.fps != "" ? "  ·  " + root.a.fps : "");
+                font-size: Theme.font-sm; color: Theme.text-dim; overflow: elide;
+            }
+            Text {
+                text: root.a.codec + (root.a.kind != 1 && root.a.audio != "" ? "  ·  " + root.a.audio : "");
+                font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Rectangle {
+                    width: 6px; height: 6px; y: 4px; border-radius: 3px;
+                    background: root.a.status-kind == 1 ? Theme.success : root.a.status-kind == 2 ? Theme.danger : Theme.warning;
+                }
+                Text {
+                    text: root.a.status + (root.a.proxy != "" ? "  ·  " + root.a.proxy : "");
+                    font-size: Theme.font-xs;
+                    color: root.a.status-kind == 2 ? Theme.danger : Theme.text-faint;
+                    overflow: elide;
+                }
+            }
+            if root.a.status-kind == 0: ProgressBar { value: root.a.progress; height: 2px; }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: self.pressed ? grabbing : pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.pressed(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
+            }
+            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                root.released(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
+            }
+        }
+        moved => {
+            if (self.pressed) { root.moved(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
+        }
+        double-clicked => { root.activated(); }
+    }
+}
+
+export component MediaLibrary inherits Rectangle {
+    in property <[AssetView]> assets;
+    in property <[BinView]> bins;
+    in property <string> summary;
+    in property <int> total-count;
+    in-out property <string> search;
+    callback import();
+    callback new-bin();
+    callback select-bin(string);
+    callback bin-action(string, string);
+    callback rename-bin(string, string);
+    callback asset-pressed(string, length, length);
+    callback asset-moved(string, length, length);
+    callback asset-released(string, length, length);
+    callback asset-activated(string);
+    callback asset-action(string, string);
+    callback search-changed(string);
+    background: Theme.bg1;
+
+    VerticalLayout {
+        PanelHeader {
+            title: Tr.t("media.title");
+            icon: Icons.folder;
+            VerticalLayout { alignment: center; IconButton { icon: Icons.plus; tooltip: Tr.t("media.new_bin"); clicked => { root.new-bin(); } } }
+            VerticalLayout { alignment: center; IconButton { icon: Icons.import; tooltip: Tr.t("media.import_tip"); clicked => { root.import(); } } }
+        }
+        if root.total-count > 0: VerticalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 8px;
+            spacing: 6px;
+            LineEdit {
+                placeholder-text: Tr.t("media.search");
+                text <=> root.search;
+                edited(t) => { root.search-changed(t); }
+            }
+        }
+        // Bins
+        Rectangle {
+            height: 38px;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 4px;
+                alignment: start;
+                for b in root.bins: Rectangle {
+                    width: b.renaming ? 140px : measure.preferred-width + 18px;
+                    measure := Text { visible: false; text: b.name + "  " + b.count; font-size: Theme.font-sm; }
+                    if !b.renaming: Rectangle {
+                        y: 7px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: b.selected ? Theme.bg4 : bta.has-hover ? Theme.bg3 : Theme.bg2;
+                        border-width: 1px;
+                        border-color: b.selected ? Theme.border-strong : Theme.border;
+                        Text {
+                            text: b.name + "  " + b.count;
+                            font-size: Theme.font-sm;
+                            color: b.selected ? Theme.text : Theme.text-dim;
+                        }
+                        ContextMenuArea {
+                            enabled: b.id != "";
+                            Menu {
+                                MenuItem { title: Tr.t("media.bin.rename"); activated => { root.bin-action(b.id, "rename"); } }
+                                MenuItem { title: Tr.t("media.bin.delete"); activated => { root.bin-action(b.id, "delete"); } }
+                            }
+                            bta := TouchArea {
+                                clicked => { root.select-bin(b.id); }
+                                double-clicked => { if (b.id != "") { root.bin-action(b.id, "rename"); } }
+                            }
+                        }
+                    }
+                    if b.renaming: LineEdit {
+                        y: 4px;
+                        width: 140px;
+                        height: 30px;
+                        text: b.name;
+                        init => { self.focus(); self.select-all(); }
+                        accepted(t) => { root.rename-bin(b.id, t); }
+                        key-pressed(e) => {
+                            if (e.text == Key.Escape) { root.rename-bin(b.id, b.name); return accept; }
+                            reject
+                        }
+                    }
+                }
+            }
+        }
+        if root.total-count == 0: EmptyState {
+            icon: Icons.film;
+            title: Tr.t("media.empty.title");
+            subtitle: Tr.t("media.empty.subtitle");
+            HorizontalLayout {
+                alignment: center;
+                padding-top: 8px;
+                Button { text: Tr.t("media.import_button"); icon: Icons.import; primary: true; clicked => { root.import(); } }
+            }
+        }
+        if root.total-count > 0 && root.assets.length == 0: EmptyState {
+            icon: Icons.folder;
+            title: root.search != "" ? Tr.t("media.no_match") : Tr.t("media.bin_empty");
+            subtitle: root.search != "" ? "" : Tr.t("media.bin_empty_hint");
+        }
+        if root.assets.length > 0: sv1 := ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                width: sv1.visible-width;
+                padding: 6px;
+                spacing: 2px;
+                alignment: start;
+                for a in root.assets: ContextMenuArea {
+                    Menu {
+                        MenuItem { title: Tr.t("media.ctx.insert"); activated => { root.asset-action(a.id, "insert"); } }
+                        MenuItem { title: Tr.t("media.ctx.overwrite"); activated => { root.asset-action(a.id, "overwrite"); } }
+                        MenuItem { title: Tr.t("media.ctx.append"); activated => { root.asset-action(a.id, "append"); } }
+                        MenuSeparator {}
+                        MenuItem { title: Tr.t("media.ctx.to_bin"); activated => { root.asset-action(a.id, "to-bin"); } }
+                        MenuItem { title: Tr.t("media.ctx.reanalyze"); activated => { root.asset-action(a.id, "reanalyze"); } }
+                        MenuItem { title: Tr.t("media.ctx.reveal"); activated => { root.asset-action(a.id, "reveal"); } }
+                        MenuSeparator {}
+                        MenuItem { title: Tr.t("media.ctx.remove"); activated => { root.asset-action(a.id, "remove"); } }
+                    }
+                    AssetCard {
+                        a: a;
+                        pressed(x, y) => { root.asset-pressed(a.id, x, y); }
+                        moved(x, y) => { root.asset-moved(a.id, x, y); }
+                        released(x, y) => { root.asset-released(a.id, x, y); }
+                        activated => { root.asset-activated(a.id); }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 24px;
+            Rectangle { height: 1px; y: 0; background: Theme.border; }
+            Text {
+                x: 12px;
+                text: root.summary;
+                font-size: Theme.font-xs;
+                color: Theme.text-faint;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

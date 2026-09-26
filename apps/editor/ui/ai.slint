@@ -1,0 +1,268 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, Button, Badge } from "widgets.slint";
+import { ScrollView, LineEdit, CheckBox } from "std-widgets.slint";
+
+export struct PlanItemView {
+    label: string,
+    enabled: bool,
+}
+
+export struct PlanView {
+    title: string,
+    findings: [string],
+    proposal: string,
+    count: int,
+    tier: string,
+    source: string,
+    cost: string,
+    confidence: string,
+    duration-change: string,
+    items: [PlanItemView],
+    reviewing: bool,
+    state: int,            // 0 pending, 1 applied, 2 cancelled, 3 undone
+}
+
+export struct OfferView {
+    title: string,
+    tier: string,
+    provider: string,
+    model: string,
+    input: string,
+    cost: string,
+    warnings: [string],
+    blocked: string,
+    can-cheaper: bool,
+    state: int,            // 0 pending, 1 running, 2 done, 3 cancelled, 4 failed
+}
+
+export struct ChatMsg {
+    kind: int,             // 0 user, 1 assistant, 2 plan, 3 offer, 4 error
+    text: string,
+    index: int,
+}
+
+component PlanCard inherits Rectangle {
+    in property <PlanView> p;
+    callback action(string);
+    callback toggle-item(int);
+    border-radius: Theme.radius;
+    background: Theme.bg2;
+    border-width: 1px;
+    border-color: root.p.state == 0 ? #4fd1c555 : Theme.border;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text { text: root.p.title; font-weight: 700; font-size: Theme.font-md; color: Theme.text; horizontal-stretch: 1; overflow: elide; }
+            Badge { text: root.p.tier; fg: Theme.text-on-accent; bg: root.p.tier == "LOCAL" ? Theme.success : Theme.ai-b; }
+        }
+        for f in root.p.findings: Text { text: f; font-size: Theme.font-sm; color: Theme.text-dim; wrap: word-wrap; }
+        Text { text: root.p.proposal; font-size: Theme.font-sm; color: Theme.text; wrap: word-wrap; }
+        if root.p.duration-change != "": Text { text: root.p.duration-change; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; }
+        HorizontalLayout {
+            spacing: 10px;
+            Text { text: root.p.source; font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; horizontal-stretch: 1; }
+            Text { text: Tr.t1("ai.plan.cost", root.p.cost); font-size: Theme.font-xs; color: Theme.text-faint; }
+            Text { text: Tr.t1("ai.plan.confidence", root.p.confidence); font-size: Theme.font-xs; color: Theme.text-faint; }
+        }
+        if root.p.reviewing: Rectangle {
+            height: min(220px, root.p.items.length * 26px + 8px);
+            border-radius: 4px;
+            background: Theme.bg1;
+            sv1 := ScrollView {
+                VerticalLayout {
+                    width: sv1.visible-width;
+                    padding: 4px;
+                    alignment: start;
+                    for it[i] in root.p.items: HorizontalLayout {
+                        height: 26px;
+                        spacing: 6px;
+                        CheckBox { checked: it.enabled; toggled => { root.toggle-item(i); } }
+                        Text { text: it.label; font-size: Theme.font-xs; font-family: Theme.mono; color: it.enabled ? Theme.text : Theme.text-faint; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        IconButton { size: 22px; icon-size: 11px; icon: Icons.play; filled: true; tooltip: Tr.t("ai.plan.goto"); clicked => { root.action("goto:" + i); } }
+                    }
+                }
+            }
+        }
+        if root.p.state == 0: HorizontalLayout {
+            spacing: 6px;
+            Button { text: root.p.count > 0 ? Tr.t1("ai.plan.apply_n", root.p.count) : Tr.t("ai.plan.apply"); primary: true; compact: true; enabled: root.p.count > 0; clicked => { root.action("apply"); } }
+            Button { text: root.p.reviewing ? Tr.t("ai.plan.hide_review") : Tr.t("ai.plan.review"); compact: true; enabled: root.p.items.length > 0; clicked => { root.action("review"); } }
+            Button { text: Tr.t("common.cancel"); compact: true; ghost: true; clicked => { root.action("cancel"); } }
+        }
+        if root.p.state == 1: HorizontalLayout {
+            spacing: 8px;
+            Text { text: Tr.t("ai.plan.applied"); color: Theme.success; font-size: Theme.font-sm; vertical-alignment: center; horizontal-stretch: 1; }
+            Button { text: Tr.t("ai.plan.undo"); icon: Icons.undo; compact: true; clicked => { root.action("undo"); } }
+        }
+        if root.p.state == 2: Text { text: Tr.t("ai.plan.cancelled"); color: Theme.text-faint; font-size: Theme.font-sm; }
+        if root.p.state == 3: Text { text: Tr.t("ai.plan.undone"); color: Theme.text-faint; font-size: Theme.font-sm; }
+    }
+}
+
+component OfferCard inherits Rectangle {
+    in property <OfferView> o;
+    callback action(string);
+    border-radius: Theme.radius;
+    background: Theme.bg2;
+    border-width: 1px;
+    border-color: root.o.blocked != "" ? #ef5b5b66 : root.o.warnings.length > 0 ? #e5a50a88 : #8b7cf666;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 5px;
+        HorizontalLayout {
+            Text { text: root.o.title; font-weight: 700; font-size: Theme.font-md; color: Theme.text; horizontal-stretch: 1; }
+            Badge { text: root.o.tier; fg: Theme.text-on-accent; bg: Theme.ai-b; }
+        }
+        GridLayout {
+            spacing: 4px;
+            Row { Text { text: Tr.t("ai.offer.provider"); font-size: Theme.font-xs; color: Theme.text-faint; } Text { text: root.o.provider; font-size: Theme.font-sm; color: Theme.text; } }
+            Row { Text { text: Tr.t("ai.offer.model"); font-size: Theme.font-xs; color: Theme.text-faint; } Text { text: root.o.model; font-size: Theme.font-sm; color: Theme.text; } }
+            Row { Text { text: Tr.t("ai.offer.input"); font-size: Theme.font-xs; color: Theme.text-faint; } Text { text: root.o.input; font-size: Theme.font-sm; color: Theme.text; } }
+            Row { Text { text: Tr.t("ai.offer.cost"); font-size: Theme.font-xs; color: Theme.text-faint; } Text { text: root.o.cost; font-size: Theme.font-sm; font-weight: 700; color: Theme.warning; } }
+        }
+        Text { text: Tr.t("ai.offer.privacy_note"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+        for w in root.o.warnings: Text { text: "⚠ " + w; font-size: Theme.font-xs; color: Theme.warning; wrap: word-wrap; }
+        if root.o.blocked != "": Text { text: root.o.blocked; font-size: Theme.font-xs; color: Theme.danger; wrap: word-wrap; }
+        if root.o.state == 0 && root.o.blocked == "": HorizontalLayout {
+            spacing: 6px;
+            Button { text: root.o.warnings.length > 0 ? Tr.t("ai.offer.run_anyway") : Tr.t("ai.offer.run"); primary: root.o.warnings.length == 0; danger: root.o.warnings.length > 0; compact: true; clicked => { root.action("run"); } }
+            Button { text: Tr.t("ai.offer.cheaper"); compact: true; enabled: root.o.can-cheaper; clicked => { root.action("cheaper"); } }
+            Button { text: Tr.t("ai.offer.local"); compact: true; ghost: true; clicked => { root.action("local"); } }
+        }
+        if root.o.state == 0 && root.o.blocked != "": HorizontalLayout {
+            spacing: 6px;
+            Button { text: Tr.t("ai.offer.open_settings"); icon: Icons.gear; compact: true; clicked => { root.action("settings"); } }
+            Button { text: Tr.t("ai.offer.local"); compact: true; ghost: true; clicked => { root.action("local"); } }
+        }
+        if root.o.state == 1: HorizontalLayout {
+            spacing: 8px;
+            Text { text: Tr.t1("ai.offer.waiting", root.o.provider); font-size: Theme.font-sm; color: Theme.ai-a; vertical-alignment: center; horizontal-stretch: 1; }
+            Button { text: Tr.t("common.cancel"); compact: true; clicked => { root.action("abort"); } }
+        }
+        if root.o.state == 2: Text { text: Tr.t("ai.offer.done"); font-size: Theme.font-sm; color: Theme.success; }
+        if root.o.state == 3: Text { text: Tr.t("ai.offer.not_sent"); font-size: Theme.font-sm; color: Theme.text-faint; }
+        if root.o.state == 4: Text { text: Tr.t("ai.offer.failed"); font-size: Theme.font-sm; color: Theme.danger; }
+    }
+}
+
+export component AiPanel inherits Rectangle {
+    in property <[ChatMsg]> messages;
+    in property <[PlanView]> plans;
+    in property <[OfferView]> offers;
+    in property <string> mode-label;
+    in property <string> cost-label;
+    in property <bool> busy;
+    in-out property <string> draft;
+    callback send(string);
+    callback plan-action(int, string);
+    callback plan-toggle(int, int);
+    callback offer-action(int, string);
+    callback close();
+    callback settings();
+    callback clear();
+    background: Theme.bg1;
+
+    VerticalLayout {
+        Rectangle {
+            height: Theme.panel-header;
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 6px;
+                spacing: 6px;
+                Icon {
+                    y: (parent.height - self.height) / 2;
+                    icon: Icons.sparkle; filled: true; width: 14px; height: 14px;
+                    color: Theme.ai-a;
+                }
+                Text { text: Tr.t("ai.title"); font-size: Theme.font-sm; font-weight: 600; letter-spacing: 0.6px; color: Theme.text-dim; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout { alignment: center; Badge { text: root.mode-label; fg: Theme.text-dim; } }
+                if root.messages.length > 0: VerticalLayout { alignment: center; IconButton { icon: Icons.trash; tooltip: Tr.t("ai.clear"); clicked => { root.clear(); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.gear; tooltip: Tr.t("ai.settings"); clicked => { root.settings(); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.chevron-right; tooltip: Tr.t("ai.collapse"); tooltip-right: true; clicked => { root.close(); } } }
+            }
+        }
+        sv2 := ScrollView {
+            vertical-stretch: 1;
+            content-y: min(0px, self.visible-height - self.content-height);
+            VerticalLayout {
+                width: sv2.visible-width;
+                padding: 12px;
+                spacing: 8px;
+                alignment: start;
+                if root.messages.length == 0: VerticalLayout {
+                    spacing: 8px;
+                    padding-top: 6px;
+                    alignment: start;
+                    Text { text: Tr.t("ai.empty.title"); font-size: Theme.font-lg; font-weight: 600; color: Theme.text; }
+                    Text { text: Tr.t("ai.empty.body"); font-size: Theme.font-sm; color: Theme.text-dim; wrap: word-wrap; }
+                    Text { text: Tr.t("ai.empty.try"); font-size: Theme.font-xs; font-weight: 700; letter-spacing: 0.6px; color: Theme.text-faint; }
+                    for s in [Tr.t("ai.suggest.1"), Tr.t("ai.suggest.2"), Tr.t("ai.suggest.3"), Tr.t("ai.suggest.4")]: Rectangle {
+                        height: 32px;
+                        border-radius: 16px;
+                        background: sa.has-hover ? Theme.bg3 : Theme.bg2;
+                        border-width: 1px;
+                        border-color: sa.has-hover ? Theme.border-strong : Theme.border;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 8px;
+                            Icon { y: 9px; icon: Icons.sparkle; filled: true; width: 12px; height: 12px; color: Theme.ai-a; }
+                            Text { text: s; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; }
+                        }
+                        sa := TouchArea { clicked => { root.send(s); } }
+                    }
+                }
+                for m in root.messages: HorizontalLayout {
+                    alignment: m.kind == 0 ? end : stretch;
+                    if m.kind == 0: Rectangle {
+                        width: min(260px, ut.preferred-width + 22px);
+                        height: ut.preferred-height + 14px;
+                        border-radius: 10px;
+                        background: #2d3350;
+                        ut := Text { x: 11px; width: parent.width - 22px; text: m.text; wrap: word-wrap; font-size: Theme.font; color: Theme.text; }
+                    }
+                    if m.kind == 1 || m.kind == 4: Text {
+                        text: m.text; wrap: word-wrap; font-size: Theme.font;
+                        color: m.kind == 4 ? Theme.danger : Theme.text-dim;
+                    }
+                    if m.kind == 2 && m.index >= 0 && m.index < root.plans.length: PlanCard {
+                        p: root.plans[m.index];
+                        action(a) => { root.plan-action(m.index, a); }
+                        toggle-item(i) => { root.plan-toggle(m.index, i); }
+                    }
+                    if m.kind == 3 && m.index >= 0 && m.index < root.offers.length: OfferCard {
+                        o: root.offers[m.index];
+                        action(a) => { root.offer-action(m.index, a); }
+                    }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 6px;
+                LineEdit {
+                    placeholder-text: Tr.t("ai.input.placeholder");
+                    text <=> root.draft;
+                    accepted(t) => { if (t != "") { root.send(t); } }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 32px; height: 32px; border-radius: 16px;
+                        background: root.draft == "" ? Theme.bg3 : sba.has-hover ? #9aa6ff : Theme.accent;
+                        Icon { icon: Icons.send; filled: true; width: 14px; height: 14px; color: root.draft == "" ? Theme.text-faint : Theme.text-on-accent; }
+                        sba := TouchArea { clicked => { if (root.draft != "") { root.send(root.draft); } } }
+                    }
+                }
+            }
+            Text { text: root.cost-label; font-size: Theme.font-xs; color: Theme.text-faint; }
+        }
+    }
+}

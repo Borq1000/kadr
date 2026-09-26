@@ -1,0 +1,11 @@
+[package]
+name = "kadr-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kadr-core = { path = "../core" }
+cpal.workspace = true
+rtrb = "0.4"
+tracing.workspace = true

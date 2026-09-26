@@ -1,0 +1,9 @@
+[package]
+name = "kadr-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kadr-core = { path = "../core" }
+serde.workspace = true

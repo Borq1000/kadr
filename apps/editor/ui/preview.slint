@@ -1,0 +1,175 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, PanelHeader, Badge, Segmented } from "widgets.slint";
+
+export component Preview inherits Rectangle {
+    in property <image> frame;
+    in property <bool> has-frame;
+    in property <float> frame-aspect: 16 / 9;
+    in property <bool> playing;
+    in property <string> timecode;
+    in property <string> duration;
+    in property <string> info;
+    in property <string> clip-name;
+    in property <int> empty-kind; // 0 has content, 1 empty timeline, 2 gap, 3 offline
+    in property <int> quality; // 0 full, 1 half, 2 quarter
+    in property <int> zoom;    // 0 fit, 1 150%, 2 250%
+    in property <bool> safe-areas;
+    in property <bool> bypass;
+    in property <bool> loading;
+    in property <float> scrub-fraction;
+    callback transport(string);
+    callback set-quality(int);
+    callback set-zoom(int);
+    callback scrub(float);
+    background: Theme.bg1;
+    // Narrow preview: secondary controls hide (still in View menu / keys).
+    property <bool> compact: self.width < 640px;
+
+    VerticalLayout {
+        PanelHeader {
+            title: Tr.t("preview.title");
+            icon: Icons.film;
+            if root.bypass: VerticalLayout { alignment: center; Badge { text: Tr.t("preview.before"); fg: Theme.text-on-accent; bg: Theme.warning; } }
+            Text { text: root.info; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+            Rectangle { width: 4px; }
+        }
+        viewport := Rectangle {
+            background: #000000;
+            clip: true;
+            property <length> fit-w: min(self.width - 24px, (self.height - 24px) * root.frame-aspect);
+            property <length> fit-h: self.fit-w / root.frame-aspect;
+            property <float> zf: root.zoom == 0 ? 1 : root.zoom == 1 ? 1.5 : 2.5;
+            Rectangle {
+                width: viewport.fit-w * viewport.zf;
+                height: viewport.fit-h * viewport.zf;
+                x: (viewport.width - self.width) / 2;
+                y: (viewport.height - self.height) / 2;
+                background: #050505;
+                if root.has-frame && root.empty-kind == 0: Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.frame;
+                    image-fit: contain;
+                    image-rendering: smooth;
+                }
+                if root.empty-kind != 0: VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Icon {
+                            icon: root.empty-kind == 3 ? Icons.close : Icons.film;
+                            width: 28px; height: 28px;
+                            color: root.empty-kind == 3 ? Theme.danger : #ffffff30;
+                        }
+                    }
+                    Text {
+                        horizontal-alignment: center;
+                        text: root.empty-kind == 1 ? Tr.t("preview.empty.timeline") : root.empty-kind == 3 ? Tr.t("preview.empty.offline") : Tr.t("preview.empty.gap");
+                        color: root.empty-kind == 3 ? Theme.danger : #ffffff60;
+                        font-size: Theme.font;
+                    }
+                }
+                if root.safe-areas: Rectangle {
+                    width: parent.width * 0.93;
+                    height: parent.height * 0.93;
+                    border-width: 1px;
+                    border-color: #ffffff50;
+                }
+                if root.safe-areas: Rectangle {
+                    width: parent.width * 0.90;
+                    height: parent.height * 0.90;
+                    border-width: 1px;
+                    border-color: #ffffff30;
+                    Rectangle { width: 16px; height: 1px; background: #ffffff50; }
+                    Rectangle { width: 1px; height: 16px; background: #ffffff50; }
+                }
+            }
+            if root.clip-name != "" && root.empty-kind == 0: Rectangle {
+                x: 10px; y: 10px;
+                width: cn.preferred-width + 14px; height: 20px;
+                border-radius: 4px;
+                background: #00000090;
+                cn := Text { text: root.clip-name; font-size: Theme.font-xs; color: #ffffffc0; }
+            }
+            if root.loading: Rectangle {
+                x: parent.width - 18px; y: 12px; width: 8px; height: 8px; border-radius: 4px;
+                background: Theme.warning;
+            }
+        }
+        // Scrub bar
+        Rectangle {
+            height: 16px;
+            background: Theme.bg1;
+            Rectangle {
+                x: 12px; y: 7px; width: parent.width - 24px; height: 3px; border-radius: 1.5px; background: Theme.bg3;
+                Rectangle { x: 0; width: parent.width * clamp(root.scrub-fraction, 0, 1); height: parent.height; border-radius: 1.5px; background: Theme.playhead; }
+                Rectangle {
+                    x: parent.width * clamp(root.scrub-fraction, 0, 1) - 5px; y: -3.5px; width: 10px; height: 10px; border-radius: 5px;
+                    background: sta.has-hover || sta.pressed ? #ffffff : #d0d3d8;
+                }
+            }
+            sta := TouchArea {
+                x: 12px; width: parent.width - 24px;
+                mouse-cursor: pointer;
+                pointer-event(e) => { if (e.kind == PointerEventKind.down) { root.scrub(clamp(self.mouse-x / self.width, 0, 1)); } }
+                moved => { if (self.pressed) { root.scrub(clamp(self.mouse-x / self.width, 0, 1)); } }
+            }
+        }
+        // Transport
+        Rectangle {
+            height: 46px;
+            background: Theme.bg1;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 10px;
+                spacing: 2px;
+                VerticalLayout {
+                    alignment: center;
+                    min-width: 100px;
+                    preferred-width: 150px;
+                    horizontal-stretch: 0;
+                    Text { text: root.timecode; font-family: Theme.mono; font-size: Theme.font-lg; color: Theme.text; overflow: elide; }
+                    Text { text: root.duration; font-family: Theme.mono; font-size: Theme.font-xs; color: Theme.text-faint; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.to-start; filled: true; tooltip: Tr.t("preview.tip.start"); tooltip-above: true; clicked => { root.transport("start"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.step-back; filled: true; tooltip: Tr.t("preview.tip.prev"); tooltip-above: true; clicked => { root.transport("prev"); } } }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 38px; height: 38px; border-radius: 19px;
+                        background: pta.pressed ? #d9dbe0 : pta.has-hover ? #ffffff : #eceef1;
+                        animate background { duration: 90ms; }
+                        Icon { icon: root.playing ? Icons.pause : Icons.play; filled: true; width: 18px; height: 18px; color: #0e0f12; }
+                        pta := TouchArea { clicked => { root.transport("toggle"); } }
+                    }
+                }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.step-fwd; filled: true; tooltip: Tr.t("preview.tip.next"); tooltip-above: true; clicked => { root.transport("next"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.to-end; filled: true; tooltip: Tr.t("preview.tip.end"); tooltip-above: true; clicked => { root.transport("end"); } } }
+                Rectangle { horizontal-stretch: 1; }
+                if !root.compact: VerticalLayout { alignment: center; IconButton { icon: Icons.compare; tooltip: Tr.t("preview.tip.bypass"); tooltip-above: true; active: root.bypass; clicked => { root.transport("bypass"); } } }
+                if !root.compact: VerticalLayout { alignment: center; IconButton { icon: Icons.safe; tooltip: Tr.t("preview.tip.safe"); tooltip-above: true; active: root.safe-areas; clicked => { root.transport("safe"); } } }
+                if !root.compact: VerticalLayout {
+                    alignment: center;
+                    Segmented {
+                        options: [Tr.t("preview.q.full"), "1/2", "1/4"];
+                        current: root.quality;
+                        selected(i) => { root.set-quality(i); }
+                    }
+                }
+                if !root.compact: VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 58px; height: 28px; border-radius: 5px; background: za.has-hover ? Theme.bg3 : Theme.bg2;
+                        border-width: 1px; border-color: Theme.border;
+                        Text { text: root.zoom == 0 ? Tr.t("preview.zoom.fit") : root.zoom == 1 ? "150%" : "250%"; font-size: Theme.font-xs; color: Theme.text-dim; }
+                        za := TouchArea { clicked => { root.set-zoom(mod(root.zoom + 1, 3)); } }
+                    }
+                }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.fullscreen; tooltip: Tr.t("preview.tip.fullscreen"); tooltip-above: true; tooltip-right: true; clicked => { root.transport("fullscreen"); } } }
+            }
+        }
+    }
+}

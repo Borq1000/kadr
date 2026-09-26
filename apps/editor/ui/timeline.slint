@@ -1,0 +1,572 @@
+// Timeline: custom-drawn, virtualized. Rust computes only the visible
+// clips/ticks as flat rectangles and does all hit-testing, dragging,
+// trimming and snapping in time coordinates. Slint just paints.
+
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, TinyToggle, Tooltip, Button } from "widgets.slint";
+import { LineEdit } from "std-widgets.slint";
+
+export struct TrackView {
+    index: int,
+    name: string,
+    is-audio: bool,
+    muted: bool,
+    solo: bool,
+    locked: bool,
+    y: length,
+    height: length,
+    empty: bool,
+    renaming: bool,
+}
+
+export struct ClipView {
+    id: string,
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+    name: string,
+    is-audio: bool,
+    selected: bool,
+    enabled: bool,
+    linked: bool,
+    speed-label: string,
+    thumb: image,
+    has-thumb: bool,
+    wave: image,
+    has-wave: bool,
+    wave-x: length,
+    wave-width: length,
+    fade-in: length,
+    fade-out: length,
+    offline: bool,
+}
+
+export struct TickView {
+    x: length,
+    label: string,
+    major: bool,
+}
+
+export struct MarkerView {
+    x: length,
+    name: string,
+    color: color,
+}
+
+export struct TransitionView {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+}
+
+component TrackHeader inherits Rectangle {
+    in property <TrackView> track;
+    callback toggle(string);
+    callback action(string);
+    callback rename(string);
+    background: Theme.bg1;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+    Rectangle {
+        x: 0;
+        width: 3px;
+        background: root.track.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
+    }
+    ContextMenuArea {
+        Menu {
+            MenuItem { title: Tr.t("tl.track.rename"); activated => { root.action("rename"); } }
+            MenuSeparator {}
+            MenuItem { title: Tr.t("tl.track.add_video"); activated => { root.action("add-video"); } }
+            MenuItem { title: Tr.t("tl.track.add_audio"); activated => { root.action("add-audio"); } }
+            MenuSeparator {}
+            MenuItem { title: Tr.t("tl.track.delete"); enabled: root.track.empty; activated => { root.action("delete"); } }
+        }
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 8px;
+            spacing: 4px;
+            alignment: stretch;
+            if !root.track.renaming: Rectangle {
+                width: 64px;
+                Text {
+                    x: 0;
+                    width: parent.width;
+                    text: root.track.name;
+                    vertical-alignment: center;
+                    font-size: Theme.font-sm;
+                    font-weight: 700;
+                    color: root.track.locked ? Theme.text-faint : Theme.text;
+                    overflow: elide;
+                }
+                TouchArea { double-clicked => { root.action("rename"); } }
+            }
+            if root.track.renaming: VerticalLayout {
+                alignment: center;
+                LineEdit {
+                    width: 90px;
+                    text: root.track.name;
+                    init => { self.focus(); self.select-all(); }
+                    accepted(t) => { root.rename(t); }
+                    key-pressed(e) => {
+                        if (e.text == Key.Escape) { root.rename(root.track.name); return accept; }
+                        reject
+                    }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 3px;
+                    TinyToggle {
+                        text: root.track.is-audio ? "M" : "H";
+                        tooltip: root.track.is-audio ? Tr.t("tl.track.mute") : Tr.t("tl.track.hide");
+                        on: root.track.muted;
+                        on-color: Theme.warning;
+                        toggled => { root.toggle("mute"); }
+                    }
+                    if root.track.is-audio: TinyToggle {
+                        text: "S";
+                        tooltip: Tr.t("tl.track.solo");
+                        on: root.track.solo;
+                        on-color: Theme.success;
+                        toggled => { root.toggle("solo"); }
+                    }
+                    Rectangle {
+                        width: 20px;
+                        height: 18px;
+                        border-radius: 3px;
+                        background: root.track.locked ? Theme.danger : lk.has-hover ? Theme.bg4 : Theme.bg3;
+                        Icon {
+                            icon: root.track.locked ? Icons.lock : Icons.unlock;
+                            width: 12px;
+                            height: 12px;
+                            color: root.track.locked ? Theme.text-on-accent : Theme.text-dim;
+                        }
+                        lk := TouchArea { clicked => { root.toggle("lock"); } }
+                        if lk.has-hover: Tooltip { text: Tr.t("tl.track.lock"); y: parent.height + 4px; x: -20px; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ClipRect inherits Rectangle {
+    in property <ClipView> cv;
+    x: root.cv.x;
+    y: root.cv.y + 2px;
+    width: root.cv.width;
+    height: root.cv.height - 4px;
+    border-radius: 4px;
+    clip: true;
+    background: root.cv.offline ? #5a2a2a : !root.cv.enabled ? Theme.clip-disabled : root.cv.is-audio ? Theme.clip-audio : Theme.clip-video;
+    Rectangle {
+        y: 0;
+        height: 16px;
+        background: root.cv.offline ? #7a3434 : !root.cv.enabled ? #44474e : root.cv.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
+    }
+    if root.cv.has-thumb && root.cv.width > 40px: Image {
+        x: 0;
+        y: 16px;
+        height: parent.height - 16px;
+        width: min(self.height * 16 / 9, parent.width);
+        source: root.cv.thumb;
+        image-fit: cover;
+        opacity: root.cv.enabled ? 0.9 : 0.4;
+    }
+    if root.cv.has-wave: Image {
+        x: root.cv.wave-x;
+        y: 16px;
+        width: root.cv.wave-width;
+        height: parent.height - 16px;
+        source: root.cv.wave;
+        image-fit: fill;
+        opacity: root.cv.enabled ? 1 : 0.4;
+    }
+    if root.cv.fade-in > 0: Path {
+        x: 0; y: 16px;
+        width: root.cv.fade-in;
+        height: parent.height - 16px;
+        viewbox-width: 1; viewbox-height: 1;
+        commands: "M0 0 L1 0 L0 1 Z";
+        fill: #00000066;
+    }
+    if root.cv.fade-out > 0: Path {
+        x: parent.width - root.cv.fade-out; y: 16px;
+        width: root.cv.fade-out;
+        height: parent.height - 16px;
+        viewbox-width: 1; viewbox-height: 1;
+        commands: "M0 0 L1 0 L1 1 Z";
+        fill: #00000066;
+    }
+    if root.cv.width > 24px: HorizontalLayout {
+        y: 0;
+        height: 16px;
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+        if root.cv.linked: Icon { y: 2px; icon: Icons.link; width: 11px; height: 11px; color: #ffffffb0; }
+        Text {
+            text: root.cv.offline ? Tr.t1("tl.clip.offline", root.cv.name) : root.cv.name;
+            font-size: Theme.font-xs;
+            font-weight: 600;
+            color: #ffffffe6;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.cv.speed-label != "": Text {
+            text: root.cv.speed-label;
+            font-size: Theme.font-xs;
+            color: Theme.warning;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        border-radius: 4px;
+        border-width: root.cv.selected ? 2px : 1px;
+        border-color: root.cv.selected ? Theme.selection : #00000055;
+    }
+}
+
+export component Timeline inherits Rectangle {
+    in property <[TrackView]> tracks;
+    in property <[ClipView]> clips;
+    in property <[TickView]> ticks;
+    in property <[MarkerView]> markers;
+    in property <[TransitionView]> transitions;
+    in property <length> playhead-x;
+    in property <bool> show-playhead: true;
+    in property <length> snap-x;
+    in property <bool> show-snap;
+    in property <length> in-x;
+    in property <length> out-x;
+    in property <bool> has-in-out;
+    in property <length> ghost-x;
+    in property <length> ghost-y;
+    in property <length> ghost-w;
+    in property <length> ghost-h;
+    in property <bool> show-ghost;
+    in property <int> cursor-kind; // 0 default, 1 trim, 2 move
+    in property <bool> snapping;
+    in property <bool> ripple-mode;
+    in property <bool> blade-mode;
+    in property <string> zoom-label;
+    in property <bool> can-undo;
+    in property <bool> can-redo;
+    in property <string> timecode;
+    in property <bool> is-empty;
+    in property <bool> has-selection;
+    in property <float> scroll-fraction;
+    in property <float> view-fraction;
+    out property <length> lanes-width: lanes.width;
+    out property <length> lanes-height: lanes.height;
+    out property <length> lanes-abs-x: lanes.absolute-position.x;
+    out property <length> lanes-abs-y: lanes.absolute-position.y;
+    property <length> header-width: 170px;
+    property <length> ruler-height: 26px;
+    property <int> hover-marker: -1;
+
+    callback lane-pointer(int /*kind 0 down,1 move,2 up,3 dbl*/, length, length, int /*button 0 l,1 r,2 m*/, bool /*shift*/, bool /*ctrl*/, bool /*alt*/);
+    callback scroll(length, length, bool /*ctrl*/, bool /*shift*/);
+    callback ruler(int, length);
+    callback track-toggle(int, string);
+    callback track-action(int, string);
+    callback track-rename(int, string);
+    callback context-action(string);
+    callback tool(string);
+    callback scrollbar(float);
+    callback focus-editor();
+    callback import();
+
+    background: Theme.bg1;
+
+    VerticalLayout {
+        // Toolbar
+        Rectangle {
+            height: 38px;
+            background: Theme.bg1;
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 4px;
+                Text {
+                    width: 128px;
+                    text: root.timecode;
+                    vertical-alignment: center;
+                    font-family: Theme.mono;
+                    font-size: Theme.font-lg;
+                    color: Theme.text;
+                }
+                Rectangle { width: 1px; background: Theme.border; }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.undo; tooltip: Tr.t("tl.tip.undo"); enabled: root.can-undo; clicked => { root.tool("undo"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.redo; tooltip: Tr.t("tl.tip.redo"); enabled: root.can-redo; clicked => { root.tool("redo"); } } }
+                Rectangle { width: 8px; }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.scissors; tooltip: Tr.t("tl.tip.blade"); active: root.blade-mode; clicked => { root.tool("blade"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.magnet; tooltip: Tr.t("tl.tip.snap"); active: root.snapping; clicked => { root.tool("snap"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.ripple; tooltip: Tr.t("tl.tip.ripple"); active: root.ripple-mode; clicked => { root.tool("ripple"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.marker; tooltip: Tr.t("tl.tip.marker"); clicked => { root.tool("marker"); } } }
+                Rectangle { width: 1px; background: Theme.border; }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.trash; tooltip: Tr.t("tl.tip.delete"); enabled: root.has-selection; clicked => { root.context-action("delete"); } } }
+                if root.blade-mode: VerticalLayout {
+                    alignment: center;
+                    Text { text: Tr.t("tl.blade_hint"); font-size: Theme.font-xs; color: Theme.warning; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.zoom-out; tooltip: Tr.t("tl.tip.zoom_out"); clicked => { root.tool("zoom-out"); } } }
+                Text {
+                    width: 70px;
+                    text: root.zoom-label;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: Theme.font-sm;
+                    color: Theme.text-dim;
+                }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.zoom-in; tooltip: Tr.t("tl.tip.zoom_in"); clicked => { root.tool("zoom-in"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.fullscreen; tooltip: Tr.t("tl.tip.zoom_fit"); tooltip-right: true; clicked => { root.tool("zoom-fit"); } } }
+            }
+        }
+
+        HorizontalLayout {
+            // Track headers
+            VerticalLayout {
+                width: root.header-width;
+                Rectangle { height: root.ruler-height; background: Theme.bg1; Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; } }
+                Rectangle {
+                    clip: true;
+                    background: Theme.bg1;
+                    for t in root.tracks: TrackHeader {
+                        y: t.y;
+                        height: t.height;
+                        width: parent.width;
+                        track: t;
+                        toggle(which) => { root.track-toggle(t.index, which); }
+                        action(a) => { root.track-action(t.index, a); }
+                        rename(n) => { root.track-rename(t.index, n); }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: Theme.bg1;
+                    Rectangle { y: 0; height: 1px; background: Theme.border; }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 4px;
+                        alignment: start;
+                        VerticalLayout { alignment: center; Button { compact: true; ghost: true; icon: Icons.plus; text: Tr.t("tl.add_video_short"); clicked => { root.track-action(-1, "add-video"); } } }
+                        VerticalLayout { alignment: center; Button { compact: true; ghost: true; icon: Icons.plus; text: Tr.t("tl.add_audio_short"); clicked => { root.track-action(-1, "add-audio"); } } }
+                    }
+                }
+            }
+            Rectangle { width: 1px; background: Theme.border; }
+
+            VerticalLayout {
+                // Ruler
+                ContextMenuArea {
+                    Menu {
+                        MenuItem { title: Tr.t("tl.ruler.add_marker"); activated => { root.context-action("marker"); } }
+                        MenuItem { title: Tr.t("tl.ruler.rename_marker"); activated => { root.context-action("rename-marker"); } }
+                        MenuItem { title: Tr.t("tl.ruler.delete_marker"); activated => { root.context-action("delete-marker"); } }
+                        MenuSeparator {}
+                        MenuItem { title: Tr.t("tl.ruler.set_in"); activated => { root.context-action("set-in"); } }
+                        MenuItem { title: Tr.t("tl.ruler.set_out"); activated => { root.context-action("set-out"); } }
+                        MenuItem { title: Tr.t("tl.ruler.clear_in_out"); activated => { root.context-action("clear-in-out"); } }
+                    }
+                    ruler := Rectangle {
+                        height: root.ruler-height;
+                        background: Theme.bg2;
+                        clip: true;
+                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                        if root.has-in-out: Rectangle {
+                            x: root.in-x;
+                            width: max(0px, root.out-x - root.in-x);
+                            height: parent.height;
+                            background: Theme.in-out;
+                        }
+                        for tk in root.ticks: Rectangle {
+                            x: tk.x;
+                            y: tk.major ? parent.height - 10px : parent.height - 5px;
+                            width: 1px;
+                            height: tk.major ? 10px : 5px;
+                            background: tk.major ? Theme.text-faint : Theme.border-strong;
+                            if tk.label != "": Text {
+                                x: 4px;
+                                y: -12px;
+                                text: tk.label;
+                                font-size: Theme.font-xs;
+                                font-family: Theme.mono;
+                                color: Theme.text-faint;
+                            }
+                        }
+                        for m[i] in root.markers: Path {
+                            x: m.x - 5px;
+                            y: 2px;
+                            width: 10px;
+                            height: 12px;
+                            viewbox-width: 10; viewbox-height: 12;
+                            commands: "M0 0 H10 V7 L5 12 L0 7 Z";
+                            fill: m.color;
+                        }
+                        rta := TouchArea {
+                            mouse-cursor: pointer;
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.focus-editor(); root.ruler(0, self.mouse-x); }
+                                if (e.kind == PointerEventKind.up) { root.ruler(2, self.mouse-x); }
+                            }
+                            moved => { if (self.pressed) { root.ruler(1, self.mouse-x); } }
+                            double-clicked => { root.ruler(3, self.mouse-x); }
+                        }
+                    }
+                }
+
+                // Lanes
+                lanes := Rectangle {
+                    clip: true;
+                    background: Theme.bg0;
+                    for t in root.tracks: Rectangle {
+                        y: t.y;
+                        height: t.height;
+                        background: mod(t.index, 2) == 0 ? #121418 : #111317;
+                        Rectangle { y: parent.height - 1px; height: 1px; background: #1a1d22; }
+                        if t.locked: Rectangle {
+                            background: #ffffff05;
+                            Path {
+                                width: parent.width; height: parent.height;
+                                viewbox-width: 40; viewbox-height: 40;
+                                commands: "M0 40 L40 0";
+                                stroke: #ffffff08; stroke-width: 1px;
+                            }
+                        }
+                    }
+                    if root.has-in-out: Rectangle {
+                        x: root.in-x;
+                        width: max(0px, root.out-x - root.in-x);
+                        background: #7c8cff10;
+                    }
+                    for c in root.clips: ClipRect { cv: c; }
+                    for tr in root.transitions: Rectangle {
+                        x: tr.x; y: tr.y + 18px; width: tr.width; height: tr.height - 22px;
+                        border-radius: 3px;
+                        background: #ffffff22;
+                        border-width: 1px;
+                        border-color: #ffffff55;
+                        Path {
+                            width: parent.width; height: parent.height;
+                            viewbox-width: 1; viewbox-height: 1;
+                            commands: "M0 1 L1 0 M0 0 L1 1";
+                            stroke: #ffffff60; stroke-width: 1px;
+                        }
+                    }
+                    for m in root.markers: Rectangle {
+                        x: m.x;
+                        width: 1px;
+                        background: #e5a50a55;
+                    }
+                    if root.show-ghost: Rectangle {
+                        x: root.ghost-x; y: root.ghost-y; width: root.ghost-w; height: root.ghost-h;
+                        border-radius: 4px;
+                        background: #7c8cff40;
+                        border-width: 1px;
+                        border-color: Theme.accent;
+                    }
+                    if root.show-snap: Rectangle {
+                        x: root.snap-x;
+                        width: 1px;
+                        background: Theme.snap;
+                    }
+                    ContextMenuArea {
+                        Menu {
+                            MenuItem { title: Tr.t("tl.ctx.split"); activated => { root.context-action("split"); } }
+                            MenuItem { title: Tr.t("tl.ctx.delete"); enabled: root.has-selection; activated => { root.context-action("delete"); } }
+                            MenuItem { title: Tr.t("tl.ctx.ripple_delete"); enabled: root.has-selection; activated => { root.context-action("ripple-delete"); } }
+                            MenuSeparator {}
+                            MenuItem { title: Tr.t("tl.ctx.rename"); enabled: root.has-selection; activated => { root.context-action("rename-clip"); } }
+                            MenuItem { title: Tr.t("tl.ctx.toggle_enabled"); enabled: root.has-selection; activated => { root.context-action("toggle-enabled"); } }
+                            MenuItem { title: Tr.t("tl.ctx.unlink"); enabled: root.has-selection; activated => { root.context-action("unlink"); } }
+                            MenuItem { title: Tr.t("tl.ctx.reveal_media"); enabled: root.has-selection; activated => { root.context-action("reveal-media"); } }
+                            MenuItem { title: Tr.t("tl.ctx.dissolve"); activated => { root.context-action("dissolve"); } }
+                            MenuSeparator {}
+                            MenuItem { title: Tr.t("tl.ctx.marker"); activated => { root.context-action("marker"); } }
+                            MenuItem { title: Tr.t("tl.ctx.select_all"); activated => { root.context-action("select-all"); } }
+                        }
+                        ta := TouchArea {
+                            mouse-cursor: root.blade-mode ? crosshair : root.cursor-kind == 1 ? ew-resize : root.cursor-kind == 2 ? grabbing : default;
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down) { root.focus-editor(); }
+                                if (e.kind == PointerEventKind.down || e.kind == PointerEventKind.up) {
+                                    root.lane-pointer(e.kind == PointerEventKind.down ? 0 : 2, self.mouse-x, self.mouse-y,
+                                        e.button == PointerEventButton.left ? 0 : e.button == PointerEventButton.right ? 1 : 2,
+                                        e.modifiers.shift, e.modifiers.control, e.modifiers.alt);
+                                }
+                            }
+                            moved => { root.lane-pointer(1, self.mouse-x, self.mouse-y, 0, false, false, false); }
+                            double-clicked => { root.lane-pointer(3, self.mouse-x, self.mouse-y, 0, false, false, false); }
+                            scroll-event(e) => {
+                                root.scroll(e.delta-x, e.delta-y, e.modifiers.control, e.modifiers.shift);
+                                accept
+                            }
+                        }
+                    }
+                    if root.show-playhead: Rectangle {
+                        x: root.playhead-x;
+                        width: 1px;
+                        background: Theme.playhead;
+                    }
+                    if root.is-empty: VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        Text {
+                            text: Tr.t("tl.empty.title");
+                            color: Theme.text-dim;
+                            font-size: Theme.font-md;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: Tr.t("tl.empty.hint");
+                            color: Theme.text-faint;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Button { text: Tr.t("media.import_button"); icon: Icons.import; clicked => { root.import(); } }
+                        }
+                    }
+                }
+                // Horizontal scrollbar
+                Rectangle {
+                    height: 10px;
+                    background: Theme.bg1;
+                    Rectangle {
+                        x: parent.width * root.scroll-fraction;
+                        y: 2px;
+                        width: max(24px, parent.width * min(1, root.view-fraction));
+                        height: 6px;
+                        border-radius: 3px;
+                        background: sb.pressed ? Theme.text-faint : sb.has-hover ? Theme.border-strong : Theme.bg4;
+                    }
+                    sb := TouchArea {
+                        property <float> start;
+                        pointer-event(e) => { if (e.kind == PointerEventKind.down) { self.start = root.scroll-fraction; } }
+                        moved => { if (self.pressed) { root.scrollbar(self.start + (self.mouse-x - self.pressed-x) / parent.width); } }
+                    }
+                }
+            }
+        }
+    }
+    // Playhead head over the ruler
+    if root.show-playhead: Path {
+        x: root.header-width + 1px + root.playhead-x - 6px;
+        y: 38px + root.ruler-height - 12px;
+        width: 13px;
+        height: 12px;
+        viewbox-width: 13; viewbox-height: 12;
+        commands: "M0 0 H13 V6 L6.5 12 L0 6 Z";
+        fill: Theme.playhead;
+    }
+}

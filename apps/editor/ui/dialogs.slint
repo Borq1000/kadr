@@ -1,0 +1,502 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, IconButton, Button, ProgressBar, Badge, SectionTitle, Tabs, Segmented, KeyCap } from "widgets.slint";
+import { LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.slint";
+
+component Modal inherits Rectangle {
+    in property <string> title;
+    in property <length> card-width: 460px;
+    callback dismiss();
+    background: #000000a0;
+    TouchArea { clicked => { root.dismiss(); } }
+    Rectangle {
+        width: root.card-width;
+        height: body.preferred-height;
+        border-radius: 10px;
+        background: Theme.bg1;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000090;
+        TouchArea {}
+        body := VerticalLayout {
+            padding: 18px;
+            spacing: 12px;
+            HorizontalLayout {
+                Text { text: root.title; font-size: Theme.font-lg; font-weight: 700; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+                IconButton { icon: Icons.close; tooltip: Tr.t("common.close_esc"); clicked => { root.dismiss(); } }
+            }
+            @children
+        }
+    }
+}
+
+export struct ExportState {
+    path: string,
+    preset: int,
+    resolution: int,
+    running: bool,
+    progress: float,
+    status: string,
+    done: bool,
+    failed: bool,
+    duration: string,
+    estimate: string,
+}
+
+export component ExportDialog inherits Modal {
+    in property <ExportState> st;
+    callback choose-path();
+    callback start(int, int);
+    callback cancel();
+    callback reveal();
+    callback open-file();
+    callback changed(int, int);
+    title: Tr.t("export.title");
+    card-width: 520px;
+    property <int> preset: root.st.preset;
+    property <int> res: root.st.resolution;
+    Text { text: Tr.t1("export.subtitle", root.st.duration); font-size: Theme.font-sm; color: Theme.text-dim; }
+    VerticalLayout {
+        spacing: 4px;
+        Text { text: Tr.t("export.file"); font-size: Theme.font-xs; color: Theme.text-faint; }
+        HorizontalLayout {
+            spacing: 8px;
+            LineEdit { text: root.st.path; read-only: true; horizontal-stretch: 1; }
+            Button { text: Tr.t("common.browse"); enabled: !root.st.running; clicked => { root.choose-path(); } }
+        }
+    }
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout {
+            spacing: 4px;
+            Text { text: Tr.t("export.quality"); font-size: Theme.font-xs; color: Theme.text-faint; }
+            ComboBox {
+                model: [Tr.t("export.q.high"), Tr.t("export.q.balanced"), Tr.t("export.q.draft")];
+                current-index <=> root.preset;
+                enabled: !root.st.running;
+                selected => { root.changed(root.preset, root.res); }
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            Text { text: Tr.t("export.resolution"); font-size: Theme.font-xs; color: Theme.text-faint; }
+            ComboBox {
+                model: [Tr.t("export.r.sequence"), "1080p", "720p", "2160p (4K)"];
+                current-index <=> root.res;
+                enabled: !root.st.running;
+                selected => { root.changed(root.preset, root.res); }
+            }
+        }
+    }
+    Text { text: root.st.estimate; font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+    if root.st.running || root.st.done || root.st.failed: VerticalLayout {
+        spacing: 6px;
+        ProgressBar { value: root.st.progress; height: 6px; bar-color: root.st.failed ? Theme.danger : root.st.done ? Theme.success : Theme.accent; }
+        Text { text: root.st.status; font-size: Theme.font-sm; color: root.st.failed ? Theme.danger : Theme.text-dim; wrap: word-wrap; }
+    }
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+        if root.st.done: Button { text: Tr.t("export.open_file"); clicked => { root.open-file(); } }
+        if root.st.done: Button { text: Tr.t("export.show_folder"); clicked => { root.reveal(); } }
+        if root.st.running: Button { text: Tr.t("export.cancel"); danger: true; clicked => { root.cancel(); } }
+        if !root.st.running: Button { text: Tr.t("common.close"); clicked => { root.dismiss(); } }
+        if !root.st.running: Button { text: root.st.done ? Tr.t("export.again") : Tr.t("export.start"); icon: Icons.export; primary: true; enabled: root.st.path != ""; clicked => { root.start(root.preset, root.res); } }
+    }
+}
+
+export struct ProviderRow {
+    id: string,
+    name: string,
+    kind: string,
+    base-url: string,
+    has-key: bool,
+    allowed: bool,
+    local: bool,
+}
+
+export struct SettingsState {
+    tab: int,
+    language: int,        // index into Lang::ALL (0 ru, 1 en)
+    autosave: int,        // 0 off, 1 = 1 min, 2 = 2 min, 3 = 5 min
+    quality: int,
+    mode: int,            // 0 off, 1 local, 2 ask, 3 allow selected
+    providers: [ProviderRow],
+    economy: string,
+    smart: string,
+    director: string,
+    jev-model: string,
+    per-request: string,
+    per-session: string,
+    per-project: string,
+    monthly: string,
+    spent: string,
+    cache-size: string,
+    data-dir: string,
+}
+
+export struct ShortcutRow {
+    keys: string,
+    action: string,
+    group: bool,
+}
+
+export component SettingsDialog inherits Modal {
+    in property <SettingsState> st;
+    in property <[ShortcutRow]> shortcuts;
+    callback set-tab(int);
+    callback set-language(int);
+    callback set-autosave(int);
+    callback set-quality(int);
+    callback clear-cache();
+    callback open-data-dir();
+    callback set-mode(int);
+    callback save-key(string, string);
+    callback delete-key(string);
+    callback toggle-allowed(string);
+    callback set-route(string, string);
+    callback set-limit(string, string);
+    callback test-provider(string);
+    title: Tr.t("settings.title");
+    card-width: 660px;
+    Tabs {
+        labels: [Tr.t("settings.tab.general"), Tr.t("settings.tab.ai"), Tr.t("settings.tab.shortcuts")];
+        current: root.st.tab;
+        // Tabs writes `current` locally; mirror it to Rust so it persists.
+        changed current => { root.set-tab(self.current); }
+    }
+    Rectangle {
+        height: 500px;
+        if root.st.tab == 0: sv1 := ScrollView {
+            VerticalLayout {
+                width: sv1.visible-width;
+                spacing: 10px;
+                padding-right: 12px;
+                alignment: start;
+                SectionTitle { text: Tr.t("settings.language"); }
+                HorizontalLayout {
+                    alignment: start;
+                    Segmented { options: ["Русский", "English"]; current: root.st.language; selected(i) => { root.set-language(i); } }
+                }
+                Text { text: Tr.t("settings.language.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                SectionTitle { text: Tr.t("settings.autosave"); }
+                HorizontalLayout {
+                    alignment: start;
+                    Segmented {
+                        options: [Tr.t("settings.autosave.off"), Tr.t("settings.autosave.1"), Tr.t("settings.autosave.2"), Tr.t("settings.autosave.5")];
+                        current: root.st.autosave;
+                        selected(i) => { root.set-autosave(i); }
+                    }
+                }
+                Text { text: Tr.t("settings.autosave.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                SectionTitle { text: Tr.t("settings.preview_quality"); }
+                HorizontalLayout {
+                    alignment: start;
+                    Segmented { options: [Tr.t("preview.q.full"), "1/2", "1/4"]; current: root.st.quality; selected(i) => { root.set-quality(i); } }
+                }
+                Text { text: Tr.t("settings.preview_quality.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                SectionTitle { text: Tr.t("settings.storage"); }
+                Text { text: root.st.cache-size; font-size: Theme.font-sm; color: Theme.text-dim; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Button { text: Tr.t("settings.clear_cache"); clicked => { root.clear-cache(); } }
+                    Button { text: Tr.t("settings.open_data"); clicked => { root.open-data-dir(); } }
+                }
+                Text { text: Tr.t("settings.clear_cache.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+            }
+        }
+        if root.st.tab == 1: sv2 := ScrollView {
+            VerticalLayout {
+                width: sv2.visible-width;
+                spacing: 8px;
+                padding-right: 12px;
+                alignment: start;
+                SectionTitle { text: Tr.t("settings.privacy"); }
+                for m[i] in [
+                    { t: Tr.t("settings.mode.off"), d: Tr.t("settings.mode.off.d") },
+                    { t: Tr.t("settings.mode.local"), d: Tr.t("settings.mode.local.d") },
+                    { t: Tr.t("settings.mode.ask"), d: Tr.t("settings.mode.ask.d") },
+                    { t: Tr.t("settings.mode.allow"), d: Tr.t("settings.mode.allow.d") },
+                ]: Rectangle {
+                    height: 44px;
+                    border-radius: 6px;
+                    background: root.st.mode == i ? Theme.accent-soft : ma.has-hover ? Theme.bg3 : Theme.bg2;
+                    border-width: 1px;
+                    border-color: root.st.mode == i ? #7c8cff88 : Theme.border;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 14px; height: 14px; y: 15px; border-radius: 7px;
+                            border-width: 2px; border-color: root.st.mode == i ? Theme.accent : Theme.text-faint;
+                            if root.st.mode == i: Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.accent; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: m.t; font-size: Theme.font; font-weight: 600; color: Theme.text; }
+                            Text { text: m.d; font-size: Theme.font-xs; color: Theme.text-faint; }
+                        }
+                    }
+                    ma := TouchArea { clicked => { root.set-mode(i); } }
+                }
+                SectionTitle { text: Tr.t("settings.providers"); }
+                for p in root.st.providers: Rectangle {
+                    border-radius: 6px;
+                    background: Theme.bg2;
+                    height: pl.preferred-height;
+                    pl := VerticalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: p.name; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                            Badge { text: p.kind; }
+                            if p.local: Badge { text: Tr.t("settings.on_device"); fg: Theme.text-on-accent; bg: Theme.success; }
+                            Rectangle { horizontal-stretch: 1; }
+                            if !p.local: Badge {
+                                text: p.has-key ? Tr.t("settings.key_stored") : Tr.t("settings.no_key");
+                                fg: Theme.text-on-accent;
+                                bg: p.has-key ? Theme.success : Theme.bg4;
+                            }
+                            CheckBox { text: Tr.t("settings.allowed"); checked: p.allowed; toggled => { root.toggle-allowed(p.id); } }
+                        }
+                        Text { text: p.base-url; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; }
+                        if !p.local: HorizontalLayout {
+                            spacing: 6px;
+                            key := LineEdit { placeholder-text: p.has-key ? Tr.t("settings.key_replace") : Tr.t("settings.key_paste"); input-type: password; horizontal-stretch: 1; }
+                            Button { text: Tr.t("settings.key_save"); compact: true; enabled: key.text != ""; clicked => { root.save-key(p.id, key.text); key.text = ""; } }
+                            if p.has-key: Button { text: Tr.t("settings.key_remove"); compact: true; clicked => { root.delete-key(p.id); } }
+                            Button { text: Tr.t("settings.test"); compact: true; enabled: p.has-key; clicked => { root.test-provider(p.id); } }
+                        }
+                    }
+                }
+                SectionTitle { text: Tr.t("settings.routes"); }
+                GridLayout {
+                    spacing: 6px;
+                    Row { Text { text: "ECONOMY"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.economy; edited(t) => { root.set-route("economy", t); } } }
+                    Row { Text { text: "SMART"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.smart; edited(t) => { root.set-route("smart", t); } } }
+                    Row { Text { text: "DIRECTOR"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.director; edited(t) => { root.set-route("director", t); } } }
+                    Row { Text { text: "JEV"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.jev-model; edited(t) => { root.set-route("jev", t); } } }
+                }
+                SectionTitle { text: Tr.t("settings.budget"); }
+                GridLayout {
+                    spacing: 6px;
+                    Row {
+                        Text { text: Tr.t("settings.budget.request"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                        LineEdit { text: root.st.per-request; edited(t) => { root.set-limit("request", t); } }
+                        Text { text: Tr.t("settings.budget.session"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                        LineEdit { text: root.st.per-session; edited(t) => { root.set-limit("session", t); } }
+                    }
+                    Row {
+                        Text { text: Tr.t("settings.budget.project"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                        LineEdit { text: root.st.per-project; edited(t) => { root.set-limit("project", t); } }
+                        Text { text: Tr.t("settings.budget.monthly"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                        LineEdit { text: root.st.monthly; edited(t) => { root.set-limit("monthly", t); } }
+                    }
+                }
+                Text { text: root.st.spent; font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+            }
+        }
+        if root.st.tab == 2: sv3 := ScrollView {
+            VerticalLayout {
+                width: sv3.visible-width;
+                spacing: 2px;
+                padding-right: 12px;
+                alignment: start;
+                for s in root.shortcuts: HorizontalLayout {
+                    height: s.group ? 34px : 26px;
+                    spacing: 12px;
+                    if s.group: Text { text: s.action; font-size: Theme.font-xs; font-weight: 700; letter-spacing: 0.8px; color: Theme.text-faint; vertical-alignment: bottom; }
+                    if !s.group: Text { text: s.action; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; horizontal-stretch: 1; }
+                    if !s.group: HorizontalLayout {
+                        alignment: end;
+                        VerticalLayout { alignment: center; KeyCap { text: s.keys; } }
+                    }
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        alignment: end;
+        Button { text: Tr.t("common.done"); primary: true; clicked => { root.dismiss(); } }
+    }
+}
+
+export component ConfirmDialog inherits Modal {
+    in property <string> message;
+    in property <string> ok-text;
+    in property <string> alt-text;
+    in property <bool> danger;
+    callback ok();
+    callback alt();
+    Text { text: root.message; wrap: word-wrap; font-size: Theme.font; color: Theme.text-dim; }
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+        Button { text: Tr.t("common.cancel"); ghost: true; clicked => { root.dismiss(); } }
+        if root.alt-text != "": Button { text: root.alt-text; clicked => { root.alt(); } }
+        Button { text: root.ok-text; primary: !root.danger; danger: root.danger; clicked => { root.ok(); } }
+    }
+}
+
+// Generic single-line text input (renames).
+export component PromptDialog inherits Modal {
+    in property <string> label;
+    in property <string> value;
+    callback submit(string);
+    card-width: 420px;
+    Text { text: root.label; font-size: Theme.font-sm; color: Theme.text-dim; }
+    input := LineEdit {
+        text: root.value;
+        init => { self.focus(); self.select-all(); }
+        accepted(t) => { root.submit(t); }
+    }
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+        Button { text: Tr.t("common.cancel"); ghost: true; clicked => { root.dismiss(); } }
+        Button { text: Tr.t("common.ok"); primary: true; clicked => { root.submit(input.text); } }
+    }
+}
+
+export struct JobView {
+    id: int,
+    title: string,
+    category: string,
+    state: string,
+    progress: float,
+    failed: bool,
+    running: bool,
+    finished: bool,
+}
+
+export component JobsPopup inherits Rectangle {
+    in property <[JobView]> jobs;
+    callback cancel(int);
+    callback retry(int);
+    callback clear();
+    callback dismiss();
+    width: 400px;
+    height: min(440px, list.preferred-height + 56px);
+    border-radius: 8px;
+    background: Theme.bg1;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    drop-shadow-blur: 18px;
+    drop-shadow-color: #000000a0;
+    TouchArea {}
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text { text: Tr.t("jobs.title"); font-weight: 700; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+            Button { text: Tr.t("jobs.clear"); compact: true; clicked => { root.clear(); } }
+            IconButton { icon: Icons.close; clicked => { root.dismiss(); } }
+        }
+        sv4 := ScrollView {
+            list := VerticalLayout {
+                width: sv4.visible-width;
+                spacing: 4px;
+                alignment: start;
+                if root.jobs.length == 0: Text { text: Tr.t("jobs.none"); color: Theme.text-faint; font-size: Theme.font-sm; }
+                for j in root.jobs: Rectangle {
+                    height: 46px;
+                    border-radius: 5px;
+                    background: Theme.bg2;
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 3px;
+                            alignment: center;
+                            Text { text: j.title; font-size: Theme.font-sm; color: Theme.text; overflow: elide; }
+                            Text { text: j.category + " · " + j.state; font-size: Theme.font-xs; color: j.failed ? Theme.danger : Theme.text-faint; overflow: elide; }
+                            if j.running: ProgressBar { value: j.progress; height: 3px; }
+                        }
+                        if !j.finished: VerticalLayout { alignment: center; IconButton { icon: Icons.close; tooltip: Tr.t("common.cancel"); clicked => { root.cancel(j.id); } } }
+                        if j.failed: VerticalLayout { alignment: center; IconButton { icon: Icons.redo; tooltip: Tr.t("jobs.retry"); clicked => { root.retry(j.id); } } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export struct RecentView {
+    index: int,
+    name: string,
+    path: string,
+    when: string,
+    exists: bool,
+}
+
+// First screen: shown for an empty, untitled project.
+export component WelcomeScreen inherits Rectangle {
+    in property <[RecentView]> recent;
+    callback action(string);
+    callback open-recent(int);
+    background: #0e0f12e8;
+    TouchArea {}
+    Rectangle {
+        width: 720px;
+        height: body.preferred-height;
+        border-radius: 12px;
+        background: Theme.bg1;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 30px;
+        drop-shadow-color: #000000a0;
+        body := HorizontalLayout {
+            padding: 28px;
+            spacing: 28px;
+            VerticalLayout {
+                width: 280px;
+                spacing: 10px;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Image { source: @image-url("icon.png"); width: 36px; height: 36px; }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "Kadr"; font-size: 22px; font-weight: 700; color: Theme.text; }
+                        Text { text: Tr.t("welcome.tagline"); font-size: Theme.font-sm; color: Theme.text-faint; }
+                    }
+                }
+                Rectangle { height: 10px; }
+                Button { text: Tr.t("welcome.new"); icon: Icons.plus; primary: true; clicked => { root.action("new"); } }
+                Button { text: Tr.t("welcome.import"); icon: Icons.import; clicked => { root.action("import"); } }
+                Button { text: Tr.t("welcome.open"); icon: Icons.folder; clicked => { root.action("open"); } }
+                Rectangle { height: 6px; }
+                Text { text: Tr.t("welcome.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+            }
+            Rectangle { width: 1px; background: Theme.border; }
+            VerticalLayout {
+                spacing: 6px;
+                alignment: start;
+                Text { text: Tr.t("welcome.recent"); font-size: Theme.font-xs; font-weight: 700; letter-spacing: 0.8px; color: Theme.text-faint; }
+                if root.recent.length == 0: Text { text: Tr.t("welcome.recent.none"); font-size: Theme.font-sm; color: Theme.text-faint; wrap: word-wrap; }
+                for r in root.recent: Rectangle {
+                    height: 46px;
+                    border-radius: 6px;
+                    background: ra.has-hover && r.exists ? Theme.bg3 : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 10px;
+                        Icon { y: 15px; icon: Icons.film; width: 16px; height: 16px; color: r.exists ? Theme.accent : Theme.text-faint; }
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: r.name; font-size: Theme.font; font-weight: 600; color: r.exists ? Theme.text : Theme.text-faint; overflow: elide; }
+                            Text { text: r.exists ? r.path : Tr.t("welcome.recent.missing"); font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; }
+                        }
+                        Text { text: r.when; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; }
+                    }
+                    ra := TouchArea { enabled: r.exists; clicked => { root.open-recent(r.index); } }
+                }
+            }
+        }
+    }
+}

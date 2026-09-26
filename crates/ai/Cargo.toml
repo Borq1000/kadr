@@ -1,0 +1,20 @@
+[package]
+name = "kadr-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kadr-core = { path = "../core" }
+kadr-project = { path = "../project" }
+kadr-timeline = { path = "../timeline" }
+kadr-i18n = { path = "../i18n" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "http2"] }
+keyring = "4"
+
+[dev-dependencies]
