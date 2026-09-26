@@ -94,6 +94,10 @@ pub enum EditCommand {
     RemoveTrack { track: TrackId },
     /// Replaces the marker with the same id (rename / recolour / move).
     UpdateMarker(Marker),
+    /// Shows another angle of the clip's multicam group over the same
+    /// timeline span. With `at` inside the clip it first cuts there and
+    /// switches only the part after the cut (a live cut).
+    SwitchAngle { clip: ClipId, angle: u32, at: Option<Time> },
     /// Applied atomically; one undo step (e.g. an AI edit).
     Batch { label: String, commands: Vec<EditCommand> },
 }
@@ -101,6 +105,7 @@ pub enum EditCommand {
 /// Read-only project data some commands need (source durations).
 pub struct EditContext<'a> {
     pub assets: &'a [MediaAsset],
+    pub multicam: &'a [kadr_project::MulticamGroup],
 }
 
 impl EditContext<'_> {
@@ -141,6 +146,8 @@ impl EditCommand {
             EditCommand::RenameTrack { .. } => "cmd.rename_track",
             EditCommand::RemoveTrack { .. } => "cmd.remove_track",
             EditCommand::UpdateMarker(_) => "cmd.edit_marker",
+            EditCommand::SwitchAngle { at: Some(_), .. } => "cmd.cut_to_angle",
+            EditCommand::SwitchAngle { .. } => "cmd.switch_angle",
             EditCommand::Batch { label, .. } => return label.clone(),
         };
         k.to_string()
@@ -382,6 +389,36 @@ impl EditCommand {
                 }
                 *slot = m;
                 seq.markers.sort_by_key(|x| x.time);
+                Ok(())
+            }
+            EditCommand::SwitchAngle { clip, angle, at } => {
+                let mut target = *clip;
+                if let Some(t) = *at {
+                    let (ti, _) = seq.locate_clip(*clip).ok_or(EditError::ClipNotFound)?;
+                    let c = seq.clip(*clip).ok_or(EditError::ClipNotFound)?;
+                    if t > c.timeline_in && t < c.timeline_out {
+                        EditCommand::Split { at: t, clips: Some(vec![*clip]) }.apply(seq, ctx)?;
+                        target = seq.tracks[ti].clip_at(t).ok_or(EditError::ClipNotFound)?.id;
+                    }
+                }
+                let (ti, ci) = seq.locate_clip(target).ok_or(EditError::ClipNotFound)?;
+                if seq.tracks[ti].locked {
+                    return Err(EditError::TrackLocked(seq.tracks[ti].name.clone()));
+                }
+                let c = &seq.tracks[ti].clips[ci];
+                let sel = c.multicam.clone().ok_or(EditError::InvalidRange)?;
+                if sel.angle == *angle {
+                    return Err(EditError::NoOp);
+                }
+                let group = ctx.multicam.iter().find(|g| g.id == sel.group).ok_or(EditError::InvalidRange)?;
+                let (asset, src) = crate::multicam::angle_source(group, *angle, c, ctx.assets)?;
+                let label = group.angles[*angle as usize].label.clone();
+                let c = &mut seq.tracks[ti].clips[ci];
+                c.asset = asset;
+                c.source_in = src.start;
+                c.source_out = src.end;
+                c.name = label;
+                c.multicam = Some(kadr_project::MulticamSelection { group: sel.group, angle: *angle });
                 Ok(())
             }
             EditCommand::Batch { commands, .. } => {

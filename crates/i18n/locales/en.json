@@ -585,5 +585,7 @@
   "toast.drop_project_only": "A project was dropped together with media: the project is opened, the media is not imported",
   "toast.drop_nothing": "No media files found in the dropped folder",
   "err.ai.too_large": "The request is too large for one call",
-  "err.ai.unknown_model": "The provider does not know this model: {model}"
+  "err.ai.unknown_model": "The provider does not know this model: {model}",
+  "cmd.switch_angle": "Switch angle",
+  "cmd.cut_to_angle": "Cut to angle"
 }

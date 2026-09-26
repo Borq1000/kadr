@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod composition;
 pub mod engine;
+pub mod multicam;
 pub mod ops;
 pub mod snap;
 
