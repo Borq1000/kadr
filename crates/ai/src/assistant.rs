@@ -34,6 +34,10 @@ pub enum Reply {
     /// The request needs an LLM: show the cost preview first.
     CloudOffer(CloudOffer),
     Message(String),
+    /// Jev shot grading (the editor gathers shots and shows the cost card).
+    GradeShots,
+    /// Jev multicam auto-cut for the multicam clip(s) in play.
+    CutCameras,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +143,8 @@ impl Assistant {
                 )),
                 message: t("ai.msg.marker_added"),
             },
+            Intent::GradeShots => Reply::GradeShots,
+            Intent::CutCameras => Reply::CutCameras,
             Intent::Unknown => self.cloud_offer(text, project, st, self.settings.default_tier),
         }
     }

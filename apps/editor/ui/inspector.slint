@@ -10,6 +10,15 @@ export struct MarkerRow {
     color: color,
 }
 
+export struct ShotRow {
+    index: int,
+    time: string,
+    info: string,
+    verdict: string,
+    kind: int, // 0 keep, 1 review, 2 discard, 3 not graded
+    human: bool,
+}
+
 export struct InspectorData {
     has-clip: bool,
     is-audio: bool,
@@ -43,6 +52,9 @@ export struct InspectorData {
     seq-duration: string,
     seq-stats: string,
     markers: [MarkerRow],
+    // Jev shot grading of the inspected clip's media.
+    shots: [ShotRow],
+    shots-graded: bool,
 }
 
 component InfoRow inherits HorizontalLayout {
@@ -62,6 +74,7 @@ export component Inspector inherits Rectangle {
     callback reset(string);
     callback marker-action(int, string);
     callback sequence-action(string);
+    callback shot-clicked(int);
     background: Theme.bg1;
 
     VerticalLayout {
@@ -128,7 +141,8 @@ export component Inspector inherits Rectangle {
                     Badge { text: root.d.is-audio ? Tr.t("inspector.badge.audio") : Tr.t("inspector.badge.video"); fg: Theme.text-on-accent; bg: root.d.is-audio ? Theme.clip-audio-top : Theme.clip-video-top; }
                 }
                 Text { text: root.d.source; font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; }
-                Text { text: root.d.timing; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; }
+                // Wraps: an unbreakable line would widen the panel past its edge.
+                Text { text: root.d.timing; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; wrap: word-wrap; }
                 HorizontalLayout {
                     padding-top: 4px;
                     Text { text: Tr.t("inspector.enabled"); font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; horizontal-stretch: 1; }
@@ -163,6 +177,26 @@ export component Inspector inherits Rectangle {
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.pan"); value: root.d.pan; minimum: -1; maximum: 1; default-value: 0; changed(v) => { root.live("pan", v); } committed(v) => { root.commit("pan", v); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
+
+                if root.d.shots.length > 0: SectionTitle { text: Tr.t("inspector.shots"); }
+                if root.d.shots.length > 0 && !root.d.shots-graded: Text { text: Tr.t("inspector.shots.ungraded"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                for s in root.d.shots: HorizontalLayout {
+                    height: 28px;
+                    spacing: 8px;
+                    Text { text: s.time; width: 64px; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; vertical-alignment: center; }
+                    Text { text: s.info; font-size: Theme.font-xs; color: Theme.text-dim; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                    if s.kind != 3: Rectangle {
+                        width: chip.preferred-width + 16px;
+                        height: 20px;
+                        y: 4px;
+                        border-radius: 10px;
+                        background: s.kind == 2 ? Theme.danger : s.kind == 1 ? Theme.warning : Theme.success;
+                        opacity: sca.has-hover ? 0.85 : 1;
+                        chip := Text { text: s.verdict + (s.human ? Tr.t("inspector.shots.yours") : ""); font-size: Theme.font-xs; font-weight: 700; color: Theme.text-on-accent; }
+                        sca := TouchArea { mouse-cursor: pointer; clicked => { root.shot-clicked(s.index); } }
+                    }
+                }
+                if root.d.shots-graded: Text { text: Tr.t("inspector.shots.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
 
                 SectionTitle { text: Tr.t("inspector.effects"); }
                 if root.d.effects.length == 0: Text { text: Tr.t("inspector.effects.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }

@@ -95,7 +95,7 @@ pub enum AiCommand {
         #[serde(default)]
         reason: String,
     },
-    /// Reserved: multicam (V0.3). Accepted by the schema, rejected by validation.
+    /// Show `angle` (its label, e.g. "CAM2") over a range of a multicam clip.
     SelectCamera {
         start_ms: i64,
         end_ms: i64,
@@ -322,7 +322,31 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                     duration: ms(*duration_ms),
                 })
             }
-            AiCommand::SelectCamera { .. } => return Err(ValidationError::Unsupported { index: i, what: "multicam camera selection" }),
+            AiCommand::SelectCamera { start_ms, end_ms, angle, .. } => {
+                let (s, e) = (in_seq(i, *start_ms)?, in_seq(i, *end_ms)?);
+                if e <= s {
+                    return Err(ValidationError::Range { index: i, msg: "end must be after start".into() });
+                }
+                // The multicam clip on the topmost video track at the start.
+                let sel = seq
+                    .tracks
+                    .iter()
+                    .rev()
+                    .filter(|t| t.kind == TrackKind::Video)
+                    .find_map(|t| t.clip_at(s).and_then(|c| c.multicam.clone()))
+                    .ok_or(ValidationError::Range { index: i, msg: "no multicam clip at start_ms".into() })?;
+                let group = project
+                    .multicam_groups
+                    .iter()
+                    .find(|g| g.id == sel.group)
+                    .ok_or(ValidationError::Range { index: i, msg: "multicam group missing".into() })?;
+                let idx = group
+                    .angles
+                    .iter()
+                    .position(|a| a.label.eq_ignore_ascii_case(angle.trim()))
+                    .ok_or(ValidationError::Range { index: i, msg: format!("unknown angle {angle:?}") })?;
+                EditCommand::SetAngleRange { range: TimeRange::new(s, e), angle: idx as u32 }
+            }
             AiCommand::AddCaption { .. } => return Err(ValidationError::Unsupported { index: i, what: "captions" }),
         };
         out.push(cmd);
@@ -354,4 +378,43 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"add_transition","at_ms":int,"kind":"cross_dissolve"|"dip_to_black"|"wipe","duration_ms":int,"reason":string}
 When deleting several ranges with ripple, list them from the LATEST to the EARLIEST.
 If the request cannot be done with these commands, return an empty commands list and explain in summary."#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kadr_core::{MediaInfo, MediaKind, MulticamId, Time, TimeRange};
+    use kadr_project::{Clip, MediaAsset, MulticamAngle, MulticamGroup, MulticamSelection, SyncMethod};
+
+    fn multicam_project() -> Project {
+        let mut p = Project::new("mc");
+        let info = MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(60), container: "mp4".into(), size_bytes: 0, video: None, audio: None, timecode: None };
+        let (a, b) = (MediaAsset::new("a.mp4", info.clone()), MediaAsset::new("b.mp4", info));
+        let angle = |asset, label: &str| MulticamAngle { asset, label: label.into(), description: String::new(), sync_offset: Time::ZERO, sync_method: SyncMethod::Manual };
+        let group = MulticamGroup { id: MulticamId::new(), name: "g".into(), angles: vec![angle(a.id, "CAM1"), angle(b.id, "CAM2")], master_audio: None };
+        let mut c = Clip::new(a.id, "CAM1", TimeRange::new(Time::ZERO, Time::from_secs(20)), Time::ZERO);
+        c.multicam = Some(MulticamSelection { group: group.id, angle: 0 });
+        p.sequence_mut().tracks[0].clips.push(c);
+        p.assets.extend([a, b]);
+        p.multicam_groups.push(group);
+        p
+    }
+
+    fn select(start_ms: i64, end_ms: i64, angle: &str) -> AiCommand {
+        AiCommand::SelectCamera { start_ms, end_ms, angle: angle.into(), reason: String::new() }
+    }
+
+    #[test]
+    fn select_camera_maps_to_an_angle_range() {
+        let p = multicam_project();
+        let cmds = validate(&[select(2_000, 6_000, "CAM2")], &p, &Permissions::default()).unwrap();
+        assert_eq!(cmds, vec![EditCommand::SetAngleRange { range: TimeRange::new(Time::from_secs(2), Time::from_secs(6)), angle: 1 }]);
+    }
+
+    #[test]
+    fn select_camera_rejects_unknown_angles_and_plain_clips() {
+        let p = multicam_project();
+        assert!(validate(&[select(2_000, 6_000, "CAM9")], &p, &Permissions::default()).is_err());
+        assert!(validate(&[select(30_000, 32_000, "CAM2")], &p, &Permissions::default()).is_err(), "no multicam clip there");
+    }
 }

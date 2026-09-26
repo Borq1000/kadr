@@ -55,7 +55,10 @@ impl App {
             .map(|a| {
                 let rt = self.assets_rt.get(&a.id);
                 let (status, kind, progress) = match rt.map(|r| &r.status) {
-                    Some(AssetStatus::Ready) => (t("media.status.ready"), 1, 1.0),
+                    Some(AssetStatus::Ready) => match self.asset_verdicts(a.id) {
+                        (0, 0) => (t("media.status.ready"), 1, 1.0),
+                        (bad, review) => (tf("media.status.verdicts", &[("bad", &bad.to_string()), ("review", &review.to_string())]), 1, 1.0),
+                    },
                     Some(AssetStatus::Working) => {
                         let p = rt.map_or(0.0, |r| r.progress);
                         (tf("media.status.analyzing", &[("pct", &format!("{:.0}", p * 100.0))]), 0, p)

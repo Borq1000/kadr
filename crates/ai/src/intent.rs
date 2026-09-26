@@ -22,6 +22,10 @@ pub enum Intent {
     Redo,
     /// "Поставь маркер [название]".
     AddMarker { name: String },
+    /// "Оцени кадры" / "найди брак" / "grade shots": Jev shot grading.
+    GradeShots,
+    /// "Смонтируй камеры" / "auto-cut cameras": Jev multicam picks.
+    CutCameras,
     /// Not recognised locally.
     Unknown,
 }
@@ -132,6 +136,16 @@ pub fn parse(input: &str) -> Intent {
             return Intent::DeleteFirst { duration: d };
         }
     }
+    if (has(&toks, &["оцени", "оценк", "grade", "rate"]) && has(&toks, &["кадр", "шот", "shot", "footage", "качеств"]))
+        || has(&toks, &["брак"])
+    {
+        return Intent::GradeShots;
+    }
+    if has(&toks, &["камер", "camera", "ракурс", "angle", "мультикам", "multicam"])
+        && has(&toks, &["смонтир", "монтир", "нарежь", "переключ", "выбер", "cut", "edit", "switch", "pick"])
+    {
+        return Intent::CutCameras;
+    }
     if has(&toks, &["разреж", "разрез", "режь", "split", "раздел"]) || text.trim() == "cut here" {
         return Intent::SplitAtPlayhead;
     }
@@ -190,6 +204,8 @@ mod tests {
         assert_eq!(parse("Верни."), Intent::Undo);
         assert_eq!(parse("отмени"), Intent::Undo);
         assert_eq!(parse("Поставь маркер Второй номер"), Intent::AddMarker { name: "Второй номер".into() });
+        assert_eq!(parse("Смонтируй камеры"), Intent::CutCameras);
+        assert_eq!(parse("auto-cut the cameras"), Intent::CutCameras);
     }
 
     #[test]

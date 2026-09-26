@@ -98,6 +98,9 @@ pub enum EditCommand {
     /// timeline span. With `at` inside the clip it first cuts there and
     /// switches only the part after the cut (a live cut).
     SwitchAngle { clip: ClipId, angle: u32, at: Option<Time> },
+    /// Shows `angle` over `range` on the topmost video track that has a
+    /// multicam clip at `range.start`, cutting at both edges (AI camera picks).
+    SetAngleRange { range: TimeRange, angle: u32 },
     /// Applied atomically; one undo step (e.g. an AI edit).
     Batch { label: String, commands: Vec<EditCommand> },
 }
@@ -148,6 +151,7 @@ impl EditCommand {
             EditCommand::UpdateMarker(_) => "cmd.edit_marker",
             EditCommand::SwitchAngle { at: Some(_), .. } => "cmd.cut_to_angle",
             EditCommand::SwitchAngle { .. } => "cmd.switch_angle",
+            EditCommand::SetAngleRange { .. } => "cmd.switch_angle",
             EditCommand::Batch { label, .. } => return label.clone(),
         };
         k.to_string()
@@ -420,6 +424,38 @@ impl EditCommand {
                 c.name = label;
                 c.multicam = Some(kadr_project::MulticamSelection { group: sel.group, angle: *angle });
                 Ok(())
+            }
+            EditCommand::SetAngleRange { range, angle } => {
+                if range.is_empty() {
+                    return Err(EditError::InvalidRange);
+                }
+                let ti = seq
+                    .tracks
+                    .iter()
+                    .rposition(|t| t.kind == TrackKind::Video && t.clip_at(range.start).is_some_and(|c| c.multicam.is_some()))
+                    .ok_or(EditError::ClipNotFound)?;
+                // Cut at both edges (each cut only if it falls inside a clip).
+                for at in [range.start, range.end] {
+                    if let Some(c) = seq.tracks[ti].clip_at(at).filter(|c| c.timeline_in < at && c.multicam.is_some()) {
+                        let id = c.id;
+                        EditCommand::Split { at, clips: Some(vec![id]) }.apply(seq, ctx)?;
+                    }
+                }
+                let inside: Vec<ClipId> = seq.tracks[ti]
+                    .clips
+                    .iter()
+                    .filter(|c| c.multicam.is_some() && c.timeline_in >= range.start && c.timeline_out <= range.end)
+                    .map(|c| c.id)
+                    .collect();
+                let mut changed = false;
+                for id in inside {
+                    match (EditCommand::SwitchAngle { clip: id, angle: *angle, at: None }).apply(seq, ctx) {
+                        Ok(()) => changed = true,
+                        Err(EditError::NoOp) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                if changed { Ok(()) } else { Err(EditError::NoOp) }
             }
             EditCommand::Batch { commands, .. } => {
                 let mut applied = 0;

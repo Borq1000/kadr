@@ -4,7 +4,7 @@
 
 use crate::app::App;
 use crate::util::{fmt_ruler, rgb};
-use crate::{ClipView, MarkerView, TickView, TrackView, TransitionView};
+use crate::{ClipMark, ClipView, MarkerView, TickView, TrackView, TransitionView};
 use kadr_core::{ClipId, LinkId, MediaKind, Time, TimeRange, TrackId};
 use kadr_project::{Clip, Sequence, TrackKind, Transition, TransitionKind};
 use kadr_timeline::snap::{snap, snap_move, snap_points};
@@ -825,6 +825,7 @@ impl App {
                     (None, 0.0, 0.0)
                 };
                 let speed = c.speed();
+                let marks: Vec<ClipMark> = if is_audio { vec![] } else { self.clip_marks(c, width) };
                 clips.push(ClipView {
                     id: c.id.to_string().into(),
                     x: x as f32,
@@ -846,6 +847,7 @@ impl App {
                     fade_in: (c.audio.fade_in.as_secs_f64() * self.tl.pps) as f32,
                     fade_out: (c.audio.fade_out.as_secs_f64() * self.tl.pps) as f32,
                     offline: rt.is_some_and(|r| r.status == crate::app::AssetStatus::Missing),
+                    marks: ModelRc::new(VecModel::from(marks)),
                 });
                 let _ = ri;
             }

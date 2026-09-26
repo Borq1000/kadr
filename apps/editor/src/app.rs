@@ -322,6 +322,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_asset_released, |id, x, y| |app: &mut App| app.asset_released(&id, x, y));
     cb!(ui.on_asset_activated, |id| |app: &mut App| app.asset_activated(&id));
     cb!(ui.on_asset_action, |id, a| |app: &mut App| app.asset_action(&id, &a));
+    cb!(ui.on_inspector_shot, |i| |app: &mut App| app.inspector_shot_clicked(i));
     cb!(ui.on_angle_clicked, |i| |app: &mut App| {
         app.cut_to_angle(i as u32);
     });

@@ -20,6 +20,13 @@ export struct TrackView {
     renaming: bool,
 }
 
+/// A Jev shot verdict drawn along the bottom of a clip.
+export struct ClipMark {
+    x: length,
+    w: length,
+    kind: int, // 1 review, 2 discard
+}
+
 export struct ClipView {
     id: string,
     x: length,
@@ -41,6 +48,7 @@ export struct ClipView {
     fade-in: length,
     fade-out: length,
     offline: bool,
+    marks: [ClipMark],
 }
 
 export struct TickView {
@@ -224,6 +232,13 @@ component ClipRect inherits Rectangle {
             color: Theme.warning;
             vertical-alignment: center;
         }
+    }
+    for m in root.cv.marks: Rectangle {
+        x: m.x;
+        y: parent.height - 4px;
+        width: m.w;
+        height: 4px;
+        background: m.kind == 2 ? Theme.danger : Theme.warning;
     }
     Rectangle {
         border-radius: 4px;

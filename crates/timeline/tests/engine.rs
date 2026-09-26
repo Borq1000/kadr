@@ -382,3 +382,21 @@ fn group_span_and_clip_cover_all_angles() {
     assert_eq!((c.source_in, c.source_out, c.timeline_in, c.timeline_out), (s(0), s(58), s(5), s(63)));
     assert_eq!(multicam::group_time_at(&group, &c, s(5)), Some(s(2)));
 }
+
+#[test]
+fn set_angle_range_cuts_both_edges_and_switches_inside() {
+    let (mut p, mut e, _, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(3), s(6)), angle: 1 }).unwrap();
+    let v1: Vec<_> = p.sequence().tracks[0].clips.iter().map(|c| (c.name.clone(), c.timeline_in, c.timeline_out)).collect();
+    assert_eq!(v1, vec![("CAM1".into(), s(0), s(3)), ("CAM2".into(), s(3), s(6)), ("CAM1".into(), s(6), s(10))]);
+    // A range already on that angle is a no-op; one undo restores everything.
+    assert_eq!(e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(3), s(6)), angle: 1 }), Err(EditError::NoOp));
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence().tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn set_angle_range_outside_multicam_fails() {
+    let (mut p, mut e, _, _) = multicam_project(10, 20);
+    assert_eq!(e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(12), s(14)), angle: 1 }), Err(EditError::ClipNotFound));
+}

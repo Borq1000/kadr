@@ -10,6 +10,7 @@ mod export_ui;
 mod file_drop;
 mod import;
 mod inspector;
+mod jev_ui;
 mod keys;
 mod library;
 mod multicam_ui;
