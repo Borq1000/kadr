@@ -129,7 +129,7 @@ component OfferCard inherits Rectangle {
         if root.o.state == 0 && root.o.blocked == "": HorizontalLayout {
             spacing: 6px;
             Button { text: root.o.warnings.length > 0 ? Tr.t("ai.offer.run_anyway") : Tr.t("ai.offer.run"); primary: root.o.warnings.length == 0; danger: root.o.warnings.length > 0; compact: true; clicked => { root.action("run"); } }
-            Button { text: Tr.t("ai.offer.cheaper"); compact: true; enabled: root.o.can-cheaper; clicked => { root.action("cheaper"); } }
+            if root.o.can-cheaper: Button { text: Tr.t("ai.offer.cheaper"); compact: true; clicked => { root.action("cheaper"); } }
             Button { text: Tr.t("ai.offer.local"); compact: true; ghost: true; clicked => { root.action("local"); } }
         }
         if root.o.state == 0 && root.o.blocked != "": HorizontalLayout {

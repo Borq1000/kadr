@@ -664,5 +664,7 @@
   "jev.word.shake_is": "shake: {v}",
   "ai.suggest.5": "Grade shots",
   "ai.suggest.6": "Auto-cut cameras",
-  "inspector.shots.yours": " · yours"
+  "inspector.shots.yours": " · yours",
+  "jev.cams.all_unsure": "Jev couldn't choose a camera anywhere: it has too little to go on. Describe what each camera shows (right-click the group → Edit angles…), or switch angles by hand with keys 1–9: Jev learns from those picks.",
+  "jev.cams.agree_some_unsure": "Nothing to change: where Jev was sure, it agrees with the current cut. In {n} intervals it couldn't choose — describe the cameras in the group to help it."
 }

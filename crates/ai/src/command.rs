@@ -323,7 +323,22 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                 })
             }
             AiCommand::SelectCamera { start_ms, end_ms, angle, .. } => {
-                let (s, e) = (in_seq(i, *start_ms)?, in_seq(i, *end_ms)?);
+                // Milliseconds can't name flick-exact positions: a bound within
+                // half a frame of a clip edge means that edge (edges need not
+                // sit on frames), anything else lands on a frame. Otherwise a
+                // bound misses the clip it names or cuts off a sliver.
+                let rate = seq.frame_rate;
+                let half = rate.frame_duration().div_ratio(1, 2);
+                let snap = |t: Time| {
+                    seq.tracks
+                        .iter()
+                        .flat_map(|t| &t.clips)
+                        .flat_map(|c| [c.timeline_in, c.timeline_out])
+                        .filter(|edge| (*edge - t).abs() < half)
+                        .min_by_key(|edge| (*edge - t).abs())
+                        .unwrap_or_else(|| rate.snap(t))
+                };
+                let (s, e) = (snap(in_seq(i, *start_ms)?), snap(in_seq(i, *end_ms)?));
                 if e <= s {
                     return Err(ValidationError::Range { index: i, msg: "end must be after start".into() });
                 }
@@ -400,6 +415,16 @@ mod tests {
         p
     }
 
+    /// The multicam clip placed at `start` for `dur` on a 29.97 fps sequence.
+    fn ntsc_multicam_project(start: Time, dur: Time) -> Project {
+        let mut p = multicam_project();
+        let seq = p.sequence_mut();
+        seq.frame_rate = kadr_core::FrameRate::FPS_29_97;
+        let c = &mut seq.tracks[0].clips[0];
+        (c.source_out, c.timeline_in, c.timeline_out) = (dur, start, start + dur);
+        p
+    }
+
     fn select(start_ms: i64, end_ms: i64, angle: &str) -> AiCommand {
         AiCommand::SelectCamera { start_ms, end_ms, angle: angle.into(), reason: String::new() }
     }
@@ -409,6 +434,29 @@ mod tests {
         let p = multicam_project();
         let cmds = validate(&[select(2_000, 6_000, "CAM2")], &p, &Permissions::default()).unwrap();
         assert_eq!(cmds, vec![EditCommand::SetAngleRange { range: TimeRange::new(Time::from_secs(2), Time::from_secs(6)), angle: 1 }]);
+    }
+
+    #[test]
+    fn select_camera_snaps_millisecond_bounds_to_the_clip_frames() {
+        // At 29.97 fps frame boundaries are not whole milliseconds: a clip
+        // starting on frame 91 (3.0364 s) is addressed as 3033 ms, which
+        // lies before the clip; its end (frame 481) as 16049 ms, just short.
+        let rate = kadr_core::FrameRate::FPS_29_97;
+        let (start, end) = (rate.frame_to_time(91), rate.frame_to_time(481));
+        let p = ntsc_multicam_project(start, end - start);
+        let cmds = validate(&[select(start.as_millis(), end.as_millis(), "CAM2")], &p, &Permissions::default()).unwrap();
+        assert_eq!(cmds, vec![EditCommand::SetAngleRange { range: TimeRange::new(start, end), angle: 1 }]);
+    }
+
+    #[test]
+    fn select_camera_ending_at_an_off_frame_clip_end_leaves_no_sliver() {
+        // A multicam clip spans the angles' overlap, which need not be a
+        // whole number of frames: this one ends 13.016 s after frame 91.
+        let p = ntsc_multicam_project(kadr_core::FrameRate::FPS_29_97.frame_to_time(91), Time::from_millis(13_016));
+        let clip_end = p.sequence().tracks[0].clips[0].timeline_range().end;
+        let cmds = validate(&[select(4_000, clip_end.as_millis(), "CAM2")], &p, &Permissions::default()).unwrap();
+        let EditCommand::SetAngleRange { range, .. } = &cmds[0] else { panic!() };
+        assert_eq!(range.end, clip_end, "the end names the clip edge, not a frame 3 ms before it");
     }
 
     #[test]

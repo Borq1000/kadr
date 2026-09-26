@@ -23,8 +23,8 @@ pub struct PlanUi {
 pub enum OfferKind {
     Chat(CloudOffer),
     Jev(Box<crate::jev_ui::JevRequest>),
-    /// Consumed after its result was turned into a plan.
-    Done,
+    /// Consumed after its result was turned into a plan: what it cost.
+    Done { model: String, input: u64, cost: f64 },
 }
 
 pub struct OfferUi {
@@ -399,7 +399,7 @@ impl App {
                 let of = match &o.kind {
                     OfferKind::Chat(of) => of,
                     OfferKind::Jev(req) => return jev_offer_view(req, o.state),
-                    OfferKind::Done => return jev_done_view(o.state),
+                    OfferKind::Done { model, input, cost } => return jev_done_view(model, *input, *cost, o.state),
                 };
                 let warnings = budget_warnings(&of.budget);
                 let blocked = match &of.gate {
@@ -469,8 +469,17 @@ fn jev_offer_view(req: &crate::jev_ui::JevRequest, state: i32) -> OfferView {
     }
 }
 
-fn jev_done_view(state: i32) -> OfferView {
-    OfferView { title: t("jev.card.done").into(), tier: "JEV".into(), provider: "Jev (TypeSafe)".into(), state, ..Default::default() }
+fn jev_done_view(model: &str, input: u64, cost: f64, state: i32) -> OfferView {
+    OfferView {
+        title: t("jev.card.done").into(),
+        tier: "JEV".into(),
+        provider: "Jev (TypeSafe)".into(),
+        model: model.into(),
+        input: fmt_tokens(input).into(),
+        cost: if input == 0 { t("jev.card.free").into() } else { money(cost).into() },
+        state,
+        ..Default::default()
+    }
 }
 
 /// User-facing text for provider / network errors.

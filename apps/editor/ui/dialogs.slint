@@ -413,7 +413,7 @@ export component MulticamDialog inherits Modal {
                         Text { text: r.name; overflow: elide; color: r.checked ? Theme.text : Theme.text-dim; font-size: Theme.font-sm; font-weight: 600; }
                         Text { text: r.sync; overflow: elide; color: r.sync-warn ? Theme.warning : Theme.text-faint; font-size: Theme.font-xs; }
                     }
-                    VerticalLayout { alignment: center; width: 84px; LineEdit { enabled: r.checked; text: r.label; edited(t) => { root.set-label(i, t); } } }
+                    VerticalLayout { alignment: center; width: 84px; LineEdit { min-width: 0px; enabled: r.checked; text: r.label; edited(t) => { root.set-label(i, t); } } }
                     VerticalLayout {
                         alignment: center;
                         width: 210px;

@@ -123,6 +123,16 @@ pub fn merge_picks(picks: Vec<Pick>, min: Time) -> Vec<Pick> {
     v
 }
 
+/// Chat line for a camera plan with nothing to change. UNSURE everywhere
+/// means Jev had nothing to go on, which is not agreement with the cut.
+fn no_change_key(unsure: usize, total: usize) -> &'static str {
+    match unsure {
+        0 => "jev.cams.nothing_to_change",
+        n if n >= total => "jev.cams.all_unsure",
+        _ => "jev.cams.agree_some_unsure",
+    }
+}
+
 /// What a Jev card is for, with what's needed to use its answers.
 pub enum JevPurpose {
     Grade,
@@ -252,7 +262,7 @@ impl App {
             self.refresh_timeline();
             self.refresh_inspector();
         } else {
-            let OfferKind::Jev(req) = std::mem::replace(&mut self.ai.offers[i].kind, OfferKind::Done) else { return };
+            let OfferKind::Jev(req) = std::mem::replace(&mut self.ai.offers[i].kind, OfferKind::Done { model: model.clone(), input, cost }) else { return };
             let JevPurpose::Cameras(slots) = req.purpose else { return };
             self.finish_camera_plan(slots, decided, model, cost);
         }
@@ -447,6 +457,7 @@ impl App {
         let mut picks = vec![];
         let mut stored = vec![];
         let mut personal_n = 0;
+        let mut unsure_n = 0;
         for (slot, mut d) in slots.into_iter().zip(decided) {
             if !d.from_cache {
                 // Personal pick when the history has precedents for this moment.
@@ -471,6 +482,7 @@ impl App {
             let personal = d.stored.features.get("personal").is_some();
             personal_n += personal as usize;
             let usable = d.stored.value != UNSURE && d.stored.gate != kadr_project::Gate::Review && slot.labels.contains(&d.stored.value);
+            unsure_n += !usable as usize;
             let label = if usable { d.stored.effective().to_string() } else { slot.current.clone() };
             picks.push((Pick { range: slot.range, label, p: d.stored.p_max }, personal, slot.current));
             stored.push(d.stored);
@@ -499,7 +511,7 @@ impl App {
             })
             .collect();
         if items.is_empty() {
-            self.ai.say(1, t("jev.cams.nothing_to_change"));
+            self.ai.say(1, tf(no_change_key(unsure_n, picks.len()), &[("n", &unsure_n.to_string())]));
             return;
         }
         let mean_p = merged.iter().map(|p| p.p).sum::<f32>() / merged.len().max(1) as f32;
@@ -672,6 +684,13 @@ mod tests {
         assert_eq!(next_verdict("KEEP"), "REVIEW");
         assert_eq!(next_verdict("REVIEW"), "DISCARD");
         assert_eq!(next_verdict("DISCARD"), "KEEP");
+    }
+
+    #[test]
+    fn an_unsure_answer_is_not_reported_as_agreement() {
+        assert_eq!(no_change_key(4, 4), "jev.cams.all_unsure");
+        assert_eq!(no_change_key(1, 4), "jev.cams.agree_some_unsure");
+        assert_eq!(no_change_key(0, 4), "jev.cams.nothing_to_change");
     }
 
     #[test]
