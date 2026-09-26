@@ -7,6 +7,7 @@ mod ai_ui;
 mod app;
 mod app_settings;
 mod export_ui;
+mod file_drop;
 mod import;
 mod inspector;
 mod keys;

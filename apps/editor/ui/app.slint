@@ -42,6 +42,9 @@ export component AppWindow inherits Window {
     in property <length> drag-x;
     in property <length> drag-y;
     in property <string> drag-label;
+    // Files dragged in from Explorer.
+    in property <bool> file-drop-active;
+    in property <string> file-drop-label;
 
     // ---- Preview
     in property <image> preview-frame;
@@ -555,6 +558,41 @@ export component AppWindow inherits Window {
         border-radius: 5px;
         background: #7c8cffd0;
         dl := Text { text: root.drag-label; color: Theme.text-on-accent; font-size: Theme.font-sm; font-weight: 600; }
+    }
+
+    if root.file-drop-active: Rectangle {
+        background: #0e0f12b0;
+        Rectangle {
+            x: 16px;
+            y: 16px;
+            width: parent.width - 32px;
+            height: parent.height - 32px;
+            border-radius: 12px;
+            border-width: 2px;
+            border-color: Theme.accent;
+            background: Theme.accent-soft;
+            VerticalLayout {
+                alignment: center;
+                spacing: 10px;
+                HorizontalLayout {
+                    alignment: center;
+                    Icon { icon: Icons.import; width: 40px; height: 40px; color: Theme.accent; }
+                }
+                Text {
+                    horizontal-alignment: center;
+                    text: root.file-drop-label;
+                    color: Theme.text;
+                    font-size: 20px;
+                    font-weight: 600;
+                }
+                Text {
+                    horizontal-alignment: center;
+                    text: Tr.t("drop.hint");
+                    color: Theme.text-dim;
+                    font-size: Theme.font-sm;
+                }
+            }
+        }
     }
 
     // Toasts (bottom-right, above the status bar)

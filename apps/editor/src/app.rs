@@ -206,6 +206,7 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
     APP.with(|a| *a.borrow_mut() = Some(rc.clone()));
 
     wire_callbacks(&ui);
+    crate::file_drop::install(&ui);
     start_timers();
 
     with_app(|app| {

@@ -20,7 +20,7 @@ kadr-jobs = { path = "../../crates/jobs" }
 kadr-cache = { path = "../../crates/cache" }
 kadr-ai = { path = "../../crates/ai" }
 kadr-i18n = { path = "../../crates/i18n" }
-slint.workspace = true
+slint = { workspace = true, features = ["unstable-winit-030"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -29,6 +29,9 @@ tracing-appender.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 rfd = "0.17"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

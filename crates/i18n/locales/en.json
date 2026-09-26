@@ -576,5 +576,12 @@
   "err.ai.blocked": "blocked: {reason}",
   "project.sequence_default": "Sequence {n}",
   "toast.test_ok.one": "✓ {model} answered ({n} token)",
-  "toast.test_ok.other": "✓ {model} answered ({n} tokens)"
+  "toast.test_ok.other": "✓ {model} answered ({n} tokens)",
+  "drop.title.one": "Drop to add {n} item",
+  "drop.title.other": "Drop to add {n} items",
+  "drop.hint": "Media files and folders are imported into the library; a .kadr file opens the project",
+  "toast.drop_skipped.one": "{n} file skipped: not a supported media format",
+  "toast.drop_skipped.other": "{n} files skipped: not a supported media format",
+  "toast.drop_project_only": "A project was dropped together with media: the project is opened, the media is not imported",
+  "toast.drop_nothing": "No media files found in the dropped folder"
 }
