@@ -101,3 +101,18 @@ fn autosave_newer_than_project_is_offered_for_recovery() {
     io::save(&mut p, &path).unwrap();
     assert!(io::recovery_candidate(&path).is_none());
 }
+
+#[test]
+fn old_project_json_still_loads() {
+    // A project written before decisions / angle descriptions existed.
+    let mut v = serde_json::to_value(Project::new("old")).unwrap();
+    v.as_object_mut().unwrap().remove("jev_decisions");
+    v["multicam_groups"] = serde_json::json!([{"id": kadr_core::MulticamId::new(), "name": "g",
+        "angles": [{"asset": kadr_core::AssetId::new(), "label": "CAM1", "sync_offset": 0}]}]);
+    v["preference_events"] = serde_json::json!([{"at_ms": 1, "action": null, "kind": "camera_changed", "context": {},
+        "features": {}, "ai_choice": "CAM1", "ai_confidence": 0.5, "human_choice": "CAM2"}]);
+    let p: Project = serde_json::from_value(v).unwrap();
+    assert!(p.jev_decisions.is_empty());
+    assert_eq!(p.multicam_groups[0].angles[0].description, "");
+    assert_eq!(p.preference_events[0].decision, None);
+}

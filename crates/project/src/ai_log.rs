@@ -78,6 +78,9 @@ pub struct EditorPreferenceEvent {
     pub ai_choice: String,
     pub ai_confidence: f32,
     pub human_choice: String,
+    /// The Jev decision this event overrides or confirms.
+    #[serde(default)]
+    pub decision: Option<kadr_core::DecisionId>,
 }
 
 pub type EditorCorrection = EditorPreferenceEvent;

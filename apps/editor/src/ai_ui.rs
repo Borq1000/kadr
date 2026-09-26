@@ -156,6 +156,7 @@ impl App {
                         ai_choice: p.proposal.clone(),
                         ai_confidence: p.confidence,
                         human_choice: "undo".into(),
+                        decision: None,
                     });
                     self.meta_dirty = true;
                     self.after_edit();
@@ -194,6 +195,7 @@ impl App {
                     ai_choice: "delete".into(),
                     ai_confidence: plan.confidence,
                     human_choice: "keep".into(),
+                    decision: None,
                 });
             }
             let after = self.project.sequence().duration();

@@ -42,5 +42,5 @@ macro_rules! define_id {
 
 define_id!(
     ProjectId, AssetId, BinId, SequenceId, TrackId, ClipId, LinkId, TransitionId, EffectId,
-    MarkerId, TranscriptId, ActionId, MulticamId,
+    MarkerId, TranscriptId, ActionId, MulticamId, DecisionId,
 );

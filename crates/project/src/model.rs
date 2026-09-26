@@ -35,6 +35,9 @@ pub struct Project {
     pub ai_actions: Vec<AIAction>,
     #[serde(default)]
     pub preference_events: Vec<EditorPreferenceEvent>,
+    /// Jev decisions (cache + audit trail + human overrides).
+    #[serde(default)]
+    pub jev_decisions: Vec<crate::decisions::StoredDecision>,
     /// Lifetime external-AI spend for this project, USD.
     #[serde(default)]
     pub ai_cost_usd: f64,
@@ -60,6 +63,7 @@ impl Project {
             history_log: vec![],
             ai_actions: vec![],
             preference_events: vec![],
+            jev_decisions: vec![],
             ai_cost_usd: 0.0,
         }
     }
@@ -165,6 +169,9 @@ pub struct MulticamAngle {
     pub asset: AssetId,
     /// "CAM_A", "CAM1"…
     pub label: String,
+    /// What the angle shows ("wide stage", "singer close-up"); Jev reads it.
+    #[serde(default)]
+    pub description: String,
     /// Group time 0 corresponds to this source time.
     pub sync_offset: Time,
     #[serde(default)]
