@@ -1,6 +1,11 @@
 //! Jev decision service — typed decisions made from *locally extracted
-//! features* (never raw video). V0.1 defines the contract; the service is
-//! wired to the Economy tier in V0.2.
+//! features* (never raw video).
+
+pub mod decided;
+pub mod service;
+
+pub use decided::{decide_gate, Decided};
+pub use service::{apply_hysteresis, JevDecisionService, JevEstimate, JevItem};
 
 use serde::{Deserialize, Serialize};
 

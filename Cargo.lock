@@ -2796,6 +2796,7 @@ dependencies = [
 name = "kadr-ai"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "kadr-core",
  "kadr-i18n",
  "kadr-project",
