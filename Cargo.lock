@@ -2895,6 +2895,7 @@ dependencies = [
 name = "kadr-media"
 version = "0.1.0"
 dependencies = [
+ "kadr-analysis",
  "kadr-core",
  "serde",
  "serde_json",

@@ -610,5 +610,6 @@
   "err.ai.too_large": "Запрос слишком большой для одного вызова",
   "err.ai.unknown_model": "Провайдер не знает эту модель: {model}",
   "cmd.switch_angle": "Смена ракурса",
-  "cmd.cut_to_angle": "Склейка на ракурс"
+  "cmd.cut_to_angle": "Склейка на ракурс",
+  "jobs.title.video": "Анализ изображения · {name}"
 }

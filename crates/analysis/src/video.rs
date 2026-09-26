@@ -66,10 +66,13 @@ pub fn analyze_gray_frame(gray: &[u8], w: u32, h: u32, prev: Option<&[u8]>) -> F
 
 // Bucket words are what Jev reads; they match the level wording of the
 // shot-usability template so the model doesn't mis-map them (research §5b).
+// Sharpness: the common "variance of Laplacian < 100 (0..255 scale) is
+// blurry" heuristic is ≈ 0.0015 here; the 160×90 proxy sharpens slightly.
+// Provisional until calibrated on real camera footage.
 pub fn bucket_sharpness(s: f32) -> &'static str {
-    if s >= 0.01 {
+    if s >= 0.003 {
         "sharp"
-    } else if s >= 0.002 {
+    } else if s >= 0.0008 {
         "soft"
     } else {
         "very blurry"

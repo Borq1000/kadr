@@ -587,5 +587,6 @@
   "err.ai.too_large": "The request is too large for one call",
   "err.ai.unknown_model": "The provider does not know this model: {model}",
   "cmd.switch_angle": "Switch angle",
-  "cmd.cut_to_angle": "Cut to angle"
+  "cmd.cut_to_angle": "Cut to angle",
+  "jobs.title.video": "Picture analysis · {name}"
 }

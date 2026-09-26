@@ -18,6 +18,7 @@ mod settings_ui;
 mod timeline_ui;
 mod toasts;
 mod util;
+mod video_analysis;
 mod waveform;
 mod winutil;
 
