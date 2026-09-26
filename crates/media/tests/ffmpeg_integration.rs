@@ -96,11 +96,12 @@ fn export_cut_with_gap_has_expected_duration() {
         output: output.clone(),
         total: Time::from_millis(4_000),
         video: vec![
-            ExportVideo { duration: Time::from_millis(1_000), source: src(0, VideoLook::default()) },
-            ExportVideo { duration: Time::from_millis(1_000), source: None },
+            ExportVideo { duration: Time::from_millis(1_000), source: src(0, VideoLook::default()), transition_in: None },
+            ExportVideo { duration: Time::from_millis(1_000), source: None, transition_in: None },
             ExportVideo {
                 duration: Time::from_millis(2_000),
                 source: src(4_000, VideoLook { scale: 0.5, x: 100.0, opacity: 0.8, contrast: 1.2, ..Default::default() }),
+                transition_in: None,
             },
         ],
         audio: vec![ExportAudio {
@@ -145,10 +146,57 @@ fn cancelled_export_leaves_no_output() {
         video: vec![ExportVideo {
             duration: Time::from_secs(6),
             source: Some(ExportVideoSource { path: clip, source_start: Time::ZERO, speed: 1.0, look: VideoLook::default() }),
+            transition_in: None,
         }],
         audio: vec![],
         settings: ExportSettings { width: 640, height: 360, rate: FrameRate::FPS_25, ..Default::default() },
     };
     assert!(matches!(ff.export(&plan, &|_| {}, &cancel), Err(MediaError::Cancelled)));
     assert!(!output.exists());
+}
+
+fn mean_luma(f: &RgbaFrame) -> f64 {
+    let px = f.data.chunks_exact(4);
+    let n = px.len() as f64;
+    px.map(|p| 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64).sum::<f64>() / n
+}
+
+#[test]
+fn export_dissolve_blends_across_the_cut_and_keeps_duration() {
+    let Some(ff) = backend() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let clip = make_clip(dir.path());
+    let output = dir.path().join("out.mp4");
+    let dissolve = |ms| Some(ExportTransition { kind: ExportTransitionKind::Dissolve, duration: Time::from_millis(ms) });
+    let plan = ExportPlan {
+        output: output.clone(),
+        total: Time::from_millis(3_000),
+        video: vec![
+            ExportVideo { duration: Time::from_millis(1_000), source: None, transition_in: None },
+            // Source starts at 0: the head handle before the cut must be synthesised.
+            ExportVideo {
+                duration: Time::from_millis(1_000),
+                source: Some(ExportVideoSource { path: clip.clone(), source_start: Time::ZERO, speed: 1.0, look: VideoLook::default() }),
+                transition_in: dissolve(800),
+            },
+            ExportVideo { duration: Time::from_millis(1_000), source: None, transition_in: dissolve(400) },
+        ],
+        audio: vec![],
+        settings: ExportSettings { width: 320, height: 180, rate: FrameRate::FPS_25, preset: "ultrafast".into(), ..Default::default() },
+    };
+    ff.export(&plan, &|_| {}, &CancelToken::new()).unwrap();
+
+    let frames = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "75", "a dissolve must not change the length");
+
+    let luma = |ms| mean_luma(&ff.decode_frame(&output, Time::from_millis(ms), 320, 180).unwrap());
+    let (black, early, cut, full, late) = (luma(300), luma(700), luma(1_000), luma(1_500), luma(2_500));
+    assert!(black < 20.0, "pure black before the dissolve: {black}");
+    assert!(full > 60.0, "picture fully visible after the dissolve: {full}");
+    assert!(early > black + 5.0 && early < cut && cut < full - 5.0, "ramps up across the cut: {early} {cut} {full}");
+    assert!(late < 20.0, "second dissolve finished into black: {late}");
 }

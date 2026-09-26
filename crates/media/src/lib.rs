@@ -9,7 +9,7 @@ use kadr_core::{CancelToken, FrameRate, MediaInfo, Time};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub use export::{ExportAudio, ExportPlan, ExportSettings, ExportVideo};
+pub use export::{ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo};
 
 #[derive(Debug, Error)]
 pub enum MediaError {

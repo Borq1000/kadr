@@ -8,8 +8,9 @@ use kadr_core::{Time, TimeRange};
 use kadr_i18n::{duration, t, tf};
 use kadr_jobs::{JobError, JobSpec, JobState, Priority};
 use kadr_media::export::ExportVideoSource;
-use kadr_media::{ExportAudio, ExportPlan, ExportSettings, ExportVideo};
-use kadr_timeline::composition::{audio_segments, video_segments};
+use kadr_project::TransitionKind;
+use kadr_media::{ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo};
+use kadr_timeline::composition::{audio_segments, transitions_into, video_segments};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -82,9 +83,20 @@ impl App {
         let range = TimeRange::new(Time::ZERO, dur);
         let (w, h) = self.export_size(resolution);
         let px_scale = w as f64 / seq.width.max(1) as f64;
-        let video = video_segments(seq, range)
+        let segs = video_segments(seq, range);
+        let transitions = transitions_into(seq, &segs);
+        let video = segs
             .into_iter()
-            .map(|s| ExportVideo {
+            .zip(transitions)
+            .map(|(s, tr)| ExportVideo {
+                transition_in: tr.map(|t| ExportTransition {
+                    kind: match t.kind {
+                        TransitionKind::CrossDissolve => ExportTransitionKind::Dissolve,
+                        TransitionKind::DipToBlack => ExportTransitionKind::DipToBlack,
+                        TransitionKind::Wipe => ExportTransitionKind::Wipe,
+                    },
+                    duration: t.duration,
+                }),
                 duration: s.range.duration(),
                 source: s.source.and_then(|v| {
                     let a = self.project.asset(v.asset)?;

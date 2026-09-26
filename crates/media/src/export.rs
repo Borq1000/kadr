@@ -47,12 +47,39 @@ pub struct ExportVideoSource {
     pub look: VideoLook,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportTransitionKind {
+    Dissolve,
+    DipToBlack,
+    Wipe,
+}
+
+impl ExportTransitionKind {
+    fn xfade_name(self) -> &'static str {
+        match self {
+            ExportTransitionKind::Dissolve => "fade",
+            ExportTransitionKind::DipToBlack => "fadeblack",
+            ExportTransitionKind::Wipe => "wipeleft",
+        }
+    }
+}
+
+/// A transition centred on the cut *into* a segment: half of it plays over
+/// the end of the previous segment, half over the start of this one.
+#[derive(Clone, Debug)]
+pub struct ExportTransition {
+    pub kind: ExportTransitionKind,
+    pub duration: Time,
+}
+
 /// One flat video segment; segments are laid end to end.
 #[derive(Clone, Debug)]
 pub struct ExportVideo {
     pub duration: Time,
     /// `None` renders black.
     pub source: Option<ExportVideoSource>,
+    /// Transition from the previous segment (ignored on the first one).
+    pub transition_in: Option<ExportTransition>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,21 +196,49 @@ pub fn build_graph(plan: &ExportPlan) -> (Vec<String>, String) {
     let rate = st.rate.to_ffmpeg_arg();
     let mut inputs: Vec<String> = vec![];
     let mut graph = String::new();
-    let mut vlabels = vec![];
     let mut n_in = 0usize;
 
+    // Everything is counted in output frames so cuts stay frame-exact.
+    let n = plan.video.len();
+    let seg_frames: Vec<i64> = plan.video.iter().map(|s| st.rate.time_to_frame_round(s.duration).max(1)).collect();
+    // Frames of the transition into segment i, clamped to both neighbours so
+    // the transitions on either side of a short segment never overlap.
+    let xf: Vec<i64> = (0..n)
+        .map(|i| match &plan.video[i].transition_in {
+            Some(t) if i > 0 => st.rate.time_to_frame_round(t.duration).min(seg_frames[i - 1]).min(seg_frames[i]),
+            _ => 0,
+        })
+        .map(|f| if f >= 2 { f } else { 0 })
+        .collect();
+    // Each segment is rendered with handles: the second half of the incoming
+    // transition before its start, the first half of the outgoing one after.
+    let head = |i: usize| xf[i] / 2;
+    let tail = |i: usize| if i + 1 < n { xf[i + 1] - xf[i + 1] / 2 } else { 0 };
+    let fps = st.rate.as_f64();
+    let secs = |frames: i64| frames as f64 / fps;
+
+    let mut seg_len = vec![];
     for (i, seg) in plan.video.iter().enumerate() {
-        let frames = st.rate.time_to_frame_round(seg.duration).max(1);
+        let frames = seg_frames[i] + head(i) + tail(i);
+        seg_len.push(frames);
         match &seg.source {
             Some(src) => {
                 let speed = if src.speed > 0.0 { src.speed } else { 1.0 };
-                let src_dur = Time::from_secs_f64(seg.duration.as_secs_f64() * speed) + Time::from_secs(1);
-                inputs.extend(["-ss".into(), src.source_start.max(Time::ZERO).to_ffmpeg_arg(), "-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
+                // Media before the clip's in-point may not exist: take what is
+                // there and freeze the first frame for the rest of the handle.
+                let start = src.source_start.max(Time::ZERO);
+                let have = head(i).min((start.as_secs_f64() / speed * fps).floor() as i64);
+                let seek = start - Time::from_secs_f64(secs(have) * speed);
+                let src_dur = Time::from_secs_f64(secs(frames) * speed) + Time::from_secs(1);
+                inputs.extend(["-ss".into(), seek.max(Time::ZERO).to_ffmpeg_arg(), "-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
                 inputs.push(src.path.to_string_lossy().into_owned());
+                let freeze = match head(i) - have {
+                    0 => String::new(),
+                    f => format!("start_mode=clone:start={f}:"),
+                };
                 let _ = writeln!(
                     graph,
-                    "[{n_in}:v:0]setpts=(PTS-STARTPTS)/{speed:.6},fps={rate},{look},format=yuv420p,\
-                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame={frames},setpts=PTS-STARTPTS[v{i}];",
+                    "[{n_in}:v:0]setpts=(PTS-STARTPTS)/{speed:.6},fps={rate},{look},format=yuv420p,                     tpad={freeze}stop_mode=clone:stop_duration=2,trim=end_frame={frames},setpts=PTS-STARTPTS[v{i}];",
                     look = look_filter(&src.look, w, h, 1.0)
                 );
                 n_in += 1;
@@ -192,14 +247,44 @@ pub fn build_graph(plan: &ExportPlan) -> (Vec<String>, String) {
                 let _ = writeln!(graph, "color=c=black:s={w}x{h}:r={rate},format=yuv420p,trim=end_frame={frames},setpts=PTS-STARTPTS[v{i}];");
             }
         }
-        vlabels.push(format!("[v{i}]"));
     }
-    if vlabels.is_empty() {
+    if n == 0 {
         let frames = st.rate.time_to_frame_round(plan.total).max(1);
-        let _ = writeln!(graph, "color=c=black:s={w}x{h}:r={rate},format=yuv420p,trim=end_frame={frames}[v0];");
-        vlabels.push("[v0]".into());
+        let _ = writeln!(graph, "color=c=black:s={w}x{h}:r={rate},format=yuv420p,trim=end_frame={frames}[vout];");
+    } else {
+        // Plain cuts are concatenated in runs; each transition cross-fades the
+        // stream built so far with the next segment.
+        let mut run = vec!["[v0]".to_string()];
+        let mut acc = seg_len[0];
+        let flush = |run: &mut Vec<String>, graph: &mut String, out: &str| {
+            if run.len() == 1 {
+                let _ = writeln!(graph, "{}null{out};", run[0]);
+            } else {
+                let _ = writeln!(graph, "{}concat=n={}:v=1:a=0{out};", run.concat(), run.len());
+            }
+            run.clear();
+            run.push(out.to_string());
+        };
+        for i in 1..n {
+            if xf[i] > 0 {
+                flush(&mut run, &mut graph, &format!("[c{i}]"));
+                let kind = plan.video[i].transition_in.as_ref().map_or(ExportTransitionKind::Dissolve, |t| t.kind);
+                let _ = writeln!(
+                    graph,
+                    "[c{i}][v{i}]xfade=transition={}:duration={:.6}:offset={:.6}[x{i}];",
+                    kind.xfade_name(),
+                    secs(xf[i]),
+                    secs(acc - xf[i])
+                );
+                run = vec![format!("[x{i}]")];
+                acc += seg_len[i] - xf[i];
+            } else {
+                run.push(format!("[v{i}]"));
+                acc += seg_len[i];
+            }
+        }
+        flush(&mut run, &mut graph, "[vout]");
     }
-    let _ = writeln!(graph, "{}concat=n={}:v=1:a=0[vout];", vlabels.concat(), vlabels.len());
 
     let sr = st.sample_rate;
     let total_s = plan.total.as_secs_f64();
