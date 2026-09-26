@@ -224,7 +224,7 @@ impl App {
                     Some(k) => {
                         let jev = JevProvider::new(cfg, k);
                         let q = BTreeMap::from([("ok".to_string(), JevQuestion::Noul { instructions: "Is the sky usually blue on a clear day?".into() })]);
-                        jev.decide(&jev_model, "Connectivity test.", &q)
+                        jev.decide(&jev_model, &serde_json::json!("Connectivity test."), &q)
                             .await
                             .map(|r| tf("toast.test_ok_jev", &[("model", &r.model), ("p", &format!("{:.2}", r.answers["ok"].noul.unwrap_or(0.0)))]))
                             .map_err(|e| crate::ai_ui::ai_error_text(&e))

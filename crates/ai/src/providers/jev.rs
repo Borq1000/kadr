@@ -6,14 +6,16 @@
 //! `POST {base}/v1/systemone` with `{model, state, questions}`.
 
 use super::http::{client, send_json};
-use super::{AiError, ProviderConfig};
+use super::{AiError, BoxFuture, ProviderConfig};
 use crate::credentials::Secret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub const DEFAULT_MODEL: &str = "jev-latest";
+/// Pinned: the `jev-latest` alias moves with releases and answers can
+/// shift under calibrated thresholds (research §1.2).
+pub const DEFAULT_MODEL: &str = "jev-1.13.0";
 /// Conservative client-side cap (API: 64k tokens per request).
 pub const MAX_REQUEST_TOKENS: u64 = 56_000;
 
@@ -22,10 +24,55 @@ pub const MAX_REQUEST_TOKENS: u64 = 56_000;
 pub enum JevQuestion {
     /// Yes/no → probability of "yes".
     Noul { instructions: String },
-    /// One of named options (id → description).
-    Choice { instructions: String, criteria: BTreeMap<String, String> },
-    /// One of ordered levels.
-    Score { instructions: String, criteria: Vec<String> },
+    /// One of named options (id → description: string or `{what, not_for, examples}`).
+    Choice { instructions: String, criteria: BTreeMap<String, serde_json::Value> },
+    /// One of ordered levels, low to high.
+    Score { instructions: String, criteria: Vec<serde_json::Value> },
+}
+
+impl JevQuestion {
+    /// API limits checked locally: the API silently ignores unknown fields
+    /// but rejects these with a 400 after a round trip.
+    pub fn validate(&self) -> Result<(), AiError> {
+        let bad = |m: &str| Err(AiError::Blocked(format!("invalid Jev question: {m}")));
+        match self {
+            JevQuestion::Noul { .. } => Ok(()),
+            JevQuestion::Choice { criteria, .. } if criteria.is_empty() || criteria.len() > 255 => bad("choice needs 1..=255 options"),
+            JevQuestion::Score { criteria, .. } if !(2..=10).contains(&criteria.len()) => bad("score needs 2..=10 levels"),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn instructions(&self) -> &str {
+        match self {
+            JevQuestion::Noul { instructions } | JevQuestion::Choice { instructions, .. } | JevQuestion::Score { instructions, .. } => {
+                instructions
+            }
+        }
+    }
+}
+
+/// Anything that answers Jev requests: the REST client, or a fake in tests.
+pub trait JevTransport: Send + Sync {
+    fn decide<'a>(
+        &'a self,
+        model: &'a str,
+        state: &'a serde_json::Value,
+        questions: &'a BTreeMap<String, JevQuestion>,
+    ) -> BoxFuture<'a, Result<JevResponse, AiError>>;
+}
+
+/// Documented 400 bodies that deserve their own error (research §2.5).
+pub(crate) fn map_400(body: &str) -> Option<AiError> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let d = &v["detail"];
+    match d["error_type"].as_str() {
+        Some("max_tokens_exceeded") => Some(AiError::TooLarge),
+        Some(_) if d["message"].as_str().is_some_and(|m| m.starts_with("Unknown model")) => {
+            Some(AiError::UnknownModel(d["message"].as_str().unwrap_or_default().to_string()))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -73,16 +120,35 @@ impl JevProvider {
     /// request); the API answers 400 `max_tokens_exceeded` beyond that. We
     /// refuse oversized requests up front so callers split batches instead
     /// of silently losing context to truncation.
-    pub async fn decide(&self, model: &str, state: &str, questions: &BTreeMap<String, JevQuestion>) -> Result<JevResponse, AiError> {
+    pub async fn decide(&self, model: &str, state: &serde_json::Value, questions: &BTreeMap<String, JevQuestion>) -> Result<JevResponse, AiError> {
+        for q in questions.values() {
+            q.validate()?;
+        }
         let q_tokens: u64 = questions.values().map(|q| crate::cost::estimate_tokens(&serde_json::to_string(q).unwrap_or_default())).sum();
-        let total = crate::cost::estimate_tokens(state) + q_tokens;
+        let total = crate::cost::estimate_tokens(&state.to_string()) + q_tokens;
         if total > MAX_REQUEST_TOKENS {
-            return Err(AiError::Blocked(format!("Jev request too large (~{total} tokens > {MAX_REQUEST_TOKENS}); split the batch")));
+            return Err(AiError::TooLarge);
         }
         let body = json!({"model": model, "state": state, "questions": questions});
         let url = format!("{}/v1/systemone", self.config.base_url.trim_end_matches('/'));
-        let v = send_json(&self.config.name, || self.http.post(&url).bearer_auth(self.key.expose()).json(&body)).await?;
+        let v = send_json(&self.config.name, || self.http.post(&url).bearer_auth(self.key.expose()).json(&body))
+            .await
+            .map_err(|e| match e {
+                AiError::Http { status: 400, ref body } => map_400(body).unwrap_or(e),
+                e => e,
+            })?;
         parse_response(&v)
+    }
+}
+
+impl JevTransport for JevProvider {
+    fn decide<'a>(
+        &'a self,
+        model: &'a str,
+        state: &'a serde_json::Value,
+        questions: &'a BTreeMap<String, JevQuestion>,
+    ) -> BoxFuture<'a, Result<JevResponse, AiError>> {
+        Box::pin(JevProvider::decide(self, model, state, questions))
     }
 }
 
@@ -114,9 +180,29 @@ mod tests {
     fn question_serialization_matches_api() {
         let q = JevQuestion::Choice {
             instructions: "i".into(),
-            criteria: BTreeMap::from([("KEEP".to_string(), "good".to_string())]),
+            criteria: BTreeMap::from([("KEEP".to_string(), json!("good"))]),
         };
         assert_eq!(serde_json::to_value(&q).unwrap(), json!({"type":"choice","instructions":"i","criteria":{"KEEP":"good"}}));
+    }
+
+    #[test]
+    fn local_limits_are_enforced() {
+        let many: BTreeMap<String, serde_json::Value> = (0..256).map(|i| (format!("O{i}"), json!(null))).collect();
+        assert!(JevQuestion::Choice { instructions: "i".into(), criteria: many }.validate().is_err());
+        assert!(JevQuestion::Choice { instructions: "i".into(), criteria: BTreeMap::new() }.validate().is_err());
+        assert!(JevQuestion::Score { instructions: "i".into(), criteria: vec![json!("only")] }.validate().is_err());
+        assert!(JevQuestion::Score { instructions: "i".into(), criteria: vec![json!("a"), json!({"what": "b"})] }.validate().is_ok());
+        assert!(JevQuestion::Noul { instructions: "i".into() }.validate().is_ok());
+    }
+
+    #[test]
+    fn maps_documented_400s() {
+        assert_eq!(map_400(r#"{"detail":{"error_type":"max_tokens_exceeded"}}"#), Some(AiError::TooLarge));
+        assert!(matches!(
+            map_400(r#"{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-9"}}"#),
+            Some(AiError::UnknownModel(_))
+        ));
+        assert_eq!(map_400("{}"), None);
     }
 
     #[test]

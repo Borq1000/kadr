@@ -50,16 +50,16 @@ fn jev_typed_decisions() {
             JevQuestion::Choice {
                 instructions: "What should the editor do with this shot?".into(),
                 criteria: BTreeMap::from([
-                    ("KEEP".to_string(), "good enough for the edit".to_string()),
-                    ("DISCARD".to_string(), "technically unusable".to_string()),
-                    ("REVIEW".to_string(), "unclear, a human should check".to_string()),
+                    ("KEEP".to_string(), "good enough for the edit".into()),
+                    ("DISCARD".to_string(), "technically unusable".into()),
+                    ("REVIEW".to_string(), "unclear, a human should check".into()),
                 ]),
             },
         ),
     ]);
     let state = "Shot 42, camera CAM_B, 6.1 s. Sharpness 0.08 (very blurred, lens out of focus). \
                  Shake 0.7 (strong). No faces visible. Audio: music, no speech.";
-    let r = rt().block_on(jev.decide("jev-latest", state, &questions)).unwrap();
+    let r = rt().block_on(jev.decide("jev-1.13.0", &serde_json::json!(state), &questions)).unwrap();
     eprintln!("jev: {:?}, tokens {}", r.answers, r.input_tokens);
     assert!(r.answers["usable"].noul.unwrap() < 0.5, "a blurred, shaky shot should not be usable");
     assert_ne!(r.answers["action"].choice.as_deref(), Some("KEEP"));

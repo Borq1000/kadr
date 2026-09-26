@@ -428,6 +428,8 @@ pub fn ai_error_text(e: &kadr_ai::providers::AiError) -> String {
         Http { status, .. } => tf("err.ai.http", &[("status", &status.to_string())]),
         BadResponse(d) => tf("err.ai.bad_response", &[("detail", d)]),
         Cancelled => t("err.ai.cancelled"),
+        TooLarge => t("err.ai.too_large"),
+        UnknownModel(m) => tf("err.ai.unknown_model", &[("model", m)]),
         Blocked(r) => {
             let k = if r.starts_with("privacy.") { t(r) } else { r.clone() };
             tf("err.ai.blocked", &[("reason", &k)])
