@@ -82,7 +82,9 @@ component TrackHeader inherits Rectangle {
         width: 3px;
         background: root.track.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
     }
-    ContextMenuArea {
+    // A TouchArea inside accepts the right press, so ContextMenuArea never
+    // sees it: every TouchArea below opens its menu explicitly.
+    header-menu := ContextMenuArea {
         Menu {
             MenuItem { title: Tr.t("tl.track.rename"); activated => { root.action("rename"); } }
             MenuSeparator {}
@@ -108,7 +110,10 @@ component TrackHeader inherits Rectangle {
                     color: root.track.locked ? Theme.text-faint : Theme.text;
                     overflow: elide;
                 }
-                TouchArea { double-clicked => { root.action("rename"); } }
+                TouchArea {
+                    double-clicked => { root.action("rename"); }
+                    pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { header-menu.show({ x: self.absolute-position.x - header-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - header-menu.absolute-position.y + self.mouse-y }); } }
+                }
             }
             if root.track.renaming: VerticalLayout {
                 alignment: center;
@@ -381,7 +386,7 @@ export component Timeline inherits Rectangle {
 
             VerticalLayout {
                 // Ruler
-                ContextMenuArea {
+                ruler-menu := ContextMenuArea {
                     Menu {
                         MenuItem { title: Tr.t("tl.ruler.add_marker"); activated => { root.context-action("marker"); } }
                         MenuItem { title: Tr.t("tl.ruler.rename_marker"); activated => { root.context-action("rename-marker"); } }
@@ -431,6 +436,7 @@ export component Timeline inherits Rectangle {
                             pointer-event(e) => {
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.focus-editor(); root.ruler(0, self.mouse-x); }
                                 if (e.kind == PointerEventKind.up) { root.ruler(2, self.mouse-x); }
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { ruler-menu.show({ x: self.absolute-position.x - ruler-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - ruler-menu.absolute-position.y + self.mouse-y }); }
                             }
                             moved => { if (self.pressed) { root.ruler(1, self.mouse-x); } }
                             double-clicked => { root.ruler(3, self.mouse-x); }
@@ -493,7 +499,7 @@ export component Timeline inherits Rectangle {
                         width: 1px;
                         background: Theme.snap;
                     }
-                    ContextMenuArea {
+                    lane-menu := ContextMenuArea {
                         Menu {
                             MenuItem { title: Tr.t("tl.ctx.split"); activated => { root.context-action("split"); } }
                             MenuItem { title: Tr.t("tl.ctx.delete"); enabled: root.has-selection; activated => { root.context-action("delete"); } }
@@ -502,6 +508,9 @@ export component Timeline inherits Rectangle {
                             MenuItem { title: Tr.t("tl.ctx.rename"); enabled: root.has-selection; activated => { root.context-action("rename-clip"); } }
                             MenuItem { title: Tr.t("tl.ctx.toggle_enabled"); enabled: root.has-selection; activated => { root.context-action("toggle-enabled"); } }
                             MenuItem { title: Tr.t("tl.ctx.unlink"); enabled: root.has-selection; activated => { root.context-action("unlink"); } }
+                            MenuItem { title: Tr.t("tl.ctx.link"); enabled: root.has-selection; activated => { root.context-action("link"); } }
+                            MenuItem { title: Tr.t("tl.ctx.delete_video"); enabled: root.has-selection; activated => { root.context-action("delete-video"); } }
+                            MenuItem { title: Tr.t("tl.ctx.delete_audio"); enabled: root.has-selection; activated => { root.context-action("delete-audio"); } }
                             MenuItem { title: Tr.t("tl.ctx.reveal_media"); enabled: root.has-selection; activated => { root.context-action("reveal-media"); } }
                             MenuItem { title: Tr.t("tl.ctx.dissolve"); activated => { root.context-action("dissolve"); } }
                             MenuSeparator {}
@@ -517,6 +526,8 @@ export component Timeline inherits Rectangle {
                                         e.button == PointerEventButton.left ? 0 : e.button == PointerEventButton.right ? 1 : 2,
                                         e.modifiers.shift, e.modifiers.control, e.modifiers.alt);
                                 }
+                                // After tl-pointer selected the clip under the cursor.
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { lane-menu.show({ x: self.absolute-position.x - lane-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - lane-menu.absolute-position.y + self.mouse-y }); }
                             }
                             moved => { root.lane-pointer(1, self.mouse-x, self.mouse-y, 0, false, false, false); }
                             double-clicked => { root.lane-pointer(3, self.mouse-x, self.mouse-y, 0, false, false, false); }

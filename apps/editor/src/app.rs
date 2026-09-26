@@ -296,7 +296,7 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_key(|text, ctrl, shift, alt| {
         // Ctrl shortcuts that open native dialogs must not hold the borrow.
         if ctrl && !alt {
-            let k = text.to_lowercase();
+            let k = crate::keys::latin_key(text.as_str());
             let id = match (k.as_str(), shift) {
                 ("o", false) => Some("open"),
                 ("s", true) => Some("save-as"),

@@ -427,3 +427,38 @@ fn set_angle_range_outside_multicam_fails() {
     let (mut p, mut e, _, _) = multicam_project(10, 20);
     assert_eq!(e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(12), s(14)), angle: 1 }), Err(EditError::ClipNotFound));
 }
+
+#[test]
+fn delete_only_the_audio_of_a_linked_pair_is_one_undo_step() {
+    let (mut p, mut e) = setup();
+    let video = p.sequence().tracks[0].clips[0].id;
+    let commands = commands::delete_part(p.sequence(), &[video], TrackKind::Audio).expect("the pair has audio");
+    e.execute(&mut p, EditCommand::Batch { label: "delete audio".into(), commands }).unwrap();
+    assert_eq!(spans(&p, 0), vec![(0, 60_000)], "video stays");
+    assert!(spans(&p, 1).is_empty(), "its audio is gone");
+    assert_eq!(spans(&p, 2), vec![(0, 60_000)], "unrelated audio stays");
+    assert_eq!(p.sequence().tracks[0].clips[0].link, None, "no link to a deleted clip");
+    e.undo(&mut p).unwrap();
+    assert_eq!(spans(&p, 1), vec![(0, 60_000)]);
+    assert!(p.sequence().tracks[0].clips[0].link.is_some(), "undo restores the link");
+    // Nothing of that kind selected → nothing to do.
+    let ext = p.sequence().tracks[2].clips[0].id;
+    assert!(commands::delete_part(p.sequence(), &[ext], TrackKind::Video).is_none());
+}
+
+#[test]
+fn link_selection_joins_unlinked_clips_and_moves_them_together() {
+    let (mut p, mut e) = setup();
+    let video = p.sequence().tracks[0].clips[0].id;
+    let ext = p.sequence().tracks[2].clips[0].id;
+    let commands = commands::link_selection(p.sequence(), &[video, ext]).expect("two clips");
+    e.execute(&mut p, EditCommand::Batch { label: "link".into(), commands }).unwrap();
+    let seq = p.sequence();
+    let (lv, la, le) = (seq.tracks[0].clips[0].link, seq.tracks[1].clips[0].link, seq.tracks[2].clips[0].link);
+    assert!(lv.is_some() && lv == la && la == le, "the old partner joins the new group");
+    e.execute(&mut p, EditCommand::MoveClips { clips: vec![ext], delta: s(5), track_delta: 0 }).unwrap();
+    assert_eq!(spans(&p, 0), vec![(5_000, 65_000)], "video follows the linked external audio");
+    // A single clip can't be linked.
+    let (p2, _) = setup();
+    assert!(commands::link_selection(p2.sequence(), &[p2.sequence().tracks[2].clips[0].id]).is_none());
+}
