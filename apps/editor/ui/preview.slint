@@ -36,7 +36,9 @@ export component Preview inherits Rectangle {
     callback scrub(float);
     background: Theme.bg1;
     // Narrow preview: secondary controls hide (still in View menu / keys).
-    property <bool> compact: self.width < 640px;
+    // Set from Rust (window width minus side panels): deriving it from our
+    // own width is a binding loop, since it hides buttons that set our width.
+    in property <bool> compact;
 
     VerticalLayout {
         PanelHeader {

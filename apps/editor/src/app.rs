@@ -591,6 +591,13 @@ impl App {
         let scale = ui.window().scale_factor();
         let w = ui.window().size().width as f32 / scale;
         let h = ui.window().size().height as f32 / scale;
+        // Narrow preview hides secondary transport buttons (they stay in the
+        // View menu). Splitter drags are picked up on the next tick.
+        let ai_w = if ui.get_ai_open() { ui.get_ai_width() } else { 36.0 };
+        let compact = w - ui.get_library_width() - ui.get_inspector_width() - ai_w - 20.0 < 640.0;
+        if ui.get_preview_compact() != compact {
+            ui.set_preview_compact(compact);
+        }
         if (w - self.last_window_width).abs() < 1.0 && (h - self.last_window_height).abs() < 1.0 {
             return;
         }

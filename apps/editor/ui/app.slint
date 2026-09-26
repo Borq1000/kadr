@@ -62,6 +62,7 @@ export component AppWindow inherits Window {
     in property <bool> bypass;
     in property <bool> preview-loading;
     in property <float> scrub-fraction;
+    in property <bool> preview-compact;
     in property <[AngleView]> angles;
     in property <int> active-angle;
     callback angle-clicked(int);
@@ -407,6 +408,7 @@ export component AppWindow inherits Window {
                     bypass: root.bypass;
                     loading: root.preview-loading;
                     scrub-fraction: root.scrub-fraction;
+                    compact: root.preview-compact;
                     angles: root.angles;
                     active-angle: root.active-angle;
                     angle-clicked(i) => { root.angle-clicked(i); root.focus-editor(); }
