@@ -127,6 +127,7 @@ export struct SettingsState {
     smart: string,
     director: string,
     jev-model: string,
+    jev-personalize: bool,
     per-request: string,
     per-session: string,
     per-project: string,
@@ -156,6 +157,7 @@ export component SettingsDialog inherits Modal {
     callback delete-key(string);
     callback toggle-allowed(string);
     callback set-route(string, string);
+    callback set-personalize(bool);
     callback set-limit(string, string);
     callback test-provider(string);
     title: Tr.t("settings.title");
@@ -280,6 +282,8 @@ export component SettingsDialog inherits Modal {
                     Row { Text { text: "DIRECTOR"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.director; edited(t) => { root.set-route("director", t); } } }
                     Row { Text { text: "JEV"; font-size: Theme.font-xs; color: Theme.text-faint; vertical-alignment: center; } LineEdit { text: root.st.jev-model; edited(t) => { root.set-route("jev", t); } } }
                 }
+                CheckBox { text: Tr.t("settings.jev_personalize"); checked: root.st.jev-personalize; toggled => { root.set-personalize(self.checked); } }
+                Text { text: Tr.t("settings.jev_personalize_hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
                 SectionTitle { text: Tr.t("settings.budget"); }
                 GridLayout {
                     spacing: 6px;

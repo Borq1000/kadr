@@ -220,6 +220,7 @@ export component AppWindow inherits Window {
     callback settings-delete-key(string);
     callback settings-toggle-allowed(string);
     callback settings-route(string, string);
+    callback settings-personalize(bool);
     callback settings-limit(string, string);
     callback settings-test(string);
     callback confirm-ok-clicked();
@@ -687,6 +688,7 @@ export component AppWindow inherits Window {
         delete-key(id) => { root.settings-delete-key(id); }
         toggle-allowed(id) => { root.settings-toggle-allowed(id); }
         set-route(t, m) => { root.settings-route(t, m); }
+        set-personalize(on) => { root.settings-personalize(on); }
         set-limit(k, v) => { root.settings-limit(k, v); }
         test-provider(id) => { root.settings-test(id); }
         dismiss => { root.settings-open = false; root.focus-editor(); }

@@ -55,18 +55,18 @@
 | Crate | Ответственность |
 |---|---|
 | `kadr-core` | `Time` (i64 flicks), `FrameRate` (рациональный), конвертации кадр↔время с округлением, timecode (включая drop-frame отображение), `Id`-типы |
-| `kadr-project` | Project, MediaAsset, Bin, Sequence, Track, Clip, Transition, Effect, Keyframe, Marker, Transcript, AnalysisResult, AIAction, EditorPreferenceEvent; сериализация `.kadr` c `format_version`; атомарная запись; autosave/recovery |
-| `kadr-timeline` | EditEngine: команды (Split/Trim/Move/Delete/Insert/ChangeProperty/AddTransition/Batch), undo/redo, ripple, snapping, linked A/V, composition plan (что видно/слышно в каждый момент) |
+| `kadr-project` | Project, MediaAsset, Bin, Sequence, Track, Clip, Transition, Effect, Keyframe, Marker, Transcript, AnalysisResult, AIAction, EditorPreferenceEvent, MulticamGroup (ракурсы + смещения синхронизации), StoredDecision (решения Jev с вердиктом человека); сериализация `.kadr` c `format_version`; атомарная запись; autosave/recovery |
+| `kadr-timeline` | EditEngine: команды (Split/Trim/Move/Delete/Insert/ChangeProperty/AddTransition/SwitchAngle/SetAngleRange/Batch), мультикам-клипы (время группы ↔ таймлайн ↔ источник ракурса), undo/redo, ripple, snapping, linked A/V, composition plan (что видно/слышно в каждый момент) |
 | `kadr-media` | `MediaBackend` trait; `FfmpegCli` backend: probe, thumbnails, decode кадра, потоковый decode, извлечение PCM, export/encode/mux с прогрессом |
 | `kadr-audio` | воспроизведение: cpal-поток + микшер клипов из PCM-кэша, мастер-часы воспроизведения |
-| `kadr-analysis` | детерминированный анализ: пики waveform, RMS/loudness, детекция тишины (V0.2+: сцены, blur, лица) |
+| `kadr-analysis` | детерминированный анализ: пики waveform, RMS/loudness, детекция тишины; изображение — резкость/экспозиция/тряска/чёрный кадр по уменьшенным кадрам, границы планов (`VideoOverview`, `ShotSummary`); синхронизация ракурсов по огибающей звука (корреляция Пирсона, мин. перекрытие — половина короткого клипа) или по таймкоду |
 | `kadr-jobs` | фоновые задачи: priority queue, worker pool, progress, cancellation token, retry с backoff, error state |
 | `kadr-cache` | каталог кэша, ключ = blake3(path+size+mtime) + версия алгоритма; инвалидация |
-| `kadr-ai` | Edit Command Language + валидация; локальный intent-парсер; `AIProvider` + REST реализации; тарифы/стоимость; бюджеты; privacy-политика; хранение ключей |
+| `kadr-ai` | Edit Command Language + валидация; локальный intent-парсер; `AIProvider` + REST реализации; тарифы/стоимость; бюджеты; privacy-политика; хранение ключей; модуль `jev`: `JevDecisionService`, шаблоны вопросов, гейты, персонализация (§11) |
 | `kadr-i18n` | локализация RU/EN: JSON-каталоги (`locales/*.json`, встроены в бинарник), плюрализация, локализованные длительности; общий источник строк для Slint и Rust |
 | `apps/editor` | Slint UI, контроллер, preview/audio плееры, связывание всего |
 
-Сознательно **не** создаём в V0.1 отдельные `render`, `transcription`, `jev`, `platform`: пока у них нет содержимого. `jev` и `transcription` появятся в V0.2 как модули/крейты рядом с `ai`.
+Сознательно **не** создаём отдельные `render`, `transcription`, `platform`: пока у них нет содержимого. Jev живёт модулем `kadr_ai::jev` — ему нужны те же CostGuard, PrivacyPolicy и ledger, что и чату.
 
 ## 4. Модель времени
 
@@ -146,6 +146,22 @@ Natural language (chat / voice→STT)
 - **CostGuard**: оценка токенов до запроса → проверка лимитов (request/session/project/month) → при превышении требуется явное подтверждение; фактический usage → ledger (сессия, проект, месяц).
 - **PrivacyPolicy**: `Off | LocalOnly | AskBeforeCloud | AllowSelected`, разрешения по типам данных (Text/Images/Audio/Video) на провайдера. Любой облачный вызов проходит через одну функцию-шлюз, которая проверяет политику: скрытых вызовов нет by construction.
 - AI не имеет доступа к filesystem/shell: единственный выход LLM — `EditCommand` из закрытого enum.
+- Границы времени в командах AI — миллисекунды; `SelectCamera` притягивает их к краю клипа (в пределах полукадра) или к кадру, иначе при NTSC-частотах граница промахивается мимо клипа или отрезает осколок.
+
+### 11.1 Решения Jev
+
+```
+JevItem { kind, subject, state, questions, primary }        ← templates.rs (shot_item / camera_item)
+   → JevDecisionService::estimate  → карточка согласия (модель, токены, $, кэш) — тот же шлюз CostGuard + PrivacyPolicy
+   → JevDecisionService::run
+        ├─ кэш: ключ blake3(model + prompt_version + state + questions); попадание — бесплатно
+        ├─ батчи: вопросы с {item}, id с префиксом i<j>.; 400 TooLarge → батч делится пополам
+        └─ decided.rs: распределение → value, p_max, margin → Gate {AutoApply | Suggest | Review}
+   → Project.jev_decisions (StoredDecision), гистерезис 0.05 против дребезга между запросами
+```
+- **Оценка кадров** (`ShotUsability`): KEEP / REVIEW / DISCARD по сводке анализа изображения и звука. Вердикты — метки на клипах, в инспекторе и в статусе библиотеки; ничего не удаляется. Щелчок по вердикту — исправление человека (`StoredDecision.human`) + `EditorPreferenceEvent` со ссылкой на решение.
+- **Выбор камеры** (`CameraPick`): мультикам-клип режется на интервалы по 4 с, для каждого — признаки ракурсов (описание из группы, резкость, экспозиция, громкость). Результат — `Plan` из `SelectCamera` (всегда на просмотр, склейки не короче 2 с). UNSURE и Review-гейт оставляют текущий ракурс; если так везде, пользователь получает подсказку описать камеры, а не «Jev согласен».
+- **Персонализация** (настройка «Учиться на моих правках», `AiSettings.jev_personalize`): ручное переключение ракурса внутри решённого интервала записывает `CameraChanged`. При следующем запросе `prefs::precedents` отбирает k похожих прошлых исправлений (похожесть × затухание по времени) и кладёт их в `state`; вопросы `editor_pick` + `has_precedent`. Если прецедент уместен (`has_precedent ≥ 0.5`), распределение Jev смешивается с частотным априором прошлых выборов: `blend(p_jev, p_freq, blend_weight(n))`.
 
 ## 12. Cache architecture
 

@@ -57,6 +57,7 @@ impl App {
             smart: route(Tier::Smart).into(),
             director: route(Tier::Director).into(),
             jev_model: s.jev_model.clone().into(),
+            jev_personalize: s.jev_personalize,
             per_request: lim(s.limits.per_request_usd).into(),
             per_session: lim(s.limits.per_session_usd).into(),
             per_project: lim(s.limits.per_project_usd).into(),
@@ -169,6 +170,13 @@ impl App {
         self.refresh_settings();
         self.ai.refresh_offer_gates();
         self.refresh_ai();
+    }
+
+    /// Whether camera picks send the editor's past corrections to Jev.
+    pub fn settings_personalize(&mut self, on: bool) {
+        self.ai.assistant.settings.jev_personalize = on;
+        self.save_ai_settings();
+        self.refresh_settings();
     }
 
     pub fn settings_route(&mut self, tier: &str, model: &str) {

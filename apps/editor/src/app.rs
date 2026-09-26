@@ -379,6 +379,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_settings_delete_key, |id| |app: &mut App| app.settings_delete_key(&id));
     cb!(ui.on_settings_toggle_allowed, |id| |app: &mut App| app.settings_toggle_allowed(&id));
     cb!(ui.on_settings_route, |t, m| |app: &mut App| app.settings_route(&t, &m));
+    cb!(ui.on_settings_personalize, |on| |app: &mut App| app.settings_personalize(on));
     cb!(ui.on_settings_limit, |k, v| |app: &mut App| app.settings_limit(&k, &v));
     cb!(ui.on_settings_test, |id| |app: &mut App| app.settings_test(&id));
 
