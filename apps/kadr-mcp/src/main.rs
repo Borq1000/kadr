@@ -54,8 +54,10 @@ fn main() {
             continue; // notification we don't handle
         };
         let params = req.get("params").cloned().unwrap_or(json!({}));
-        let reply = handle(method, params, &mut inst);
-        let msg = json!({"jsonrpc": "2.0", "id": id, "result": reply}).to_string();
+        let msg = match handle(method, params, &mut inst) {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string(),
+        };
         if writeln!(stdout, "{msg}").is_err() || stdout.flush().is_err() {
             break;
         }
@@ -80,17 +82,21 @@ fn ensure_connected(inst: &mut Option<Instance>) -> Result<&Instance, String> {
     Ok(inst.as_ref().unwrap())
 }
 
-fn handle(method: &str, params: Value, inst: &mut Option<Instance>) -> Value {
+/// `Ok` becomes the JSON-RPC `result`; `Err` becomes the JSON-RPC `error`
+/// object (used only for top-level protocol errors, e.g. an unknown
+/// method). Tool-call failures are reported as `Ok` results with
+/// `isError: true`, per MCP convention.
+fn handle(method: &str, params: Value, inst: &mut Option<Instance>) -> Result<Value, Value> {
     match method {
-        "initialize" => json!({
+        "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "kadr", "version": env!("CARGO_PKG_VERSION")},
             "instructions": INSTRUCTIONS,
-        }),
-        "tools/list" => tools_list(inst),
-        "tools/call" => tools_call(params, inst),
-        _ => json!({"isError": true, "content": [{"type": "text", "text": format!("unknown method: {method}")}]}),
+        })),
+        "tools/list" => Ok(tools_list(inst)),
+        "tools/call" => Ok(tools_call(params, inst)),
+        _ => Err(json!({"code": -32601, "message": format!("Method not found: {method}")})),
     }
 }
 

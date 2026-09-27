@@ -43,6 +43,7 @@ fn stdio_server_reports_launch_failure_as_a_tool_error() {
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_state","arguments":{{}}}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/lsit","params":{{}}}}"#).unwrap();
 
     let stdout = child.stdout.take().unwrap();
     let mut lines = BufReader::new(stdout).lines();
@@ -56,6 +57,13 @@ fn stdio_server_reports_launch_failure_as_a_tool_error() {
     assert_eq!(v2["result"]["isError"], true);
     let text = v2["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("cannot start"), "unexpected text: {text}");
+
+    let line3 = lines.next().unwrap().unwrap();
+    let v3: serde_json::Value = serde_json::from_str(&line3).unwrap();
+    assert!(v3.get("result").is_none(), "unknown method must not produce a `result`: {v3}");
+    assert_eq!(v3["error"]["code"], -32601);
+    let msg = v3["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("tools/lsit"), "unexpected error message: {msg}");
 
     drop(stdin);
     let _ = child.wait();

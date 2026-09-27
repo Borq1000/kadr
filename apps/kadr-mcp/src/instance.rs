@@ -45,7 +45,13 @@ pub fn connect(data: &Path) -> Result<Instance, String> {
     let exe = std::env::var_os("KADR_EXE").map(Into::into).unwrap_or_else(|| {
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(if cfg!(windows) { "kadr.exe" } else { "kadr" }))).unwrap_or_default()
     });
-    let child = std::process::Command::new(&exe).arg("--headless").spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let child = std::process::Command::new(&exe)
+        .arg("--headless")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
     let pid = child.id();
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(15) {
