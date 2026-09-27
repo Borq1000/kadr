@@ -95,7 +95,20 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     }
 }
 
-pub fn init(log_dir: &Path) -> WorkerGuard {
+/// The file writer's guard: dropping it writes out buffered lines.
+static GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+
+fn keep(guard: WorkerGuard) {
+    *GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+}
+
+/// Writes buffered log lines to the file and stops file logging. Call on
+/// the way out, and before `std::process::exit` (which skips destructors).
+pub fn flush() {
+    drop(GUARD.lock().unwrap_or_else(|e| e.into_inner()).take());
+}
+
+pub fn init(log_dir: &Path) {
     let _ = std::fs::create_dir_all(log_dir);
     let file = tracing_appender::rolling::daily(log_dir, "kadr.log");
     let (writer, guard) = tracing_appender::non_blocking(file);
@@ -112,13 +125,28 @@ pub fn init(log_dir: &Path) -> WorkerGuard {
         tracing::error!(panic = %info, "panic");
         prev(info);
     }));
-    guard
+    keep(guard);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn flush_writes_buffered_lines_to_the_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::never(dir.path(), "t.log"));
+        keep(guard);
+        for i in 0..200 {
+            writeln!(writer, "line {i}").unwrap();
+        }
+        flush();
+        let text = std::fs::read_to_string(dir.path().join("t.log")).unwrap();
+        assert!(text.contains("line 199"), "the last line reached the file before exit");
+        flush(); // a second flush is harmless
+    }
 
     #[test]
     fn ring_keeps_the_newest_lines_and_filters_by_level() {

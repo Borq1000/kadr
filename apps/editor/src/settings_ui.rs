@@ -17,6 +17,11 @@ const AUTOSAVE_STEPS: [u64; 4] = [0, 60, 120, 300];
 
 impl App {
     fn save_ai_settings(&mut self) {
+        // Like settings.json: a headless instance changes AI settings for its
+        // own session only and never writes the user's file.
+        if self.flags.headless {
+            return;
+        }
         if let Err(e) = self.ai.assistant.settings.save(&self.dirs.data.join("ai-settings.json")) {
             self.toast_error(tf("err.settings.save", &[("error", &e.to_string())]));
         }

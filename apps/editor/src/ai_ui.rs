@@ -338,15 +338,15 @@ impl App {
     }
 
     pub fn record_month_spend(&mut self, usd: f64) {
-        let key = month_key();
+        let path = self.dirs.data.join("ai-settings.json");
+        // A headless instance records only its spend: the rest of the file
+        // belongs to the user's window.
+        let write_all = !self.flags.headless;
         let s = &mut self.ai.assistant.settings;
-        if s.month_key != key {
-            s.month_key = key;
-            s.month_spent_usd = 0.0;
+        if let Err(e) = s.record_spend(&path, &month_key(), usd, write_all) {
+            tracing::warn!(error = %e, "could not record AI spend");
         }
-        s.month_spent_usd += usd;
         self.ai.assistant.ledger.lock().unwrap().month_usd = s.month_spent_usd;
-        let _ = s.save(&self.dirs.data.join("ai-settings.json"));
     }
 
     pub fn refresh_ai_status(&mut self) {

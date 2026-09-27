@@ -62,9 +62,47 @@ pub fn recovery_dir(data: &Path, headless: bool) -> PathBuf {
     data.join(if headless { "recovery-headless" } else { "recovery" })
 }
 
+/// Headless autosaves are never offered for restore (nobody sees a prompt),
+/// so they are only a safety net kept this long, then pruned.
+pub const HEADLESS_AUTOSAVE_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Deletes files in `dir` last modified more than `max_age` before `now`;
+/// returns how many. Subdirectories and unreadable entries are left alone.
+pub fn prune_old_files(dir: &Path, max_age: std::time::Duration, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| {
+            let Ok(m) = e.metadata() else { return false };
+            let old = m.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > max_age);
+            m.is_file() && old && std::fs::remove_file(e.path()).is_ok()
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_headless_autosaves_are_pruned_and_recent_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let file = |name: &str, age_days: u64| {
+            let p = dir.path().join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(age_days * 86_400)).unwrap();
+            p
+        };
+        let old = file("a.kadr.autosave", 8);
+        let fresh = file("b.kadr.autosave", 1);
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert_eq!(prune_old_files(dir.path(), HEADLESS_AUTOSAVE_KEEP, now), 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(dir.path().join("sub").exists(), "only files are pruned");
+        assert_eq!(prune_old_files(&dir.path().join("missing"), HEADLESS_AUTOSAVE_KEEP, now), 0);
+    }
 
     #[test]
     fn headless_recovery_dir_is_separate() {

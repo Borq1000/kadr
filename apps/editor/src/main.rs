@@ -51,7 +51,7 @@ fn main() {
         // SAFETY: as above, before any thread or Slint init.
         None => unsafe { std::env::remove_var("SLINT_MCP_PORT") },
     }
-    let _log = logging::init(&dirs.logs());
+    logging::init(&dirs.logs());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kadr starting");
     if let Some(&port) = mcp_env::UI_PORT.get() {
         tracing::info!(ui_port = port, "Slint MCP enabled");
@@ -65,6 +65,7 @@ fn main() {
         tracing::error!(error = %e, "fatal");
         eprintln!("Kadr failed to start: {e}");
     }
+    logging::flush();
 }
 
 mod logging;

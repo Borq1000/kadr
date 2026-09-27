@@ -143,4 +143,63 @@ impl AiSettings {
         std::fs::write(&tmp, serde_json::to_vec_pretty(self).expect("settings"))?;
         std::fs::rename(tmp, path)
     }
+
+    /// Adds `usd` to month `key`'s spend. The file is re-read first, so
+    /// spend recorded meanwhile by another Kadr (a second window, a headless
+    /// MCP instance) is kept. `write_all` saves all of `self`; otherwise only
+    /// the spend fields change on disk (an instance that must not overwrite
+    /// the user's settings).
+    pub fn record_spend(&mut self, path: &std::path::Path, key: &str, usd: f64, write_all: bool) -> std::io::Result<()> {
+        let disk: Option<AiSettings> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let spent = |s: &AiSettings| if s.month_key == key { s.month_spent_usd } else { 0.0 };
+        let base = disk.as_ref().map_or(0.0, spent).max(spent(self));
+        self.month_key = key.to_string();
+        self.month_spent_usd = base + usd;
+        if write_all {
+            return self.save(path);
+        }
+        let mut out = disk.unwrap_or_else(|| self.clone());
+        out.month_key = self.month_key.clone();
+        out.month_spent_usd = self.month_spent_usd;
+        out.save(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spend_is_added_to_what_another_kadr_already_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-settings.json");
+        let mut window = AiSettings { month_key: "2026-09".into(), month_spent_usd: 5.0, ..AiSettings::default() };
+        window.save(&path).unwrap();
+        // A headless instance loaded the same file, the user then changed a
+        // setting in their window.
+        let mut headless = AiSettings::load(&path);
+        window.jev_personalize = false;
+        window.save(&path).unwrap();
+        headless.record_spend(&path, "2026-09", 2.0, false).unwrap();
+        let disk = AiSettings::load(&path);
+        assert_eq!(disk.month_spent_usd, 7.0);
+        assert!(!disk.jev_personalize, "a spend-only write keeps the user's newer settings");
+        window.record_spend(&path, "2026-09", 1.0, true).unwrap();
+        assert_eq!(window.month_spent_usd, 8.0, "the headless spend is not lost");
+        assert_eq!(AiSettings::load(&path).month_spent_usd, 8.0);
+    }
+
+    #[test]
+    fn a_new_month_starts_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-settings.json");
+        let mut s = AiSettings { month_key: "2026-08".into(), month_spent_usd: 9.0, ..AiSettings::default() };
+        s.save(&path).unwrap();
+        s.record_spend(&path, "2026-09", 0.5, true).unwrap();
+        assert_eq!((s.month_key.as_str(), s.month_spent_usd), ("2026-09", 0.5));
+        let fresh = dir.path().join("missing.json");
+        let mut s = AiSettings::default();
+        s.record_spend(&fresh, "2026-09", 0.25, false).unwrap();
+        assert_eq!(AiSettings::load(&fresh).month_spent_usd, 0.25);
+    }
 }
