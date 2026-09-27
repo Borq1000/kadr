@@ -20,8 +20,15 @@ pub struct PlanUi {
     pub state: i32,
 }
 
+pub enum OfferKind {
+    Chat(CloudOffer),
+    Jev(Box<crate::jev_ui::JevRequest>),
+    /// Consumed after its result was turned into a plan: what it cost.
+    Done { model: String, input: u64, cost: f64 },
+}
+
 pub struct OfferUi {
-    pub offer: CloudOffer,
+    pub kind: OfferKind,
     pub state: i32,
     pub cancel: CancelToken,
 }
@@ -38,7 +45,7 @@ impl AiUi {
         AiUi { assistant, chat: vec![], plans: vec![], offers: vec![] }
     }
 
-    fn say(&mut self, kind: i32, text: impl Into<String>) {
+    pub fn say(&mut self, kind: i32, text: impl Into<String>) {
         self.chat.push((kind, text.into(), -1));
     }
 
@@ -47,8 +54,18 @@ impl AiUi {
     pub fn refresh_offer_gates(&mut self) {
         let st = &self.assistant.settings;
         for o in self.offers.iter_mut().filter(|o| o.state == 0) {
-            if let Some(p) = st.provider(&o.offer.provider_id) {
-                o.offer.gate = kadr_ai::privacy::gate(st.mode, p.is_local(), &p.permissions, &[kadr_ai::privacy::DataKind::Text]);
+            match &mut o.kind {
+                OfferKind::Chat(offer) => {
+                    if let Some(p) = st.provider(&offer.provider_id) {
+                        offer.gate = kadr_ai::privacy::gate(st.mode, p.is_local(), &p.permissions, &[kadr_ai::privacy::DataKind::Text]);
+                    }
+                }
+                OfferKind::Jev(req) if req.estimate.calls > 0 && !matches!(&req.gate, GateDecision::Deny(r) if r == "jev.no_key") => {
+                    if let Some(p) = st.provider("jev") {
+                        req.gate = kadr_ai::privacy::gate(st.mode, p.is_local(), &p.permissions, &[kadr_ai::privacy::DataKind::Text]);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -114,9 +131,11 @@ impl App {
                 self.ai.say(1, t("ai.msg.redone"));
             }
             Reply::NeedsAnalysis { message, .. } => self.ai.say(1, message),
+            Reply::GradeShots => self.grade_shots(),
+            Reply::CutCameras => self.cut_cameras(),
             Reply::Message(m) => self.ai.say(1, m),
             Reply::CloudOffer(offer) => {
-                self.ai.offers.push(OfferUi { offer, state: 0, cancel: CancelToken::new() });
+                self.ai.offers.push(OfferUi { kind: OfferKind::Chat(offer), state: 0, cancel: CancelToken::new() });
                 let i = self.ai.offers.len() as i32 - 1;
                 self.ai.chat.push((3, String::new(), i));
             }
@@ -156,6 +175,7 @@ impl App {
                         ai_choice: p.proposal.clone(),
                         ai_confidence: p.confidence,
                         human_choice: "undo".into(),
+                        decision: None,
                     });
                     self.meta_dirty = true;
                     self.after_edit();
@@ -194,6 +214,7 @@ impl App {
                     ai_choice: "delete".into(),
                     ai_confidence: plan.confidence,
                     human_choice: "keep".into(),
+                    decision: None,
                 });
             }
             let after = self.project.sequence().duration();
@@ -247,8 +268,10 @@ impl App {
             return;
         }
         match action {
+            "run" if matches!(self.ai.offers[i].kind, OfferKind::Jev(_)) => self.jev_run(i),
             "run" => {
-                let offer = self.ai.offers[i].offer.clone();
+                let OfferKind::Chat(offer) = &self.ai.offers[i].kind else { return };
+                let offer = offer.clone();
                 let cancel = CancelToken::new();
                 self.ai.offers[i].cancel = cancel.clone();
                 self.ai.offers[i].state = 1;
@@ -261,7 +284,8 @@ impl App {
                 self.ai.offers[i].state = 3;
             }
             "cheaper" => {
-                let o = self.ai.offers[i].offer.clone();
+                let OfferKind::Chat(o) = &self.ai.offers[i].kind else { return };
+                let o = o.clone();
                 self.ai.offers[i].state = 3;
                 if let Some(t) = o.tier.cheaper().filter(|t| t.is_cloud()) {
                     let st = self.editor_state();
@@ -372,19 +396,12 @@ impl App {
             .offers
             .iter()
             .map(|o| {
-                let of = &o.offer;
-                let warnings: Vec<SharedString> = match &of.budget {
-                    BudgetDecision::ExceedsLimit(v) => v
-                        .iter()
-                        .map(|h| {
-                            SharedString::from(tf(
-                                "ai.offer.over_budget",
-                                &[("limit", &t(h.kind)), ("spent", &money(h.spent)), ("est", &money(h.estimate)), ("max", &money(h.limit))],
-                            ))
-                        })
-                        .collect(),
-                    BudgetDecision::Allowed => vec![],
+                let of = match &o.kind {
+                    OfferKind::Chat(of) => of,
+                    OfferKind::Jev(req) => return jev_offer_view(req, o.state),
+                    OfferKind::Done { model, input, cost } => return jev_done_view(model, *input, *cost, o.state),
                 };
+                let warnings = budget_warnings(&of.budget);
                 let blocked = match &of.gate {
                     GateDecision::Deny(r) => t(r),
                     _ => String::new(),
@@ -414,6 +431,57 @@ impl App {
     }
 }
 
+fn budget_warnings(b: &BudgetDecision) -> Vec<SharedString> {
+    match b {
+        BudgetDecision::ExceedsLimit(v) => v
+            .iter()
+            .map(|h| {
+                SharedString::from(tf(
+                    "ai.offer.over_budget",
+                    &[("limit", &t(h.kind)), ("spent", &money(h.spent)), ("est", &money(h.estimate)), ("max", &money(h.limit))],
+                ))
+            })
+            .collect(),
+        BudgetDecision::Allowed => vec![],
+    }
+}
+
+/// Jev card: same layout and consent rules as a cloud chat request.
+fn jev_offer_view(req: &crate::jev_ui::JevRequest, state: i32) -> OfferView {
+    let mut warnings = budget_warnings(&req.budget);
+    if req.estimate.cached > 0 {
+        warnings.push(tf("jev.card.cached", &[("n", &req.estimate.cached.to_string()), ("total", &req.estimate.total.to_string())]).into());
+    }
+    OfferView {
+        title: req.title.clone().into(),
+        tier: "JEV".into(),
+        provider: "Jev (TypeSafe)".into(),
+        model: req.model.clone().into(),
+        input: fmt_tokens(req.estimate.input_tokens).into(),
+        cost: if req.estimate.calls == 0 { t("jev.card.free").into() } else { money(req.estimate.usd).into() },
+        warnings: ModelRc::new(VecModel::from(warnings)),
+        blocked: match &req.gate {
+            GateDecision::Deny(r) => t(r).into(),
+            _ => "".into(),
+        },
+        can_cheaper: false,
+        state,
+    }
+}
+
+fn jev_done_view(model: &str, input: u64, cost: f64, state: i32) -> OfferView {
+    OfferView {
+        title: t("jev.card.done").into(),
+        tier: "JEV".into(),
+        provider: "Jev (TypeSafe)".into(),
+        model: model.into(),
+        input: fmt_tokens(input).into(),
+        cost: if input == 0 { t("jev.card.free").into() } else { money(cost).into() },
+        state,
+        ..Default::default()
+    }
+}
+
 /// User-facing text for provider / network errors.
 pub fn ai_error_text(e: &kadr_ai::providers::AiError) -> String {
     use kadr_ai::providers::AiError::*;
@@ -426,6 +494,8 @@ pub fn ai_error_text(e: &kadr_ai::providers::AiError) -> String {
         Http { status, .. } => tf("err.ai.http", &[("status", &status.to_string())]),
         BadResponse(d) => tf("err.ai.bad_response", &[("detail", d)]),
         Cancelled => t("err.ai.cancelled"),
+        TooLarge => t("err.ai.too_large"),
+        UnknownModel(m) => tf("err.ai.unknown_model", &[("model", m)]),
         Blocked(r) => {
             let k = if r.starts_with("privacy.") { t(r) } else { r.clone() };
             tf("err.ai.blocked", &[("reason", &k)])

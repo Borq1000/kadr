@@ -7,7 +7,7 @@ pub mod jev;
 mod openai;
 
 pub use anthropic::AnthropicProvider;
-pub use jev::{JevProvider, JevQuestion, JevResponse};
+pub use jev::{JevProvider, JevQuestion, JevResponse, JevTransport};
 pub use openai::OpenAiCompatibleProvider;
 
 use crate::credentials::Secret;
@@ -72,6 +72,10 @@ pub enum AiError {
     Cancelled,
     #[error("blocked: {0}")]
     Blocked(String),
+    #[error("request too large for one call; split the batch")]
+    TooLarge,
+    #[error("unknown model: {0}")]
+    UnknownModel(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

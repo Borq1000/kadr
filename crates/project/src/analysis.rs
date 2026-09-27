@@ -58,4 +58,21 @@ pub enum AnalysisData {
     SceneCuts {
         cuts: Vec<Time>,
     },
+    /// Shots with bucketed picture quality (what Jev is told).
+    Shots {
+        shots: Vec<ShotSummary>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShotSummary {
+    /// Source-time range within the asset.
+    pub range: TimeRange,
+    /// "sharp" | "soft" | "very blurry"
+    pub sharpness: String,
+    /// "black" | "dark" | "normal" | "blown out"
+    pub exposure: String,
+    /// "none" | "slight" | "heavy"
+    pub shake: String,
+    pub black: bool,
 }

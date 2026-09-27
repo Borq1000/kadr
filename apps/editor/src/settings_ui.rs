@@ -57,6 +57,7 @@ impl App {
             smart: route(Tier::Smart).into(),
             director: route(Tier::Director).into(),
             jev_model: s.jev_model.clone().into(),
+            jev_personalize: s.jev_personalize,
             per_request: lim(s.limits.per_request_usd).into(),
             per_session: lim(s.limits.per_session_usd).into(),
             per_project: lim(s.limits.per_project_usd).into(),
@@ -171,6 +172,13 @@ impl App {
         self.refresh_ai();
     }
 
+    /// Whether camera picks send the editor's past corrections to Jev.
+    pub fn settings_personalize(&mut self, on: bool) {
+        self.ai.assistant.settings.jev_personalize = on;
+        self.save_ai_settings();
+        self.refresh_settings();
+    }
+
     pub fn settings_route(&mut self, tier: &str, model: &str) {
         let model = model.split("  (").next().unwrap_or(model).trim().to_string();
         if model.is_empty() {
@@ -224,7 +232,7 @@ impl App {
                     Some(k) => {
                         let jev = JevProvider::new(cfg, k);
                         let q = BTreeMap::from([("ok".to_string(), JevQuestion::Noul { instructions: "Is the sky usually blue on a clear day?".into() })]);
-                        jev.decide(&jev_model, "Connectivity test.", &q)
+                        jev.decide(&jev_model, &serde_json::json!("Connectivity test."), &q)
                             .await
                             .map(|r| tf("toast.test_ok_jev", &[("model", &r.model), ("p", &format!("{:.2}", r.answers["ok"].noul.unwrap_or(0.0)))]))
                             .map_err(|e| crate::ai_ui::ai_error_text(&e))

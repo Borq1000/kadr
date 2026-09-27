@@ -2,6 +2,14 @@ import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
 import { Icon, IconButton, PanelHeader, Badge, Segmented } from "widgets.slint";
 
+export struct AngleView {
+    label: string,
+    description: string,
+    thumb: image,
+    has-thumb: bool,
+    available: bool,
+}
+
 export component Preview inherits Rectangle {
     in property <image> frame;
     in property <bool> has-frame;
@@ -18,13 +26,19 @@ export component Preview inherits Rectangle {
     in property <bool> bypass;
     in property <bool> loading;
     in property <float> scrub-fraction;
+    /// Multicam angles of the clip under the playhead (empty = no strip).
+    in property <[AngleView]> angles;
+    in property <int> active-angle;
+    callback angle-clicked(int);
     callback transport(string);
     callback set-quality(int);
     callback set-zoom(int);
     callback scrub(float);
     background: Theme.bg1;
     // Narrow preview: secondary controls hide (still in View menu / keys).
-    property <bool> compact: self.width < 640px;
+    // Set from Rust (window width minus side panels): deriving it from our
+    // own width is a binding loop, since it hides buttons that set our width.
+    in property <bool> compact;
 
     VerticalLayout {
         PanelHeader {
@@ -96,6 +110,51 @@ export component Preview inherits Rectangle {
             if root.loading: Rectangle {
                 x: parent.width - 18px; y: 12px; width: 8px; height: 8px; border-radius: 4px;
                 background: Theme.warning;
+            }
+        }
+        // Multicam angle viewer: click or press 1-9 to cut to an angle.
+        if root.angles.length > 0: Rectangle {
+            height: 96px;
+            background: Theme.bg0;
+            clip: true;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 6px;
+                alignment: center;
+                // Sized by the layout only: a width derived from the Preview's own
+                // width would form a binding loop (Slint panics on it).
+                for a[i] in root.angles: Rectangle {
+                    min-width: 48px;
+                    preferred-width: 160px;
+                    max-width: 160px;
+                    horizontal-stretch: 1;
+                    border-radius: 5px;
+                    background: #000000;
+                    clip: true;
+                    border-width: i == root.active-angle ? 2px : 1px;
+                    border-color: i == root.active-angle ? Theme.accent : ata.has-hover ? Theme.border-strong : Theme.border;
+                    if a.has-thumb: Image { source: a.thumb; width: parent.width; height: parent.height; image-fit: contain; opacity: a.available ? 1 : 0.3; }
+                    if !a.available: Text { text: Tr.t("mc.no_media"); font-size: Theme.font-xs; color: #ffffff80; }
+                    Rectangle {
+                        x: 4px; y: 4px;
+                        width: kt.preferred-width + 10px; height: 16px;
+                        border-radius: 3px;
+                        background: i == root.active-angle ? Theme.accent : #000000b0;
+                        kt := Text {
+                            text: (i < 9 ? (i + 1) + "  " : "") + a.label;
+                            font-size: Theme.font-xs;
+                            font-weight: 600;
+                            color: i == root.active-angle ? Theme.text-on-accent : #ffffffd8;
+                        }
+                    }
+                    if a.description != "": Rectangle {
+                        y: parent.height - 18px;
+                        height: 18px;
+                        background: #00000099;
+                        Text { x: 5px; width: parent.width - 10px; text: a.description; font-size: Theme.font-xs; color: #ffffffb8; overflow: elide; }
+                    }
+                    ata := TouchArea { mouse-cursor: pointer; enabled: a.available; clicked => { root.angle-clicked(i); } }
+                }
             }
         }
         // Scrub bar

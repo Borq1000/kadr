@@ -97,6 +97,7 @@ pub struct App {
     pub export: ExportUi,
     pub inspector_snapshot: Option<(ClipId, Clip)>,
     pub library_drag: Option<LibDrag>,
+    pub mc: crate::multicam_ui::McState,
     pub waves: WaveCache,
     pub confirm: Option<Confirm>,
     pub prompt: Option<Prompt>,
@@ -190,6 +191,7 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
         export: ExportUi::default(),
         inspector_snapshot: None,
         library_drag: None,
+        mc: Default::default(),
         waves: WaveCache::default(),
         confirm: None,
         prompt: None,
@@ -320,6 +322,15 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_asset_released, |id, x, y| |app: &mut App| app.asset_released(&id, x, y));
     cb!(ui.on_asset_activated, |id| |app: &mut App| app.asset_activated(&id));
     cb!(ui.on_asset_action, |id, a| |app: &mut App| app.asset_action(&id, &a));
+    cb!(ui.on_inspector_shot, |i| |app: &mut App| app.inspector_shot_clicked(i));
+    cb!(ui.on_angle_clicked, |i| |app: &mut App| {
+        app.cut_to_angle(i as u32);
+    });
+    cb!(ui.on_mc_toggle, |i| |app: &mut App| app.mc_toggle(i));
+    cb!(ui.on_mc_set_label, |i, s| |app: &mut App| app.mc_set_label(i, &s));
+    cb!(ui.on_mc_set_description, |i, s| |app: &mut App| app.mc_set_description(i, &s));
+    cb!(ui.on_mc_confirm, |n| |app: &mut App| app.mc_confirm(&n));
+    cb!(ui.on_mc_dismiss, | | |app: &mut App| app.mc_dismiss());
 
     cb!(ui.on_transport, |a| |app: &mut App| app.transport(&a));
     cb!(ui.on_set_quality, |q| |app: &mut App| app.set_quality(q));
@@ -368,6 +379,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_settings_delete_key, |id| |app: &mut App| app.settings_delete_key(&id));
     cb!(ui.on_settings_toggle_allowed, |id| |app: &mut App| app.settings_toggle_allowed(&id));
     cb!(ui.on_settings_route, |t, m| |app: &mut App| app.settings_route(&t, &m));
+    cb!(ui.on_settings_personalize, |on| |app: &mut App| app.settings_personalize(on));
     cb!(ui.on_settings_limit, |k, v| |app: &mut App| app.settings_limit(&k, &v));
     cb!(ui.on_settings_test, |id| |app: &mut App| app.settings_test(&id));
 
@@ -523,6 +535,7 @@ impl App {
         self.expire_toasts();
         self.refresh_jobs();
         self.export_poll();
+        self.tick_angles();
     }
 
     /// Applies a new UI language everywhere, instantly.
@@ -580,6 +593,13 @@ impl App {
         let scale = ui.window().scale_factor();
         let w = ui.window().size().width as f32 / scale;
         let h = ui.window().size().height as f32 / scale;
+        // Narrow preview hides secondary transport buttons (they stay in the
+        // View menu). Splitter drags are picked up on the next tick.
+        let ai_w = if ui.get_ai_open() { ui.get_ai_width() } else { 36.0 };
+        let compact = w - ui.get_library_width() - ui.get_inspector_width() - ai_w - 20.0 < 640.0;
+        if ui.get_preview_compact() != compact {
+            ui.set_preview_compact(compact);
+        }
         if (w - self.last_window_width).abs() < 1.0 && (h - self.last_window_height).abs() < 1.0 {
             return;
         }

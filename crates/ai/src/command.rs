@@ -95,7 +95,7 @@ pub enum AiCommand {
         #[serde(default)]
         reason: String,
     },
-    /// Reserved: multicam (V0.3). Accepted by the schema, rejected by validation.
+    /// Show `angle` (its label, e.g. "CAM2") over a range of a multicam clip.
     SelectCamera {
         start_ms: i64,
         end_ms: i64,
@@ -322,7 +322,46 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                     duration: ms(*duration_ms),
                 })
             }
-            AiCommand::SelectCamera { .. } => return Err(ValidationError::Unsupported { index: i, what: "multicam camera selection" }),
+            AiCommand::SelectCamera { start_ms, end_ms, angle, .. } => {
+                // Milliseconds can't name flick-exact positions: a bound within
+                // half a frame of a clip edge means that edge (edges need not
+                // sit on frames), anything else lands on a frame. Otherwise a
+                // bound misses the clip it names or cuts off a sliver.
+                let rate = seq.frame_rate;
+                let half = rate.frame_duration().div_ratio(1, 2);
+                let snap = |t: Time| {
+                    seq.tracks
+                        .iter()
+                        .flat_map(|t| &t.clips)
+                        .flat_map(|c| [c.timeline_in, c.timeline_out])
+                        .filter(|edge| (*edge - t).abs() < half)
+                        .min_by_key(|edge| (*edge - t).abs())
+                        .unwrap_or_else(|| rate.snap(t))
+                };
+                let (s, e) = (snap(in_seq(i, *start_ms)?), snap(in_seq(i, *end_ms)?));
+                if e <= s {
+                    return Err(ValidationError::Range { index: i, msg: "end must be after start".into() });
+                }
+                // The multicam clip on the topmost video track at the start.
+                let sel = seq
+                    .tracks
+                    .iter()
+                    .rev()
+                    .filter(|t| t.kind == TrackKind::Video)
+                    .find_map(|t| t.clip_at(s).and_then(|c| c.multicam.clone()))
+                    .ok_or(ValidationError::Range { index: i, msg: "no multicam clip at start_ms".into() })?;
+                let group = project
+                    .multicam_groups
+                    .iter()
+                    .find(|g| g.id == sel.group)
+                    .ok_or(ValidationError::Range { index: i, msg: "multicam group missing".into() })?;
+                let idx = group
+                    .angles
+                    .iter()
+                    .position(|a| a.label.eq_ignore_ascii_case(angle.trim()))
+                    .ok_or(ValidationError::Range { index: i, msg: format!("unknown angle {angle:?}") })?;
+                EditCommand::SetAngleRange { range: TimeRange::new(s, e), angle: idx as u32 }
+            }
             AiCommand::AddCaption { .. } => return Err(ValidationError::Unsupported { index: i, what: "captions" }),
         };
         out.push(cmd);
@@ -354,4 +393,76 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"add_transition","at_ms":int,"kind":"cross_dissolve"|"dip_to_black"|"wipe","duration_ms":int,"reason":string}
 When deleting several ranges with ripple, list them from the LATEST to the EARLIEST.
 If the request cannot be done with these commands, return an empty commands list and explain in summary."#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kadr_core::{MediaInfo, MediaKind, MulticamId, Time, TimeRange};
+    use kadr_project::{Clip, MediaAsset, MulticamAngle, MulticamGroup, MulticamSelection, SyncMethod};
+
+    fn multicam_project() -> Project {
+        let mut p = Project::new("mc");
+        let info = MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(60), container: "mp4".into(), size_bytes: 0, video: None, audio: None, timecode: None };
+        let (a, b) = (MediaAsset::new("a.mp4", info.clone()), MediaAsset::new("b.mp4", info));
+        let angle = |asset, label: &str| MulticamAngle { asset, label: label.into(), description: String::new(), sync_offset: Time::ZERO, sync_method: SyncMethod::Manual };
+        let group = MulticamGroup { id: MulticamId::new(), name: "g".into(), angles: vec![angle(a.id, "CAM1"), angle(b.id, "CAM2")], master_audio: None };
+        let mut c = Clip::new(a.id, "CAM1", TimeRange::new(Time::ZERO, Time::from_secs(20)), Time::ZERO);
+        c.multicam = Some(MulticamSelection { group: group.id, angle: 0 });
+        p.sequence_mut().tracks[0].clips.push(c);
+        p.assets.extend([a, b]);
+        p.multicam_groups.push(group);
+        p
+    }
+
+    /// The multicam clip placed at `start` for `dur` on a 29.97 fps sequence.
+    fn ntsc_multicam_project(start: Time, dur: Time) -> Project {
+        let mut p = multicam_project();
+        let seq = p.sequence_mut();
+        seq.frame_rate = kadr_core::FrameRate::FPS_29_97;
+        let c = &mut seq.tracks[0].clips[0];
+        (c.source_out, c.timeline_in, c.timeline_out) = (dur, start, start + dur);
+        p
+    }
+
+    fn select(start_ms: i64, end_ms: i64, angle: &str) -> AiCommand {
+        AiCommand::SelectCamera { start_ms, end_ms, angle: angle.into(), reason: String::new() }
+    }
+
+    #[test]
+    fn select_camera_maps_to_an_angle_range() {
+        let p = multicam_project();
+        let cmds = validate(&[select(2_000, 6_000, "CAM2")], &p, &Permissions::default()).unwrap();
+        assert_eq!(cmds, vec![EditCommand::SetAngleRange { range: TimeRange::new(Time::from_secs(2), Time::from_secs(6)), angle: 1 }]);
+    }
+
+    #[test]
+    fn select_camera_snaps_millisecond_bounds_to_the_clip_frames() {
+        // At 29.97 fps frame boundaries are not whole milliseconds: a clip
+        // starting on frame 91 (3.0364 s) is addressed as 3033 ms, which
+        // lies before the clip; its end (frame 481) as 16049 ms, just short.
+        let rate = kadr_core::FrameRate::FPS_29_97;
+        let (start, end) = (rate.frame_to_time(91), rate.frame_to_time(481));
+        let p = ntsc_multicam_project(start, end - start);
+        let cmds = validate(&[select(start.as_millis(), end.as_millis(), "CAM2")], &p, &Permissions::default()).unwrap();
+        assert_eq!(cmds, vec![EditCommand::SetAngleRange { range: TimeRange::new(start, end), angle: 1 }]);
+    }
+
+    #[test]
+    fn select_camera_ending_at_an_off_frame_clip_end_leaves_no_sliver() {
+        // A multicam clip spans the angles' overlap, which need not be a
+        // whole number of frames: this one ends 13.016 s after frame 91.
+        let p = ntsc_multicam_project(kadr_core::FrameRate::FPS_29_97.frame_to_time(91), Time::from_millis(13_016));
+        let clip_end = p.sequence().tracks[0].clips[0].timeline_range().end;
+        let cmds = validate(&[select(4_000, clip_end.as_millis(), "CAM2")], &p, &Permissions::default()).unwrap();
+        let EditCommand::SetAngleRange { range, .. } = &cmds[0] else { panic!() };
+        assert_eq!(range.end, clip_end, "the end names the clip edge, not a frame 3 ms before it");
+    }
+
+    #[test]
+    fn select_camera_rejects_unknown_angles_and_plain_clips() {
+        let p = multicam_project();
+        assert!(validate(&[select(2_000, 6_000, "CAM9")], &p, &Permissions::default()).is_err());
+        assert!(validate(&[select(30_000, 32_000, "CAM2")], &p, &Permissions::default()).is_err(), "no multicam clip there");
+    }
 }

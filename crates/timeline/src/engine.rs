@@ -99,8 +99,8 @@ impl EditEngine {
         let seq_id = project.active_sequence;
         let before = project.sequence().clone();
         let result = {
-            let (assets, seq) = split_borrow(project);
-            cmd.apply(seq, &EditContext { assets })
+            let (assets, multicam, seq) = split_borrow(project);
+            cmd.apply(seq, &EditContext { assets, multicam })
         };
         if let Err(e) = result {
             *project.sequence_mut() = before;
@@ -154,10 +154,10 @@ impl EditEngine {
     }
 }
 
-fn split_borrow(p: &mut Project) -> (&[kadr_project::MediaAsset], &mut kadr_project::Sequence) {
+fn split_borrow(p: &mut Project) -> (&[kadr_project::MediaAsset], &[kadr_project::MulticamGroup], &mut kadr_project::Sequence) {
     let id = p.active_sequence;
     let idx = p.sequences.iter().position(|s| s.id == id).unwrap_or(0);
-    (&p.assets, &mut p.sequences[idx])
+    (&p.assets, &p.multicam_groups, &mut p.sequences[idx])
 }
 
 fn diff(before: &kadr_project::Sequence, after: &kadr_project::Sequence) -> (SeqState, SeqState) {

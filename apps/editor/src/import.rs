@@ -103,6 +103,9 @@ impl App {
             }
         };
 
+        if asset.kind() == MediaKind::Video {
+            self.submit_video_analysis(id, media.clone(), cache.clone(), asset.path.clone(), asset.duration(), &asset.name);
+        }
         if asset.kind() != MediaKind::Audio {
             let (m, c, path, dur) = (media.clone(), cache.clone(), asset.path.clone(), asset.duration());
             self.jobs.submit(JobSpec::new(tf("jobs.title.thumb", &[("name", &asset.name)]), "thumbnails").priority(Priority::High).retries(1), move |ctx| {

@@ -24,11 +24,18 @@ pub struct AiSettings {
     /// Jev model for typed decisions (Economy tier).
     #[serde(default = "default_jev_model")]
     pub jev_model: String,
+    /// Send the editor's past corrections as precedents to Jev.
+    #[serde(default = "yes")]
+    pub jev_personalize: bool,
     /// Monthly spend tracking ("YYYY-MM" → USD).
     #[serde(default)]
     pub month_key: String,
     #[serde(default)]
     pub month_spent_usd: f64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_jev_model() -> String {
@@ -107,6 +114,7 @@ impl Default for AiSettings {
             },
             default_tier: Tier::Smart,
             jev_model: default_jev_model(),
+            jev_personalize: true,
             month_key: String::new(),
             month_spent_usd: 0.0,
         }

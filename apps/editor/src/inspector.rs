@@ -43,15 +43,32 @@ fn property_for(prop: &str, c: &Clip) -> ClipProperty {
 }
 
 impl App {
-    fn inspected(&self) -> Option<kadr_core::ClipId> {
-        (self.tl.selection.len() == 1).then(|| self.tl.selection[0])
+    /// The clip the Inspector edits: a single selected clip, or the video
+    /// clip of one selected linked video+audio pair (a click selects both).
+    pub fn inspected(&self) -> Option<kadr_core::ClipId> {
+        let sel = &self.tl.selection;
+        if sel.len() == 1 {
+            return Some(sel[0]);
+        }
+        let seq = self.project.sequence();
+        let clips: Vec<_> = sel.iter().filter_map(|id| seq.clip(*id)).collect();
+        let link = clips.first()?.link?;
+        if clips.len() != sel.len() || clips.iter().any(|c| c.link != Some(link)) {
+            return None;
+        }
+        let videos: Vec<_> = sel
+            .iter()
+            .filter(|id| seq.locate_clip(**id).is_some_and(|(ti, _)| seq.tracks[ti].kind == TrackKind::Video))
+            .collect();
+        (videos.len() == 1).then(|| *videos[0])
     }
 
     pub fn refresh_inspector(&mut self) {
         let ui = self.ui();
         let seq = self.project.sequence();
         let fr = seq.frame_rate;
-        let mut d = InspectorData { multi_count: self.tl.selection.len() as i32, ..Default::default() };
+        let multi = if self.inspected().is_some() { 0 } else { self.tl.selection.len() as i32 };
+        let mut d = InspectorData { multi_count: multi, ..Default::default() };
         // Sequence summary (always filled; shown when no single clip is selected).
         let clips: usize = seq.tracks.iter().map(|t| t.clips.len()).sum();
         let vt = seq.tracks_of(TrackKind::Video).count();
@@ -114,6 +131,11 @@ impl App {
             d.enabled = c.enabled;
             let fx: Vec<SharedString> = c.effects.iter().map(|e| SharedString::from(e.kind.as_str())).collect();
             d.effects = ModelRc::new(VecModel::from(fx));
+            if !is_audio {
+                let (rows, graded) = self.inspector_shots(c);
+                d.shots = ModelRc::new(VecModel::from(rows));
+                d.shots_graded = graded;
+            }
         }
         ui.set_inspector(d);
     }

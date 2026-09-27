@@ -129,7 +129,7 @@ component OfferCard inherits Rectangle {
         if root.o.state == 0 && root.o.blocked == "": HorizontalLayout {
             spacing: 6px;
             Button { text: root.o.warnings.length > 0 ? Tr.t("ai.offer.run_anyway") : Tr.t("ai.offer.run"); primary: root.o.warnings.length == 0; danger: root.o.warnings.length > 0; compact: true; clicked => { root.action("run"); } }
-            Button { text: Tr.t("ai.offer.cheaper"); compact: true; enabled: root.o.can-cheaper; clicked => { root.action("cheaper"); } }
+            if root.o.can-cheaper: Button { text: Tr.t("ai.offer.cheaper"); compact: true; clicked => { root.action("cheaper"); } }
             Button { text: Tr.t("ai.offer.local"); compact: true; ghost: true; clicked => { root.action("local"); } }
         }
         if root.o.state == 0 && root.o.blocked != "": HorizontalLayout {
@@ -201,7 +201,7 @@ export component AiPanel inherits Rectangle {
                     Text { text: Tr.t("ai.empty.title"); font-size: Theme.font-lg; font-weight: 600; color: Theme.text; }
                     Text { text: Tr.t("ai.empty.body"); font-size: Theme.font-sm; color: Theme.text-dim; wrap: word-wrap; }
                     Text { text: Tr.t("ai.empty.try"); font-size: Theme.font-xs; font-weight: 700; letter-spacing: 0.6px; color: Theme.text-faint; }
-                    for s in [Tr.t("ai.suggest.1"), Tr.t("ai.suggest.2"), Tr.t("ai.suggest.3"), Tr.t("ai.suggest.4")]: Rectangle {
+                    for s in [Tr.t("ai.suggest.1"), Tr.t("ai.suggest.2"), Tr.t("ai.suggest.5"), Tr.t("ai.suggest.6"), Tr.t("ai.suggest.3")]: Rectangle {
                         height: 32px;
                         border-radius: 16px;
                         background: sa.has-hover ? Theme.bg3 : Theme.bg2;

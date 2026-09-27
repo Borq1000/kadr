@@ -151,7 +151,10 @@ fn llm_commands_are_strictly_validated() {
     let c = command::parse_commands(r#"{"commands":[{"type":"delete_range","start_ms":0,"end_ms":1000}]}"#).unwrap();
     let ro = Permissions { allow_destructive: false, ..Default::default() };
     assert!(matches!(command::validate(&c, &p, &ro), Err(ValidationError::Permission { .. })));
-    // Reserved commands are rejected until implemented.
+    // Camera selection needs a multicam clip at that time.
     let c = command::parse_commands(r#"[{"type":"select_camera","start_ms":0,"end_ms":10,"angle":"CAM_B"}]"#).unwrap();
+    assert!(matches!(command::validate(&c, &p, &perms), Err(ValidationError::Range { .. })));
+    // Reserved commands are rejected until implemented.
+    let c = command::parse_commands(r#"[{"type":"add_caption","start_ms":0,"end_ms":10,"text":"hi"}]"#).unwrap();
     assert!(matches!(command::validate(&c, &p, &perms), Err(ValidationError::Unsupported { .. })));
 }

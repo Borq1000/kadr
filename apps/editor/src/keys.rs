@@ -34,6 +34,7 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
         r(",", "keys.insert"),
         r(".", "keys.overwrite"),
         r("M", "keys.marker"),
+        r("1 … 9", "keys.angle"),
         r("I / O / X", "keys.in_out"),
         r("Ctrl+Z", "keys.undo"),
         r("Ctrl+Shift+Z · Ctrl+Y", "keys.redo"),
@@ -112,6 +113,10 @@ impl App {
                 self.prompt_dismiss();
                 return true;
             }
+            if ui.get_mc_open() {
+                self.mc_dismiss();
+                return true;
+            }
             if ui.get_settings_open() {
                 ui.set_settings_open(false);
                 return true;
@@ -135,6 +140,9 @@ impl App {
             self.refresh_timeline();
             self.refresh_inspector();
             self.refresh_status();
+        } else if let Some(n) = text.chars().next().filter(|c| text.len() == 1 && ('1'..='9').contains(c)) {
+            // 1-9: cut to that angle when a multicam clip is under the playhead.
+            return self.cut_to_angle(n as u32 - '1' as u32);
         } else {
             match text.to_lowercase().as_str() {
                 " " => self.toggle_playback(),

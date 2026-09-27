@@ -6,7 +6,7 @@ import { ScrollView, LineEdit } from "std-widgets.slint";
 export struct AssetView {
     id: string,
     name: string,
-    kind: int, // 0 video, 1 audio, 2 image
+    kind: int, // 0 video, 1 audio, 2 image, 3 multicam group
     duration: string,
     resolution: string,
     fps: string,
@@ -52,7 +52,7 @@ component AssetCard inherits Rectangle {
             clip: true;
             if root.a.has-thumb: Image { width: parent.width; height: parent.height; source: root.a.thumb; image-fit: cover; opacity: root.a.status-kind == 2 ? 0.35 : 1; }
             if !root.a.has-thumb: Icon {
-                icon: root.a.kind == 1 ? Icons.audio : root.a.kind == 2 ? Icons.image : Icons.film;
+                icon: root.a.kind == 1 ? Icons.audio : root.a.kind == 2 ? Icons.image : root.a.kind == 3 ? Icons.multicam : Icons.film;
                 width: 22px; height: 22px;
                 color: root.a.kind == 1 ? Theme.clip-audio-top : Theme.text-faint;
             }
@@ -64,6 +64,11 @@ component AssetCard inherits Rectangle {
                 border-radius: 3px;
                 background: #000000b0;
                 dur := Text { text: root.a.duration; font-size: 9px; font-family: Theme.mono; color: #ffffff; }
+            }
+            if root.a.kind == 3: Rectangle {
+                x: 3px; y: parent.height - 18px; width: mcl.preferred-width + 8px; height: 15px; border-radius: 3px;
+                background: Theme.accent;
+                mcl := Text { text: "MC"; font-size: 9px; font-weight: 700; color: Theme.text-on-accent; }
             }
             if root.a.in-use: Rectangle {
                 x: 4px; y: 4px; width: 7px; height: 7px; border-radius: 3.5px; background: Theme.accent;
@@ -138,6 +143,7 @@ export component MediaLibrary inherits Rectangle {
         PanelHeader {
             title: Tr.t("media.title");
             icon: Icons.folder;
+            VerticalLayout { alignment: center; IconButton { icon: Icons.multicam; tooltip: Tr.t("mc.new_tip"); clicked => { root.asset-action("", "mc-create"); } } }
             VerticalLayout { alignment: center; IconButton { icon: Icons.plus; tooltip: Tr.t("media.new_bin"); clicked => { root.new-bin(); } } }
             VerticalLayout { alignment: center; IconButton { icon: Icons.import; tooltip: Tr.t("media.import_tip"); clicked => { root.import(); } } }
         }
@@ -229,6 +235,8 @@ export component MediaLibrary inherits Rectangle {
                         MenuItem { title: Tr.t("media.ctx.insert"); activated => { root.asset-action(a.id, "insert"); } }
                         MenuItem { title: Tr.t("media.ctx.overwrite"); activated => { root.asset-action(a.id, "overwrite"); } }
                         MenuItem { title: Tr.t("media.ctx.append"); activated => { root.asset-action(a.id, "append"); } }
+                        MenuSeparator {}
+                        MenuItem { title: a.kind == 3 ? Tr.t("mc.ctx.edit") : Tr.t("mc.ctx.create"); activated => { root.asset-action(a.id, a.kind == 3 ? "mc-edit" : "mc-create"); } }
                         MenuSeparator {}
                         MenuItem { title: Tr.t("media.ctx.to_bin"); activated => { root.asset-action(a.id, "to-bin"); } }
                         MenuItem { title: Tr.t("media.ctx.reanalyze"); activated => { root.asset-action(a.id, "reanalyze"); } }

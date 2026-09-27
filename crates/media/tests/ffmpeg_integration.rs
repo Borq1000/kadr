@@ -200,3 +200,63 @@ fn export_dissolve_blends_across_the_cut_and_keeps_duration() {
     assert!(early > black + 5.0 && early < cut && cut < full - 5.0, "ramps up across the cut: {early} {cut} {full}");
     assert!(late < 20.0, "second dissolve finished into black: {late}");
 }
+
+/// Same loop as the editor's analysis job: 4 fps grey proxy → stats.
+fn video_overview(ff: &FfmpegCli, path: &Path) -> kadr_analysis::video::VideoOverview {
+    use kadr_analysis::video::*;
+    let mut s = ff
+        .open_stream(&StreamRequest {
+            path: path.to_path_buf(),
+            start: Time::ZERO,
+            width: ANALYSIS_W,
+            height: ANALYSIS_H,
+            rate: FrameRate::new(ANALYSIS_FPS, 1),
+            speed: 1.0,
+            look: VideoLook::default(),
+            px_scale: 1.0,
+        })
+        .unwrap();
+    let mut frames = vec![];
+    let mut prev: Option<Vec<u8>> = None;
+    while let Some(f) = s.next_frame().unwrap() {
+        let g = rgba_to_gray(&f.data);
+        frames.push(analyze_gray_frame(&g, f.width, f.height, prev.as_deref()));
+        prev = Some(g);
+    }
+    VideoOverview { fps: ANALYSIS_FPS, frames }
+}
+
+fn lavfi_clip(dir: &Path, name: &str, filter: &str) -> PathBuf {
+    let out = dir.join(name);
+    let st = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", filter, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    out
+}
+
+#[test]
+fn video_analysis_buckets_real_footage() {
+    use kadr_analysis::video::*;
+    let Some(ff) = backend() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let sharp = make_clip(dir.path());
+    let blurry = lavfi_clip(dir.path(), "blur.mp4", "testsrc2=size=640x360:rate=25:duration=3,boxblur=12:4");
+    let black = lavfi_clip(dir.path(), "black.mp4", "color=c=black:s=640x360:r=25:d=3");
+
+    let ov = video_overview(&ff, &sharp);
+    assert!((22..=26).contains(&ov.frames.len()), "6 s at 4 fps, got {}", ov.frames.len());
+    let shots = detect_shots(&ov, Time::from_secs(1));
+    eprintln!("sharp: {:?}", shots.iter().map(|s| (s.sharpness, s.luma, s.motion)).collect::<Vec<_>>());
+    assert!(shots.iter().all(|s| bucket_sharpness(s.sharpness) == "sharp" && !s.black));
+    assert_eq!(bucket_exposure(shots[0].luma), "normal");
+
+    let b = detect_shots(&video_overview(&ff, &blurry), Time::from_secs(1));
+    eprintln!("blurry: {:?}", b.iter().map(|s| (s.sharpness, s.luma, s.motion)).collect::<Vec<_>>());
+    assert_ne!(bucket_sharpness(b[0].sharpness), "sharp");
+
+    let k = detect_shots(&video_overview(&ff, &black), Time::from_secs(1));
+    assert!(k.len() == 1 && k[0].black && bucket_exposure(k[0].luma) == "black");
+}

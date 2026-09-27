@@ -311,3 +311,119 @@ fn history_marker_returns_to_saved_state() {
     e.execute(&mut p, EditCommand::Split { at: s(20), clips: None }).unwrap();
     assert_ne!(e.history_marker(), after, "a different edit is a different state");
 }
+
+/// Two 60 s angles; CAM2 started recording 2 s later (sync_offset −2 s:
+/// source = group + offset). One clip shows CAM1 for group time `g0..g1`.
+fn multicam_project(g0: i64, g1: i64) -> (Project, EditEngine, kadr_core::ClipId, MulticamGroup) {
+    let mut p = Project::new("mc");
+    p.sequence_mut().frame_rate = FrameRate::FPS_25;
+    let a = MediaAsset::new("cam1.mp4", video_info(s(60)));
+    let b = MediaAsset::new("cam2.mp4", video_info(s(60)));
+    let group = MulticamGroup {
+        id: kadr_core::MulticamId::new(),
+        name: "show".into(),
+        angles: vec![
+            MulticamAngle { asset: a.id, label: "CAM1".into(), description: String::new(), sync_offset: s(0), sync_method: SyncMethod::Manual },
+            MulticamAngle { asset: b.id, label: "CAM2".into(), description: String::new(), sync_offset: s(-2), sync_method: SyncMethod::Manual },
+        ],
+        master_audio: None,
+    };
+    let mut clip = Clip::new(a.id, "CAM1", TimeRange::new(s(g0), s(g1)), s(0));
+    clip.multicam = Some(MulticamSelection { group: group.id, angle: 0 });
+    let id = clip.id;
+    p.assets.extend([a, b]);
+    p.multicam_groups.push(group.clone());
+    p.sequence_mut().tracks[0].clips.push(clip);
+    (p, EditEngine::new(), id, group)
+}
+
+#[test]
+fn switch_angle_keeps_timing_and_maps_source() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: None }).unwrap();
+    let c = p.sequence().clip(clip).unwrap();
+    assert_eq!((c.timeline_in, c.timeline_out), (s(0), s(10)));
+    assert_eq!((c.source_in, c.source_out), (s(8), s(18)), "group 10 s is CAM2 source 8 s");
+    assert_eq!(c.asset, p.multicam_groups[0].angles[1].asset);
+    assert_eq!(c.name, "CAM2");
+    assert_eq!(c.multicam.as_ref().unwrap().angle, 1);
+    assert_eq!(e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: None }), Err(EditError::NoOp));
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence().clip(clip).unwrap().source_in, s(10));
+}
+
+#[test]
+fn switch_to_angle_without_media_fails() {
+    let (mut p, mut e, clip, _) = multicam_project(0, 10);
+    let before = p.sequence().clone();
+    assert_eq!(e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: None }), Err(EditError::InvalidRange));
+    assert_eq!(p.sequence(), &before);
+    assert_eq!(e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 7, at: None }), Err(EditError::InvalidRange));
+}
+
+#[test]
+fn switch_at_a_time_is_a_live_cut() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(s(4)) }).unwrap();
+    let v1 = &p.sequence().tracks[0].clips;
+    assert_eq!(v1.len(), 2);
+    assert_eq!((v1[0].name.as_str(), v1[0].source_in, v1[0].timeline_out), ("CAM1", s(10), s(4)));
+    assert_eq!((v1[1].name.as_str(), v1[1].source_in, v1[1].timeline_out), ("CAM2", s(12), s(10)));
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence().tracks[0].clips.len(), 1, "one undo step");
+}
+
+#[test]
+fn an_off_frame_live_cut_switches_the_part_after_the_cut() {
+    // During playback the playhead follows the audio clock, between frames.
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(4_030)) }).unwrap();
+    let v1: Vec<_> = p.sequence().tracks[0].clips.iter().map(|c| (c.name.clone(), c.timeline_in.as_millis())).collect();
+    assert_eq!(v1, vec![("CAM1".to_string(), 0), ("CAM2".to_string(), 4_040)]);
+}
+
+#[test]
+fn a_live_cut_within_half_a_frame_of_the_clip_end_does_nothing_quietly() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    assert_eq!(e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(9_990)) }), Err(EditError::NoOp));
+    // …and half a frame after the start switches the whole clip.
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(Time::from_millis(10)) }).unwrap();
+    let v1 = &p.sequence().tracks[0].clips;
+    assert_eq!((v1.len(), v1[0].name.as_str()), (1, "CAM2"));
+}
+
+#[test]
+fn no_group_clip_for_an_angle_whose_media_is_gone() {
+    let (mut p, _, _, group) = multicam_project(10, 20);
+    let cam1 = group.angles[0].asset;
+    p.assets.retain(|a| a.id != cam1);
+    assert!(multicam::group_clip(&group, 0, &p.assets, s(0)).is_none());
+}
+
+#[test]
+fn group_span_and_clip_cover_all_angles() {
+    let (p, _, _, group) = multicam_project(10, 20);
+    // CAM1 covers group 0..60, CAM2 covers group 2..62.
+    assert_eq!(multicam::group_span(&group, &p.assets), TimeRange::new(s(2), s(60)));
+    let c = multicam::group_clip(&group, 1, &p.assets, s(5)).unwrap();
+    assert_eq!((c.source_in, c.source_out, c.timeline_in, c.timeline_out), (s(0), s(58), s(5), s(63)));
+    assert_eq!(multicam::group_time_at(&group, &c, s(5)), Some(s(2)));
+}
+
+#[test]
+fn set_angle_range_cuts_both_edges_and_switches_inside() {
+    let (mut p, mut e, _, _) = multicam_project(10, 20);
+    e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(3), s(6)), angle: 1 }).unwrap();
+    let v1: Vec<_> = p.sequence().tracks[0].clips.iter().map(|c| (c.name.clone(), c.timeline_in, c.timeline_out)).collect();
+    assert_eq!(v1, vec![("CAM1".into(), s(0), s(3)), ("CAM2".into(), s(3), s(6)), ("CAM1".into(), s(6), s(10))]);
+    // A range already on that angle is a no-op; one undo restores everything.
+    assert_eq!(e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(3), s(6)), angle: 1 }), Err(EditError::NoOp));
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence().tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn set_angle_range_outside_multicam_fails() {
+    let (mut p, mut e, _, _) = multicam_project(10, 20);
+    assert_eq!(e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(12), s(14)), angle: 1 }), Err(EditError::ClipNotFound));
+}
