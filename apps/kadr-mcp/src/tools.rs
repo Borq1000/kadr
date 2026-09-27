@@ -15,6 +15,24 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
+const EDIT_DESCRIPTION: &str = "Apply an undoable batch of timeline edit ops (undo label \"Claude: <label>\"). Times are timeline milliseconds; clip ids come from `get_state`. `reason` (string) is optional on every op except add_caption. Ops by `type`:
+- \"split_clip\": at_ms, clip_id? (default: every clip under at_ms)
+- \"delete_range\": start_ms, end_ms, ripple? (default true), sequence_id?
+- \"delete_clip\": clip_id, ripple? (default false)
+- \"trim_clip\": clip_id, edge (\"start\"|\"end\"), to_ms, ripple? (default false)
+- \"move_clip\": clip_id, to_ms
+- \"set_transform\": clip_id, scale?, x?, y?, rotation_deg?, opacity? (numbers)
+- \"change_speed\": clip_id, speed (number, 1.0 = normal)
+- \"set_audio_gain\": clip_id, gain_db (number)
+- \"add_marker\": at_ms, name
+- \"add_transition\": at_ms, kind (\"cross_dissolve\"|\"dip_to_black\"|\"wipe\"), duration_ms
+- \"select_camera\": start_ms, end_ms, angle (multicam angle label, e.g. \"CAM2\")
+- \"add_caption\": start_ms, end_ms, text (not supported yet: rejected)
+- \"unlink\": clips (array of clip ids; their linked partners are unlinked too)
+- \"link\": clips (array of at least two clip ids)
+- \"delete_part\": clips (array of clip ids), part (\"video\"|\"audio\"): deletes only that half of linked clips
+Unknown fields are rejected.";
+
 /// One JSON Schema tool entry per Kadr tool.
 pub fn kadr_tools() -> Vec<Value> {
     vec![
@@ -39,16 +57,16 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "layout_text",
-            "Type text respecting a specific keyboard layout, for layout-dependent shortcuts.",
+            "Map text to the characters the same physical keys produce on the other layout (ЙЦУКЕН ↔ QWERTY). Returns the mapped string; it does not type anything — send the result with `ui_dispatch_key_event` to test layout-independent shortcuts.",
             json!({
-                "text": {"type": "string"},
-                "layout": {"type": "string", "description": "Keyboard layout identifier."},
+                "text": {"type": "string", "description": "Text as typed on the source layout."},
+                "layout": {"type": "string", "enum": ["ru", "en"], "description": "Target layout: `ru` maps QWERTY keys to Russian characters, `en` maps Russian characters to QWERTY."},
             }),
             &["text", "layout"],
         ),
         tool(
             "wait_idle",
-            "Wait until Kadr's UI has settled (no pending renders/animations) after input.",
+            "Wait until background jobs finished and the preview frame loaded (polls Kadr until both hold twice in a row). Call after edits, imports or input before reading state or a frame.",
             json!({
                 "timeout_ms": {"type": "integer", "description": "Max time to wait; defaults to 20000."},
             }),
@@ -56,9 +74,9 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "edit",
-            "Apply an undoable batch of timeline edit operations.",
+            EDIT_DESCRIPTION,
             json!({
-                "ops": {"type": "array", "description": "Edit operations to apply."},
+                "ops": {"type": "array", "items": {"type": "object"}, "description": "Edit operations, each an object with a `type` (see the tool description). Applied as one undoable batch; any invalid op rejects the whole batch with `edit_rejected: op #<index>: …`."},
                 "label": {"type": "string", "description": "Undo history label."},
             }),
             &["ops"],
@@ -84,8 +102,8 @@ pub fn kadr_tools() -> Vec<Value> {
             "playback",
             "Control playback (play/pause/step).",
             json!({
-                "action": {"type": "string", "description": "One of the supported playback actions."},
-                "frames": {"type": "integer", "description": "Number of frames to step, if applicable."},
+                "action": {"type": "string", "enum": ["play", "pause", "stop", "step"], "description": "`stop` also returns the playhead to the start; `step` moves by `frames`."},
+                "frames": {"type": "integer", "description": "Frames to step for `step` (negative = backwards); default 1."},
             }),
             &["action"],
         ),
@@ -101,7 +119,7 @@ pub fn kadr_tools() -> Vec<Value> {
             json!({
                 "id": {"type": "string", "description": "Media id to place."},
                 "at_ms": {"type": "integer", "description": "Timeline position in milliseconds."},
-                "mode": {"type": "string", "description": "Placement mode."},
+                "mode": {"type": "string", "enum": ["insert", "overwrite"], "description": "`insert` (default) pushes later clips right; `overwrite` replaces what is under the new clip."},
             }),
             &["id"],
         ),
@@ -109,7 +127,7 @@ pub fn kadr_tools() -> Vec<Value> {
             "project",
             "New/open/save the project. Use this instead of the `ui` tool for anything that would open an OS file dialog.",
             json!({
-                "action": {"type": "string", "description": "One of: new, open, save, save_as."},
+                "action": {"type": "string", "enum": ["new", "open", "save", "save_as"], "description": "`open` and `save_as` need `path`; `save` needs `path` when the project was never saved."},
                 "path": {"type": "string", "description": "Project file path, for open/save_as."},
             }),
             &["action"],
@@ -119,8 +137,8 @@ pub fn kadr_tools() -> Vec<Value> {
             "Start exporting the project to a file. Use `export_status` to poll progress.",
             json!({
                 "path": {"type": "string", "description": "Output file path."},
-                "preset": {"type": "string", "description": "Export preset name."},
-                "resolution": {"type": "string", "description": "Output resolution."},
+                "preset": {"type": "integer", "enum": [0, 1, 2], "description": "Quality: 0 = High (CRF 18, default), 1 = Balanced (CRF 21), 2 = Draft (CRF 26, fast)."},
+                "resolution": {"type": "integer", "enum": [0, 1, 2, 3], "description": "0 = same as sequence (default), 1 = 1080p, 2 = 720p, 3 = 2160p (4K); scaled to fit, keeping the aspect ratio."},
             }),
             &["path"],
         ),
