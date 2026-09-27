@@ -227,6 +227,7 @@ impl App {
     /// allow it without asking (or when everything is cached).
     fn open_jev_request(&mut self, purpose: JevPurpose, title: String, items: Vec<JevItem>) {
         let Some((svc, has_key, pricing, privacy)) = self.jev_service() else { return };
+        self.sync_month_spend();
         let estimate = svc.estimate(&items, &self.project.jev_decisions);
         let cost = CostEstimate::new(&pricing, estimate.input_tokens, 0, 0);
         let ledger = self.ai.assistant.ledger.lock().unwrap().clone();

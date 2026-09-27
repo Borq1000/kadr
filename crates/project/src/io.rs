@@ -124,11 +124,6 @@ pub fn autosave_path(project_path: &Path) -> PathBuf {
     sidecar(project_path, "autosave")
 }
 
-/// Autosave location for a project that was never saved.
-pub fn untitled_autosave_path(data_dir: &Path, project: &Project) -> PathBuf {
-    data_dir.join("recovery").join(format!("{}.{EXTENSION}.autosave", project.id))
-}
-
 pub fn write_autosave(project: &Project, autosave: &Path) -> Result<(), ProjectIoError> {
     write_atomic(autosave, &to_json(project), false)
 }

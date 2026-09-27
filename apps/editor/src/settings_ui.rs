@@ -17,6 +17,11 @@ const AUTOSAVE_STEPS: [u64; 4] = [0, 60, 120, 300];
 
 impl App {
     fn save_ai_settings(&mut self) {
+        // Like settings.json: a headless instance changes AI settings for its
+        // own session only and never writes the user's file.
+        if self.flags.headless {
+            return;
+        }
         if let Err(e) = self.ai.assistant.settings.save(&self.dirs.data.join("ai-settings.json")) {
             self.toast_error(tf("err.settings.save", &[("error", &e.to_string())]));
         }
@@ -79,7 +84,7 @@ impl App {
         };
         let ui = self.ui();
         ui.set_settings_state(st);
-        ui.set_shortcuts(ModelRc::new(VecModel::from(crate::keys::shortcut_rows())));
+        crate::util::sync_rows(ui.get_shortcuts(), crate::keys::shortcut_rows(), |m| ui.set_shortcuts(m));
     }
 
     pub fn open_settings(&mut self, tab: i32) {

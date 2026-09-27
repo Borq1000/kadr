@@ -1,6 +1,6 @@
 //! Finding or launching the Kadr instance to drive.
 
-use kadr_mcp_bridge::{call, discovery, pid_alive, Discovery, EXIT_MCP_DISABLED};
+use kadr_mcp_bridge::{call, discovery, pid_alive, Discovery, EXIT_MCP_DISABLED, PARENT_PID_ENV};
 use serde_json::json;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -95,18 +95,21 @@ pub fn connect(data: &Path) -> Result<Instance, String> {
     launch(data, &exe)
 }
 
+/// `exe --headless`, told our pid so it quits when we are gone.
+pub fn launch_command(exe: &Path) -> Command {
+    let mut c = Command::new(exe);
+    c.arg("--headless")
+        .env(PARENT_PID_ENV, std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    c
+}
+
 /// Starts `exe --headless` and waits for its discovery file. On every
 /// failure path the child is killed and reaped: no hidden orphans.
 pub fn launch(data: &Path, exe: &Path) -> Result<Instance, String> {
-    let mut child = Command::new(exe)
-        .arg("--headless")
-        .arg("--parent-pid")
-        .arg(std::process::id().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let mut child = launch_command(exe).spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
     let job = crate::job::Job::kill_on_close(&child);
     let pid = child.id();
     let fail = |child: &mut Child, msg: String| {

@@ -4,6 +4,7 @@ use crate::app::App;
 use crate::mcp_state;
 use kadr_mcp_bridge::{BridgeError, Reply};
 use serde_json::{json, Value};
+use slint::ComponentHandle;
 
 fn bad(msg: impl Into<String>) -> Reply {
     Reply::Now(Err(BridgeError::new("bad_params", msg)))
@@ -19,8 +20,10 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
         "get_state" => Reply::Now(Ok(app.mcp_state())),
         "get_log" => {
             let n = p.get("lines").and_then(Value::as_u64).unwrap_or(50) as usize;
-            let level = p.get("level").and_then(Value::as_str).unwrap_or("trace").parse().unwrap_or(tracing::Level::TRACE);
-            Reply::Now(Ok(json!(crate::logging::ring().tail(n, level))))
+            match log_level(&p) {
+                Ok(level) => Reply::Now(Ok(json!(crate::logging::ring().tail(n, level)))),
+                Err(e) => Reply::Now(Err(e)),
+            }
         }
         "idle" => Reply::Now(Ok(json!({
             "idle": app.jobs.active_count() == 0 && !app.ui().get_preview_loading(),
@@ -30,11 +33,41 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
             (Some(t), Some(l @ ("ru" | "en"))) => Reply::Now(Ok(json!(mcp_state::layout_text(t, l)))),
             _ => bad("layout_text needs text and layout: ru|en"),
         },
+        "click_at" | "drag_at" => {
+            let ui = app.ui();
+            let (size, scale) = (ui.window().size(), ui.window().scale_factor());
+            let size = (size.width as f32 / scale, size.height as f32 / scale);
+            let events = if method == "click_at" { crate::mcp_input::click_events(&p, size) } else { crate::mcp_input::drag_events(&p, size) };
+            match events {
+                Ok(events) => app.mcp_pointer(events),
+                Err(e) => Reply::Now(Err(e)),
+            }
+        }
         "get_frame" => match ms(&p, "at_ms") {
-            Some(t) => app.mcp_frame(t, p.get("max_w").and_then(Value::as_u64).unwrap_or(960) as u32),
+            Some(t) => {
+                let dim = |k: &str| p.get(k).and_then(Value::as_u64).map(|v| v.clamp(2, 8192) as u32);
+                app.mcp_frame(t, dim("max_w").unwrap_or(960), dim("max_h"))
+            }
             None => bad("get_frame needs at_ms"),
         },
         _ => crate::mcp_api::actions(app, method, p),
+    }
+}
+
+/// `get_log`'s `level`: the minimum level to return (default: everything).
+fn log_level(p: &Value) -> Result<tracing::Level, BridgeError> {
+    let bad = || BridgeError::new("bad_params", format!("`level` must be one of error|warn|info|debug|trace, got {}", p["level"]));
+    match p.get("level") {
+        None | Some(Value::Null) => Ok(tracing::Level::TRACE),
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "error" => Ok(tracing::Level::ERROR),
+            "warn" => Ok(tracing::Level::WARN),
+            "info" => Ok(tracing::Level::INFO),
+            "debug" => Ok(tracing::Level::DEBUG),
+            "trace" => Ok(tracing::Level::TRACE),
+            _ => Err(bad()),
+        },
+        Some(_) => Err(bad()),
     }
 }
 
@@ -381,15 +414,47 @@ impl App {
         })
     }
 
-    /// The composited preview frame at `t` as PNG, decoded off the UI thread.
-    pub fn mcp_frame(&self, t: kadr_core::Time, max_w: u32) -> Reply {
+    /// Sends pointer events to the window one per ~10 ms, like a mouse, and
+    /// replies once the last one is handled. They go out from a timer, after
+    /// this MCP handler has returned: dispatched here, inside the `App`
+    /// borrow, Kadr's own callbacks could not borrow `App` and would drop them.
+    pub fn mcp_pointer(&self, events: Vec<slint::platform::WindowEvent>) -> Reply {
+        type Queue = std::collections::VecDeque<slint::platform::WindowEvent>;
+        /// Dispatches the next event; reports how many were delivered when
+        /// the queue is empty or the window is gone.
+        fn next(ui: slint::Weak<crate::AppWindow>, mut queue: Queue, sent: usize, done: std::sync::mpsc::Sender<usize>) {
+            match (queue.pop_front(), ui.upgrade()) {
+                (Some(ev), Some(w)) => {
+                    w.window().dispatch_event(ev);
+                    slint::Timer::single_shot(std::time::Duration::from_millis(10), move || next(ui, queue, sent + 1, done));
+                }
+                _ => {
+                    let _ = done.send(sent);
+                }
+            }
+        }
+        let n = events.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ui = self.ui.clone();
+        crate::app::defer(move || next(ui, events.into(), 0, tx));
+        Reply::Later(Box::new(move || match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(sent) if sent == n => Ok(json!({"events": n})),
+            Ok(sent) => Err(BridgeError::new("io", format!("the window closed after {sent} of {n} pointer events"))),
+            Err(_) => Err(BridgeError::new("busy_timeout", format!("the {n} pointer events were not all delivered within 20 s (UI busy); the rest may still arrive — check `get_state` before retrying"))),
+        }))
+    }
+
+    /// The preview frame at `t` as PNG (at most `max_w` wide, and `max_h`
+    /// tall when given), decoded off the UI thread.
+    pub fn mcp_frame(&self, t: kadr_core::Time, max_w: u32, max_h: Option<u32>) -> Reply {
         let Some(media) = self.media.clone() else { return Reply::Now(Err(BridgeError::new("io", "no FFmpeg"))) };
-        let seq = self.project.sequence();
-        let Some(v) = kadr_timeline::composition::video_at(seq, t) else { return Reply::Now(Err(BridgeError::new("not_found", "no video at this time"))) };
-        let Some(path) = self.project.asset(v.asset).map(|a| a.path.clone()) else { return Reply::Now(Err(BridgeError::new("not_found", "asset missing"))) };
-        let src = v.source_start;
+        let src = match mcp_state::frame_source(&self.project, t) {
+            Ok(s) => s,
+            Err(e) => return Reply::Now(Err(e)),
+        };
+        let (w, h) = mcp_state::frame_size(src.size, max_w, max_h);
         Reply::Later(Box::new(move || {
-            let f = media.decode_frame(&path, src, max_w, max_w).map_err(|e| BridgeError::new("io", e.to_string()))?;
+            let f = media.decode_frame(&src.path, src.source, w, h).map_err(|e| BridgeError::new("io", e.to_string()))?;
             let mut png = Vec::new();
             {
                 let mut enc = png::Encoder::new(&mut png, f.width, f.height);
@@ -513,6 +578,18 @@ mod tests {
             serde_json::json!({"resolution": "1080p"}),
         ] {
             assert_eq!(export_indices(&bad).unwrap_err().code, "bad_params", "{bad}");
+        }
+    }
+
+    #[test]
+    fn log_level_is_validated_not_guessed() {
+        assert_eq!(log_level(&serde_json::json!({})).unwrap(), tracing::Level::TRACE);
+        assert_eq!(log_level(&serde_json::json!({"level": "warn"})).unwrap(), tracing::Level::WARN);
+        assert_eq!(log_level(&serde_json::json!({"level": "ERROR"})).unwrap(), tracing::Level::ERROR);
+        for bad in [serde_json::json!({"level": "warning"}), serde_json::json!({"level": "3"}), serde_json::json!({"level": 2})] {
+            let e = log_level(&bad).unwrap_err();
+            assert_eq!(e.code, "bad_params", "{bad}");
+            assert!(e.message.contains("error|warn|info|debug|trace"), "{}", e.message);
         }
     }
 

@@ -151,3 +151,63 @@ fn stdio_server_reports_launch_failure_as_a_tool_error() {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[test]
+fn launch_passes_the_parent_pid_in_the_environment_not_as_an_argument() {
+    // A Kadr from before `--parent-pid` would import an unknown argument as
+    // a media path; an environment variable it doesn't know is ignored.
+    let c = kadr_mcp::instance::launch_command(std::path::Path::new("kadr.exe"));
+    let args: Vec<_> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert_eq!(args, ["--headless"]);
+    let pid = c.get_envs().find(|(k, _)| *k == kadr_mcp_bridge::PARENT_PID_ENV).and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned());
+    assert_eq!(pid, Some(std::process::id().to_string()));
+}
+
+/// Sends `lines` to a fresh kadr-mcp and returns its first `n` replies.
+fn replies(lines: &[&str], n: usize) -> Vec<serde_json::Value> {
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kadr-mcp"))
+        .env("KADR_DATA_DIR", data_dir.path())
+        .env("KADR_EXE", data_dir.path().join("no-such-kadr.exe"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for l in lines {
+        writeln!(stdin, "{l}").unwrap();
+    }
+    // Read on a thread: a reply that never comes must fail the test, not hang it.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for l in BufReader::new(stdout).lines().take(n) {
+            let _ = tx.send(l.unwrap());
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut out = vec![];
+    while out.len() < n {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(l) => out.push(serde_json::from_str(&l).unwrap()),
+            Err(_) => {
+                let _ = child.kill();
+                panic!("kadr-mcp gave {} of {n} replies: {out:?}", out.len());
+            }
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    out
+}
+
+#[test]
+fn unparseable_and_invalid_messages_get_json_rpc_errors() {
+    let r = replies(&["this is not json", r#"{"jsonrpc":"2.0","id":5}"#, "[1,2]", r#"{"jsonrpc":"2.0","id":6,"method":"ping"}"#], 4);
+    assert_eq!(r[0]["error"]["code"], -32700, "{}", r[0]);
+    assert!(r[0]["id"].is_null(), "the id is unknown: {}", r[0]);
+    assert_eq!((r[1]["error"]["code"].as_i64(), r[1]["id"].as_i64()), (Some(-32600), Some(5)), "{}", r[1]);
+    assert_eq!(r[2]["error"]["code"], -32600, "{}", r[2]);
+    assert_eq!(r[3]["id"], 6, "the server keeps going: {}", r[3]);
+}

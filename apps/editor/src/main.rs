@@ -14,6 +14,7 @@ mod jev_ui;
 mod keys;
 mod library;
 mod mcp_env;
+mod mcp_input;
 mod mcp_state;
 mod mcp_api;
 mod multicam_ui;
@@ -41,18 +42,17 @@ fn main() {
         eprintln!("Kadr: --headless needs \"Allow control via MCP\" (Settings → General)");
         std::process::exit(code);
     }
-    if settings.allow_mcp {
-        if let Ok(port) = mcp_env::free_port() {
+    match mcp_env::slint_ui_port(settings.allow_mcp, mcp_env::free_port()) {
+        Some(port) => {
             // SAFETY: as above, before any thread or Slint init.
             unsafe { std::env::set_var("SLINT_MCP_PORT", port.to_string()) };
             let _ = mcp_env::UI_PORT.set(port);
         }
-    } else {
         // An inherited SLINT_MCP_PORT would start Slint's UI server anyway.
         // SAFETY: as above, before any thread or Slint init.
-        unsafe { std::env::remove_var("SLINT_MCP_PORT") };
+        None => unsafe { std::env::remove_var("SLINT_MCP_PORT") },
     }
-    let _log = logging::init(&dirs.logs());
+    logging::init(&dirs.logs());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kadr starting");
     if let Some(&port) = mcp_env::UI_PORT.get() {
         tracing::info!(ui_port = port, "Slint MCP enabled");
@@ -62,10 +62,11 @@ fn main() {
             tracing::warn!(error = %e, "headless window hook unavailable; falling back to moving the window after show");
         }
     }
-    if let Err(e) = app::run(dirs, flags, args) {
+    if let Err(e) = app::run(dirs, settings, flags, args) {
         tracing::error!(error = %e, "fatal");
         eprintln!("Kadr failed to start: {e}");
     }
+    logging::flush();
 }
 
 mod logging;

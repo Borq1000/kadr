@@ -22,8 +22,22 @@ pub fn headless_exit_code(flags: Flags, allow_mcp: bool) -> Option<i32> {
 /// The port Slint's embedded MCP server listens on (0 = disabled).
 pub static UI_PORT: OnceLock<u16> = OnceLock::new();
 
+/// Reads the command line and takes `KADR_PARENT_PID` out of the
+/// environment, so programs Kadr starts (Explorer, a player, another Kadr)
+/// don't inherit it. Call before any other thread exists.
 pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
-    let mut flags = Flags::default();
+    let env_parent = std::env::var_os(kadr_mcp_bridge::PARENT_PID_ENV);
+    // SAFETY: called first thing in `main`, before any thread starts.
+    unsafe { std::env::remove_var(kadr_mcp_bridge::PARENT_PID_ENV) };
+    parse_flags_with_env(args, env_parent)
+}
+
+/// `kadr-mcp` passes its pid in `KADR_PARENT_PID`; `--parent-pid <pid>`
+/// (what the first MCP release sent) is still understood and wins. Only a
+/// headless instance follows its parent: a user's window never quits
+/// because some other process exited.
+fn parse_flags_with_env(args: &[OsString], env_parent: Option<OsString>) -> (Flags, Vec<OsString>) {
+    let mut flags = Flags { parent_pid: env_parent.and_then(|v| v.to_str()?.parse().ok()), ..Flags::default() };
     let mut rest = vec![];
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -35,7 +49,17 @@ pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
             rest.push(a.clone());
         }
     }
+    if !flags.headless {
+        flags.parent_pid = None;
+    }
     (flags, rest)
+}
+
+/// The port to export as `SLINT_MCP_PORT`, or `None` to remove the variable
+/// (MCP off, or no free port found): an inherited value must never start
+/// Slint's UI server on a port we didn't choose.
+pub fn slint_ui_port(allow_mcp: bool, free: std::io::Result<u16>) -> Option<u16> {
+    if allow_mcp { free.ok() } else { None }
 }
 
 /// An OS-chosen free loopback port (bind to :0, read it, release it).
@@ -49,9 +73,47 @@ pub fn recovery_dir(data: &Path, headless: bool) -> PathBuf {
     data.join(if headless { "recovery-headless" } else { "recovery" })
 }
 
+/// Headless autosaves are never offered for restore (nobody sees a prompt),
+/// so they are only a safety net kept this long, then pruned.
+pub const HEADLESS_AUTOSAVE_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Deletes files in `dir` last modified more than `max_age` before `now`;
+/// returns how many. Subdirectories and unreadable entries are left alone.
+pub fn prune_old_files(dir: &Path, max_age: std::time::Duration, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| {
+            let Ok(m) = e.metadata() else { return false };
+            let old = m.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > max_age);
+            m.is_file() && old && std::fs::remove_file(e.path()).is_ok()
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_headless_autosaves_are_pruned_and_recent_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let file = |name: &str, age_days: u64| {
+            let p = dir.path().join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(age_days * 86_400)).unwrap();
+            p
+        };
+        let old = file("a.kadr.autosave", 8);
+        let fresh = file("b.kadr.autosave", 1);
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert_eq!(prune_old_files(dir.path(), HEADLESS_AUTOSAVE_KEEP, now), 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(dir.path().join("sub").exists(), "only files are pruned");
+        assert_eq!(prune_old_files(&dir.path().join("missing"), HEADLESS_AUTOSAVE_KEEP, now), 0);
+    }
 
     #[test]
     fn headless_recovery_dir_is_separate() {
@@ -93,6 +155,36 @@ mod tests {
         assert_eq!(headless_exit_code(headless, false), Some(kadr_mcp_bridge::EXIT_MCP_DISABLED));
         assert_eq!(headless_exit_code(headless, true), None);
         assert_eq!(headless_exit_code(Flags::default(), false), None, "a normal window starts regardless");
+    }
+
+    #[test]
+    fn parent_pid_comes_from_the_environment_too() {
+        let (f, rest) = parse_flags_with_env(&["--headless".into()], Some("4242".into()));
+        assert_eq!(f.parent_pid, Some(4242));
+        assert!(rest.is_empty());
+        let (f, _) = parse_flags_with_env(&[], Some("junk".into()));
+        assert_eq!(f.parent_pid, None, "a bad value is ignored");
+        let (f, _) = parse_flags_with_env(&["--headless".into(), "--parent-pid".into(), "7".into()], Some("4242".into()));
+        assert_eq!(f.parent_pid, Some(7), "the explicit argument wins");
+    }
+
+    #[test]
+    fn a_users_window_ignores_a_parent_pid() {
+        // Inherited by a window started from a headless Kadr's process tree,
+        // it would make that window quit when kadr-mcp goes away.
+        let (f, _) = parse_flags_with_env(&[], Some("4242".into()));
+        assert_eq!(f.parent_pid, None);
+        let (f, rest) = parse_flags_with_env(&["--parent-pid".into(), "7".into()], None);
+        assert_eq!(f.parent_pid, None);
+        assert!(rest.is_empty(), "still consumed, never a media path");
+    }
+
+    #[test]
+    fn slint_ui_port_only_when_mcp_is_allowed_and_a_port_was_found() {
+        let none = || Err(std::io::Error::other("no port"));
+        assert_eq!(slint_ui_port(true, Ok(5000)), Some(5000));
+        assert_eq!(slint_ui_port(true, none()), None, "no port: the inherited variable must be dropped too");
+        assert_eq!(slint_ui_port(false, Ok(5000)), None);
     }
 
     #[test]

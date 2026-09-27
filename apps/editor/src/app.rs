@@ -68,7 +68,6 @@ pub enum Prompt {
     RenameClip(ClipId),
     RenameMarker(kadr_core::MarkerId),
     RenameSequence,
-    RenameBin(BinId),
 }
 
 pub struct App {
@@ -145,8 +144,8 @@ pub fn defer(f: impl FnOnce() + 'static) {
     slint::Timer::single_shot(Duration::from_millis(1), f);
 }
 
-pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
-    let mut settings = AppSettings::load(&dirs.settings_file());
+/// `settings` are the ones `main` loaded to decide on MCP before any window.
+pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
     // A headless (MCP) instance reads the user's settings but never writes them.
     settings.read_only = flags.headless;
     kadr_i18n::set_lang(settings.lang());
@@ -166,6 +165,13 @@ pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsSt
     let audio = if flags.headless { AudioEngine::silent() } else { AudioEngine::new() };
     let clock = audio.clock();
     let ai_settings = AiSettings::load(&dirs.data.join("ai-settings.json"));
+    if flags.headless {
+        let dir = crate::mcp_env::recovery_dir(&dirs.data, true);
+        let n = crate::mcp_env::prune_old_files(&dir, crate::mcp_env::HEADLESS_AUTOSAVE_KEEP, std::time::SystemTime::now());
+        if n > 0 {
+            tracing::info!(n, "pruned old headless autosaves");
+        }
+    }
     let cache = Cache::new(dirs.cache());
     let mut preview = PreviewController::new(media.clone(), clock);
     preview.quality = settings.preview_quality;
@@ -291,6 +297,7 @@ fn watch_parent(parent: u32) {
             // file, then exit at once (a graceful window teardown can leave
             // the process stuck exiting).
             with_app(|app| app.shutdown());
+            crate::logging::flush();
             std::process::exit(0);
         }
     });
@@ -717,7 +724,7 @@ impl App {
                     finished: j.state.is_finished(),
                 })
                 .collect();
-            ui.set_jobs(slint::ModelRc::new(slint::VecModel::from(views)));
+            crate::util::sync_rows_by_key(ui.get_jobs(), views, |j| j.id, |m| ui.set_jobs(m));
         }
         if changed {
             self.refresh_library();
@@ -728,8 +735,12 @@ impl App {
         self.stop_playback();
         self.preview.shutdown();
         self.layout_changed();
-        if let Err(e) = self.ai.assistant.settings.save(&self.dirs.data.join("ai-settings.json")) {
-            tracing::warn!(error = %e, "could not save AI settings");
+        // A headless instance's copy is stale (loaded at its start): saving it
+        // would undo changes made meanwhile in the user's window.
+        if !self.flags.headless {
+            if let Err(e) = self.ai.assistant.settings.save(&self.dirs.data.join("ai-settings.json")) {
+                tracing::warn!(error = %e, "could not save AI settings");
+            }
         }
         kadr_mcp_bridge::discovery::remove(&self.dirs.data, std::process::id());
         tracing::info!("Kadr exiting");

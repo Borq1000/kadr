@@ -38,6 +38,11 @@ pub type Dispatch = Arc<dyn Fn(String, Value, crossbeam_channel::Sender<Reply>) 
 /// "Allow control via MCP" is off in Kadr's settings.
 pub const EXIT_MCP_DISABLED: i32 = 3;
 
+/// Environment variable carrying the pid of the `kadr-mcp` that launched a
+/// headless Kadr (an older Kadr ignores it; an argument would be imported
+/// as a media path).
+pub const PARENT_PID_ENV: &str = "KADR_PARENT_PID";
+
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 60);

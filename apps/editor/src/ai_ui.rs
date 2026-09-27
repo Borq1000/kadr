@@ -101,6 +101,7 @@ impl App {
         }
         self.ui().set_ai_draft("".into());
         self.ai.chat.push((0, text.clone(), -1));
+        self.sync_month_spend();
         let st = self.editor_state();
         let reply = self.ai.assistant.handle(&text, &self.project, &st);
         self.handle_reply(reply);
@@ -338,24 +339,30 @@ impl App {
     }
 
     pub fn record_month_spend(&mut self, usd: f64) {
-        let key = month_key();
+        let path = self.dirs.data.join("ai-settings.json");
+        // A headless instance records only its spend: the rest of the file
+        // belongs to the user's window.
+        let write_all = !self.flags.headless;
         let s = &mut self.ai.assistant.settings;
-        if s.month_key != key {
-            s.month_key = key;
-            s.month_spent_usd = 0.0;
+        if let Err(e) = s.record_spend(&path, &month_key(), usd, write_all) {
+            tracing::warn!(error = %e, "could not record AI spend");
         }
-        s.month_spent_usd += usd;
         self.ai.assistant.ledger.lock().unwrap().month_usd = s.month_spent_usd;
-        let _ = s.save(&self.dirs.data.join("ai-settings.json"));
+    }
+
+    /// Takes in AI spend other Kadr instances recorded (a headless MCP one,
+    /// a second window), so the monthly budget counts the combined total.
+    pub fn sync_month_spend(&mut self) {
+        self.ai.assistant.settings.refresh_spend(&self.dirs.data.join("ai-settings.json"));
+        let s = &self.ai.assistant.settings;
+        let mut l = self.ai.assistant.ledger.lock().unwrap();
+        l.project_usd = self.project.ai_cost_usd;
+        l.month_usd = if s.month_key == month_key() { s.month_spent_usd } else { 0.0 };
     }
 
     pub fn refresh_ai_status(&mut self) {
+        self.sync_month_spend();
         let ui = self.ui();
-        {
-            let mut l = self.ai.assistant.ledger.lock().unwrap();
-            l.project_usd = self.project.ai_cost_usd;
-            l.month_usd = if self.ai.assistant.settings.month_key == month_key() { self.ai.assistant.settings.month_spent_usd } else { 0.0 };
-        }
         let l = self.ai.assistant.ledger.lock().unwrap().clone();
         ui.set_ai_mode_label(self.ai.assistant.status_label().into());
         ui.set_ai_cloud(self.ai.assistant.cloud_enabled());
@@ -428,9 +435,29 @@ impl App {
                 }
             })
             .collect();
-        ui.set_chat(ModelRc::new(VecModel::from(chat)));
-        ui.set_plans(ModelRc::new(VecModel::from(plans)));
-        ui.set_offers(ModelRc::new(VecModel::from(offers)));
+        // Nested lists keep their previous models (see `reuse_rows`).
+        let (old_plans, old_offers) = (ui.get_plans(), ui.get_offers());
+        let plans: Vec<PlanView> = plans
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut p)| {
+                let prev = slint::Model::row_data(&old_plans, i);
+                p.items = crate::util::reuse_rows(prev.as_ref().map(|o| o.items.clone()), slint::Model::iter(&p.items).collect());
+                p.findings = crate::util::reuse_rows(prev.map(|o| o.findings), slint::Model::iter(&p.findings).collect());
+                p
+            })
+            .collect();
+        let offers: Vec<OfferView> = offers
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut o)| {
+                o.warnings = crate::util::reuse_rows(slint::Model::row_data(&old_offers, i).map(|p| p.warnings), slint::Model::iter(&o.warnings).collect());
+                o
+            })
+            .collect();
+        crate::util::sync_rows(ui.get_chat(), chat, |m| ui.set_chat(m));
+        crate::util::sync_rows(ui.get_plans(), plans, |m| ui.set_plans(m));
+        crate::util::sync_rows(ui.get_offers(), offers, |m| ui.set_offers(m));
         ui.set_ai_busy(self.ai.offers.iter().any(|o| o.state == 1));
         self.refresh_ai_status();
     }

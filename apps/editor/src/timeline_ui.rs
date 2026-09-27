@@ -96,7 +96,7 @@ pub fn rows(seq: &Sequence, scroll_y: f64) -> Vec<Row> {
 
 enum Hit {
     Clip { id: ClipId, edge: Option<TrimEdge> },
-    Empty { row: Option<usize> },
+    Empty,
 }
 
 impl App {
@@ -120,7 +120,7 @@ impl App {
     fn hit(&self, x: f64, y: f64) -> Hit {
         let seq = self.project.sequence();
         let rs = rows(seq, self.tl.scroll_y);
-        let Some(ri) = rs.iter().position(|r| y >= r.y && y < r.y + r.h) else { return Hit::Empty { row: None } };
+        let Some(ri) = rs.iter().position(|r| y >= r.y && y < r.y + r.h) else { return Hit::Empty };
         let track = &seq.tracks[rs[ri].track];
         let t = self.x_to_time(x);
         let tol = Time::from_secs_f64(TRIM_ZONE / self.tl.pps);
@@ -137,7 +137,7 @@ impl App {
         }
         match track.clip_at(t).or_else(|| track.clip_at(t + tol)) {
             Some(c) => Hit::Clip { id: c.id, edge: None },
-            None => Hit::Empty { row: Some(ri) },
+            None => Hit::Empty,
         }
     }
 
@@ -252,7 +252,7 @@ impl App {
                     clicked: (!ctrl && !shift).then_some(id),
                 });
             }
-            Hit::Empty { .. } => {
+            Hit::Empty => {
                 if !ctrl && !shift {
                     self.tl.selection.clear();
                 }
@@ -932,11 +932,20 @@ impl App {
             })
             .collect();
 
-        ui.set_tracks(ModelRc::new(VecModel::from(tracks)));
-        ui.set_clips(ModelRc::new(VecModel::from(clips)));
-        ui.set_ticks(ModelRc::new(VecModel::from(ticks)));
-        ui.set_markers(ModelRc::new(VecModel::from(markers)));
-        ui.set_transitions(ModelRc::new(VecModel::from(transitions)));
+        crate::util::sync_rows(ui.get_tracks(), tracks, |m| ui.set_tracks(m));
+        // Each clip keeps its previous marks model (see `reuse_rows`).
+        let old_marks: std::collections::HashMap<slint::SharedString, ModelRc<ClipMark>> = slint::Model::iter(&ui.get_clips()).map(|c| (c.id, c.marks)).collect();
+        let clips: Vec<ClipView> = clips
+            .into_iter()
+            .map(|mut c| {
+                c.marks = crate::util::reuse_rows(old_marks.get(&c.id).cloned(), slint::Model::iter(&c.marks).collect());
+                c
+            })
+            .collect();
+        crate::util::sync_rows_by_key(ui.get_clips(), clips, |c| c.id.clone(), |m| ui.set_clips(m));
+        crate::util::sync_rows(ui.get_ticks(), ticks, |m| ui.set_ticks(m));
+        crate::util::sync_rows(ui.get_markers(), markers, |m| ui.set_markers(m));
+        crate::util::sync_rows(ui.get_transitions(), transitions, |m| ui.set_transitions(m));
         match self.tl.snap_line {
             Some(t) => {
                 ui.set_snap_x(self.time_to_x(t) as f32);

@@ -42,7 +42,7 @@ pub fn kadr_tools() -> Vec<Value> {
             "Read recent editor log lines.",
             json!({
                 "lines": {"type": "integer", "description": "Max number of lines to return."},
-                "level": {"type": "string", "description": "Minimum log level."},
+                "level": {"type": "string", "enum": ["error", "warn", "info", "debug", "trace"], "description": "Minimum log level (default trace: everything)."},
             }),
             &[],
         ),
@@ -51,7 +51,8 @@ pub fn kadr_tools() -> Vec<Value> {
             "Render a preview frame at a given timeline position.",
             json!({
                 "at_ms": {"type": "integer", "description": "Timeline position in milliseconds."},
-                "max_w": {"type": "integer", "description": "Max width in pixels; scaled down if larger."},
+                "max_w": {"type": "integer", "description": "Max width in pixels (default 960); the frame keeps its aspect and is never upscaled."},
+                "max_h": {"type": "integer", "description": "Optional max height in pixels."},
             }),
             &["at_ms"],
         ),
@@ -154,6 +155,28 @@ pub fn kadr_tools() -> Vec<Value> {
             "Ask Kadr's built-in AI assistant to perform an editing task in natural language.",
             json!({"prompt": {"type": "string"}}),
             &["prompt"],
+        ),
+        tool(
+            "click_at",
+            "Click at a point of the Kadr window, in logical window pixels (the coordinates of `ui_take_screenshot` divided by the window's scale factor, and of element geometry in `ui_get_element_tree`). Real pointer events through Slint's routing, like a mouse; unlike `ui_click_element` it needs no element handle. For modifier clicks, hold the key with `ui_dispatch_key_event` (Press … Release) around it.",
+            json!({
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Default left."},
+                "double": {"type": "boolean", "description": "Double-click."},
+            }),
+            &["x", "y"],
+        ),
+        tool(
+            "drag_at",
+            "Press at `from`, move to `to` in steps (~10 ms apart), release: a real pointer drag in logical window pixels (see `click_at`).",
+            json!({
+                "from": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]},
+                "to": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Default left."},
+                "steps": {"type": "integer", "description": "Intermediate moves (default 12, max 200)."},
+            }),
+            &["from", "to"],
         ),
         tool("list_instances", "List all discoverable Kadr instances and whether they are alive.", json!({}), &[]),
         tool(

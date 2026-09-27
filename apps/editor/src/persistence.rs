@@ -8,7 +8,6 @@ use kadr_i18n::{t, tf};
 use kadr_project::io;
 use kadr_project::Project;
 use kadr_timeline::EditCommand;
-use slint::{ModelRc, VecModel};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -242,7 +241,6 @@ impl App {
                 self.refresh_inspector();
                 self.refresh_status();
             }
-            Prompt::RenameBin(id) => self.rename_bin(&id.to_string(), text),
         }
     }
 
@@ -383,7 +381,8 @@ impl App {
                 exists: r.path.exists(),
             })
             .collect();
-        self.ui().set_recent(ModelRc::new(VecModel::from(v)));
+        let ui = self.ui();
+        crate::util::sync_rows_by_key(ui.get_recent(), v, |r| r.path.clone(), |m| ui.set_recent(m));
     }
 
     // ------------------------------------------------------------ autosave

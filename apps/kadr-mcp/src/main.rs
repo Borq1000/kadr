@@ -16,7 +16,14 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "\
 Tools prefixed `ui_` come from Slint's embedded UI-automation server and drive \
-real input events; call `ui_list_windows` first to get a window handle. Kadr's \
+real input events; call `ui_list_windows` first to get a window handle. Element \
+handles stay valid while their element exists; clips, media, bins, jobs and \
+toasts keep their element by id (a removed clip's handle dies: find it again \
+with `ui_find_elements_by_id`), while lists without ids (tracks, ruler ticks, \
+chat) are positional, so look elements up again after rows are added or \
+removed there. Geometry of elements inside a popup (context menus) is \
+relative to the popup, not the window: click those by handle. To act at a point instead of an \
+element, use `click_at` / `drag_at` (logical window pixels). Kadr's \
 own tools read and edit the project. After sending input, call `wait_idle` \
 before reading state or a frame, since edits and renders can be asynchronous. \
 Input events do not go through the OS's normal input pipeline, so \
@@ -38,25 +45,17 @@ fn main() {
         if line.is_empty() {
             continue;
         }
-        let req: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("kadr-mcp: ignoring unparseable line: {e}");
-                continue;
+        let msg = match parse_request(line) {
+            Parsed::Request { id, method, params } => match handle(&method, params, &mut inst) {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+                Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string(),
+            },
+            // Notifications (`notifications/initialized`, cancellations, …) get no reply.
+            Parsed::Notification => continue,
+            Parsed::Invalid { id, code, message } => {
+                eprintln!("kadr-mcp: {message}");
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
             }
-        };
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let id = req.get("id").cloned();
-        if method == "notifications/initialized" {
-            continue; // no reply
-        }
-        let Some(id) = id else {
-            continue; // notification we don't handle
-        };
-        let params = req.get("params").cloned().unwrap_or(json!({}));
-        let msg = match handle(method, params, &mut inst) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
-            Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string(),
         };
         if writeln!(stdout, "{msg}").is_err() || stdout.flush().is_err() {
             break;
@@ -64,6 +63,32 @@ fn main() {
     }
     // `inst` drops here, killing any Kadr we launched.
     drop(inst);
+}
+
+/// One line of input, classified per JSON-RPC 2.0.
+enum Parsed {
+    Request { id: Value, method: String, params: Value },
+    Notification,
+    /// Answered with an error: `id` is null when it couldn't be read.
+    Invalid { id: Value, code: i32, message: String },
+}
+
+fn parse_request(line: &str) -> Parsed {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return Parsed::Invalid { id: Value::Null, code: -32700, message: format!("Parse error: {e}") },
+    };
+    let Some(obj) = req.as_object() else {
+        return Parsed::Invalid { id: Value::Null, code: -32600, message: "Invalid Request: expected a JSON object (batches are not supported)".into() };
+    };
+    let id = obj.get("id").cloned();
+    match (obj.get("method").and_then(Value::as_str), id) {
+        (Some(method), Some(id)) => Parsed::Request { id, method: method.to_string(), params: obj.get("params").cloned().unwrap_or(json!({})) },
+        (Some(_), None) => Parsed::Notification,
+        // A reply from the client (we never send requests) or garbage.
+        (None, Some(_)) if obj.contains_key("result") || obj.contains_key("error") => Parsed::Notification,
+        (None, id) => Parsed::Invalid { id: id.unwrap_or(Value::Null), code: -32600, message: "Invalid Request: missing `method`".into() },
+    }
 }
 
 fn data_dir() -> std::path::PathBuf {
