@@ -87,6 +87,76 @@ pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> R
     Ok(out)
 }
 
+/// Menu ids `App::menu` handles that never open a native (OS) dialog.
+/// `new`/`open`/`save`/`save-as`/`import`/`export` are excluded even though
+/// some of them are handled, because they can defer into `rfd::FileDialog`
+/// (e.g. plain `"save"` with no current path opens the native "save as"
+/// picker) — those go through the dedicated `project`/`import_media`/`export`
+/// tools instead, which never touch a native dialog.
+const UI_MENU_ALLOWED: &[&str] = &[
+    "welcome",
+    "settings",
+    "settings-ai",
+    "shortcuts",
+    "undo",
+    "redo",
+    "split",
+    "delete",
+    "ripple-delete",
+    "select-all",
+    "deselect",
+    "marker",
+    "add-video-track",
+    "add-audio-track",
+    "toggle-ai",
+    "toggle-jobs",
+    "zoom-fit",
+    "snap",
+    "ripple",
+    "safe",
+    "fullscreen",
+    "reset-layout",
+    "lang-ru",
+    "lang-en",
+    "logs",
+    "about",
+    "exit",
+];
+
+/// Pure allow-list check for the `ui` tool's `menu` id. Rejects anything that
+/// can open a native file dialog (project new/open/save/save-as, import,
+/// export) and anything `App::menu` doesn't actually handle.
+fn ui_menu_allowed(id: &str) -> Result<(), BridgeError> {
+    if UI_MENU_ALLOWED.contains(&id) {
+        return Ok(());
+    }
+    match id {
+        "new" | "open" | "save" | "save-as" | "import" | "export" => Err(BridgeError::new(
+            "bad_params",
+            format!("`{id}` opens a native dialog or isn't routed here: new/open/save/save_as -> use the `project` tool; import -> `import_media`; export -> `export`"),
+        )),
+        _ => Err(BridgeError::new("bad_params", format!("unknown menu id `{id}`"))),
+    }
+}
+
+/// `after` minus `before`, keeping order — the toasts that appeared during an
+/// action, used so replies don't claim success on a silent no-op.
+fn new_messages(before: &[String], after: &[String]) -> Vec<String> {
+    after[before.len().min(after.len())..].to_vec()
+}
+
+/// Removes later duplicates, keeping each id's first occurrence in place.
+fn dedupe_keep_first(ids: &mut Vec<ClipId>) {
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+}
+
+/// Total clip count across all tracks — used to tell whether an edit that
+/// claims to place/apply something actually changed the timeline.
+fn clip_count(seq: &kadr_project::Sequence) -> usize {
+    seq.tracks.iter().map(|t| t.clips.len()).sum()
+}
+
 pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
     let ok = |v: Value| Reply::Now(Ok(v));
     match method {
@@ -125,6 +195,7 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
             } else {
                 app.tl.selection = ids
             }
+            dedupe_keep_first(&mut app.tl.selection);
             app.refresh_timeline();
             app.refresh_inspector();
             app.refresh_status();
@@ -160,8 +231,13 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
             if let Some(missing) = paths.iter().find(|x| !x.exists()) {
                 return Reply::Now(Err(BridgeError::new("not_found", missing.display().to_string())));
             }
+            if let Some(dir) = paths.iter().find(|x| !x.is_file()) {
+                return bad(format!("{} is a directory, not a file", dir.display()));
+            }
+            let before = app.toasts.texts();
             app.import_paths(paths);
-            ok(json!({"note": "probing runs in the background; poll `idle`"}))
+            let messages = new_messages(&before, &app.toasts.texts());
+            ok(json!({"note": "probing runs in the background; poll `idle`", "messages": messages}))
         }
         "place_media" => {
             let at = ms(&p, "at_ms").unwrap_or(app.playhead);
@@ -170,6 +246,8 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
                 _ => InsertMode::Insert,
             };
             let id = p.get("id").and_then(Value::as_str).unwrap_or_default();
+            let before_toasts = app.toasts.texts();
+            let before_clips = clip_count(app.project.sequence());
             if let Some(a) = kadr_core::AssetId::parse(id).filter(|a| app.project.asset(*a).is_some()) {
                 app.place_asset(a, at, mode, None);
             } else if let Some(g) = kadr_core::MulticamId::parse(id).filter(|g| app.project.multicam_groups.iter().any(|x| x.id == *g)) {
@@ -177,41 +255,68 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
             } else {
                 return Reply::Now(Err(BridgeError::new("not_found", format!("asset or group {id}"))));
             }
-            ok(json!({"timeline": mcp_state::timeline_json(app.project.sequence(), &app.tl.selection, app.playhead)}))
+            let applied = clip_count(app.project.sequence()) != before_clips;
+            let messages = new_messages(&before_toasts, &app.toasts.texts());
+            ok(json!({"applied": applied, "messages": messages, "timeline": mcp_state::timeline_json(app.project.sequence(), &app.tl.selection, app.playhead)}))
         }
-        "project" => match (p.get("action").and_then(Value::as_str), p.get("path").and_then(Value::as_str)) {
-            (Some("new"), _) => {
-                app.new_project();
-                ok(json!({}))
+        "project" => {
+            let before = app.toasts.texts();
+            let reply = match (p.get("action").and_then(Value::as_str), p.get("path").and_then(Value::as_str)) {
+                (Some("new"), _) => {
+                    app.new_project();
+                    ok(json!({}))
+                }
+                (Some("open"), Some(path)) => {
+                    app.open_project(path.into());
+                    ok(json!({}))
+                }
+                (Some("save"), _) if app.path.is_some() => {
+                    let pth = app.path.clone().unwrap();
+                    app.save_to(pth);
+                    ok(json!({}))
+                }
+                (Some("save_as" | "save"), Some(path)) => {
+                    app.save_to(path.into());
+                    ok(json!({"path": path}))
+                }
+                _ => bad("action: new|open(path)|save|save_as(path)"),
+            };
+            let messages = new_messages(&before, &app.toasts.texts());
+            match reply {
+                Reply::Now(Ok(mut v)) => {
+                    if let Value::Object(o) = &mut v {
+                        o.insert("messages".into(), json!(messages));
+                    }
+                    Reply::Now(Ok(v))
+                }
+                other => other,
             }
-            (Some("open"), Some(path)) => {
-                app.open_project(path.into());
-                ok(json!({}))
-            }
-            (Some("save"), _) if app.path.is_some() => {
-                let pth = app.path.clone().unwrap();
-                app.save_to(pth);
-                ok(json!({}))
-            }
-            (Some("save_as" | "save"), Some(path)) => {
-                app.save_to(path.into());
-                ok(json!({"path": path}))
-            }
-            _ => bad("action: new|open(path)|save|save_as(path)"),
-        },
+        }
         "export" => {
             let Some(path) = p.get("path").and_then(Value::as_str) else { return bad("path") };
             app.export.path = Some(path.into());
+            let before = app.toasts.texts();
             app.export_start(p.get("preset").and_then(Value::as_i64).unwrap_or(0) as i32, p.get("resolution").and_then(Value::as_i64).unwrap_or(0) as i32);
-            ok(json!({"started": app.export.job.is_some(), "note": "poll export_status"}))
+            let messages = new_messages(&before, &app.toasts.texts());
+            let started = app.export.job.is_some();
+            if started {
+                ok(json!({"started": true, "messages": messages, "note": "poll export_status"}))
+            } else {
+                ok(json!({"started": false, "reason": messages}))
+            }
         }
         "export_status" => ok(json!({"running": app.export.job.is_some() && !app.export.done && !app.export.failed, "done": app.export.done, "failed": app.export.failed, "status": app.export.status})),
         "ui" => match p.get("menu").and_then(Value::as_str) {
-            Some(m) => {
-                app.menu(m);
-                ok(json!({}))
-            }
-            None => bad("ui needs `menu`: a menu action id (new, save, export, settings, undo, split, delete, select-all, marker, …)"),
+            Some(m) => match ui_menu_allowed(m) {
+                Ok(()) => {
+                    let before = app.toasts.texts();
+                    app.menu(m);
+                    let messages = new_messages(&before, &app.toasts.texts());
+                    ok(json!({"messages": messages}))
+                }
+                Err(e) => Reply::Now(Err(e)),
+            },
+            None => bad("ui needs `menu`: a menu action id (undo, redo, split, delete, select-all, marker, settings, …)"),
         },
         "assistant" => match p.get("prompt").and_then(Value::as_str) {
             Some(text) => {
@@ -346,5 +451,29 @@ mod tests {
         let (p, v, _) = project_with_pair();
         let cmds = edit_commands(&p, &[], &serde_json::json!([{"type": "delete_part", "clips": [v.to_string()], "part": "audio"}])).unwrap();
         assert!(cmds.iter().any(|c| matches!(c, EditCommand::DeleteClips { .. })));
+    }
+
+    #[test]
+    fn ui_menu_allowed_lets_dialog_free_ids_through() {
+        for id in ["undo", "redo", "split", "delete", "select-all", "marker", "settings"] {
+            assert!(ui_menu_allowed(id).is_ok(), "{id} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ui_menu_allowed_rejects_dialog_opening_and_unknown_ids() {
+        for id in ["save", "save-as", "open", "import", "export", "new", "totally-unknown"] {
+            let e = ui_menu_allowed(id).unwrap_err();
+            assert_eq!(e.code, "bad_params", "{id} should be rejected as bad_params");
+        }
+    }
+
+    #[test]
+    fn new_messages_returns_only_what_was_appended() {
+        let before = vec!["a".to_string(), "b".to_string()];
+        let after = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+        assert_eq!(new_messages(&before, &after), vec!["c".to_string(), "d".to_string()]);
+        assert_eq!(new_messages(&[], &[]), Vec::<String>::new());
+        assert_eq!(new_messages(&before, &before), Vec::<String>::new());
     }
 }
