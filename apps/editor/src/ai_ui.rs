@@ -428,9 +428,9 @@ impl App {
                 }
             })
             .collect();
-        ui.set_chat(ModelRc::new(VecModel::from(chat)));
-        ui.set_plans(ModelRc::new(VecModel::from(plans)));
-        ui.set_offers(ModelRc::new(VecModel::from(offers)));
+        crate::util::sync_rows(ui.get_chat(), chat, |m| ui.set_chat(m));
+        crate::util::sync_rows(ui.get_plans(), plans, |m| ui.set_plans(m));
+        crate::util::sync_rows(ui.get_offers(), offers, |m| ui.set_offers(m));
         ui.set_ai_busy(self.ai.offers.iter().any(|o| o.state == 1));
         self.refresh_ai_status();
     }

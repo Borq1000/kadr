@@ -932,11 +932,11 @@ impl App {
             })
             .collect();
 
-        ui.set_tracks(ModelRc::new(VecModel::from(tracks)));
-        ui.set_clips(ModelRc::new(VecModel::from(clips)));
-        ui.set_ticks(ModelRc::new(VecModel::from(ticks)));
-        ui.set_markers(ModelRc::new(VecModel::from(markers)));
-        ui.set_transitions(ModelRc::new(VecModel::from(transitions)));
+        crate::util::sync_rows(ui.get_tracks(), tracks, |m| ui.set_tracks(m));
+        crate::util::sync_rows(ui.get_clips(), clips, |m| ui.set_clips(m));
+        crate::util::sync_rows(ui.get_ticks(), ticks, |m| ui.set_ticks(m));
+        crate::util::sync_rows(ui.get_markers(), markers, |m| ui.set_markers(m));
+        crate::util::sync_rows(ui.get_transitions(), transitions, |m| ui.set_transitions(m));
         match self.tl.snap_line {
             Some(t) => {
                 ui.set_snap_x(self.time_to_x(t) as f32);

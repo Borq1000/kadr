@@ -2,7 +2,6 @@
 
 use crate::app::App;
 use crate::ToastView;
-use slint::{ModelRc, VecModel};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -124,7 +123,8 @@ impl App {
     fn refresh_toasts(&mut self) {
         let v: Vec<ToastView> =
             self.toasts.items.iter().map(|t| ToastView { id: t.id, kind: t.kind as i32, text: t.text.clone().into() }).collect();
-        self.ui().set_toasts(ModelRc::new(VecModel::from(v)));
+        let ui = self.ui();
+        crate::util::sync_rows(ui.get_toasts(), v, |m| ui.set_toasts(m));
     }
 }
 

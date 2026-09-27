@@ -11,7 +11,7 @@ use kadr_jobs::{JobSpec, Priority};
 use kadr_project::{Clip, CorrectionKind, DecisionKind, EditorPreferenceEvent, MulticamAngle, MulticamGroup, Sequence, SyncMethod, TrackKind};
 use kadr_timeline::multicam::{group_clip, group_span, group_time_at};
 use kadr_timeline::{EditCommand, InsertMode};
-use slint::{Model, ModelRc, VecModel};
+use slint::Model;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,7 +148,7 @@ impl App {
                 }
             })
             .collect();
-        ui.set_mc_rows(ModelRc::new(VecModel::from(rows)));
+        crate::util::sync_rows(ui.get_mc_rows(), rows, |m| ui.set_mc_rows(m));
         ui.set_mc_editing(d.editing.is_some());
         ui.set_mc_hint(if d.syncing { t("mc.dlg.syncing").into() } else { "".into() });
         if open {
@@ -429,7 +429,8 @@ impl App {
             self.mc.view_key = None;
             self.mc.view_sig = None;
             self.mc.view_thumbs.clear();
-            self.ui().set_angles(ModelRc::new(VecModel::from(vec![])));
+            let ui = self.ui();
+            crate::util::sync_rows(ui.get_angles(), vec![], |m| ui.set_angles(m));
         }
     }
 
@@ -531,7 +532,7 @@ impl App {
             })
             .collect();
         let ui = self.ui();
-        ui.set_angles(ModelRc::new(VecModel::from(views)));
+        crate::util::sync_rows(ui.get_angles(), views, |m| ui.set_angles(m));
         ui.set_active_angle(active as i32);
     }
 }

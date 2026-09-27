@@ -724,7 +724,7 @@ impl App {
                     finished: j.state.is_finished(),
                 })
                 .collect();
-            ui.set_jobs(slint::ModelRc::new(slint::VecModel::from(views)));
+            crate::util::sync_rows(ui.get_jobs(), views, |m| ui.set_jobs(m));
         }
         if changed {
             self.refresh_library();

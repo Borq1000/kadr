@@ -109,6 +109,36 @@ pub fn clock_time(ms: i64) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
 
+/// Puts `rows` into the `VecModel` behind `current` in place: changed rows
+/// are replaced one by one, extra rows appended, surplus rows removed. A
+/// Repeater then keeps its element instances (and handles held by UI
+/// automation stay valid) instead of rebuilding every element on each
+/// refresh. `Err(rows)` when `current` is not a `VecModel<T>` yet.
+pub fn update_rows<T: Clone + PartialEq + 'static>(current: &slint::ModelRc<T>, rows: Vec<T>) -> Result<(), Vec<T>> {
+    use slint::Model;
+    let Some(model) = current.as_any().downcast_ref::<slint::VecModel<T>>() else { return Err(rows) };
+    let keep = model.row_count().min(rows.len());
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if i >= keep {
+            model.push(row);
+        } else if model.row_data(i).as_ref() != Some(&row) {
+            model.set_row_data(i, row);
+        }
+    }
+    Ok(())
+}
+
+/// [`update_rows`] for a model property: `set` installs a new model only
+/// when the property has none to update.
+pub fn sync_rows<T: Clone + PartialEq + 'static>(current: slint::ModelRc<T>, rows: Vec<T>, set: impl FnOnce(slint::ModelRc<T>)) {
+    if let Err(rows) = update_rows(&current, rows) {
+        set(slint::ModelRc::new(slint::VecModel::from(rows)));
+    }
+}
+
 /// "just now", "5 min ago", "yesterday", "12.09.2026".
 pub fn relative_time(ms: i64) -> String {
     let now = kadr_project::now_ms();
@@ -154,6 +184,28 @@ mod tests {
         assert_eq!(fmt_ruler(1.4, 0.2, 25.0), "00:01:10");
         assert_eq!(money(0.00012), "$0.0001");
         assert_eq!(money_range(0.01, 0.05), "$0.01–$0.05");
+    }
+
+    #[test]
+    fn rows_are_updated_in_the_same_model() {
+        use slint::{Model, ModelRc, VecModel};
+        let model = ModelRc::new(VecModel::from(vec![1, 2, 3]));
+        let before = model.as_any().downcast_ref::<VecModel<i32>>().unwrap() as *const _;
+        for rows in [vec![1, 5, 3, 4, 9], vec![7], vec![], vec![2, 2]] {
+            update_rows(&model, rows.clone()).unwrap();
+            assert_eq!(model.iter().collect::<Vec<_>>(), rows);
+        }
+        let after = model.as_any().downcast_ref::<VecModel<i32>>().unwrap() as *const _;
+        assert_eq!(before, after, "the model is kept, so a Repeater keeps its element instances");
+    }
+
+    #[test]
+    fn a_property_without_a_vec_model_gets_a_new_one() {
+        use slint::{Model, ModelRc};
+        assert_eq!(update_rows(&ModelRc::<i32>::default(), vec![4]), Err(vec![4]));
+        let mut set = None;
+        sync_rows(ModelRc::<i32>::default(), vec![4, 5], |m| set = Some(m));
+        assert_eq!(set.unwrap().iter().collect::<Vec<_>>(), [4, 5]);
     }
 
     #[test]

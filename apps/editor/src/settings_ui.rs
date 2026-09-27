@@ -84,7 +84,7 @@ impl App {
         };
         let ui = self.ui();
         ui.set_settings_state(st);
-        ui.set_shortcuts(ModelRc::new(VecModel::from(crate::keys::shortcut_rows())));
+        crate::util::sync_rows(ui.get_shortcuts(), crate::keys::shortcut_rows(), |m| ui.set_shortcuts(m));
     }
 
     pub fn open_settings(&mut self, tab: i32) {
