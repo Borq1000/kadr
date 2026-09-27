@@ -242,7 +242,6 @@ impl App {
                 self.refresh_inspector();
                 self.refresh_status();
             }
-            Prompt::RenameBin(id) => self.rename_bin(&id.to_string(), text),
         }
     }
 

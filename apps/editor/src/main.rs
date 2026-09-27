@@ -61,7 +61,7 @@ fn main() {
             tracing::warn!(error = %e, "headless window hook unavailable; falling back to moving the window after show");
         }
     }
-    if let Err(e) = app::run(dirs, flags, args) {
+    if let Err(e) = app::run(dirs, settings, flags, args) {
         tracing::error!(error = %e, "fatal");
         eprintln!("Kadr failed to start: {e}");
     }

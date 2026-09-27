@@ -209,7 +209,7 @@ export component SettingsDialog inherits Modal {
                     Button { text: Tr.t("settings.open_data"); clicked => { root.open-data-dir(); } }
                 }
                 Text { text: Tr.t("settings.clear_cache.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
-                SectionTitle { text: Tr.t("settings.allow_mcp"); }
+                SectionTitle { text: Tr.t("settings.mcp"); }
                 CheckBox { text: Tr.t("settings.allow_mcp"); checked: root.st.allow-mcp; toggled => { root.set-allow-mcp(self.checked); } }
                 Text { text: Tr.t("settings.allow_mcp_hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
             }

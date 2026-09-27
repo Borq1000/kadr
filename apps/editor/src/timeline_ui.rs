@@ -96,7 +96,7 @@ pub fn rows(seq: &Sequence, scroll_y: f64) -> Vec<Row> {
 
 enum Hit {
     Clip { id: ClipId, edge: Option<TrimEdge> },
-    Empty { row: Option<usize> },
+    Empty,
 }
 
 impl App {
@@ -120,7 +120,7 @@ impl App {
     fn hit(&self, x: f64, y: f64) -> Hit {
         let seq = self.project.sequence();
         let rs = rows(seq, self.tl.scroll_y);
-        let Some(ri) = rs.iter().position(|r| y >= r.y && y < r.y + r.h) else { return Hit::Empty { row: None } };
+        let Some(ri) = rs.iter().position(|r| y >= r.y && y < r.y + r.h) else { return Hit::Empty };
         let track = &seq.tracks[rs[ri].track];
         let t = self.x_to_time(x);
         let tol = Time::from_secs_f64(TRIM_ZONE / self.tl.pps);
@@ -137,7 +137,7 @@ impl App {
         }
         match track.clip_at(t).or_else(|| track.clip_at(t + tol)) {
             Some(c) => Hit::Clip { id: c.id, edge: None },
-            None => Hit::Empty { row: Some(ri) },
+            None => Hit::Empty,
         }
     }
 
@@ -252,7 +252,7 @@ impl App {
                     clicked: (!ctrl && !shift).then_some(id),
                 });
             }
-            Hit::Empty { .. } => {
+            Hit::Empty => {
                 if !ctrl && !shift {
                     self.tl.selection.clear();
                 }

@@ -334,6 +334,7 @@
   "settings.clear_cache": "Clear cache…",
   "settings.open_data": "Open data folder",
   "settings.clear_cache.hint": "The cache holds thumbnails, audio previews and analysis. It is rebuilt automatically; source media are never touched.",
+  "settings.mcp": "CONTROL FROM CLAUDE",
   "settings.allow_mcp": "Allow control via MCP (Claude)",
   "settings.allow_mcp_hint": "Claude can see the Kadr window and act in it. Local to this computer only. Takes effect after a restart.",
   "settings.privacy": "PRIVACY MODE",

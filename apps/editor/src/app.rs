@@ -68,7 +68,6 @@ pub enum Prompt {
     RenameClip(ClipId),
     RenameMarker(kadr_core::MarkerId),
     RenameSequence,
-    RenameBin(BinId),
 }
 
 pub struct App {
@@ -145,8 +144,8 @@ pub fn defer(f: impl FnOnce() + 'static) {
     slint::Timer::single_shot(Duration::from_millis(1), f);
 }
 
-pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
-    let mut settings = AppSettings::load(&dirs.settings_file());
+/// `settings` are the ones `main` loaded to decide on MCP before any window.
+pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
     // A headless (MCP) instance reads the user's settings but never writes them.
     settings.read_only = flags.headless;
     kadr_i18n::set_lang(settings.lang());
