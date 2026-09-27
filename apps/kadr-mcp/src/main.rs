@@ -5,7 +5,7 @@
 //! anything but JSON-RPC to stdout; all logging goes to stderr.
 
 use kadr_cache::AppDirs;
-use kadr_mcp::instance::{self, Instance};
+use kadr_mcp::instance::{self, Instance, Liveness};
 use kadr_mcp::tools::kadr_tools;
 use kadr_mcp_bridge::{call, discovery, post};
 use serde_json::{json, Value};
@@ -70,14 +70,31 @@ fn data_dir() -> std::path::PathBuf {
     AppDirs::new().data
 }
 
-/// Lazily connects (or reconnects) to a Kadr instance.
-fn ensure_connected(inst: &mut Option<Instance>) -> Result<&Instance, String> {
-    let stale = match inst {
-        Some(i) => !instance::answers(&i.d),
-        None => true,
-    };
-    if stale {
-        *inst = Some(instance::connect(&data_dir())?);
+/// A failed connection, as (error code, message) for the tool result.
+type ConnectError = (&'static str, String);
+
+/// Lazily connects to a Kadr instance. An instance whose process is alive
+/// is kept even when it is slow (calls then report `busy_timeout`); only
+/// when its process has exited (or its bridge port refuses connections)
+/// do we switch — and then the current call is NOT run, and the result
+/// says `instance_gone`, so nothing lands in a different project silently.
+fn ensure_connected(inst: &mut Option<Instance>) -> Result<&Instance, ConnectError> {
+    match inst {
+        None => *inst = Some(instance::connect(&data_dir()).map_err(|e| ("io", e))?),
+        Some(i) => {
+            if instance::liveness(&i.d) == Liveness::Gone {
+                let old = i.d.pid;
+                *inst = None;
+                let new = instance::connect(&data_dir()).map_err(|e| ("instance_gone", format!("Kadr instance {old} exited; reconnecting failed: {e}")))?;
+                let msg = format!(
+                    "Kadr instance {old} exited; now connected to {} ({}). The call was not run: check `get_state` and repeat it if still intended.",
+                    new.d.pid,
+                    if new.d.headless { "headless" } else { "window" }
+                );
+                *inst = Some(new);
+                return Err(("instance_gone", msg));
+            }
+        }
     }
     Ok(inst.as_ref().unwrap())
 }
@@ -96,13 +113,21 @@ fn handle(method: &str, params: Value, inst: &mut Option<Instance>) -> Result<Va
         })),
         "tools/list" => Ok(tools_list(inst)),
         "tools/call" => Ok(tools_call(params, inst)),
+        "ping" => Ok(json!({})),
         _ => Err(json!({"code": -32601, "message": format!("Method not found: {method}")})),
     }
 }
 
 fn tools_list(inst: &mut Option<Instance>) -> Value {
     let mut tools = kadr_tools();
-    match ensure_connected(inst) {
+    let connected = match ensure_connected(inst) {
+        Err(("instance_gone", e)) => {
+            eprintln!("kadr-mcp: {e}");
+            inst.as_ref().ok_or(("io", e))
+        }
+        other => other,
+    };
+    match connected {
         Ok(i) => {
             let ui_port = i.d.ui_port;
             match fetch_ui_tools(ui_port) {
@@ -110,7 +135,7 @@ fn tools_list(inst: &mut Option<Instance>) -> Value {
                 Err(e) => eprintln!("kadr-mcp: Slint UI tools unavailable: {e}"),
             }
         }
-        Err(e) => eprintln!("kadr-mcp: no Kadr instance for tools/list: {e}"),
+        Err((_, e)) => eprintln!("kadr-mcp: no Kadr instance for tools/list: {e}"),
     }
     json!({"tools": tools})
 }
@@ -152,7 +177,7 @@ fn tools_call(params: Value, inst: &mut Option<Instance>) -> Value {
 
     let i = match ensure_connected(inst) {
         Ok(i) => i,
-        Err(e) => return error_result("io", &e),
+        Err((code, e)) => return error_result(code, &e),
     };
     let timeout = if name == "export" || name == "export_status" { Duration::from_secs(30 * 60) } else { Duration::from_secs(30) };
     match call(i.d.port, &i.d.token, &name, arguments, timeout) {
@@ -164,7 +189,7 @@ fn tools_call(params: Value, inst: &mut Option<Instance>) -> Value {
 fn call_ui(ui_name: &str, arguments: Value, inst: &mut Option<Instance>) -> Value {
     let i = match ensure_connected(inst) {
         Ok(i) => i,
-        Err(e) => return error_result("io", &e),
+        Err((code, e)) => return error_result(code, &e),
     };
     let ui_port = i.d.ui_port;
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": ui_name, "arguments": arguments}}).to_string();
@@ -187,7 +212,7 @@ fn wait_idle(arguments: Value, inst: &mut Option<Instance>) -> Value {
     let timeout_ms = arguments.get("timeout_ms").and_then(Value::as_u64).unwrap_or(20_000);
     let i = match ensure_connected(inst) {
         Ok(i) => i,
-        Err(e) => return error_result("io", &e),
+        Err((code, e)) => return error_result(code, &e),
     };
     let (port, token) = (i.d.port, i.d.token.clone());
     let start = std::time::Instant::now();
@@ -217,7 +242,7 @@ fn wait_idle(arguments: Value, inst: &mut Option<Instance>) -> Value {
 fn get_frame(arguments: Value, inst: &mut Option<Instance>) -> Value {
     let i = match ensure_connected(inst) {
         Ok(i) => i,
-        Err(e) => return error_result("io", &e),
+        Err((code, e)) => return error_result(code, &e),
     };
     match call(i.d.port, &i.d.token, "get_frame", arguments, Duration::from_secs(30)) {
         Ok(v) => {
@@ -235,8 +260,8 @@ fn list_instances() -> Value {
     let out: Vec<Value> = list
         .into_iter()
         .map(|d| {
-            let alive = instance::answers(&d);
-            json!({"pid": d.pid, "headless": d.headless, "started_ms": d.started_ms, "alive": alive})
+            let state = instance::liveness(&d);
+            json!({"pid": d.pid, "headless": d.headless, "started_ms": d.started_ms, "alive": state != Liveness::Gone, "responding": state == Liveness::Ready})
         })
         .collect();
     text_result(&json!({"instances": out}))
@@ -250,8 +275,8 @@ fn use_instance(arguments: Value, inst: &mut Option<Instance>) -> Value {
     let dir = data_dir();
     let found = discovery::list(&dir).into_iter().find(|d| d.pid == pid);
     match found {
-        Some(d) if instance::answers(&d) => {
-            *inst = Some(Instance { d, child: None });
+        Some(d) if instance::liveness(&d) == Liveness::Ready => {
+            *inst = Some(Instance::attached(d));
             text_result(&json!({"ok": true}))
         }
         Some(_) => error_result("not_found", &format!("instance {pid} is not responding")),

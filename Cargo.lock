@@ -2949,6 +2949,7 @@ dependencies = [
 name = "kadr-mcp"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "kadr-cache",
  "kadr-mcp-bridge",
  "serde_json",

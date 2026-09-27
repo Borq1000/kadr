@@ -34,6 +34,10 @@ pub enum Reply {
 
 pub type Dispatch = Arc<dyn Fn(String, Value, crossbeam_channel::Sender<Reply>) + Send + Sync>;
 
+/// `kadr --headless` exits with this code, before creating a window, when
+/// "Allow control via MCP" is off in Kadr's settings.
+pub const EXIT_MCP_DISABLED: i32 = 3;
+
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -122,7 +126,11 @@ fn run(dispatch: &Dispatch, method: String, params: Value) -> Result<Value, Brid
 /// Blocking client (used by `kadr-mcp`).
 pub fn call(port: u16, token: &str, method: &str, params: Value, timeout: Duration) -> Result<Value, BridgeError> {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
-    let resp = http::post(port, "/rpc", Some(token), &body, timeout).map_err(|e| BridgeError::new("io", e.to_string()))?;
+    let resp = http::post(port, "/rpc", Some(token), &body, timeout).map_err(|e| {
+        // `refused`: nothing listens on the port any more (the instance is
+        // gone), as opposed to a slow or busy one.
+        BridgeError::new(if e.kind() == std::io::ErrorKind::ConnectionRefused { "refused" } else { "io" }, e.to_string())
+    })?;
     let v: Value = serde_json::from_str(&resp.body).map_err(|e| BridgeError::new("io", format!("bad reply ({}): {e}", resp.status)))?;
     if let Some(err) = v.get("error") {
         let code = err.get("code").and_then(Value::as_str).unwrap_or("io");
