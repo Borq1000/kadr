@@ -933,7 +933,16 @@ impl App {
             .collect();
 
         crate::util::sync_rows(ui.get_tracks(), tracks, |m| ui.set_tracks(m));
-        crate::util::sync_rows(ui.get_clips(), clips, |m| ui.set_clips(m));
+        // Each clip keeps its previous marks model (see `reuse_rows`).
+        let old_marks: std::collections::HashMap<slint::SharedString, ModelRc<ClipMark>> = slint::Model::iter(&ui.get_clips()).map(|c| (c.id, c.marks)).collect();
+        let clips: Vec<ClipView> = clips
+            .into_iter()
+            .map(|mut c| {
+                c.marks = crate::util::reuse_rows(old_marks.get(&c.id).cloned(), slint::Model::iter(&c.marks).collect());
+                c
+            })
+            .collect();
+        crate::util::sync_rows_by_key(ui.get_clips(), clips, |c| c.id.clone(), |m| ui.set_clips(m));
         crate::util::sync_rows(ui.get_ticks(), ticks, |m| ui.set_ticks(m));
         crate::util::sync_rows(ui.get_markers(), markers, |m| ui.set_markers(m));
         crate::util::sync_rows(ui.get_transitions(), transitions, |m| ui.set_transitions(m));

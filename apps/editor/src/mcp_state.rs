@@ -6,17 +6,23 @@ use kadr_project::{Project, Sequence, TrackKind};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// The characters the same physical keys produce on the `to` layout, with
-/// Shift (letter case) kept.
+/// What the same key gives with Shift, on the US and the Russian (ЙЦУКЕН)
+/// layout, in the order of `keys::EN` / `keys::RU`.
+const EN_SHIFT: &str = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>";
+const RU_SHIFT: &str = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ";
+/// Keys outside the letter block: `` ` ``/ё, `/`/`.` and the Shift digits
+/// that differ (US on the left, Russian on the right).
+const EN_OTHER: &str = "`~/?@#$^&";
+const RU_OTHER: &str = "ёЁ.,\"№;:?";
+
+/// The characters the same physical keys (with the same Shift state)
+/// produce on the `to` layout.
 pub fn layout_text(text: &str, to: &str) -> String {
-    let (from, dst) = if to == "ru" { (crate::keys::EN, crate::keys::RU) } else { (crate::keys::RU, crate::keys::EN) };
-    text.chars()
-        .map(|c| {
-            let lower = c.to_lowercase().next().unwrap_or(c);
-            let Some(mapped) = from.chars().position(|f| f == lower).and_then(|i| dst.chars().nth(i)) else { return c };
-            if c.is_uppercase() { mapped.to_uppercase().next().unwrap_or(mapped) } else { mapped }
-        })
-        .collect()
+    let en = [crate::keys::EN, EN_SHIFT, EN_OTHER].concat();
+    let ru = [crate::keys::RU, RU_SHIFT, RU_OTHER].concat();
+    let (from, dst) = if to == "ru" { (en, ru) } else { (ru, en) };
+    let dst: Vec<char> = dst.chars().collect();
+    text.chars().map(|c| from.chars().position(|f| f == c).map_or(c, |i| dst[i])).collect()
 }
 
 /// What `get_frame` decodes for a timeline time.
@@ -127,6 +133,17 @@ mod tests {
     fn layout_text_keeps_letter_case() {
         assert_eq!(layout_text("Ug", "ru"), "Гп");
         assert_eq!(layout_text("ГП", "en"), "UG");
+    }
+
+    #[test]
+    fn layout_text_knows_what_shift_gives_on_symbol_keys() {
+        assert_eq!(layout_text("ХЪЖЭБЮ", "en"), "{}:\"<>");
+        assert_eq!(layout_text("{}:\"<>", "ru"), "ХЪЖЭБЮ");
+        assert_eq!(layout_text("ёЁ", "en"), "`~");
+        assert_eq!(layout_text("`~", "ru"), "ёЁ");
+        assert_eq!(layout_text(".,", "en"), "/?", "on the Russian layout . and , sit on the / key");
+        assert_eq!(layout_text("/?", "ru"), ".,");
+        assert_eq!(layout_text("\"№;:?", "en"), "@#$^&");
     }
 
     fn asset(kind: MediaKind, w: u32, h: u32, rotation: i32) -> kadr_project::MediaAsset {

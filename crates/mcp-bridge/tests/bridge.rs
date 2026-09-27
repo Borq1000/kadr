@@ -185,16 +185,12 @@ fn connection_cap_prevents_exhaustion() {
     assert_eq!(conns.len(), 16, "should be able to open 16 connections");
 
     // 17th connection should get 503 Service Unavailable
-    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-        let mut buf = [0u8; 1024];
-        let mut response = String::new();
-        if let Ok(n) = s.read(&mut buf) {
-            response = String::from_utf8_lossy(&buf[..n]).to_string();
-        }
-        assert!(response.contains("503"), "17th connection should get 503, got: {}", &response[..80.min(response.len())]);
-    } else {
-        panic!("17th connection should be rejected with 503");
-    }
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("the 17th connection is accepted, then answered 503");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut response = Vec::new();
+    let read = s.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 503"), "17th connection should get 503, got {response:?} ({read:?})");
 
     // Drop the 16 connections: their threads notice the hang-up and free
     // their slots, how soon depends on the scheduler — wait for it, bounded.

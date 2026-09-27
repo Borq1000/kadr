@@ -101,6 +101,7 @@ impl App {
         }
         self.ui().set_ai_draft("".into());
         self.ai.chat.push((0, text.clone(), -1));
+        self.sync_month_spend();
         let st = self.editor_state();
         let reply = self.ai.assistant.handle(&text, &self.project, &st);
         self.handle_reply(reply);
@@ -349,13 +350,19 @@ impl App {
         self.ai.assistant.ledger.lock().unwrap().month_usd = s.month_spent_usd;
     }
 
+    /// Takes in AI spend other Kadr instances recorded (a headless MCP one,
+    /// a second window), so the monthly budget counts the combined total.
+    pub fn sync_month_spend(&mut self) {
+        self.ai.assistant.settings.refresh_spend(&self.dirs.data.join("ai-settings.json"));
+        let s = &self.ai.assistant.settings;
+        let mut l = self.ai.assistant.ledger.lock().unwrap();
+        l.project_usd = self.project.ai_cost_usd;
+        l.month_usd = if s.month_key == month_key() { s.month_spent_usd } else { 0.0 };
+    }
+
     pub fn refresh_ai_status(&mut self) {
+        self.sync_month_spend();
         let ui = self.ui();
-        {
-            let mut l = self.ai.assistant.ledger.lock().unwrap();
-            l.project_usd = self.project.ai_cost_usd;
-            l.month_usd = if self.ai.assistant.settings.month_key == month_key() { self.ai.assistant.settings.month_spent_usd } else { 0.0 };
-        }
         let l = self.ai.assistant.ledger.lock().unwrap().clone();
         ui.set_ai_mode_label(self.ai.assistant.status_label().into());
         ui.set_ai_cloud(self.ai.assistant.cloud_enabled());
@@ -426,6 +433,26 @@ impl App {
                     can_cheaper: of.tier.cheaper().is_some_and(|t| t.is_cloud()),
                     state: o.state,
                 }
+            })
+            .collect();
+        // Nested lists keep their previous models (see `reuse_rows`).
+        let (old_plans, old_offers) = (ui.get_plans(), ui.get_offers());
+        let plans: Vec<PlanView> = plans
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut p)| {
+                let prev = slint::Model::row_data(&old_plans, i);
+                p.items = crate::util::reuse_rows(prev.as_ref().map(|o| o.items.clone()), slint::Model::iter(&p.items).collect());
+                p.findings = crate::util::reuse_rows(prev.map(|o| o.findings), slint::Model::iter(&p.findings).collect());
+                p
+            })
+            .collect();
+        let offers: Vec<OfferView> = offers
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut o)| {
+                o.warnings = crate::util::reuse_rows(slint::Model::row_data(&old_offers, i).map(|p| p.warnings), slint::Model::iter(&o.warnings).collect());
+                o
             })
             .collect();
         crate::util::sync_rows(ui.get_chat(), chat, |m| ui.set_chat(m));

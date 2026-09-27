@@ -124,7 +124,7 @@ impl App {
         let v: Vec<ToastView> =
             self.toasts.items.iter().map(|t| ToastView { id: t.id, kind: t.kind as i32, text: t.text.clone().into() }).collect();
         let ui = self.ui();
-        crate::util::sync_rows(ui.get_toasts(), v, |m| ui.set_toasts(m));
+        crate::util::sync_rows_by_key(ui.get_toasts(), v, |t| t.id, |m| ui.set_toasts(m));
     }
 }
 

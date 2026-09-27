@@ -135,7 +135,31 @@ impl AiSettings {
         std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
+    fn read(path: &std::path::Path) -> Option<AiSettings> {
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// The month spend to keep when this copy meets the one on disk: several
+    /// Kadr instances (windows, headless MCP ones) share the file, and a copy
+    /// loaded earlier must never roll back what another recorded meanwhile.
+    fn merged_spend(&self, disk: Option<&AiSettings>) -> (String, f64) {
+        let mine = (self.month_key.clone(), self.month_spent_usd);
+        match disk {
+            Some(d) if d.month_key == self.month_key => (mine.0, mine.1.max(d.month_spent_usd)),
+            // "YYYY-MM" keys sort by date: the later month wins.
+            Some(d) if d.month_key > self.month_key => (d.month_key.clone(), d.month_spent_usd),
+            _ => mine,
+        }
+    }
+
+    /// Writes all settings; the month spend is merged with the file's.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut out = self.clone();
+        (out.month_key, out.month_spent_usd) = self.merged_spend(Self::read(path).as_ref());
+        out.write(path)
+    }
+
+    fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -144,24 +168,25 @@ impl AiSettings {
         std::fs::rename(tmp, path)
     }
 
-    /// Adds `usd` to month `key`'s spend. The file is re-read first, so
-    /// spend recorded meanwhile by another Kadr (a second window, a headless
-    /// MCP instance) is kept. `write_all` saves all of `self`; otherwise only
-    /// the spend fields change on disk (an instance that must not overwrite
-    /// the user's settings).
+    /// Takes in spend other instances recorded in the file (before a budget check).
+    pub fn refresh_spend(&mut self, path: &std::path::Path) {
+        (self.month_key, self.month_spent_usd) = self.merged_spend(Self::read(path).as_ref());
+    }
+
+    /// Adds `usd` to month `key`'s spend, on top of what the file already
+    /// holds. `write_all` saves all of `self`; otherwise only the spend
+    /// fields change on disk (an instance that must not overwrite the user's
+    /// settings).
     pub fn record_spend(&mut self, path: &std::path::Path, key: &str, usd: f64, write_all: bool) -> std::io::Result<()> {
-        let disk: Option<AiSettings> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let disk = Self::read(path);
         let spent = |s: &AiSettings| if s.month_key == key { s.month_spent_usd } else { 0.0 };
         let base = disk.as_ref().map_or(0.0, spent).max(spent(self));
         self.month_key = key.to_string();
         self.month_spent_usd = base + usd;
-        if write_all {
-            return self.save(path);
-        }
-        let mut out = disk.unwrap_or_else(|| self.clone());
+        let mut out = if write_all { self.clone() } else { disk.unwrap_or_else(|| self.clone()) };
         out.month_key = self.month_key.clone();
         out.month_spent_usd = self.month_spent_usd;
-        out.save(path)
+        out.write(path)
     }
 }
 
@@ -187,6 +212,39 @@ mod tests {
         window.record_spend(&path, "2026-09", 1.0, true).unwrap();
         assert_eq!(window.month_spent_usd, 8.0, "the headless spend is not lost");
         assert_eq!(AiSettings::load(&path).month_spent_usd, 8.0);
+    }
+
+    #[test]
+    fn a_plain_save_never_rolls_back_spend_recorded_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-settings.json");
+        let mut window = AiSettings { month_key: "2026-09".into(), month_spent_usd: 5.0, ..AiSettings::default() };
+        window.save(&path).unwrap();
+        let mut headless = AiSettings::load(&path);
+        headless.record_spend(&path, "2026-09", 2.0, false).unwrap();
+        // The user toggles a setting, then closes Kadr: both are plain saves.
+        window.jev_personalize = false;
+        window.save(&path).unwrap();
+        let disk = AiSettings::load(&path);
+        assert_eq!(disk.month_spent_usd, 7.0);
+        assert!(!disk.jev_personalize);
+        // An older month in memory never replaces a newer one on disk.
+        let stale = AiSettings { month_key: "2026-08".into(), month_spent_usd: 50.0, ..AiSettings::default() };
+        stale.save(&path).unwrap();
+        assert_eq!(AiSettings::load(&path).month_key, "2026-09");
+    }
+
+    #[test]
+    fn refresh_spend_sees_what_other_instances_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-settings.json");
+        let mut window = AiSettings { month_key: "2026-09".into(), month_spent_usd: 5.0, ..AiSettings::default() };
+        window.save(&path).unwrap();
+        AiSettings::load(&path).record_spend(&path, "2026-09", 2.0, false).unwrap();
+        window.refresh_spend(&path);
+        assert_eq!(window.month_spent_usd, 7.0, "the monthly budget check must count it");
+        window.refresh_spend(&dir.path().join("missing.json"));
+        assert_eq!(window.month_spent_usd, 7.0);
     }
 
     #[test]

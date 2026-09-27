@@ -130,8 +130,8 @@ impl App {
         let dur: kadr_core::Time = self.project.assets.iter().map(|a| a.duration()).fold(kadr_core::Time::ZERO, |a, b| a + b);
         ui.set_media_summary(if total == 0 { "".into() } else { tn("media.summary", total as i64, &[("d", &duration(dur.as_secs_f64()))]).into() });
         ui.set_media_total(total as i32);
-        crate::util::sync_rows(ui.get_assets(), views, |m| ui.set_assets(m));
-        crate::util::sync_rows(ui.get_bins(), bins, |m| ui.set_bins(m));
+        crate::util::sync_rows_by_key(ui.get_assets(), views, |a| a.id.clone(), |m| ui.set_assets(m));
+        crate::util::sync_rows_by_key(ui.get_bins(), bins, |b| b.id.clone(), |m| ui.set_bins(m));
     }
 
     pub fn media_search_changed(&mut self, s: &str) {

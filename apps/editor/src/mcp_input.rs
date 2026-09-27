@@ -1,6 +1,8 @@
 //! Pointer input at window coordinates for MCP (`click_at`, `drag_at`).
 //! Slint's own UI tools only act on element handles; these send the same
-//! real `WindowEvent`s a mouse would, at any logical point of the window.
+//! real `WindowEvent`s a mouse would, at any logical point of the window,
+//! and end with the pointer leaving it, so no hover state stays stuck in
+//! the user's window.
 
 use kadr_mcp_bridge::BridgeError;
 use serde_json::Value;
@@ -41,6 +43,7 @@ fn click(at: LogicalPosition, button: PointerEventButton, double: bool) -> Vec<W
         out.push(WindowEvent::PointerPressed { position: at, button });
         out.push(WindowEvent::PointerReleased { position: at, button });
     }
+    out.push(WindowEvent::PointerExited);
     out
 }
 
@@ -51,6 +54,7 @@ fn drag(from: LogicalPosition, to: LogicalPosition, button: PointerEventButton, 
         out.push(WindowEvent::PointerMoved { position: LogicalPosition::new(from.x + (to.x - from.x) * f, from.y + (to.y - from.y) * f) });
     }
     out.push(WindowEvent::PointerReleased { position: to, button });
+    out.push(WindowEvent::PointerExited);
     out
 }
 
@@ -85,11 +89,12 @@ mod tests {
     #[test]
     fn click_moves_there_then_presses_and_releases() {
         let ev = click_events(&json!({"x": 100, "y": 50.5, "button": "right"}), WINDOW).unwrap();
-        assert_eq!(ev.len(), 3);
+        assert_eq!(ev.len(), 4);
         assert!(matches!(ev[0], WindowEvent::PointerMoved { .. }));
         assert!(matches!(ev[1], WindowEvent::PointerPressed { button: PointerEventButton::Right, .. }));
         assert!(matches!(ev[2], WindowEvent::PointerReleased { button: PointerEventButton::Right, .. }));
-        assert!(ev.iter().all(|e| pos(e) == (100.0, 50.5)));
+        assert!(ev[..3].iter().all(|e| pos(e) == (100.0, 50.5)));
+        assert_eq!(ev[3], WindowEvent::PointerExited, "no hover left stuck on the user's window");
         let double = click_events(&json!({"x": 1, "y": 1, "double": true}), WINDOW).unwrap();
         assert_eq!(double.iter().filter(|e| matches!(e, WindowEvent::PointerPressed { button: PointerEventButton::Left, .. })).count(), 2);
     }
@@ -99,10 +104,12 @@ mod tests {
         let ev = drag_events(&json!({"from": {"x": 10, "y": 20}, "to": {"x": 110, "y": 20}, "steps": 4}), WINDOW).unwrap();
         assert!(matches!(ev[1], WindowEvent::PointerPressed { .. }));
         assert_eq!(pos(&ev[1]), (10.0, 20.0));
-        let xs: Vec<f32> = ev[2..ev.len() - 1].iter().map(|e| pos(e).0).collect();
+        let xs: Vec<f32> = ev[2..ev.len() - 2].iter().map(|e| pos(e).0).collect();
         assert_eq!(xs, [35.0, 60.0, 85.0, 110.0]);
-        assert!(matches!(ev.last(), Some(WindowEvent::PointerReleased { .. })));
-        assert_eq!(pos(ev.last().unwrap()), (110.0, 20.0));
+        let release = &ev[ev.len() - 2];
+        assert!(matches!(release, WindowEvent::PointerReleased { .. }));
+        assert_eq!(pos(release), (110.0, 20.0));
+        assert_eq!(ev.last(), Some(&WindowEvent::PointerExited));
     }
 
     #[test]

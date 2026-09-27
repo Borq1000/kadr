@@ -17,8 +17,12 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const INSTRUCTIONS: &str = "\
 Tools prefixed `ui_` come from Slint's embedded UI-automation server and drive \
 real input events; call `ui_list_windows` first to get a window handle. Element \
-handles stay valid while their element exists (a removed clip's handle dies: \
-find it again with `ui_find_elements_by_id`). To act at a point instead of an \
+handles stay valid while their element exists; clips, media, bins, jobs and \
+toasts keep their element by id (a removed clip's handle dies: find it again \
+with `ui_find_elements_by_id`), while lists without ids (tracks, ruler ticks, \
+chat) are positional, so look elements up again after rows are added or \
+removed there. Geometry of elements inside a popup (context menus) is \
+relative to the popup, not the window: click those by handle. To act at a point instead of an \
 element, use `click_at` / `drag_at` (logical window pixels). Kadr's \
 own tools read and edit the project. After sending input, call `wait_idle` \
 before reading state or a frame, since edits and renders can be asynchronous. \

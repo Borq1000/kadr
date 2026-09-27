@@ -382,7 +382,7 @@ impl App {
             })
             .collect();
         let ui = self.ui();
-        crate::util::sync_rows(ui.get_recent(), v, |m| ui.set_recent(m));
+        crate::util::sync_rows_by_key(ui.get_recent(), v, |r| r.path.clone(), |m| ui.set_recent(m));
     }
 
     // ------------------------------------------------------------ autosave

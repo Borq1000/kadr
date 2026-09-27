@@ -178,7 +178,25 @@ fn replies(lines: &[&str], n: usize) -> Vec<serde_json::Value> {
     for l in lines {
         writeln!(stdin, "{l}").unwrap();
     }
-    let out: Vec<serde_json::Value> = BufReader::new(child.stdout.take().unwrap()).lines().take(n).map(|l| serde_json::from_str(&l.unwrap()).unwrap()).collect();
+    // Read on a thread: a reply that never comes must fail the test, not hang it.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for l in BufReader::new(stdout).lines().take(n) {
+            let _ = tx.send(l.unwrap());
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut out = vec![];
+    while out.len() < n {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(l) => out.push(serde_json::from_str(&l).unwrap()),
+            Err(_) => {
+                let _ = child.kill();
+                panic!("kadr-mcp gave {} of {n} replies: {out:?}", out.len());
+            }
+        }
+    }
     drop(stdin);
     let _ = child.wait();
     out

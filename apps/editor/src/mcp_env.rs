@@ -22,12 +22,20 @@ pub fn headless_exit_code(flags: Flags, allow_mcp: bool) -> Option<i32> {
 /// The port Slint's embedded MCP server listens on (0 = disabled).
 pub static UI_PORT: OnceLock<u16> = OnceLock::new();
 
+/// Reads the command line and takes `KADR_PARENT_PID` out of the
+/// environment, so programs Kadr starts (Explorer, a player, another Kadr)
+/// don't inherit it. Call before any other thread exists.
 pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
-    parse_flags_with_env(args, std::env::var_os(kadr_mcp_bridge::PARENT_PID_ENV))
+    let env_parent = std::env::var_os(kadr_mcp_bridge::PARENT_PID_ENV);
+    // SAFETY: called first thing in `main`, before any thread starts.
+    unsafe { std::env::remove_var(kadr_mcp_bridge::PARENT_PID_ENV) };
+    parse_flags_with_env(args, env_parent)
 }
 
 /// `kadr-mcp` passes its pid in `KADR_PARENT_PID`; `--parent-pid <pid>`
-/// (what the first MCP release sent) is still understood and wins.
+/// (what the first MCP release sent) is still understood and wins. Only a
+/// headless instance follows its parent: a user's window never quits
+/// because some other process exited.
 fn parse_flags_with_env(args: &[OsString], env_parent: Option<OsString>) -> (Flags, Vec<OsString>) {
     let mut flags = Flags { parent_pid: env_parent.and_then(|v| v.to_str()?.parse().ok()), ..Flags::default() };
     let mut rest = vec![];
@@ -40,6 +48,9 @@ fn parse_flags_with_env(args: &[OsString], env_parent: Option<OsString>) -> (Fla
         } else {
             rest.push(a.clone());
         }
+    }
+    if !flags.headless {
+        flags.parent_pid = None;
     }
     (flags, rest)
 }
@@ -153,8 +164,19 @@ mod tests {
         assert!(rest.is_empty());
         let (f, _) = parse_flags_with_env(&[], Some("junk".into()));
         assert_eq!(f.parent_pid, None, "a bad value is ignored");
-        let (f, _) = parse_flags_with_env(&["--parent-pid".into(), "7".into()], Some("4242".into()));
+        let (f, _) = parse_flags_with_env(&["--headless".into(), "--parent-pid".into(), "7".into()], Some("4242".into()));
         assert_eq!(f.parent_pid, Some(7), "the explicit argument wins");
+    }
+
+    #[test]
+    fn a_users_window_ignores_a_parent_pid() {
+        // Inherited by a window started from a headless Kadr's process tree,
+        // it would make that window quit when kadr-mcp goes away.
+        let (f, _) = parse_flags_with_env(&[], Some("4242".into()));
+        assert_eq!(f.parent_pid, None);
+        let (f, rest) = parse_flags_with_env(&["--parent-pid".into(), "7".into()], None);
+        assert_eq!(f.parent_pid, None);
+        assert!(rest.is_empty(), "still consumed, never a media path");
     }
 
     #[test]

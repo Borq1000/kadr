@@ -724,7 +724,7 @@ impl App {
                     finished: j.state.is_finished(),
                 })
                 .collect();
-            crate::util::sync_rows(ui.get_jobs(), views, |m| ui.set_jobs(m));
+            crate::util::sync_rows_by_key(ui.get_jobs(), views, |j| j.id, |m| ui.set_jobs(m));
         }
         if changed {
             self.refresh_library();

@@ -132,9 +132,100 @@ pub fn update_rows<T: Clone + PartialEq + 'static>(current: &slint::ModelRc<T>, 
 }
 
 /// [`update_rows`] for a model property: `set` installs a new model only
-/// when the property has none to update.
+/// when the property has none to update. Positional: use it for lists
+/// without identity (ruler ticks, lanes). Lists of things with an id use
+/// [`sync_rows_by_key`].
 pub fn sync_rows<T: Clone + PartialEq + 'static>(current: slint::ModelRc<T>, rows: Vec<T>, set: impl FnOnce(slint::ModelRc<T>)) {
     if let Err(rows) = update_rows(&current, rows) {
+        set(slint::ModelRc::new(slint::VecModel::from(rows)));
+    }
+}
+
+/// A nested list (a model inside a row) for a row being rebuilt: the row's
+/// previous inner model, updated in place, when it has one. `ModelRc`
+/// compares by pointer, so a fresh inner model would make every row look
+/// changed and rebuild its nested elements on each refresh.
+pub fn reuse_rows<T: Clone + PartialEq + 'static>(previous: Option<slint::ModelRc<T>>, rows: Vec<T>) -> slint::ModelRc<T> {
+    let rows = match previous {
+        Some(m) => match update_rows(&m, rows) {
+            Ok(()) => return m,
+            Err(rows) => rows,
+        },
+        None => rows,
+    };
+    slint::ModelRc::new(slint::VecModel::from(rows))
+}
+
+/// One step of turning a model's rows into new ones.
+#[derive(Debug, PartialEq)]
+pub enum RowOp<T> {
+    Remove(usize),
+    Insert(usize, T),
+    Set(usize, T),
+}
+
+/// The steps that turn `old` into `new` keeping every surviving row (by
+/// `key`) in its own element: deleting item k removes row k (its handle
+/// dies) instead of shifting later items into earlier elements. Unchanged
+/// rows get no step.
+pub fn row_ops<T: PartialEq, K: PartialEq>(old: &[T], new: Vec<T>, key: impl Fn(&T) -> K) -> Vec<RowOp<T>> {
+    let new_len = new.len();
+    let new_keys: Vec<K> = new.iter().map(&key).collect();
+    let mut ops = vec![];
+    // Current rows: (key, index into `old`, or None once replaced/inserted).
+    let mut cur: Vec<(K, Option<usize>)> = old.iter().enumerate().map(|(i, r)| (key(r), Some(i))).collect();
+    for i in (0..cur.len()).rev() {
+        if !new_keys.contains(&cur[i].0) {
+            cur.remove(i);
+            ops.push(RowOp::Remove(i));
+        }
+    }
+    for (i, (row, k)) in new.into_iter().zip(new_keys).enumerate() {
+        loop {
+            if i < cur.len() && cur[i].0 == k {
+                if cur[i].1.is_none_or(|o| old[o] != row) {
+                    cur[i].1 = None;
+                    ops.push(RowOp::Set(i, row));
+                }
+                break;
+            }
+            if cur[i.min(cur.len())..].iter().any(|(ck, _)| *ck == k) {
+                // Out of order: drop the row in the way, it comes back later.
+                cur.remove(i);
+                ops.push(RowOp::Remove(i));
+                continue;
+            }
+            cur.insert(i, (k, None));
+            ops.push(RowOp::Insert(i, row));
+            break;
+        }
+    }
+    // Duplicate keys can leave surplus rows behind.
+    for i in (new_len..cur.len()).rev() {
+        ops.push(RowOp::Remove(i));
+    }
+    ops
+}
+
+/// [`update_rows`] keyed by `key`: rows keep their elements by identity.
+pub fn update_rows_by_key<T: Clone + PartialEq + 'static, K: PartialEq>(current: &slint::ModelRc<T>, rows: Vec<T>, key: impl Fn(&T) -> K) -> Result<(), Vec<T>> {
+    use slint::Model;
+    let Some(model) = current.as_any().downcast_ref::<slint::VecModel<T>>() else { return Err(rows) };
+    let old: Vec<T> = model.iter().collect();
+    for op in row_ops(&old, rows, key) {
+        match op {
+            RowOp::Remove(i) => drop(model.remove(i)),
+            RowOp::Insert(i, r) => model.insert(i, r),
+            RowOp::Set(i, r) => model.set_row_data(i, r),
+        }
+    }
+    Ok(())
+}
+
+/// [`sync_rows`] keyed by `key` (an id): a handle to a deleted item's
+/// element dies instead of silently pointing at its neighbour.
+pub fn sync_rows_by_key<T: Clone + PartialEq + 'static, K: PartialEq>(current: slint::ModelRc<T>, rows: Vec<T>, key: impl Fn(&T) -> K, set: impl FnOnce(slint::ModelRc<T>)) {
+    if let Err(rows) = update_rows_by_key(&current, rows, key) {
         set(slint::ModelRc::new(slint::VecModel::from(rows)));
     }
 }
@@ -206,6 +297,53 @@ mod tests {
         let mut set = None;
         sync_rows(ModelRc::<i32>::default(), vec![4, 5], |m| set = Some(m));
         assert_eq!(set.unwrap().iter().collect::<Vec<_>>(), [4, 5]);
+    }
+
+    type Row = (&'static str, i32);
+
+    fn ops(old: &[Row], new: &[Row]) -> Vec<RowOp<Row>> {
+        row_ops(old, new.to_vec(), |r| r.0)
+    }
+
+    #[test]
+    fn deleting_a_row_removes_that_row_not_the_last_one() {
+        let old = [("a", 1), ("b", 1), ("c", 1)];
+        assert_eq!(ops(&old, &[("a", 1), ("c", 1)]), [RowOp::Remove(1)]);
+    }
+
+    #[test]
+    fn inserting_changing_and_keeping_rows() {
+        let old = [("a", 1), ("c", 1)];
+        assert_eq!(ops(&old, &[("a", 1), ("b", 1), ("c", 2)]), [RowOp::Insert(1, ("b", 1)), RowOp::Set(2, ("c", 2))]);
+        assert_eq!(ops(&old, &old), [], "unchanged rows are left alone");
+        assert_eq!(ops(&[], &[("x", 0)]), [RowOp::Insert(0, ("x", 0))]);
+    }
+
+    #[test]
+    fn reordered_rows_end_in_the_new_order() {
+        use slint::{Model, ModelRc, VecModel};
+        for (old, new) in [
+            (vec![("a", 1), ("b", 1), ("c", 1)], vec![("c", 1), ("a", 1), ("b", 1)]),
+            (vec![("a", 1), ("b", 1), ("c", 1)], vec![("b", 2), ("d", 0), ("a", 1)]),
+            (vec![("a", 1), ("a", 2)], vec![("a", 3)]),
+        ] {
+            let model = ModelRc::new(VecModel::from(old));
+            update_rows_by_key(&model, new.clone(), |r| r.0).unwrap();
+            assert_eq!(model.iter().collect::<Vec<_>>(), new);
+        }
+    }
+
+    #[test]
+    fn nested_lists_reuse_the_previous_model() {
+        use slint::{Model, ModelRc, VecModel};
+        let prev = ModelRc::new(VecModel::from(vec![1, 2]));
+        let same = reuse_rows(Some(prev.clone()), vec![1, 2]);
+        assert!(same == prev, "same model, so the outer row compares equal and is left alone");
+        let changed = reuse_rows(Some(prev.clone()), vec![3]);
+        assert!(changed == prev);
+        assert_eq!(prev.iter().collect::<Vec<_>>(), [3]);
+        let fresh = reuse_rows(None, vec![7]);
+        assert_eq!(fresh.iter().collect::<Vec<_>>(), [7]);
     }
 
     #[test]

@@ -419,24 +419,28 @@ impl App {
     /// this MCP handler has returned: dispatched here, inside the `App`
     /// borrow, Kadr's own callbacks could not borrow `App` and would drop them.
     pub fn mcp_pointer(&self, events: Vec<slint::platform::WindowEvent>) -> Reply {
-        fn next(ui: slint::Weak<crate::AppWindow>, mut queue: std::collections::VecDeque<slint::platform::WindowEvent>, done: std::sync::mpsc::Sender<()>) {
+        type Queue = std::collections::VecDeque<slint::platform::WindowEvent>;
+        /// Dispatches the next event; reports how many were delivered when
+        /// the queue is empty or the window is gone.
+        fn next(ui: slint::Weak<crate::AppWindow>, mut queue: Queue, sent: usize, done: std::sync::mpsc::Sender<usize>) {
             match (queue.pop_front(), ui.upgrade()) {
                 (Some(ev), Some(w)) => {
                     w.window().dispatch_event(ev);
-                    slint::Timer::single_shot(std::time::Duration::from_millis(10), move || next(ui, queue, done));
+                    slint::Timer::single_shot(std::time::Duration::from_millis(10), move || next(ui, queue, sent + 1, done));
                 }
                 _ => {
-                    let _ = done.send(());
+                    let _ = done.send(sent);
                 }
             }
         }
         let n = events.len();
         let (tx, rx) = std::sync::mpsc::channel();
         let ui = self.ui.clone();
-        crate::app::defer(move || next(ui, events.into(), tx));
-        Reply::Later(Box::new(move || {
-            rx.recv_timeout(std::time::Duration::from_secs(20)).map_err(|_| BridgeError::new("busy_timeout", "the pointer events were not delivered (UI busy)"))?;
-            Ok(json!({"events": n}))
+        crate::app::defer(move || next(ui, events.into(), 0, tx));
+        Reply::Later(Box::new(move || match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(sent) if sent == n => Ok(json!({"events": n})),
+            Ok(sent) => Err(BridgeError::new("io", format!("the window closed after {sent} of {n} pointer events"))),
+            Err(_) => Err(BridgeError::new("busy_timeout", format!("the {n} pointer events were not all delivered within 20 s (UI busy); the rest may still arrive — check `get_state` before retrying"))),
         }))
     }
 
