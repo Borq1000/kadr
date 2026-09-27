@@ -2,8 +2,8 @@
 
 use crate::{BridgeError, MAX_BODY};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 pub struct Response {
@@ -15,7 +15,7 @@ pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 
-fn respond(s: &mut TcpStream, status: u16, body: &str) {
+fn respond(mut s: &TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -27,56 +27,103 @@ fn respond(s: &mut TcpStream, status: u16, body: &str) {
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let _ = write!(s, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    // One write: the status line must not arrive split from the headers.
+    let msg = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let _ = s.write_all(msg.as_bytes());
     let _ = s.flush();
 }
 
-pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) -> Result<Value, BridgeError>) {
-    let deadline = Instant::now() + REQUEST_DEADLINE;
-
-    // Helper to check deadline and return remaining timeout
-    let get_remaining = || -> Option<Duration> {
+/// Reads one LF-terminated line, never buffering more than `cap` bytes and
+/// never reading past `deadline` (a trickling client can't extend it).
+/// `Err` carries the HTTP status to answer with.
+fn read_line_bounded(r: &mut BufReader<&TcpStream>, deadline: Instant, cap: usize, too_long: u16) -> Result<String, u16> {
+    let mut line = Vec::new();
+    loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            None
-        } else {
-            Some(remaining)
+            return Err(408);
         }
-    };
-
-    if let Some(remaining) = get_remaining() {
-        let _ = stream.set_read_timeout(Some(remaining));
-    } else {
-        return respond(&mut stream, 408, "{}");
+        let _ = r.get_ref().set_read_timeout(Some(remaining));
+        let avail = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
+            Err(_) => return Err(400),
+        };
+        if avail.is_empty() {
+            return Err(400); // EOF before the end of the line
+        }
+        let newline = avail.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(avail.len(), |i| i + 1).min(cap + 1 - line.len());
+        line.extend_from_slice(&avail[..take]);
+        r.consume(take);
+        if line.last() == Some(&b'\n') {
+            return String::from_utf8(line).map_err(|_| 400);
+        }
+        if line.len() > cap {
+            return Err(too_long);
+        }
     }
+}
 
+/// Fills `buf` completely before `deadline`.
+fn read_exact_by(r: &mut BufReader<&TcpStream>, buf: &mut [u8], deadline: Instant) -> Result<(), u16> {
+    let mut done = 0;
+    while done < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(408);
+        }
+        let _ = r.get_ref().set_read_timeout(Some(remaining));
+        match r.read(&mut buf[done..]) {
+            Ok(0) => return Err(400),
+            Ok(n) => done += n,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
+            Err(_) => return Err(400),
+        }
+    }
+    Ok(())
+}
+
+/// Answers an error and closes gracefully: the unread rest of the request is
+/// drained (bounded) first, because closing a socket with unread input sends
+/// a reset that can destroy the response before the client reads it.
+fn reject(mut s: &TcpStream, status: u16, body: &str) {
+    respond(s, status, body);
+    let _ = s.shutdown(Shutdown::Write);
+    let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+    let until = Instant::now() + Duration::from_millis(500);
+    let mut sink = [0u8; 16 * 1024];
+    let mut drained = 0usize;
+    while Instant::now() < until && drained < 1024 * 1024 {
+        match s.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
+pub fn serve(stream: TcpStream, token: &str, request_deadline: Duration, handle: &dyn Fn(String, Value) -> Result<Value, BridgeError>) {
+    let deadline = Instant::now() + request_deadline;
     let mut r = BufReader::new(&stream);
-    let mut line = String::new();
-    if r.read_line(&mut line).is_err() || line.len() > MAX_HEADER_LINE || !line.starts_with("POST ") {
-        return respond(&mut stream, 400, "{}");
-    }
+    match read_line_bounded(&mut r, deadline, MAX_HEADER_LINE, 400) {
+        Ok(l) if l.starts_with("POST ") => {}
+        Ok(_) => return reject(&stream, 400, "{}"),
+        Err(status) => return reject(&stream, status, "{}"),
+    };
     let (mut len, mut auth) = (None, false);
     let mut header_count = 0;
     loop {
-        if let Some(remaining) = get_remaining() {
-            let _ = r.get_ref().set_read_timeout(Some(remaining));
-        } else {
-            return respond(&mut stream, 408, "{}");
-        }
-        let mut h = String::new();
-        if r.read_line(&mut h).is_err() {
-            return respond(&mut stream, 400, "{}");
-        }
-        if h.len() > MAX_HEADER_LINE {
-            return respond(&mut stream, 431, "{}");
-        }
+        let h = match read_line_bounded(&mut r, deadline, MAX_HEADER_LINE, 431) {
+            Ok(h) => h,
+            Err(status) => return reject(&stream, status, "{}"),
+        };
         let h = h.trim_end();
         if h.is_empty() {
             break;
         }
         header_count += 1;
         if header_count > MAX_HEADERS {
-            return respond(&mut stream, 431, "{}");
+            return reject(&stream, 431, "{}");
         }
         let (k, v) = h.split_once(':').unwrap_or((h, ""));
         match k.trim().to_ascii_lowercase().as_str() {
@@ -86,26 +133,20 @@ pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) 
         }
     }
     if !auth {
-        return respond(&mut stream, 401, &json!({"error": {"code": "unauthorized", "message": "bad or missing token"}}).to_string());
+        return reject(&stream, 401, &json!({"error": {"code": "unauthorized", "message": "bad or missing token"}}).to_string());
     }
-    let Some(len) = len else { return respond(&mut stream, 411, "{}") };
+    let Some(len) = len else { return reject(&stream, 411, "{}") };
     if len > MAX_BODY {
-        return respond(&mut stream, 413, "{}");
+        return reject(&stream, 413, "{}");
     }
-
-    if let Some(remaining) = get_remaining() {
-        let _ = r.get_ref().set_read_timeout(Some(remaining));
-    } else {
-        return respond(&mut stream, 408, "{}");
-    }
-
     let mut body = vec![0; len];
-    if r.read_exact(&mut body).is_err() {
-        return respond(&mut stream, 400, "{}");
+    if let Err(status) = read_exact_by(&mut r, &mut body, deadline) {
+        return reject(&stream, status, "{}");
     }
-    let Ok(req) = serde_json::from_slice::<Value>(&body) else { return respond(&mut stream, 400, "{}") };
+    drop(r);
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else { return reject(&stream, 400, "{}") };
     let (Some(method), params) = (req.get("method").and_then(Value::as_str), req.get("params").cloned().unwrap_or(Value::Null)) else {
-        return respond(&mut stream, 400, "{}");
+        return reject(&stream, 400, "{}");
     };
     let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(method.to_string(), params))) {
         Ok(Ok(v)) => json!({"jsonrpc": "2.0", "id": req.get("id"), "result": v}),
@@ -115,7 +156,7 @@ pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) 
             json!({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": "panicked", "message": msg}})
         }
     };
-    respond(&mut stream, 200, &out.to_string());
+    respond(&stream, 200, &out.to_string());
 }
 
 pub fn post(port: u16, path: &str, token: Option<&str>, body: &str, timeout: Duration) -> std::io::Result<Response> {

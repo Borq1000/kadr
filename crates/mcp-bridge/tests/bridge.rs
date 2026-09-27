@@ -204,3 +204,86 @@ fn connection_cap_prevents_exhaustion() {
     let v = call(b.port, &b.token, "echo", json!("ok"), Duration::from_secs(5)).unwrap();
     assert_eq!(v, json!("ok"));
 }
+
+/// A dispatch whose handler never runs (a UI thread that is blocked forever):
+/// it keeps every reply sender alive and never sends.
+fn blocked_ui() -> Dispatch {
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Arc::new(move |_method: String, _params: Value, tx: crossbeam_channel::Sender<Reply>| {
+        held.lock().unwrap().push(tx);
+    })
+}
+
+#[test]
+fn ping_is_answered_on_the_bridge_thread_even_when_the_ui_never_replies() {
+    let b = Bridge::start(blocked_ui()).unwrap();
+    let t = std::time::Instant::now();
+    let v = call(b.port, &b.token, "ping", json!({}), Duration::from_secs(5)).expect("ping must not need the UI thread");
+    assert_eq!(v["pid"], json!(std::process::id()));
+    assert!(t.elapsed() < Duration::from_secs(1), "ping took {:?}", t.elapsed());
+}
+
+#[test]
+fn request_line_without_newline_is_rejected_promptly() {
+    let b = Bridge::start(echo()).unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", b.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    let t = std::time::Instant::now();
+    // 64 KiB, no newline, and the connection stays open.
+    let _ = s.write_all(&vec![b'P'; 64 * 1024]);
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 4"), "expected a 4xx, got {:?}", &out[..out.len().min(60)]);
+    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    // The server keeps serving.
+    assert_eq!(call(b.port, &b.token, "echo", json!(5), Duration::from_secs(5)).unwrap(), json!(5));
+}
+
+#[test]
+fn trickling_client_gets_408_by_the_deadline() {
+    let b = Bridge::start_with_deadline(echo(), Duration::from_millis(800)).unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", b.port)).unwrap();
+    let mut w = s.try_clone().unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let trickler = std::thread::spawn(move || {
+        let _ = w.write_all(b"POST /rpc HTTP/1.1\r\n");
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+            if w.write_all(b"X").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    let t = std::time::Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    let elapsed = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = trickler.join();
+    let out = String::from_utf8_lossy(&got).to_string();
+    assert!(out.starts_with("HTTP/1.1 408"), "expected 408, got {out:?} after {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "408 came after {elapsed:?}");
+}
+
+#[test]
+fn pid_liveness_is_checked_with_the_os() {
+    assert!(pid_alive(std::process::id()));
+    let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" });
+    if cfg!(windows) {
+        c.args(["/C", "exit 0"]);
+    }
+    let mut child = c.stdout(std::process::Stdio::null()).spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    drop(child); // releases our handle, so the process object can go away
+    assert!(!pid_alive(pid), "an exited process is not alive");
+}

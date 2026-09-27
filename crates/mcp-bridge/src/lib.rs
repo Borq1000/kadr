@@ -4,6 +4,7 @@
 
 pub mod discovery;
 mod http;
+mod process;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 pub use discovery::Discovery;
 pub use http::{post, Response};
+pub use process::pid_alive;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BridgeError {
@@ -44,6 +46,12 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn start(dispatch: Dispatch) -> std::io::Result<Bridge> {
+        Self::start_with_deadline(dispatch, http::REQUEST_DEADLINE)
+    }
+
+    /// As [`Bridge::start`], with a custom per-request read deadline (tests).
+    #[doc(hidden)]
+    pub fn start_with_deadline(dispatch: Dispatch, deadline: Duration) -> std::io::Result<Bridge> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
@@ -69,7 +77,7 @@ impl Bridge {
                 std::thread::spawn(move || {
                     // Drop guard to decrement count when thread ends
                     let _guard = ConnectionGuard(conn_count_clone);
-                    http::serve(stream, &tok_clone, &|method, params| run(&dispatch_clone, method, params));
+                    http::serve(stream, &tok_clone, deadline, &|method, params| run(&dispatch_clone, method, params));
                 });
             }
         })?;
@@ -86,6 +94,11 @@ impl Drop for ConnectionGuard {
 }
 
 fn run(dispatch: &Dispatch, method: String, params: Value) -> Result<Value, BridgeError> {
+    // Liveness is answered here, on the bridge thread: a busy UI thread (a
+    // native dialog, long work) must not make a live Kadr look dead.
+    if method == "ping" {
+        return Ok(json!({"pid": std::process::id()}));
+    }
     let timeout = params
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -98,7 +111,7 @@ fn run(dispatch: &Dispatch, method: String, params: Value) -> Result<Value, Brid
         Ok(Reply::Now(r)) => r,
         Ok(Reply::Later(f)) => f(),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            Err(BridgeError::new("busy_timeout", format!("Kadr did not answer `{method}` within {} ms (UI busy or a modal is open)", timeout.as_millis())))
+            Err(BridgeError::new("busy_timeout", format!("Kadr did not answer `{method}` within {} ms (UI busy or a modal is open); the request may still run once Kadr is free — check `get_state` before retrying", timeout.as_millis())))
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             Err(BridgeError::new("busy_timeout", format!("Kadr's `{method}` handler finished without replying (UI busy, a modal is open, or the handler gave no reply)")))
