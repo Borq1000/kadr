@@ -132,8 +132,9 @@ fn slow_client_does_not_block_other_clients() {
     let token = b.token.clone();
 
     // Spawn a thread that opens a slow connection (trickles header bytes every ~300 ms)
+    let port_clone = port;
     std::thread::spawn(move || {
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port_clone)) {
             let _ = s.write_all(b"POST /rpc HTTP/1.1\r\n");
             std::thread::sleep(Duration::from_millis(300));
             let _ = s.write_all(b"X");
@@ -143,7 +144,15 @@ fn slow_client_does_not_block_other_clients() {
             let _ = s.write_all(b"eader");
             std::thread::sleep(Duration::from_millis(300));
             // Never send the full header; trickling forever
-            std::thread::sleep(Duration::from_secs(10));
+
+            // After deadline expires, server should send 408
+            let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
+            let mut buf = [0u8; 1024];
+            let mut response = String::new();
+            if let Ok(n) = s.read(&mut buf) {
+                response = String::from_utf8_lossy(&buf[..n]).to_string();
+            }
+            assert!(response.contains("408"), "slow connection should get 408 Request Timeout");
         }
     });
 
@@ -158,4 +167,40 @@ fn slow_client_does_not_block_other_clients() {
 
     assert_eq!(v, json!(42));
     assert!(elapsed < Duration::from_secs(2), "normal client was blocked by slow client for {:?}", elapsed);
+}
+
+#[test]
+fn connection_cap_prevents_exhaustion() {
+    let b = Bridge::start(echo()).unwrap();
+    let port = b.port;
+
+    // Open 16 idle connections (the cap)
+    let mut conns = vec![];
+    for _ in 0..16 {
+        if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            conns.push(s);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(conns.len(), 16, "should be able to open 16 connections");
+
+    // 17th connection should get 503 Service Unavailable
+    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let mut buf = [0u8; 1024];
+        let mut response = String::new();
+        if let Ok(n) = s.read(&mut buf) {
+            response = String::from_utf8_lossy(&buf[..n]).to_string();
+        }
+        assert!(response.contains("503"), "17th connection should get 503, got: {}", &response[..80.min(response.len())]);
+    } else {
+        panic!("17th connection should be rejected with 503");
+    }
+
+    // Drop the 16 connections
+    drop(conns);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Now we should be able to make a normal call
+    let v = call(b.port, &b.token, "echo", json!("ok"), Duration::from_secs(5)).unwrap();
+    assert_eq!(v, json!("ok"));
 }

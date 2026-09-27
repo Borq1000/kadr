@@ -7,7 +7,7 @@ mod http;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 
 pub use discovery::Discovery;
@@ -35,6 +35,7 @@ pub type Dispatch = Arc<dyn Fn(String, Value, crossbeam_channel::Sender<Reply>) 
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_CONNECTIONS: usize = 16;
 
 pub struct Bridge {
     pub port: u16,
@@ -47,17 +48,40 @@ impl Bridge {
         let port = listener.local_addr()?.port();
         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
         let tok = token.clone();
+        let conn_count = Arc::new(AtomicUsize::new(0));
         std::thread::Builder::new().name("mcp-bridge".into()).spawn(move || {
             for stream in listener.incoming().flatten() {
+                // Check connection cap
+                let current = conn_count.fetch_add(1, Ordering::SeqCst);
+                if current >= MAX_CONNECTIONS {
+                    // Decrement since we're not spawning a thread
+                    conn_count.fetch_sub(1, Ordering::SeqCst);
+                    // Send 503 on the accept thread (no thread spawned)
+                    let mut s = stream;
+                    let _ = std::io::Write::write_all(&mut s, b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
+
                 let tok_clone = tok.clone();
                 let dispatch_clone = dispatch.clone();
+                let conn_count_clone = conn_count.clone();
                 // Spawn each connection on its own thread so slow clients don't block accept loop
                 std::thread::spawn(move || {
+                    // Drop guard to decrement count when thread ends
+                    let _guard = ConnectionGuard(conn_count_clone);
                     http::serve(stream, &tok_clone, &|method, params| run(&dispatch_clone, method, params));
                 });
             }
         })?;
         Ok(Bridge { port, token })
+    }
+}
+
+// Drop guard to decrement connection count
+struct ConnectionGuard(Arc<AtomicUsize>);
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

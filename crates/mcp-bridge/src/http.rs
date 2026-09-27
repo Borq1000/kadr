@@ -24,6 +24,7 @@ fn respond(s: &mut TcpStream, status: u16, body: &str) {
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let _ = write!(s, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
