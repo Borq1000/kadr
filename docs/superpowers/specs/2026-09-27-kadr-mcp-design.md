@@ -1,6 +1,6 @@
 # Kadr MCP — design
 
-Date: 2026-09-27 · Status: approved in conversation, pending written-spec review
+Date: 2026-09-27 · Status: approved; revised the same day to reuse Slint's embedded MCP server (see §3.0)
 
 ## 1. Goal
 
@@ -23,8 +23,29 @@ both in the user's open window and in a hidden instance.
 | Confirmations | **None**: Claude may save over files, export, remove media, run paid AI without asking. AI budget limits from Settings still apply |
 | Architecture | **A**: bridge inside Kadr (127.0.0.1 + token) + separate stdio `kadr-mcp` |
 | UI control | Semantic actions **plus real input** (pointer/keyboard through Slint's event routing) so input bugs are visible; window snapshot for sight |
+| Sight + input layer | **Reuse Slint 1.18's embedded MCP server** (`slint/mcp`, `SLINT_MCP_PORT`) instead of writing our own; accepted that its port has no token (127.0.0.1 + Origin check only) |
 
 ## 3. Architecture
+
+### 3.0 Two upstreams, one MCP server for Claude
+
+Slint 1.18 ships an embedded MCP server (Streamable HTTP on
+`127.0.0.1:$SLINT_MCP_PORT`, path `/mcp`) with `list_windows`,
+`get_window_properties`, `get_element_tree`, `get_element_properties`,
+`find_elements_by_id`, `query_element_descendants`, `take_screenshot`,
+`click_element` (any button, single/double, modifiers), `drag_element`,
+`hover_element`, `move_pointer`, `scroll_element`, `dispatch_pointer_scroll`,
+`invoke_accessibility_action`, `set_element_value`, `dispatch_key_event`,
+`start_event_recording`/`stop_event_recording`. Events go through Slint's real
+routing (hit test, `TouchArea` grabs, `ContextMenuArea`, focus). Verified in a
+spike on 2026-09-27: builds on Windows without `protoc`, answers `initialize`,
+screenshots the off-screen window correctly. Element ids/types require the UI
+to be compiled with debug info (`slint_build::CompilerConfiguration::with_debug_info(true)`).
+
+`kadr-mcp` therefore aggregates two upstreams into one tool list:
+**`ui_*`** tools proxied 1:1 to Slint's server (names prefixed `ui_`), and
+**Kadr tools** (§4.3–4.4) served by our own bridge. Our bridge no longer
+implements screenshots or pointer/keyboard input.
 
 ```
 Claude ──stdio MCP──► kadr-mcp.exe ──HTTP JSON-RPC 127.0.0.1:<port>, Bearer token──► bridge thread in Kadr ──post(...)──► App (UI thread)
@@ -36,7 +57,9 @@ Claude ──stdio MCP──► kadr-mcp.exe ──HTTP JSON-RPC 127.0.0.1:<port
 
 - Tiny HTTP/1.1 server on `127.0.0.1:0` (OS-chosen port) in its own thread,
   one request at a time (a single client is the supported case).
-- On start writes `<data dir>/mcp.json`: `{ "port", "token", "pid", "started_ms", "headless" }`;
+- On start writes `<data dir>/mcp.json`: `{ "port", "token", "ui_port", "pid", "started_ms", "headless" }`
+  (`ui_port` = the Slint MCP port Kadr chose and exported as `SLINT_MCP_PORT`
+  before creating the window);
   removes it on clean exit. Token: 32 random bytes, hex.
 - Requests without `Authorization: Bearer <token>` → 401.
 - Body: JSON-RPC 2.0 `{ "method": "<tool>", "params": {...} }`. The bridge
@@ -90,27 +113,27 @@ Times are milliseconds on the sequence.
 
 ### 4.1 Sight
 
+Screenshots and the element tree come from Slint (`ui_take_screenshot`,
+`ui_get_element_tree`, …). Kadr adds what Slint can't know:
+
 | Tool | Params | Returns |
 |---|---|---|
-| `screenshot` | `region?` {x,y,w,h}, `scale?` (default fits 1600 px wide) | PNG image + window size |
 | `get_state` | `detail?` (`summary`/`full`) | project name/path/dirty, sequence format, tracks with clips (id, name, kind, times, link, multicam, enabled, **screen rect**), selection, playhead, in/out, markers, zoom/scroll, open dialog/menu/popup, toasts, running jobs, AI panel messages |
 | `get_log` | `lines?` (50), `level?` | recent log records; panics flagged |
 | `get_frame` | `at_ms`, `max_w?` | composited preview frame PNG (same pipeline as the preview panel) |
 
-### 4.2 Real input (through `Window::dispatch_event`)
+### 4.2 Real input
 
-| Tool | Params |
-|---|---|
-| `pointer` | `action`: `move`/`down`/`up`/`click`/`double_click`/`drag`/`wheel`; `x`,`y`; `button` (`left`/`right`/`middle`); `path?` [[x,y]…] for drag; `dx`,`dy` for wheel; `modifiers?` |
-| `key` | `key` (name or char), `modifiers?`, `action?` (`press` = down+up / `down` / `up`) |
-| `type_text` | `text`, `layout?` (`en`/`ru`: send the character that physical key produces on that layout) |
+All pointer and keyboard input is Slint's (`ui_click_element`,
+`ui_drag_element`, `ui_move_pointer`, `ui_dispatch_key_event`, …). Kadr adds
+one helper Slint lacks:
 
-Each call returns after the event is processed and one frame is rendered, plus
-a short `after` summary (selection, open popup/dialog, toast) so obvious
-effects need no extra `get_state`.
+| Tool | Params | Purpose |
+|---|---|---|
+| `layout_text` | `text`, `layout` (`ru`/`en`) | returns the characters the same physical keys produce on the other layout, to feed `ui_dispatch_key_event` when testing layout-dependent shortcuts |
 
-Known limit (documented in the tool description): this layer does not exercise
-the OS → winit → Slint translation.
+Known limit (documented in `kadr-mcp`'s instructions): this layer does not
+exercise the OS → winit → Slint translation.
 
 ### 4.3 Semantic actions
 
@@ -143,8 +166,10 @@ errors with `isError: true` and a readable text. Kadr exiting mid-session →
 
 ## 6. Security
 
-Loopback only; bearer token from a file in the user's data dir; setting to
-disable the bridge; no filesystem access beyond what the tools do (import
+Loopback only. Kadr's bridge: bearer token from a file in the user's data
+dir. Slint's UI server: no token (Slint's design), loopback + Origin check;
+accepted by the user. The setting "Allow control via MCP" disables **both**
+(no `SLINT_MCP_PORT` exported, no bridge); no filesystem access beyond what the tools do (import
 paths, save/export paths). No network listeners other than 127.0.0.1.
 
 ## 7. Testing
@@ -152,10 +177,11 @@ paths, save/export paths). No network listeners other than 127.0.0.1.
 - **Unit:** JSON-RPC parsing, token check, error mapping, tool schemas.
 - **Bridge integration:** `kadr-mcp` against a fake bridge: discovery, stale
   `mcp.json`, spawn + wait, timeouts.
-- **Input layer:** tests on a real Slint window with the testing backend. The
-  regression proof: "right-click on a clip opens the context menu" must
-  **fail** against the pre-fix timeline markup (TouchArea swallowing the
-  press) and pass on the current one.
+- **Input layer (Slint's):** the regression proof is live, through
+  `kadr-mcp`: with the pre-fix `timeline.slint` (commit before `2766f3a`)
+  `ui_click_element` with `button: Right` on a clip opens no menu; on the
+  current markup it opens one (visible in `ui_take_screenshot` and in
+  `ui_query_element_descendants` for the menu items).
 - **Live acceptance (by Claude through MCP only):** context menu + menu item
   click, `U` then click audio then `Del`, drag from the media library,
   Russian-layout shortcut, multicam angle key, screenshot/get_state
