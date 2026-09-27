@@ -124,3 +124,38 @@ fn oversized_header_line_is_rejected() {
     // Server should survive
     assert_eq!(call(b.port, &b.token, "echo", json!(1), Duration::from_secs(5)).unwrap(), json!(1));
 }
+
+#[test]
+fn slow_client_does_not_block_other_clients() {
+    let b = Bridge::start(echo()).unwrap();
+    let port = b.port;
+    let token = b.token.clone();
+
+    // Spawn a thread that opens a slow connection (trickles header bytes every ~300 ms)
+    std::thread::spawn(move || {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.write_all(b"POST /rpc HTTP/1.1\r\n");
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = s.write_all(b"X");
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = s.write_all(b"-H");
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = s.write_all(b"eader");
+            std::thread::sleep(Duration::from_millis(300));
+            // Never send the full header; trickling forever
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    });
+
+    // Give slow connection time to establish and start trickling
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Normal client should be served quickly even though slow client is trickling
+    // (within 2s, not blocked by slow client's 10s timeout)
+    let start = std::time::Instant::now();
+    let v = call(port, &token, "echo", json!(42), Duration::from_secs(5)).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(v, json!(42));
+    assert!(elapsed < Duration::from_secs(2), "normal client was blocked by slow client for {:?}", elapsed);
+}

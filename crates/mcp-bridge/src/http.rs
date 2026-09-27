@@ -4,13 +4,14 @@ use crate::{BridgeError, MAX_BODY};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Response {
     pub status: u16,
     pub body: String,
 }
 
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 
@@ -19,6 +20,7 @@ fn respond(s: &mut TcpStream, status: u16, body: &str) {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -29,7 +31,24 @@ fn respond(s: &mut TcpStream, status: u16, body: &str) {
 }
 
 pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) -> Result<Value, BridgeError>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+
+    // Helper to check deadline and return remaining timeout
+    let get_remaining = || -> Option<Duration> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    };
+
+    if let Some(remaining) = get_remaining() {
+        let _ = stream.set_read_timeout(Some(remaining));
+    } else {
+        return respond(&mut stream, 408, "{}");
+    }
+
     let mut r = BufReader::new(&stream);
     let mut line = String::new();
     if r.read_line(&mut line).is_err() || line.len() > MAX_HEADER_LINE || !line.starts_with("POST ") {
@@ -38,6 +57,11 @@ pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) 
     let (mut len, mut auth) = (None, false);
     let mut header_count = 0;
     loop {
+        if let Some(remaining) = get_remaining() {
+            let _ = r.get_ref().set_read_timeout(Some(remaining));
+        } else {
+            return respond(&mut stream, 408, "{}");
+        }
         let mut h = String::new();
         if r.read_line(&mut h).is_err() {
             return respond(&mut stream, 400, "{}");
@@ -67,6 +91,13 @@ pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) 
     if len > MAX_BODY {
         return respond(&mut stream, 413, "{}");
     }
+
+    if let Some(remaining) = get_remaining() {
+        let _ = r.get_ref().set_read_timeout(Some(remaining));
+    } else {
+        return respond(&mut stream, 408, "{}");
+    }
+
     let mut body = vec![0; len];
     if r.read_exact(&mut body).is_err() {
         return respond(&mut stream, 400, "{}");

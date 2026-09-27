@@ -49,9 +49,12 @@ impl Bridge {
         let tok = token.clone();
         std::thread::Builder::new().name("mcp-bridge".into()).spawn(move || {
             for stream in listener.incoming().flatten() {
-                // One request per connection, served in order: MCP clients
-                // call tools one at a time.
-                http::serve(stream, &tok, &|method, params| run(&dispatch, method, params));
+                let tok_clone = tok.clone();
+                let dispatch_clone = dispatch.clone();
+                // Spawn each connection on its own thread so slow clients don't block accept loop
+                std::thread::spawn(move || {
+                    http::serve(stream, &tok_clone, &|method, params| run(&dispatch_clone, method, params));
+                });
             }
         })?;
         Ok(Bridge { port, token })
