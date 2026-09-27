@@ -39,7 +39,7 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
 }
 
 use kadr_core::ClipId;
-use kadr_project::{Project, TrackKind};
+use kadr_project::{Project, Sequence, TrackKind};
 use kadr_timeline::{commands, ClipProperty, EditCommand, InsertMode};
 
 fn clip_ids(p: &Project, v: &Value) -> Result<Vec<ClipId>, BridgeError> {
@@ -59,32 +59,41 @@ pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> R
     let ops = ops.as_array().ok_or_else(|| BridgeError::new("bad_params", "`ops` must be an array"))?;
     let seq = project.sequence();
     let mut out = vec![];
-    for op in ops {
-        match op.get("type").and_then(Value::as_str) {
-            Some("unlink") => {
-                let ids = commands::with_links(seq, &clip_ids(project, op)?);
-                out.extend(ids.into_iter().map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(None) }));
-            }
-            Some("link") => out.extend(
-                commands::link_selection(seq, &clip_ids(project, op)?).ok_or_else(|| BridgeError::new("edit_rejected", "link needs at least two clips"))?,
-            ),
-            Some("delete_part") => {
-                let kind = match op.get("part").and_then(Value::as_str) {
-                    Some("video") => TrackKind::Video,
-                    Some("audio") => TrackKind::Audio,
-                    _ => return Err(BridgeError::new("bad_params", "part must be video|audio")),
-                };
-                out.extend(commands::delete_part(seq, &clip_ids(project, op)?, kind).ok_or_else(|| BridgeError::new("edit_rejected", "no clip of that kind in the selection"))?);
-            }
-            _ => {
-                let cmd: kadr_ai::command::AiCommand =
-                    serde_json::from_value(op.clone()).map_err(|e| BridgeError::new("edit_rejected", format!("unknown or malformed op: {e}")))?;
-                let perms = kadr_ai::command::Permissions { allow_destructive: true, max_commands: 500 };
-                out.extend(kadr_ai::command::validate(&[cmd], project, &perms).map_err(|e| BridgeError::new("edit_rejected", e.to_string()))?);
-            }
-        }
+    for (i, op) in ops.iter().enumerate() {
+        let at = |e: BridgeError| BridgeError::new(e.code, format!("op #{i}: {}", e.message));
+        out.extend(edit_op(project, seq, op).map_err(at)?);
     }
     Ok(out)
+}
+
+/// One `edit` op; `edit_commands` prefixes errors with its index.
+fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditCommand>, BridgeError> {
+    match op.get("type").and_then(Value::as_str) {
+        Some("unlink") => {
+            let ids = commands::with_links(seq, &clip_ids(project, op)?);
+            Ok(ids.into_iter().map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(None) }).collect())
+        }
+        Some("link") => commands::link_selection(seq, &clip_ids(project, op)?).ok_or_else(|| BridgeError::new("edit_rejected", "link needs at least two clips")),
+        Some("delete_part") => {
+            let kind = match op.get("part").and_then(Value::as_str) {
+                Some("video") => TrackKind::Video,
+                Some("audio") => TrackKind::Audio,
+                _ => return Err(BridgeError::new("bad_params", "part must be video|audio")),
+            };
+            commands::delete_part(seq, &clip_ids(project, op)?, kind).ok_or_else(|| BridgeError::new("edit_rejected", "no clip of that kind in the selection"))
+        }
+        _ => {
+            let cmd: kadr_ai::command::AiCommand =
+                serde_json::from_value(op.clone()).map_err(|e| BridgeError::new("edit_rejected", format!("unknown or malformed op: {e}")))?;
+            let perms = kadr_ai::command::Permissions { allow_destructive: true, max_commands: 500 };
+            // Validated one at a time, so the validator's own "command 0:"
+            // prefix is meaningless; the caller adds the real op index.
+            kadr_ai::command::validate(&[cmd], project, &perms).map_err(|e| {
+                let s = e.to_string();
+                BridgeError::new("edit_rejected", s.strip_prefix("command 0: ").map(str::to_string).unwrap_or(s))
+            })
+        }
+    }
 }
 
 /// Menu ids `App::menu` handles that never open a native (OS) dialog.
@@ -151,7 +160,26 @@ fn ui_menu_allowed_in(id: &str, headless: bool) -> Result<(), BridgeError> {
     if headless && id == "fullscreen" {
         return Err(BridgeError::new("bad_params", "`fullscreen` is not available in a headless instance"));
     }
+    if headless && id == "logs" {
+        return Err(BridgeError::new("bad_params", "`logs` opens Explorer on the user's desktop; in a headless instance use `get_log`"));
+    }
     Ok(())
+}
+
+/// `export`'s `preset` (0 High, 1 Balanced, 2 Draft) and `resolution`
+/// (0 sequence, 1 1080p, 2 720p, 3 2160p) indices; both default to 0.
+pub fn export_indices(p: &Value) -> Result<(i32, i32), BridgeError> {
+    let index = |key: &str, max: i64, meaning: &str| -> Result<i32, BridgeError> {
+        match p.get(key) {
+            None | Some(Value::Null) => Ok(0),
+            Some(v) => v
+                .as_i64()
+                .filter(|i| (0..=max).contains(i))
+                .map(|i| i as i32)
+                .ok_or_else(|| BridgeError::new("bad_params", format!("`{key}` must be an integer 0..={max} ({meaning}), got {v}"))),
+        }
+    };
+    Ok((index("preset", 2, "0 High, 1 Balanced, 2 Draft")?, index("resolution", 3, "0 sequence, 1 1080p, 2 720p, 3 2160p")?))
 }
 
 /// Removes later duplicates, keeping each id's first occurrence in place.
@@ -297,9 +325,13 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
         }
         "export" => {
             let Some(path) = p.get("path").and_then(Value::as_str) else { return bad("path") };
+            let (preset, resolution) = match export_indices(&p) {
+                Ok(x) => x,
+                Err(e) => return Reply::Now(Err(e)),
+            };
             app.export.path = Some(path.into());
             let before = app.toasts.seq();
-            app.export_start(p.get("preset").and_then(Value::as_i64).unwrap_or(0) as i32, p.get("resolution").and_then(Value::as_i64).unwrap_or(0) as i32);
+            app.export_start(preset, resolution);
             let messages = app.toasts.since(before);
             let started = app.export.job.is_some();
             if started {
@@ -408,7 +440,7 @@ mod base64_lite {
 mod tests {
     use super::*;
     use kadr_core::{LinkId, MediaInfo, MediaKind, Time, TimeRange};
-    use kadr_project::{Clip, MediaAsset, Project, Track, TrackKind};
+    use kadr_project::{Clip, MediaAsset, Project};
     use kadr_timeline::EditCommand;
 
     fn project_with_pair() -> (Project, kadr_core::ClipId, kadr_core::ClipId) {
@@ -447,6 +479,47 @@ mod tests {
         assert_eq!(e.code, "edit_rejected");
         let e = edit_commands(&p, &[], &serde_json::json!({"type": "split_clip"})).unwrap_err();
         assert_eq!(e.code, "bad_params", "ops must be an array");
+    }
+
+    #[test]
+    fn edit_errors_name_the_real_op_index() {
+        let (p, v, _) = project_with_pair();
+        let ops = serde_json::json!([
+            {"type": "split_clip", "at_ms": 4000},
+            {"type": "unlink", "clips": [v.to_string()]},
+            {"type": "split_clip", "at_ms": 999999},
+        ]);
+        let e = edit_commands(&p, &[], &ops).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        assert!(e.message.starts_with("op #2: "), "{}", e.message);
+        assert!(!e.message.contains("command 0"), "the per-op validator index is meaningless here: {}", e.message);
+        let e = edit_commands(&p, &[], &serde_json::json!([{"type": "split_clip", "at_ms": 1}, {"type": "teleport"}])).unwrap_err();
+        assert!(e.message.starts_with("op #1: "), "{}", e.message);
+        let e = edit_commands(&p, &[], &serde_json::json!([{"type": "split_clip", "at_ms": 1}, {"type": "unlink", "clips": ["nope"]}])).unwrap_err();
+        assert_eq!(e.code, "not_found");
+        assert!(e.message.starts_with("op #1: "), "{}", e.message);
+    }
+
+    #[test]
+    fn export_indices_are_validated() {
+        assert_eq!(export_indices(&serde_json::json!({})).unwrap(), (0, 0));
+        assert_eq!(export_indices(&serde_json::json!({"preset": 2, "resolution": 3})).unwrap(), (2, 3));
+        for bad in [
+            serde_json::json!({"preset": 3}),
+            serde_json::json!({"preset": -1}),
+            serde_json::json!({"preset": "1"}),
+            serde_json::json!({"preset": 1.5}),
+            serde_json::json!({"resolution": 4}),
+            serde_json::json!({"resolution": "1080p"}),
+        ] {
+            assert_eq!(export_indices(&bad).unwrap_err().code, "bad_params", "{bad}");
+        }
+    }
+
+    #[test]
+    fn logs_menu_is_rejected_only_when_headless() {
+        assert_eq!(ui_menu_allowed_in("logs", true).unwrap_err().code, "bad_params");
+        assert!(ui_menu_allowed_in("logs", false).is_ok());
     }
 
     #[test]

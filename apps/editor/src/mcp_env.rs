@@ -8,6 +8,15 @@ use std::sync::OnceLock;
 pub struct Flags {
     /// Started by `kadr-mcp`: off-screen window, no restore prompt.
     pub headless: bool,
+    /// `--parent-pid <pid>`: the `kadr-mcp` that launched us.
+    pub parent_pid: Option<u32>,
+}
+
+/// A headless Kadr exists only to be driven over MCP: with MCP disabled it
+/// would sit hidden forever, so it exits at once with a code `kadr-mcp`
+/// turns into "MCP control is disabled in Kadr settings".
+pub fn headless_exit_code(flags: Flags, allow_mcp: bool) -> Option<i32> {
+    (flags.headless && !allow_mcp).then_some(kadr_mcp_bridge::EXIT_MCP_DISABLED)
 }
 
 /// The port Slint's embedded MCP server listens on (0 = disabled).
@@ -15,15 +24,17 @@ pub static UI_PORT: OnceLock<u16> = OnceLock::new();
 
 pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
     let mut flags = Flags::default();
-    let rest = args
-        .iter()
-        .filter(|a| {
-            let hit = a.as_os_str() == "--headless";
-            flags.headless |= hit;
-            !hit
-        })
-        .cloned()
-        .collect();
+    let mut rest = vec![];
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--headless" {
+            flags.headless = true;
+        } else if a == "--parent-pid" {
+            flags.parent_pid = it.next().and_then(|v| v.to_str()?.parse().ok());
+        } else {
+            rest.push(a.clone());
+        }
+    }
     (flags, rest)
 }
 
@@ -58,6 +69,30 @@ mod tests {
         let (f, rest) = parse_flags(&[OsString::from("x.mp4")]);
         assert!(!f.headless);
         assert_eq!(rest.len(), 1);
+    }
+
+    #[test]
+    fn parent_pid_is_parsed_and_consumed() {
+        let args: Vec<OsString> = ["--headless", "--parent-pid", "4242", "a.mp4"].iter().map(OsString::from).collect();
+        let (f, rest) = parse_flags(&args);
+        assert!(f.headless);
+        assert_eq!(f.parent_pid, Some(4242));
+        assert_eq!(rest, vec![OsString::from("a.mp4")]);
+        // A missing or bad value is consumed and ignored, never taken as a file.
+        let (f, rest) = parse_flags(&["--parent-pid".into(), "x".into()]);
+        assert_eq!(f.parent_pid, None);
+        assert!(rest.is_empty());
+        let (f, rest) = parse_flags(&["--parent-pid".into()]);
+        assert_eq!(f.parent_pid, None);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn headless_without_mcp_exits_with_the_disabled_code() {
+        let headless = Flags { headless: true, ..Flags::default() };
+        assert_eq!(headless_exit_code(headless, false), Some(kadr_mcp_bridge::EXIT_MCP_DISABLED));
+        assert_eq!(headless_exit_code(headless, true), None);
+        assert_eq!(headless_exit_code(Flags::default(), false), None, "a normal window starts regardless");
     }
 
     #[test]

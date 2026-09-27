@@ -146,7 +146,9 @@ pub fn defer(f: impl FnOnce() + 'static) {
 }
 
 pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
-    let settings = AppSettings::load(&dirs.settings_file());
+    let mut settings = AppSettings::load(&dirs.settings_file());
+    // A headless (MCP) instance reads the user's settings but never writes them.
+    settings.read_only = flags.headless;
     kadr_i18n::set_lang(settings.lang());
 
     let ui = AppWindow::new()?;
@@ -160,7 +162,8 @@ pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsSt
         }
     };
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6) - 1;
-    let audio = AudioEngine::new();
+    // Headless playback stays silent: nothing plays on the user's speakers.
+    let audio = if flags.headless { AudioEngine::silent() } else { AudioEngine::new() };
     let clock = audio.clock();
     let ai_settings = AiSettings::load(&dirs.data.join("ai-settings.json"));
     let cache = Cache::new(dirs.cache());
@@ -213,6 +216,9 @@ pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsSt
     wire_callbacks(&ui);
     crate::file_drop::install(&ui);
     start_timers();
+    if let Some(parent) = flags.parent_pid {
+        watch_parent(parent);
+    }
 
     if allow_mcp {
         with_app(|app| app.start_mcp_bridge());
@@ -272,6 +278,19 @@ fn wire_translations(ui: &AppWindow) {
     tr.on_lookup(|_, k| t(&k).into());
     tr.on_lookup1(|_, k, a| kadr_i18n::t_pos(&k, &[&a]).into());
     tr.on_lookup2(|_, k, a, b| kadr_i18n::t_pos(&k, &[&a, &b]).into());
+}
+
+/// Quits when the `kadr-mcp` that launched us is gone (a backstop for its
+/// kill-on-close job, e.g. when job assignment failed).
+fn watch_parent(parent: u32) {
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
+        if !kadr_mcp_bridge::pid_alive(parent) {
+            tracing::info!(parent, "launching kadr-mcp exited; quitting");
+            let _ = slint::quit_event_loop();
+        }
+    });
+    std::mem::forget(t);
 }
 
 fn start_timers() {

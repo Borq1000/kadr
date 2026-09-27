@@ -83,3 +83,20 @@ pub fn hide_off_screen() {
 
 #[cfg(not(windows))]
 pub fn hide_off_screen() {}
+
+/// Headless mode, before the first window exists: the window is created
+/// off-screen, inactive and (on Windows) without a taskbar button, so it
+/// never flashes on screen or takes focus. `hide_off_screen` stays as a
+/// fallback after show.
+pub fn select_headless_backend() -> Result<(), slint::PlatformError> {
+    use slint::winit_030::winit;
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .with_winit_window_attributes_hook(|attrs| {
+            let attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(-32000, -32000)).with_active(false);
+            #[cfg(windows)]
+            let attrs = winit::platform::windows::WindowAttributesExtWindows::with_skip_taskbar(attrs, true);
+            attrs
+        })
+        .select()
+}
