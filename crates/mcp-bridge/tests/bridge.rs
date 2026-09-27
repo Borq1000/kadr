@@ -196,12 +196,17 @@ fn connection_cap_prevents_exhaustion() {
         panic!("17th connection should be rejected with 503");
     }
 
-    // Drop the 16 connections
+    // Drop the 16 connections: their threads notice the hang-up and free
+    // their slots, how soon depends on the scheduler — wait for it, bounded.
     drop(conns);
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Now we should be able to make a normal call
-    let v = call(b.port, &b.token, "echo", json!("ok"), Duration::from_secs(5)).unwrap();
+    let t = std::time::Instant::now();
+    let v = loop {
+        match call(b.port, &b.token, "echo", json!("ok"), Duration::from_secs(5)) {
+            Ok(v) => break v,
+            Err(_) if t.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("slots never freed: {e:?}"),
+        }
+    };
     assert_eq!(v, json!("ok"));
 }
 
@@ -234,7 +239,7 @@ fn request_line_without_newline_is_rejected_promptly() {
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
     let out = String::from_utf8_lossy(&out);
-    assert!(out.starts_with("HTTP/1.1 4"), "expected a 4xx, got {:?}", &out[..out.len().min(60)]);
+    assert!(out.starts_with("HTTP/1.1 414"), "expected 414, got {:?}", &out[..out.len().min(60)]);
     assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
     // The server keeps serving.
     assert_eq!(call(b.port, &b.token, "echo", json!(5), Duration::from_secs(5)).unwrap(), json!(5));
@@ -286,4 +291,37 @@ fn pid_liveness_is_checked_with_the_os() {
     child.wait().unwrap();
     drop(child); // releases our handle, so the process object can go away
     assert!(!pid_alive(pid), "an exited process is not alive");
+}
+
+#[test]
+fn only_the_rpc_path_is_served() {
+    let b = Bridge::start(echo()).unwrap();
+    let auth = format!("Authorization: Bearer {}\r\n", b.token);
+    let body = r#"{"method":"echo","params":1}"#;
+    for path in ["/", "/mcp", "/rpc/x", "/rpcx", "/rpc?x=1"] {
+        let out = raw(b.port, format!("POST {path} HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+        assert!(out.starts_with("HTTP/1.1 404"), "{path}: {:?}", &out[..out.len().min(40)]);
+    }
+    let out = raw(b.port, format!("POST /rpc HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+}
+
+#[test]
+fn a_client_that_hangs_up_mid_headers_gets_no_reply() {
+    let b = Bridge::start(echo()).unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", b.port)).unwrap();
+    s.write_all(b"POST /rpc HTTP/1.1\r\nContent-Le").unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(out.is_empty(), "nobody is left to read a status: {:?}", String::from_utf8_lossy(&out));
+    assert_eq!(call(b.port, &b.token, "echo", json!(7), Duration::from_secs(5)).unwrap(), json!(7));
+}
+
+#[test]
+fn an_overlong_request_line_gets_414() {
+    let b = Bridge::start(echo()).unwrap();
+    let out = raw(b.port, format!("POST /{} HTTP/1.1\r\n\r\n", "a".repeat(10_000)).as_bytes());
+    assert!(out.starts_with("HTTP/1.1 414"), "{:?}", &out[..out.len().min(40)]);
 }
