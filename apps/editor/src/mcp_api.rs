@@ -38,9 +38,190 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
     }
 }
 
-/// Filled in by Task 5.
-pub fn actions(_app: &mut App, method: &str, _p: Value) -> Reply {
-    Reply::Now(Err(BridgeError::new("unknown_method", method.to_string())))
+use kadr_core::ClipId;
+use kadr_project::{Project, TrackKind};
+use kadr_timeline::{commands, ClipProperty, EditCommand, InsertMode};
+
+fn clip_ids(p: &Project, v: &Value) -> Result<Vec<ClipId>, BridgeError> {
+    let arr = v.get("clips").and_then(Value::as_array).ok_or_else(|| BridgeError::new("bad_params", "`clips` must be an array of clip ids"))?;
+    arr.iter()
+        .map(|x| {
+            let s = x.as_str().unwrap_or_default();
+            ClipId::parse(s).filter(|id| p.sequence().clip(*id).is_some()).ok_or_else(|| BridgeError::new("not_found", format!("clip {s}")))
+        })
+        .collect()
+}
+
+/// Turns MCP `edit` ops (a mix of `AiCommand` JSON and the extra
+/// link/unlink/delete_part ops) into engine `EditCommand`s. Pure and tested
+/// without a window.
+pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> Result<Vec<EditCommand>, BridgeError> {
+    let ops = ops.as_array().ok_or_else(|| BridgeError::new("bad_params", "`ops` must be an array"))?;
+    let seq = project.sequence();
+    let mut out = vec![];
+    for op in ops {
+        match op.get("type").and_then(Value::as_str) {
+            Some("unlink") => {
+                let ids = commands::with_links(seq, &clip_ids(project, op)?);
+                out.extend(ids.into_iter().map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(None) }));
+            }
+            Some("link") => out.extend(
+                commands::link_selection(seq, &clip_ids(project, op)?).ok_or_else(|| BridgeError::new("edit_rejected", "link needs at least two clips"))?,
+            ),
+            Some("delete_part") => {
+                let kind = match op.get("part").and_then(Value::as_str) {
+                    Some("video") => TrackKind::Video,
+                    Some("audio") => TrackKind::Audio,
+                    _ => return Err(BridgeError::new("bad_params", "part must be video|audio")),
+                };
+                out.extend(commands::delete_part(seq, &clip_ids(project, op)?, kind).ok_or_else(|| BridgeError::new("edit_rejected", "no clip of that kind in the selection"))?);
+            }
+            _ => {
+                let cmd: kadr_ai::command::AiCommand =
+                    serde_json::from_value(op.clone()).map_err(|e| BridgeError::new("edit_rejected", format!("unknown or malformed op: {e}")))?;
+                let perms = kadr_ai::command::Permissions { allow_destructive: true, max_commands: 500 };
+                out.extend(kadr_ai::command::validate(&[cmd], project, &perms).map_err(|e| BridgeError::new("edit_rejected", e.to_string()))?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
+    let ok = |v: Value| Reply::Now(Ok(v));
+    match method {
+        "edit" => {
+            let label = format!("Claude: {}", p.get("label").and_then(Value::as_str).unwrap_or("edit"));
+            match edit_commands(&app.project, &app.tl.selection, p.get("ops").unwrap_or(&Value::Null)) {
+                Ok(commands) if commands.is_empty() => bad("no ops"),
+                Ok(commands) => {
+                    let applied = app.execute_as(EditCommand::Batch { label, commands }, kadr_project::EditSource::Ai, None);
+                    let seq = app.project.sequence();
+                    app.tl.selection.retain(|id| seq.clip(*id).is_some());
+                    ok(json!({"applied": applied, "timeline": mcp_state::timeline_json(app.project.sequence(), &app.tl.selection, app.playhead)}))
+                }
+                Err(e) => Reply::Now(Err(e)),
+            }
+        }
+        "undo" => {
+            app.undo();
+            ok(json!({}))
+        }
+        "redo" => {
+            app.redo();
+            ok(json!({}))
+        }
+        "select" => {
+            let ids = if p.get("clips").is_some() {
+                match clip_ids(&app.project, &p) {
+                    Ok(v) => v,
+                    Err(e) => return Reply::Now(Err(e)),
+                }
+            } else {
+                vec![]
+            };
+            if p.get("add").and_then(Value::as_bool) == Some(true) {
+                app.tl.selection.extend(ids)
+            } else {
+                app.tl.selection = ids
+            }
+            app.refresh_timeline();
+            app.refresh_inspector();
+            app.refresh_status();
+            ok(json!({"selection": app.tl.selection.iter().map(|c| c.to_string()).collect::<Vec<_>>()}))
+        }
+        "set_playhead" => match ms(&p, "at_ms") {
+            Some(t) => {
+                app.set_playhead(t);
+                ok(json!({"playhead_ms": app.playhead.as_millis()}))
+            }
+            None => bad("at_ms"),
+        },
+        "playback" => {
+            match p.get("action").and_then(Value::as_str) {
+                Some("play") if !app.playing => app.toggle_playback(),
+                Some("pause") if app.playing => app.toggle_playback(),
+                Some("stop") => {
+                    app.stop_playback();
+                    app.transport("start")
+                }
+                Some("step") => app.step_frames(p.get("frames").and_then(Value::as_i64).unwrap_or(1)),
+                Some(_) => {}
+                None => return bad("action: play|pause|stop|step"),
+            }
+            ok(json!({"playing": app.playing, "playhead_ms": app.playhead.as_millis()}))
+        }
+        "import_media" => {
+            let paths: Vec<std::path::PathBuf> =
+                p.get("paths").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(Into::into)).collect()).unwrap_or_default();
+            if paths.is_empty() {
+                return bad("paths");
+            }
+            if let Some(missing) = paths.iter().find(|x| !x.exists()) {
+                return Reply::Now(Err(BridgeError::new("not_found", missing.display().to_string())));
+            }
+            app.import_paths(paths);
+            ok(json!({"note": "probing runs in the background; poll `idle`"}))
+        }
+        "place_media" => {
+            let at = ms(&p, "at_ms").unwrap_or(app.playhead);
+            let mode = match p.get("mode").and_then(Value::as_str) {
+                Some("overwrite") => InsertMode::Overwrite,
+                _ => InsertMode::Insert,
+            };
+            let id = p.get("id").and_then(Value::as_str).unwrap_or_default();
+            if let Some(a) = kadr_core::AssetId::parse(id).filter(|a| app.project.asset(*a).is_some()) {
+                app.place_asset(a, at, mode, None);
+            } else if let Some(g) = kadr_core::MulticamId::parse(id).filter(|g| app.project.multicam_groups.iter().any(|x| x.id == *g)) {
+                app.place_group(g, at, mode, None);
+            } else {
+                return Reply::Now(Err(BridgeError::new("not_found", format!("asset or group {id}"))));
+            }
+            ok(json!({"timeline": mcp_state::timeline_json(app.project.sequence(), &app.tl.selection, app.playhead)}))
+        }
+        "project" => match (p.get("action").and_then(Value::as_str), p.get("path").and_then(Value::as_str)) {
+            (Some("new"), _) => {
+                app.new_project();
+                ok(json!({}))
+            }
+            (Some("open"), Some(path)) => {
+                app.open_project(path.into());
+                ok(json!({}))
+            }
+            (Some("save"), _) if app.path.is_some() => {
+                let pth = app.path.clone().unwrap();
+                app.save_to(pth);
+                ok(json!({}))
+            }
+            (Some("save_as" | "save"), Some(path)) => {
+                app.save_to(path.into());
+                ok(json!({"path": path}))
+            }
+            _ => bad("action: new|open(path)|save|save_as(path)"),
+        },
+        "export" => {
+            let Some(path) = p.get("path").and_then(Value::as_str) else { return bad("path") };
+            app.export.path = Some(path.into());
+            app.export_start(p.get("preset").and_then(Value::as_i64).unwrap_or(0) as i32, p.get("resolution").and_then(Value::as_i64).unwrap_or(0) as i32);
+            ok(json!({"started": app.export.job.is_some(), "note": "poll export_status"}))
+        }
+        "export_status" => ok(json!({"running": app.export.job.is_some() && !app.export.done && !app.export.failed, "done": app.export.done, "failed": app.export.failed, "status": app.export.status})),
+        "ui" => match p.get("menu").and_then(Value::as_str) {
+            Some(m) => {
+                app.menu(m);
+                ok(json!({}))
+            }
+            None => bad("ui needs `menu`: a menu action id (new, save, export, settings, undo, split, delete, select-all, marker, …)"),
+        },
+        "assistant" => match p.get("prompt").and_then(Value::as_str) {
+            Some(text) => {
+                app.ai_send(text);
+                ok(json!({"transcript": app.ai.transcript()}))
+            }
+            None => bad("prompt"),
+        },
+        _ => Reply::Now(Err(BridgeError::new("unknown_method", method.to_string()))),
+    }
 }
 
 impl App {
@@ -112,5 +293,58 @@ mod base64_lite {
             assert_eq!(encode(b"Ma"), "TWE=");
             assert_eq!(encode(b"M"), "TQ==");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kadr_core::{LinkId, MediaInfo, MediaKind, Time, TimeRange};
+    use kadr_project::{Clip, MediaAsset, Project, Track, TrackKind};
+    use kadr_timeline::EditCommand;
+
+    fn project_with_pair() -> (Project, kadr_core::ClipId, kadr_core::ClipId) {
+        let mut p = Project::new("t");
+        let a = MediaAsset::new("a.mp4", MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(10), container: "mp4".into(), size_bytes: 0, video: None, audio: None, timecode: None });
+        let link = LinkId::new();
+        let mut v = Clip::new(a.id, "a", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::ZERO);
+        v.link = Some(link);
+        let mut au = v.clone();
+        au.id = kadr_core::ClipId::new();
+        let (vid, aid) = (v.id, au.id);
+        p.sequence_mut().tracks[0].clips.push(v);
+        p.sequence_mut().tracks[1].clips.push(au);
+        p.assets.push(a);
+        (p, vid, aid)
+    }
+
+    #[test]
+    fn edit_accepts_ai_commands_and_extra_ops() {
+        let (p, v, _) = project_with_pair();
+        let ops = serde_json::json!([
+            {"type": "split_clip", "at_ms": 4000, "reason": "mcp"},
+            {"type": "unlink", "clips": [v.to_string()]},
+        ]);
+        let cmds = edit_commands(&p, &[], &ops).unwrap();
+        assert!(matches!(cmds[0], EditCommand::Split { .. }));
+        assert!(cmds[1..].iter().all(|c| matches!(c, EditCommand::SetClipProperty { .. })));
+    }
+
+    #[test]
+    fn edit_rejects_unknown_clips_and_bad_ops_with_a_reason() {
+        let (p, _, _) = project_with_pair();
+        let e = edit_commands(&p, &[], &serde_json::json!([{"type": "unlink", "clips": ["nope"]}])).unwrap_err();
+        assert_eq!(e.code, "not_found");
+        let e = edit_commands(&p, &[], &serde_json::json!([{"type": "teleport"}])).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        let e = edit_commands(&p, &[], &serde_json::json!({"type": "split_clip"})).unwrap_err();
+        assert_eq!(e.code, "bad_params", "ops must be an array");
+    }
+
+    #[test]
+    fn delete_part_audio_keeps_the_video() {
+        let (p, v, _) = project_with_pair();
+        let cmds = edit_commands(&p, &[], &serde_json::json!([{"type": "delete_part", "clips": [v.to_string()], "part": "audio"}])).unwrap();
+        assert!(cmds.iter().any(|c| matches!(c, EditCommand::DeleteClips { .. })));
     }
 }
