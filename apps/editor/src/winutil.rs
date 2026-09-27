@@ -59,6 +59,7 @@ pub fn hide_off_screen() {
     }
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_APPWINDOW: isize = 0x0004_0000;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_NOZORDER: u32 = 0x0004;
 
@@ -69,8 +70,9 @@ pub fn hide_off_screen() {
             GetWindowThreadProcessId(hwnd, &mut pid);
             if pid == std::process::id() && IsWindowVisible(hwnd) != 0 {
                 let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
-                SetWindowPos(hwnd, std::ptr::null_mut(), -32000, 0, 1920, 1040, SWP_NOACTIVATE | SWP_NOZORDER);
+                // APPWINDOW would force a taskbar button despite TOOLWINDOW.
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW);
+                SetWindowPos(hwnd, std::ptr::null_mut(), -32000, -32000, 1920, 1040, SWP_NOACTIVATE | SWP_NOZORDER);
             }
         }
         1

@@ -287,7 +287,11 @@ fn watch_parent(parent: u32) {
     t.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
         if !kadr_mcp_bridge::pid_alive(parent) {
             tracing::info!(parent, "launching kadr-mcp exited; quitting");
-            let _ = slint::quit_event_loop();
+            // Same end as being killed by kadr-mcp: tidy up our discovery
+            // file, then exit at once (a graceful window teardown can leave
+            // the process stuck exiting).
+            with_app(|app| app.shutdown());
+            std::process::exit(0);
         }
     });
     std::mem::forget(t);
