@@ -43,7 +43,7 @@ impl LogRing {
     }
 
     pub fn tail(&self, n: usize, min_level: tracing::Level) -> Vec<LogLine> {
-        let lines = self.lines.lock().unwrap();
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         let keep: Vec<LogLine> = lines
             .iter()
             .filter(|l| l.level.parse::<tracing::Level>().map_or(true, |lv| lv <= min_level))
@@ -68,6 +68,7 @@ impl tracing::field::Visit for Fields {
             "message" => self.message = format!("{v:?}").trim_matches('"').to_string(),
             "panic" => {
                 self.panic = true;
+                self.rest.push(format!("panic={v:?}"));
             }
             name => self.rest.push(format!("{name}={v:?}")),
         }
@@ -86,7 +87,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
             message,
             panic: f.panic,
         };
-        let mut lines = self.0.lines.lock().unwrap();
+        let mut lines = self.0.lines.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() == self.0.cap {
             lines.pop_front();
         }
@@ -132,8 +133,10 @@ mod tests {
         });
         let all = ring.tail(10, tracing::Level::TRACE);
         assert_eq!(all.len(), 3, "capacity");
-        assert_eq!(all.last().unwrap().message, "panic");
-        assert!(all.last().unwrap().panic);
+        let last = all.last().unwrap();
+        assert!(last.message.starts_with("panic"), "message should start with 'panic', got: {}", last.message);
+        assert!(last.message.contains("boom"), "message should contain 'boom', got: {}", last.message);
+        assert!(last.panic, "panic field should be true");
         let errors = ring.tail(10, tracing::Level::ERROR);
         assert_eq!(errors.len(), 1);
     }
