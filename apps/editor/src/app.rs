@@ -107,6 +107,7 @@ pub struct App {
     pub fullscreen: bool,
     pub last_window_width: f32,
     pub last_window_height: f32,
+    pub flags: crate::mcp_env::Flags,
 }
 
 thread_local! {
@@ -144,8 +145,10 @@ pub fn defer(f: impl FnOnce() + 'static) {
     slint::Timer::single_shot(Duration::from_millis(1), f);
 }
 
-pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
-    let settings = AppSettings::load(&dirs.settings_file());
+pub fn run(dirs: AppDirs, flags: crate::mcp_env::Flags, args: Vec<std::ffi::OsString>) -> Result<(), slint::PlatformError> {
+    let mut settings = AppSettings::load(&dirs.settings_file());
+    // A headless (MCP) instance reads the user's settings but never writes them.
+    settings.read_only = flags.headless;
     kadr_i18n::set_lang(settings.lang());
 
     let ui = AppWindow::new()?;
@@ -159,7 +162,8 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
         }
     };
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6) - 1;
-    let audio = AudioEngine::new();
+    // Headless playback stays silent: nothing plays on the user's speakers.
+    let audio = if flags.headless { AudioEngine::silent() } else { AudioEngine::new() };
     let clock = audio.clock();
     let ai_settings = AiSettings::load(&dirs.data.join("ai-settings.json"));
     let cache = Cache::new(dirs.cache());
@@ -201,15 +205,24 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
         fullscreen: false,
         last_window_width: 0.0,
         last_window_height: 0.0,
+        flags,
         settings,
         dirs,
     };
+    let allow_mcp = app.settings.allow_mcp;
     let rc = Rc::new(RefCell::new(app));
     APP.with(|a| *a.borrow_mut() = Some(rc.clone()));
 
     wire_callbacks(&ui);
     crate::file_drop::install(&ui);
     start_timers();
+    if let Some(parent) = flags.parent_pid {
+        watch_parent(parent);
+    }
+
+    if allow_mcp {
+        with_app(|app| app.start_mcp_bridge());
+    }
 
     with_app(|app| {
         app.apply_layout();
@@ -219,12 +232,12 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
         }
         app.refresh_all();
         // `kadr project.kadr` opens a project; media paths are imported.
-        let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+        let args: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
         let (projects, media): (Vec<_>, Vec<_>) =
             args.into_iter().partition(|p| p.extension().is_some_and(|e| e == kadr_project::io::EXTENSION));
         if let Some(p) = projects.into_iter().next() {
             app.open_project(p);
-        } else if media.is_empty() && !app.check_recovery() {
+        } else if !flags.headless && media.is_empty() && !app.check_recovery() {
             app.show_welcome();
         }
         if !media.is_empty() {
@@ -239,11 +252,16 @@ pub fn run(dirs: AppDirs) -> Result<(), slint::PlatformError> {
 
     // Editors live full-screen: maximize once the window is actually shown
     // (maximizing before show is overridden by the initial preferred size).
-    slint::Timer::single_shot(Duration::from_millis(30), || {
-        with_app(|app| {
-            app.ui().window().set_maximized(true);
-        });
-        crate::winutil::dark_title_bar();
+    // Headless instances stay off-screen and out of the taskbar instead.
+    slint::Timer::single_shot(Duration::from_millis(30), move || {
+        if flags.headless {
+            crate::winutil::hide_off_screen();
+        } else {
+            with_app(|app| {
+                app.ui().window().set_maximized(true);
+            });
+            crate::winutil::dark_title_bar();
+        }
     });
     ui.invoke_focus_editor();
     let r = ui.run();
@@ -260,6 +278,23 @@ fn wire_translations(ui: &AppWindow) {
     tr.on_lookup(|_, k| t(&k).into());
     tr.on_lookup1(|_, k, a| kadr_i18n::t_pos(&k, &[&a]).into());
     tr.on_lookup2(|_, k, a, b| kadr_i18n::t_pos(&k, &[&a, &b]).into());
+}
+
+/// Quits when the `kadr-mcp` that launched us is gone (a backstop for its
+/// kill-on-close job, e.g. when job assignment failed).
+fn watch_parent(parent: u32) {
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
+        if !kadr_mcp_bridge::pid_alive(parent) {
+            tracing::info!(parent, "launching kadr-mcp exited; quitting");
+            // Same end as being killed by kadr-mcp: tidy up our discovery
+            // file, then exit at once (a graceful window teardown can leave
+            // the process stuck exiting).
+            with_app(|app| app.shutdown());
+            std::process::exit(0);
+        }
+    });
+    std::mem::forget(t);
 }
 
 fn start_timers() {
@@ -382,6 +417,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_settings_personalize, |on| |app: &mut App| app.settings_personalize(on));
     cb!(ui.on_settings_limit, |k, v| |app: &mut App| app.settings_limit(&k, &v));
     cb!(ui.on_settings_test, |id| |app: &mut App| app.settings_test(&id));
+    cb!(ui.on_settings_allow_mcp, |on| |app: &mut App| app.settings_allow_mcp(on));
 
     cb!(ui.on_confirm_ok_clicked, | | |app: &mut App| app.confirm_answer(true));
     cb!(ui.on_confirm_alt_clicked, | | |app: &mut App| app.confirm_alt());
@@ -695,6 +731,45 @@ impl App {
         if let Err(e) = self.ai.assistant.settings.save(&self.dirs.data.join("ai-settings.json")) {
             tracing::warn!(error = %e, "could not save AI settings");
         }
+        kadr_mcp_bridge::discovery::remove(&self.dirs.data, std::process::id());
         tracing::info!("Kadr exiting");
+    }
+
+    pub fn start_mcp_bridge(&mut self) {
+        let dispatch: kadr_mcp_bridge::Dispatch = std::sync::Arc::new(|method, params, tx| {
+            crate::app::post(move |app| {
+                // The handler runs here, on the UI thread: a panic must not
+                // take Kadr down — it becomes a `panicked` reply with the log tail.
+                let reply = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::mcp_api::handle(app, &method, params))) {
+                    Ok(r) => r,
+                    Err(p) => {
+                        let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                        let tail = crate::logging::ring().tail(50, tracing::Level::TRACE);
+                        kadr_mcp_bridge::Reply::Now(Err(kadr_mcp_bridge::BridgeError::new(
+                            "panicked",
+                            format!("{method}: {msg}\n{}", serde_json::to_string_pretty(&tail).unwrap_or_default()),
+                        )))
+                    }
+                };
+                let _ = tx.send(reply);
+            });
+        });
+        match kadr_mcp_bridge::Bridge::start(dispatch) {
+            Ok(b) => {
+                let d = kadr_mcp_bridge::Discovery {
+                    port: b.port,
+                    token: b.token,
+                    ui_port: crate::mcp_env::UI_PORT.get().copied().unwrap_or(0),
+                    pid: std::process::id(),
+                    started_ms: kadr_project::now_ms(),
+                    headless: self.flags.headless,
+                };
+                match kadr_mcp_bridge::discovery::write(&self.dirs.data, &d) {
+                    Ok(p) => tracing::info!(file = %p.display(), port = d.port, ui_port = d.ui_port, "MCP bridge ready"),
+                    Err(e) => tracing::warn!(error = %e, "MCP discovery file not written"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "MCP bridge failed to start"),
+        }
     }
 }

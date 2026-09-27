@@ -91,15 +91,14 @@ impl AudioEngine {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "no audio output; using wall clock");
-                AudioEngine {
-                    _stream: None,
-                    shared: Arc::new(Shared::new(2)),
-                    rate: PCM_RATE,
-                    feeder: None,
-                    device_name: "No audio device".into(),
-                }
+                Self::silent()
             }
         }
+    }
+
+    /// No output device: playback runs on the wall clock, silently.
+    pub fn silent() -> Self {
+        AudioEngine { _stream: None, shared: Arc::new(Shared::new(2)), rate: PCM_RATE, feeder: None, device_name: "No audio device".into() }
     }
 
     fn open_device() -> Result<(cpal::Stream, Arc<Shared>, u32, String), String> {

@@ -336,7 +336,7 @@ impl App {
         }
         match io::save(&mut self.project, &path) {
             Ok(()) => {
-                let _ = std::fs::remove_file(io::untitled_autosave_path(&self.dirs.data, &self.project));
+                let _ = std::fs::remove_file(self.untitled_autosave_path());
                 self.path = Some(path.clone());
                 self.saved_rev = self.engine.history_marker();
                 self.meta_dirty = false;
@@ -388,6 +388,11 @@ impl App {
 
     // ------------------------------------------------------------ autosave
 
+    fn untitled_autosave_path(&self) -> PathBuf {
+        crate::mcp_env::recovery_dir(&self.dirs.data, self.flags.headless)
+            .join(format!("{}.{}.autosave", self.project.id, io::EXTENSION))
+    }
+
     pub fn tick_autosave(&mut self) {
         let every = self.settings.autosave_secs;
         if every == 0 || !self.is_dirty() || self.last_autosave.elapsed() < Duration::from_secs(every) {
@@ -396,7 +401,7 @@ impl App {
         self.last_autosave = Instant::now();
         let target = match &self.path {
             Some(p) => io::autosave_path(p),
-            None => io::untitled_autosave_path(&self.dirs.data, &self.project),
+            None => self.untitled_autosave_path(),
         };
         // Serialize on the UI thread (fast), write in the background.
         let bytes = io::to_json(&self.project);
@@ -408,7 +413,7 @@ impl App {
 
     /// On startup: offer to restore the newest untitled autosave.
     pub fn check_recovery(&mut self) -> bool {
-        let dir = self.dirs.data.join("recovery");
+        let dir = crate::mcp_env::recovery_dir(&self.dirs.data, self.flags.headless);
         let newest = std::fs::read_dir(&dir)
             .ok()
             .into_iter()

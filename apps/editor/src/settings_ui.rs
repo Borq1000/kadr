@@ -75,6 +75,7 @@ impl App {
             .into(),
             cache_size: tf("settings.cache_size", &[("size", &crate::util::fmt_bytes(self.cache.size_bytes())), ("path", &self.cache.root().display().to_string())]).into(),
             data_dir: self.dirs.data.display().to_string().into(),
+            allow_mcp: self.settings.allow_mcp,
         };
         let ui = self.ui();
         ui.set_settings_state(st);
@@ -89,6 +90,12 @@ impl App {
 
     pub fn settings_tab(&mut self, tab: i32) {
         self.settings.settings_tab = tab;
+        self.settings.save(&self.dirs.settings_file());
+        self.refresh_settings();
+    }
+
+    pub fn settings_allow_mcp(&mut self, on: bool) {
+        self.settings.allow_mcp = on;
         self.settings.save(&self.dirs.settings_file());
         self.refresh_settings();
     }

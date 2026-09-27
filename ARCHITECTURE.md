@@ -65,6 +65,8 @@
 | `kadr-ai` | Edit Command Language + валидация; локальный intent-парсер; `AIProvider` + REST реализации; тарифы/стоимость; бюджеты; privacy-политика; хранение ключей; модуль `jev`: `JevDecisionService`, шаблоны вопросов, гейты, персонализация (§11) |
 | `kadr-i18n` | локализация RU/EN: JSON-каталоги (`locales/*.json`, встроены в бинарник), плюрализация, локализованные длительности; общий источник строк для Slint и Rust |
 | `apps/editor` | Slint UI, контроллер, preview/audio плееры, связывание всего |
+| `kadr-mcp-bridge` | HTTP/1.1 сервер на `127.0.0.1:0` внутри процесса редактора: JSON-RPC диспетчер Kadr-инструментов (`get_state`, `import_media`, `edit`, …) на UI-потоке через `post(...)`; bearer-токен, файл обнаружения `mcp.json` |
+| `apps/kadr-mcp` | Отдельный бинарник — stdio MCP-сервер (JSON-RPC 2.0, протокол `2025-06-18`) для Claude: агрегирует `ui_*` (проксирует в embedded MCP-сервер Slint 1.18) и Kadr-инструменты (проксирует в `kadr-mcp-bridge`); обнаруживает/запускает headless-инстанс Kadr |
 
 Сознательно **не** создаём отдельные `render`, `transcription`, `platform`: пока у них нет содержимого. Jev живёт модулем `kadr_ai::jev` — ему нужны те же CostGuard, PrivacyPolicy и ledger, что и чату.
 
@@ -215,3 +217,40 @@ JevItem { kind, subject, state, questions, primary }        ← templates.rs (sh
 - **V0.1** — см. ТЗ §26 (текущая работа).
 - **V0.2** — Whisper (whisper.cpp), transcript editor, REST LLM, AI plan/review/apply, Jev, scene detection, multicam sync (кросс-корреляция огибающих аудио), video proxies, wgpu compositing.
 - **V0.3** — multicam rough cut, AI Director, semantic search, voice, эффекты, captions, advanced export.
+
+## 19. MCP-управление
+
+Claude (Claude Code / Claude Desktop) может видеть и управлять Kadr через
+Model Context Protocol. Полная документация для пользователя — `docs/mcp.md`;
+здесь — архитектурная схема.
+
+Два upstream-сервера объединены в один список инструментов, который отдаёт
+`apps/kadr-mcp` по stdio:
+
+```
+Claude ──stdio MCP──► kadr-mcp.exe ──HTTP JSON-RPC 127.0.0.1:<port>, Bearer token──► kadr-mcp-bridge (UI-поток Kadr)
+                          │                                                              ▲
+                          └── ui_* ──HTTP 127.0.0.1:<SLINT_MCP_PORT>──► embedded MCP-сервер Slint (sight + real input) ┘
+                          │
+                          └── нет живого инстанса → запускает `kadr.exe --headless`, ждёт mcp.json
+```
+
+- `ui_*` — 1:1 прокси в MCP-сервер Slint 1.18 (`get_element_tree`,
+  `take_screenshot`, `click_element`, `drag_element`, `dispatch_key_event`, …):
+  снимки окна и реальный ввод через настоящую маршрутизацию событий Slint.
+- Kadr-инструменты (`get_state`, `import_media`, `edit`, `undo`, `select`,
+  `place_media`, `project`, `export`, `layout_text`, …) обслуживает
+  `kadr-mcp-bridge`, встроенный в `apps/editor`.
+- Файл обнаружения инстанса: `<data dir>/mcp/<pid>.json` — `AppDirs`
+  (соответствует `KADR_DATA_DIR`, если задан), содержит `port`, `token`,
+  `ui_port`, `pid`, `started_ms`, `headless`. `kadr-mcp` читает его, проверяет,
+  что PID жив, и пингует; при отсутствии/устаревании — запускает
+  `kadr.exe --headless` рядом с собой (или `KADR_EXE`) и ждёт файл до 15 с.
+  Headless-инстанс, запущенный самим `kadr-mcp`, завершается по закрытию
+  stdin (конец MCP-сессии).
+- Контекстные меню рендерятся внутри Slint-окна (`SLINT_NO_MUDA=1`), поэтому
+  видны в `ui_take_screenshot` и кликабельны через `ui_click_element`.
+- Настройка «Разрешить управление через MCP» (по умолчанию включена)
+  выключает оба сервера — изменение вступает в силу после перезапуска Kadr,
+  после которого без неё не экспортируется `SLINT_MCP_PORT` и не стартует
+  `kadr-mcp-bridge`.
