@@ -36,6 +36,8 @@ component AssetCard inherits Rectangle {
     callback moved(length, length);
     callback released(length, length);
     callback activated();
+    /// Right press at a point in card coordinates.
+    callback context(length, length);
     height: 76px;
     border-radius: Theme.radius;
     background: root.a.selected ? Theme.accent-soft : ta.has-hover ? Theme.bg3 : transparent;
@@ -112,6 +114,7 @@ component AssetCard inherits Rectangle {
             if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
                 root.released(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
             }
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.context(self.mouse-x, self.mouse-y); }
         }
         moved => {
             if (self.pressed) { root.moved(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
@@ -181,7 +184,7 @@ export component MediaLibrary inherits Rectangle {
                             font-size: Theme.font-sm;
                             color: b.selected ? Theme.text : Theme.text-dim;
                         }
-                        ContextMenuArea {
+                        bin-menu := ContextMenuArea {
                             enabled: b.id != "";
                             Menu {
                                 MenuItem { title: Tr.t("media.bin.rename"); activated => { root.bin-action(b.id, "rename"); } }
@@ -189,6 +192,7 @@ export component MediaLibrary inherits Rectangle {
                             }
                             bta := TouchArea {
                                 clicked => { root.select-bin(b.id); }
+                                pointer-event(e) => { if (b.id != "" && e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { bin-menu.show({ x: self.mouse-x, y: self.mouse-y }); } }
                                 double-clicked => { if (b.id != "") { root.bin-action(b.id, "rename"); } }
                             }
                         }
@@ -230,7 +234,7 @@ export component MediaLibrary inherits Rectangle {
                 padding: 6px;
                 spacing: 2px;
                 alignment: start;
-                for a in root.assets: ContextMenuArea {
+                for a in root.assets: asset-menu := ContextMenuArea {
                     Menu {
                         MenuItem { title: Tr.t("media.ctx.insert"); activated => { root.asset-action(a.id, "insert"); } }
                         MenuItem { title: Tr.t("media.ctx.overwrite"); activated => { root.asset-action(a.id, "overwrite"); } }
@@ -250,6 +254,7 @@ export component MediaLibrary inherits Rectangle {
                         moved(x, y) => { root.asset-moved(a.id, x, y); }
                         released(x, y) => { root.asset-released(a.id, x, y); }
                         activated => { root.asset-activated(a.id); }
+                        context(x, y) => { asset-menu.show({ x: x, y: y }); }
                     }
                 }
             }

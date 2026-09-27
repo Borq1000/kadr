@@ -500,6 +500,37 @@ pub fn with_links(seq: &Sequence, ids: &[ClipId]) -> Vec<ClipId> {
     out
 }
 
+/// Unlink and delete only the `kind` part (video or audio) of the selection
+/// and its link partners, leaving the other part in place. `None` when the
+/// selection has no clip of that kind.
+pub fn delete_part(seq: &Sequence, ids: &[ClipId], kind: TrackKind) -> Option<Vec<EditCommand>> {
+    let of_kind = |id: &ClipId| seq.locate_clip(*id).is_some_and(|(ti, _)| seq.tracks[ti].kind == kind);
+    let targets: Vec<ClipId> = with_links(seq, ids).into_iter().filter(of_kind).collect();
+    if targets.is_empty() {
+        return None;
+    }
+    // Detach first: DeleteClips takes link partners along. The partners of
+    // a pair lose their link too, so nothing points at a deleted clip.
+    let mut out: Vec<EditCommand> = with_links(seq, &targets)
+        .into_iter()
+        .filter(|id| seq.clip(*id).is_some_and(|c| c.link.is_some()))
+        .map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(None) })
+        .collect();
+    out.push(EditCommand::DeleteClips { clips: targets, ripple: false });
+    Some(out)
+}
+
+/// One new link group for the selection and everything already linked to
+/// it, so they move, trim and delete together. `None` for fewer than two clips.
+pub fn link_selection(seq: &Sequence, ids: &[ClipId]) -> Option<Vec<EditCommand>> {
+    let all = with_links(seq, ids);
+    if all.len() < 2 {
+        return None;
+    }
+    let link = kadr_core::LinkId::new();
+    Some(all.into_iter().map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(Some(link)) }).collect())
+}
+
 fn move_clips(seq: &mut Sequence, ids: &[ClipId], delta: Time, track_delta: i32) -> Result<(), EditError> {
     let primary: HashSet<ClipId> = ids.iter().copied().collect();
     let all = with_links(seq, ids);

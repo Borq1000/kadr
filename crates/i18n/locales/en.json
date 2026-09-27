@@ -669,5 +669,15 @@
   "jev.cams.agree_some_unsure": "Nothing to change: where Jev was sure, it agrees with the current cut. In {n} intervals it couldn't choose — describe the cameras in the group to help it.",
   "settings.jev_personalize": "Learn from my edits",
   "settings.jev_personalize_hint": "When Jev picks cameras, your past corrections in similar moments are sent along as examples. They stay in the project file; turn this off to get Jev's general judgement only.",
-  "toast.media_in_group": "This clip is an angle of the multicam group “{group}”. Remove the group first."
+  "toast.media_in_group": "This clip is an angle of the multicam group “{group}”. Remove the group first.",
+  "tl.ctx.link": "Link selected clips",
+  "tl.ctx.delete_video": "Delete video only",
+  "tl.ctx.delete_audio": "Delete audio only",
+  "cmd.link": "Link clips",
+  "cmd.delete_video": "Delete video",
+  "cmd.delete_audio": "Delete audio",
+  "toast.link_needs_two": "Select at least two clips to link them",
+  "toast.no_video_part": "No video in the selection",
+  "toast.no_audio_part": "No audio in the selection",
+  "keys.unlink_link": "Unlink audio and video / link the selection"
 }

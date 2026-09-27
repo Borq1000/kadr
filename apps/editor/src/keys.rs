@@ -34,6 +34,7 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
         r(",", "keys.insert"),
         r(".", "keys.overwrite"),
         r("M", "keys.marker"),
+        r("U / G", "keys.unlink_link"),
         r("1 … 9", "keys.angle"),
         r("I / O / X", "keys.in_out"),
         r("Ctrl+Z", "keys.undo"),
@@ -63,13 +64,26 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
     ]
 }
 
+/// The shortcut letter of a key press, as on a QWERTY keyboard: shortcuts
+/// follow the physical key, so they keep working on the Russian layout.
+pub fn latin_key(text: &str) -> String {
+    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
+    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+    let lower = text.to_lowercase();
+    let mut c = lower.chars();
+    match (c.next(), c.next()) {
+        (Some(ch), None) => RU.chars().position(|r| r == ch).and_then(|i| EN.chars().nth(i)).map_or(lower, String::from),
+        _ => lower,
+    }
+}
+
 impl App {
     pub fn on_key(&mut self, text: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
         if alt {
             return false;
         }
         if ctrl {
-            let k = text.to_lowercase();
+            let k = latin_key(text);
             match (k.as_str(), shift) {
                 ("z", false) => self.undo(),
                 ("z", true) | ("y", _) => self.redo(),
@@ -144,7 +158,7 @@ impl App {
             // 1-9: cut to that angle when a multicam clip is under the playhead.
             return self.cut_to_angle(n as u32 - '1' as u32);
         } else {
-            match text.to_lowercase().as_str() {
+            match latin_key(text).as_str() {
                 " " => self.toggle_playback(),
                 "k" => self.stop_playback(),
                 "l" => {
@@ -158,6 +172,9 @@ impl App {
                 "n" => self.tl_tool("snap"),
                 "r" => self.tl_tool("ripple"),
                 "m" => self.add_marker(),
+                // Vegas-style grouping: U detaches audio/video, G links the selection.
+                "u" => self.tl_context("unlink"),
+                "g" => self.tl_context("link"),
                 "i" => self.set_in_out(true),
                 "o" => self.set_in_out(false),
                 "x" => self.clear_in_out(),
@@ -198,5 +215,23 @@ impl App {
         self.stop_playback();
         let t = Time::from_secs_f64((self.playhead.as_secs_f64() + s).max(0.0));
         self.set_playhead(t);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::latin_key;
+
+    #[test]
+    fn shortcuts_work_on_the_russian_layout() {
+        // Same physical keys: U, G, S, B, M, I, O, comma and period.
+        assert_eq!(latin_key("г"), "u");
+        assert_eq!(latin_key("П"), "g");
+        assert_eq!(latin_key("ы"), "s");
+        assert_eq!((latin_key("и"), latin_key("ь")), ("b".into(), "m".into()));
+        assert_eq!((latin_key("ш"), latin_key("щ")), ("i".into(), "o".into()));
+        assert_eq!((latin_key("б"), latin_key("ю")), (",".into(), ".".into()));
+        assert_eq!(latin_key("u"), "u");
+        assert_eq!(latin_key(" "), " ");
     }
 }

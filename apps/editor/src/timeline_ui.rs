@@ -21,8 +21,15 @@ const DRAG_THRESHOLD: f64 = 3.0;
 
 pub enum Drag {
     Scrub,
-    Move { clips: Vec<ClipId>, anchor_t: f64, start_x: f64, start_y: f64, start_row: usize, delta: Time, track_delta: i32, started: bool },
+    Move { clips: Vec<ClipId>, anchor_t: f64, start_x: f64, start_y: f64, start_row: usize, delta: Time, track_delta: i32, started: bool, clicked: Option<ClipId> },
     Trim { clip: ClipId, edge: TrimEdge, to: Time },
+}
+
+/// A plain click on a clip inside a larger selection narrows the selection
+/// to that clip when released without dragging (the selection stays whole
+/// while it may still become a group move).
+fn narrowed_on_release(selection: &[ClipId], clicked: ClipId) -> Option<Vec<ClipId>> {
+    (selection.len() > 1 && selection.contains(&clicked)).then(|| vec![clicked])
 }
 
 pub struct TimelineUi {
@@ -242,6 +249,7 @@ impl App {
                     delta: Time::ZERO,
                     track_delta: 0,
                     started: false,
+                    clicked: (!ctrl && !shift).then_some(id),
                 });
             }
             Hit::Empty { .. } => {
@@ -284,7 +292,7 @@ impl App {
                 self.tl.drag = Some(Drag::Trim { clip, edge, to });
                 self.refresh_timeline();
             }
-            Some(Drag::Move { clips, anchor_t, start_x, start_y, start_row, started, .. }) => {
+            Some(Drag::Move { clips, anchor_t, start_x, start_y, start_row, started, clicked, .. }) => {
                 let started = started || (x - start_x).abs() > DRAG_THRESHOLD || (y - start_y).abs() > DRAG_THRESHOLD;
                 let mut delta = Time::ZERO;
                 let mut track_delta = 0;
@@ -320,7 +328,7 @@ impl App {
                         }
                     }
                 }
-                self.tl.drag = Some(Drag::Move { clips, anchor_t, start_x, start_y, start_row, delta, track_delta, started });
+                self.tl.drag = Some(Drag::Move { clips, anchor_t, start_x, start_y, start_row, delta, track_delta, started, clicked });
                 self.refresh_timeline();
             }
         }
@@ -333,6 +341,12 @@ impl App {
             Some(Drag::Move { clips, delta, track_delta, started: true, .. }) => {
                 if delta != Time::ZERO || track_delta != 0 {
                     self.execute(EditCommand::MoveClips { clips, delta, track_delta });
+                }
+            }
+            Some(Drag::Move { started: false, clicked: Some(id), .. }) => {
+                if let Some(sel) = narrowed_on_release(&self.tl.selection, id) {
+                    self.tl.selection = sel;
+                    self.refresh_inspector();
                 }
             }
             Some(Drag::Trim { clip, edge, to }) => {
@@ -505,6 +519,25 @@ impl App {
                     ids.into_iter().map(|clip| EditCommand::SetClipProperty { clip, prop: ClipProperty::Link(None) }).collect();
                 if !cmds.is_empty() {
                     self.execute(EditCommand::Batch { label: t("cmd.unlink"), commands: cmds });
+                }
+            }
+            "link" => match kadr_timeline::commands::link_selection(self.project.sequence(), &self.tl.selection) {
+                Some(commands) => {
+                    self.execute(EditCommand::Batch { label: t("cmd.link"), commands });
+                }
+                None => self.toast(t("toast.link_needs_two")),
+            },
+            "delete-video" | "delete-audio" => {
+                let (kind, label) = if action == "delete-video" { (TrackKind::Video, "cmd.delete_video") } else { (TrackKind::Audio, "cmd.delete_audio") };
+                match kadr_timeline::commands::delete_part(self.project.sequence(), &self.tl.selection, kind) {
+                    Some(commands) => {
+                        self.execute(EditCommand::Batch { label: t(label), commands });
+                        let seq = self.project.sequence();
+                        self.tl.selection.retain(|id| seq.clip(*id).is_some());
+                        self.refresh_timeline();
+                        self.refresh_inspector();
+                    }
+                    None => self.toast(t(if kind == TrackKind::Video { "toast.no_video_part" } else { "toast.no_audio_part" })),
                 }
             }
             "dissolve" => self.add_dissolve(),
@@ -977,5 +1010,18 @@ fn zoom_label(pps: f64, fps: f64) -> String {
         tf("tl.zoom.px_s", &[("v", &format!("{pps:.0}"))])
     } else {
         tf("tl.zoom.px_s", &[("v", &format!("{pps:.1}"))])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_click_inside_a_multi_selection_narrows_it_on_release() {
+        let (v, a) = (ClipId::new(), ClipId::new());
+        assert_eq!(narrowed_on_release(&[v, a], a), Some(vec![a]), "pick the audio after unlinking");
+        assert_eq!(narrowed_on_release(&[v], v), None, "already alone");
+        assert_eq!(narrowed_on_release(&[v], a), None, "not part of the selection");
     }
 }
