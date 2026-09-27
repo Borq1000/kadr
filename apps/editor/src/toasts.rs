@@ -26,6 +26,13 @@ pub struct Toasts {
     next: i32,
 }
 
+impl Toasts {
+    /// Current toast texts, oldest first — used by MCP's `get_state`.
+    pub fn texts(&self) -> Vec<String> {
+        self.items.iter().map(|t| t.text.clone()).collect()
+    }
+}
+
 const MAX_VISIBLE: usize = 4;
 
 impl App {

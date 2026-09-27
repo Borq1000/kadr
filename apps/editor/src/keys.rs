@@ -64,11 +64,14 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
     ]
 }
 
+/// Physical-key layout tables shared with `mcp_state::layout_text` (the
+/// reverse mapping, EN → RU, is used there).
+pub(crate) const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
+pub(crate) const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+
 /// The shortcut letter of a key press, as on a QWERTY keyboard: shortcuts
 /// follow the physical key, so they keep working on the Russian layout.
 pub fn latin_key(text: &str) -> String {
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
     let lower = text.to_lowercase();
     let mut c = lower.chars();
     match (c.next(), c.next()) {

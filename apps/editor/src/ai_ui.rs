@@ -49,6 +49,11 @@ impl AiUi {
         self.chat.push((kind, text.into(), -1));
     }
 
+    /// Chat transcript as `{kind, text}` — used by MCP's `get_state`.
+    pub fn transcript(&self) -> Vec<serde_json::Value> {
+        self.chat.iter().map(|(kind, text, _)| serde_json::json!({"kind": kind, "text": text})).collect()
+    }
+
     /// Re-evaluates privacy gates of pending offers after a settings change,
     /// so a card never shows a stale "blocked" (or stale "allowed") state.
     pub fn refresh_offer_gates(&mut self) {
