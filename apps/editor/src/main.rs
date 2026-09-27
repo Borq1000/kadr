@@ -46,7 +46,8 @@ fn main() {
     if let Some(&port) = mcp_env::UI_PORT.get() {
         tracing::info!(ui_port = port, "Slint MCP enabled");
     }
-    if let Err(e) = app::run(dirs) {
+    let (flags, args) = mcp_env::parse_flags(&std::env::args_os().skip(1).collect::<Vec<_>>());
+    if let Err(e) = app::run(dirs, flags, args) {
         tracing::error!(error = %e, "fatal");
         eprintln!("Kadr failed to start: {e}");
     }

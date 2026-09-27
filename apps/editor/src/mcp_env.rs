@@ -1,6 +1,7 @@
 //! Startup environment for MCP control: flags, ports, in-window menus.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -31,9 +32,22 @@ pub fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
 
+/// Untitled autosaves: a headless instance keeps its own, so it never
+/// offers (or deletes) the user's.
+pub fn recovery_dir(data: &Path, headless: bool) -> PathBuf {
+    data.join(if headless { "recovery-headless" } else { "recovery" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_recovery_dir_is_separate() {
+        let d = std::path::Path::new("C:/data");
+        assert_eq!(recovery_dir(d, false), d.join("recovery"));
+        assert_eq!(recovery_dir(d, true), d.join("recovery-headless"));
+    }
 
     #[test]
     fn headless_flag_is_consumed_and_other_args_kept() {

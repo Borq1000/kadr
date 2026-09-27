@@ -223,6 +223,7 @@ export component AppWindow inherits Window {
     callback settings-personalize(bool);
     callback settings-limit(string, string);
     callback settings-test(string);
+    callback settings-allow-mcp(bool);
     callback confirm-ok-clicked();
     callback confirm-alt-clicked();
     callback confirm-dismissed();
@@ -691,6 +692,7 @@ export component AppWindow inherits Window {
         set-personalize(on) => { root.settings-personalize(on); }
         set-limit(k, v) => { root.settings-limit(k, v); }
         test-provider(id) => { root.settings-test(id); }
+        set-allow-mcp(on) => { root.settings-allow-mcp(on); }
         dismiss => { root.settings-open = false; root.focus-editor(); }
     }
 
