@@ -19,8 +19,10 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
         "get_state" => Reply::Now(Ok(app.mcp_state())),
         "get_log" => {
             let n = p.get("lines").and_then(Value::as_u64).unwrap_or(50) as usize;
-            let level = p.get("level").and_then(Value::as_str).unwrap_or("trace").parse().unwrap_or(tracing::Level::TRACE);
-            Reply::Now(Ok(json!(crate::logging::ring().tail(n, level))))
+            match log_level(&p) {
+                Ok(level) => Reply::Now(Ok(json!(crate::logging::ring().tail(n, level)))),
+                Err(e) => Reply::Now(Err(e)),
+            }
         }
         "idle" => Reply::Now(Ok(json!({
             "idle": app.jobs.active_count() == 0 && !app.ui().get_preview_loading(),
@@ -31,10 +33,30 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
             _ => bad("layout_text needs text and layout: ru|en"),
         },
         "get_frame" => match ms(&p, "at_ms") {
-            Some(t) => app.mcp_frame(t, p.get("max_w").and_then(Value::as_u64).unwrap_or(960) as u32),
+            Some(t) => {
+                let dim = |k: &str| p.get(k).and_then(Value::as_u64).map(|v| v.clamp(2, 8192) as u32);
+                app.mcp_frame(t, dim("max_w").unwrap_or(960), dim("max_h"))
+            }
             None => bad("get_frame needs at_ms"),
         },
         _ => crate::mcp_api::actions(app, method, p),
+    }
+}
+
+/// `get_log`'s `level`: the minimum level to return (default: everything).
+fn log_level(p: &Value) -> Result<tracing::Level, BridgeError> {
+    let bad = || BridgeError::new("bad_params", format!("`level` must be one of error|warn|info|debug|trace, got {}", p["level"]));
+    match p.get("level") {
+        None | Some(Value::Null) => Ok(tracing::Level::TRACE),
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "error" => Ok(tracing::Level::ERROR),
+            "warn" => Ok(tracing::Level::WARN),
+            "info" => Ok(tracing::Level::INFO),
+            "debug" => Ok(tracing::Level::DEBUG),
+            "trace" => Ok(tracing::Level::TRACE),
+            _ => Err(bad()),
+        },
+        Some(_) => Err(bad()),
     }
 }
 
@@ -381,15 +403,17 @@ impl App {
         })
     }
 
-    /// The composited preview frame at `t` as PNG, decoded off the UI thread.
-    pub fn mcp_frame(&self, t: kadr_core::Time, max_w: u32) -> Reply {
+    /// The preview frame at `t` as PNG (at most `max_w` wide, and `max_h`
+    /// tall when given), decoded off the UI thread.
+    pub fn mcp_frame(&self, t: kadr_core::Time, max_w: u32, max_h: Option<u32>) -> Reply {
         let Some(media) = self.media.clone() else { return Reply::Now(Err(BridgeError::new("io", "no FFmpeg"))) };
-        let seq = self.project.sequence();
-        let Some(v) = kadr_timeline::composition::video_at(seq, t) else { return Reply::Now(Err(BridgeError::new("not_found", "no video at this time"))) };
-        let Some(path) = self.project.asset(v.asset).map(|a| a.path.clone()) else { return Reply::Now(Err(BridgeError::new("not_found", "asset missing"))) };
-        let src = v.source_start;
+        let src = match mcp_state::frame_source(&self.project, t) {
+            Ok(s) => s,
+            Err(e) => return Reply::Now(Err(e)),
+        };
+        let (w, h) = mcp_state::frame_size(src.size, max_w, max_h);
         Reply::Later(Box::new(move || {
-            let f = media.decode_frame(&path, src, max_w, max_w).map_err(|e| BridgeError::new("io", e.to_string()))?;
+            let f = media.decode_frame(&src.path, src.source, w, h).map_err(|e| BridgeError::new("io", e.to_string()))?;
             let mut png = Vec::new();
             {
                 let mut enc = png::Encoder::new(&mut png, f.width, f.height);
@@ -513,6 +537,18 @@ mod tests {
             serde_json::json!({"resolution": "1080p"}),
         ] {
             assert_eq!(export_indices(&bad).unwrap_err().code, "bad_params", "{bad}");
+        }
+    }
+
+    #[test]
+    fn log_level_is_validated_not_guessed() {
+        assert_eq!(log_level(&serde_json::json!({})).unwrap(), tracing::Level::TRACE);
+        assert_eq!(log_level(&serde_json::json!({"level": "warn"})).unwrap(), tracing::Level::WARN);
+        assert_eq!(log_level(&serde_json::json!({"level": "ERROR"})).unwrap(), tracing::Level::ERROR);
+        for bad in [serde_json::json!({"level": "warning"}), serde_json::json!({"level": "3"}), serde_json::json!({"level": 2})] {
+            let e = log_level(&bad).unwrap_err();
+            assert_eq!(e.code, "bad_params", "{bad}");
+            assert!(e.message.contains("error|warn|info|debug|trace"), "{}", e.message);
         }
     }
 

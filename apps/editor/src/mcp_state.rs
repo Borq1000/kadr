@@ -1,15 +1,69 @@
 //! JSON snapshots of editor state for MCP (pure: no window needed).
 
 use kadr_core::{ClipId, Time};
-use kadr_project::{Sequence, TrackKind};
+use kadr_mcp_bridge::BridgeError;
+use kadr_project::{Project, Sequence, TrackKind};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
-/// The characters the same physical keys produce on the `to` layout.
+/// The characters the same physical keys produce on the `to` layout, with
+/// Shift (letter case) kept.
 pub fn layout_text(text: &str, to: &str) -> String {
     let (from, dst) = if to == "ru" { (crate::keys::EN, crate::keys::RU) } else { (crate::keys::RU, crate::keys::EN) };
     text.chars()
-        .map(|c| from.chars().position(|f| f == c.to_lowercase().next().unwrap_or(c)).and_then(|i| dst.chars().nth(i)).unwrap_or(c))
+        .map(|c| {
+            let lower = c.to_lowercase().next().unwrap_or(c);
+            let Some(mapped) = from.chars().position(|f| f == lower).and_then(|i| dst.chars().nth(i)) else { return c };
+            if c.is_uppercase() { mapped.to_uppercase().next().unwrap_or(mapped) } else { mapped }
+        })
         .collect()
+}
+
+/// What `get_frame` decodes for a timeline time.
+#[derive(Debug, PartialEq)]
+pub struct FrameSource {
+    pub path: PathBuf,
+    /// Time in the source file.
+    pub source: Time,
+    /// Displayed size (rotation applied), when probed.
+    pub size: Option<(u32, u32)>,
+}
+
+/// The video frame shown at `t`, or why there is none.
+pub fn frame_source(project: &Project, t: Time) -> Result<FrameSource, BridgeError> {
+    let seq = project.sequence();
+    let end = seq.duration();
+    if t < Time::ZERO {
+        return Err(BridgeError::new("bad_params", "at_ms must not be negative"));
+    }
+    if end == Time::ZERO {
+        return Err(BridgeError::new("not_found", "the timeline is empty"));
+    }
+    if t >= end {
+        return Err(BridgeError::new("not_found", format!("at_ms {} is past the end of the sequence ({} ms)", t.as_millis(), end.as_millis())));
+    }
+    let Some(v) = kadr_timeline::composition::video_at(seq, t) else {
+        let audio = seq.tracks.iter().any(|tr| tr.kind == TrackKind::Audio && tr.clip_at(t).is_some());
+        let why = if audio { "only audio" } else { "a gap" };
+        return Err(BridgeError::new("not_found", format!("no video at {} ms: {why} there", t.as_millis())));
+    };
+    let asset = project.asset(v.asset).ok_or_else(|| BridgeError::new("not_found", "the clip's media is missing from the project"))?;
+    let size = asset.info.video.as_ref().map(|i| if i.rotation.rem_euclid(180) == 90 { (i.height, i.width) } else { (i.width, i.height) });
+    Ok(FrameSource { path: asset.path.clone(), source: v.source_start, size })
+}
+
+/// Output size for a frame of `src` size: at most `max_w` wide (and
+/// `max_h` tall when given), aspect kept, never upscaled, even, never zero.
+pub fn frame_size(src: Option<(u32, u32)>, max_w: u32, max_h: Option<u32>) -> (u32, u32) {
+    let even = |x: f64| ((x.round() as u32) & !1).max(2);
+    let Some((w, h)) = src.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return (even(max_w as f64), even(max_h.unwrap_or(max_w.saturating_mul(4)) as f64));
+    };
+    let mut scale = (max_w as f64 / w as f64).min(1.0);
+    if let Some(mh) = max_h {
+        scale = scale.min(mh as f64 / h as f64);
+    }
+    (even(w as f64 * scale), even(h as f64 * scale))
 }
 
 pub fn timeline_json(seq: &Sequence, selection: &[ClipId], playhead: Time) -> Value {
@@ -67,5 +121,64 @@ mod tests {
         assert_eq!(layout_text("ug", "ru"), "гп");
         assert_eq!(layout_text("гп", "en"), "ug");
         assert_eq!(layout_text("1 ,.", "ru"), "1 бю");
+    }
+
+    #[test]
+    fn layout_text_keeps_letter_case() {
+        assert_eq!(layout_text("Ug", "ru"), "Гп");
+        assert_eq!(layout_text("ГП", "en"), "UG");
+    }
+
+    fn asset(kind: MediaKind, w: u32, h: u32, rotation: i32) -> kadr_project::MediaAsset {
+        let video = (kind == MediaKind::Video).then(|| kadr_core::VideoInfo { width: w, height: h, frame_rate: None, variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation });
+        kadr_project::MediaAsset::new("a.mp4", MediaInfo { kind, duration: Time::from_secs(10), container: "mp4".into(), size_bytes: 0, video, audio: None, timecode: None })
+    }
+
+    /// A project with `asset` placed on `track` from `start` to `end` seconds.
+    fn placed(a: kadr_project::MediaAsset, track: usize, start: i64, end: i64) -> Project {
+        let mut p = Project::new("t");
+        let c = Clip::new(a.id, "a", TimeRange::new(Time::ZERO, Time::from_secs(end - start)), Time::from_secs(start));
+        p.sequence_mut().tracks[track].clips.push(c);
+        p.assets.push(a);
+        p
+    }
+
+    #[test]
+    fn timeline_json_of_an_empty_project() {
+        let j = timeline_json(Project::new("t").sequence(), &[], Time::ZERO);
+        assert_eq!(j["duration_ms"], 0);
+        assert!(j["tracks"].as_array().unwrap().iter().all(|t| t["clips"].as_array().unwrap().is_empty()));
+        assert!(j["in_out"].is_null());
+    }
+
+    #[test]
+    fn frame_source_explains_why_there_is_no_frame() {
+        let msg = |p: &Project, ms| frame_source(p, Time::from_millis(ms)).unwrap_err().message;
+        assert!(msg(&Project::new("t"), 0).contains("empty"), "{}", msg(&Project::new("t"), 0));
+        let video = placed(asset(MediaKind::Video, 1920, 1080, 0), 0, 1, 4);
+        assert!(msg(&video, 5000).contains("past the end"), "{}", msg(&video, 5000));
+        assert!(msg(&video, 500).contains("no video"), "{}", msg(&video, 500));
+        let audio = placed(asset(MediaKind::Audio, 0, 0, 0), 1, 0, 4);
+        assert!(msg(&audio, 1000).contains("only audio"), "{}", msg(&audio, 1000));
+        assert_eq!(frame_source(&video, Time::from_millis(-1)).unwrap_err().code, "bad_params");
+    }
+
+    #[test]
+    fn frame_source_finds_the_clip_and_its_displayed_size() {
+        let p = placed(asset(MediaKind::Video, 1920, 1080, 0), 0, 1, 4);
+        let f = frame_source(&p, Time::from_millis(1500)).unwrap();
+        assert_eq!((f.source, f.size), (Time::from_millis(500), Some((1920, 1080))));
+        let phone = placed(asset(MediaKind::Video, 1920, 1080, 90), 0, 0, 4);
+        assert_eq!(frame_source(&phone, Time::from_millis(1)).unwrap().size, Some((1080, 1920)), "rotated streams display swapped");
+    }
+
+    #[test]
+    fn frame_size_limits_width_keeps_aspect_and_never_upscales() {
+        assert_eq!(frame_size(Some((1920, 1080)), 960, None), (960, 540));
+        assert_eq!(frame_size(Some((1080, 1920)), 960, None), (960, 1706), "portrait is limited by width, not squeezed into a square");
+        assert_eq!(frame_size(Some((640, 360)), 960, None), (640, 360));
+        assert_eq!(frame_size(Some((1920, 1080)), 960, Some(270)), (480, 270));
+        assert_eq!(frame_size(None, 960, None), (960, 3840), "unknown size: a generous box");
+        assert_eq!(frame_size(Some((1920, 1080)), 1, None), (2, 2), "never zero");
     }
 }

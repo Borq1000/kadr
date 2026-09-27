@@ -42,7 +42,7 @@ pub fn kadr_tools() -> Vec<Value> {
             "Read recent editor log lines.",
             json!({
                 "lines": {"type": "integer", "description": "Max number of lines to return."},
-                "level": {"type": "string", "description": "Minimum log level."},
+                "level": {"type": "string", "enum": ["error", "warn", "info", "debug", "trace"], "description": "Minimum log level (default trace: everything)."},
             }),
             &[],
         ),
@@ -51,7 +51,8 @@ pub fn kadr_tools() -> Vec<Value> {
             "Render a preview frame at a given timeline position.",
             json!({
                 "at_ms": {"type": "integer", "description": "Timeline position in milliseconds."},
-                "max_w": {"type": "integer", "description": "Max width in pixels; scaled down if larger."},
+                "max_w": {"type": "integer", "description": "Max width in pixels (default 960); the frame keeps its aspect and is never upscaled."},
+                "max_h": {"type": "integer", "description": "Optional max height in pixels."},
             }),
             &["at_ms"],
         ),
