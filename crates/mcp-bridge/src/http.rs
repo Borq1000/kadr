@@ -11,6 +11,9 @@ pub struct Response {
     pub body: String,
 }
 
+const MAX_HEADER_LINE: usize = 8 * 1024;
+const MAX_HEADERS: usize = 64;
+
 fn respond(s: &mut TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
@@ -18,6 +21,7 @@ fn respond(s: &mut TcpStream, status: u16, body: &str) {
         401 => "Unauthorized",
         411 => "Length Required",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
     };
     let _ = write!(s, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -28,18 +32,26 @@ pub fn serve(mut stream: TcpStream, token: &str, handle: &dyn Fn(String, Value) 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut r = BufReader::new(&stream);
     let mut line = String::new();
-    if r.read_line(&mut line).is_err() || !line.starts_with("POST ") {
+    if r.read_line(&mut line).is_err() || line.len() > MAX_HEADER_LINE || !line.starts_with("POST ") {
         return respond(&mut stream, 400, "{}");
     }
     let (mut len, mut auth) = (None, false);
+    let mut header_count = 0;
     loop {
         let mut h = String::new();
         if r.read_line(&mut h).is_err() {
             return respond(&mut stream, 400, "{}");
         }
+        if h.len() > MAX_HEADER_LINE {
+            return respond(&mut stream, 431, "{}");
+        }
         let h = h.trim_end();
         if h.is_empty() {
             break;
+        }
+        header_count += 1;
+        if header_count > MAX_HEADERS {
+            return respond(&mut stream, 431, "{}");
         }
         let (k, v) = h.split_once(':').unwrap_or((h, ""));
         match k.trim().to_ascii_lowercase().as_str() {

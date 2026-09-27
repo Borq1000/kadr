@@ -16,9 +16,40 @@ fn file(dir: &Path, pid: u32) -> PathBuf {
 }
 
 pub fn write(dir: &Path, d: &Discovery) -> std::io::Result<PathBuf> {
+    let mcp_dir = dir.join("mcp");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&mcp_dir)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On Windows, rely on per-user %LOCALAPPDATA% ACL
+        std::fs::create_dir_all(&mcp_dir)?;
+    }
+
     let p = file(dir, d.pid);
-    std::fs::create_dir_all(p.parent().unwrap())?;
     std::fs::write(&p, serde_json::to_vec_pretty(d).unwrap())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&p)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&p, perms)?;
+    }
+
     Ok(p)
 }
 

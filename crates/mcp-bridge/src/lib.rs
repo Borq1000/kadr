@@ -70,7 +70,12 @@ fn run(dispatch: &Dispatch, method: String, params: Value) -> Result<Value, Brid
     match rx.recv_timeout(timeout) {
         Ok(Reply::Now(r)) => r,
         Ok(Reply::Later(f)) => f(),
-        Err(_) => Err(BridgeError::new("busy_timeout", format!("Kadr did not answer `{method}` within {} ms (UI busy or a modal is open)", timeout.as_millis()))),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(BridgeError::new("busy_timeout", format!("Kadr did not answer `{method}` within {} ms (UI busy or a modal is open)", timeout.as_millis())))
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(BridgeError::new("busy_timeout", format!("Kadr's `{method}` handler finished without replying (UI busy, a modal is open, or the handler gave no reply)")))
+        }
     }
 }
 

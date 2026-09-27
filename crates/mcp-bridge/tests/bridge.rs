@@ -76,3 +76,51 @@ fn discovery_files_are_per_instance() {
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].pid, 1);
 }
+
+#[test]
+fn disconnected_handler_has_different_message_than_timeout() {
+    let b = Bridge::start(echo()).unwrap();
+
+    // Handler that drops tx without replying (disconnected case)
+    let e = call(b.port, &b.token, "never", json!({}), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(e.code, "busy_timeout");
+    assert!(!e.message.contains("within"), "disconnected message should not claim a wait: {}", e.message);
+    assert!(e.message.contains("without replying") || e.message.contains("gave no reply"),
+        "disconnected message should mention no reply: {}", e.message);
+
+    // Handler that holds tx alive but doesn't send (real timeout case)
+    let b2 = Bridge::start({
+        Arc::new(|method: String, _params: Value, tx: crossbeam_channel::Sender<Reply>| {
+            match method.as_str() {
+                "slow" => {
+                    // Move tx into a thread that sleeps forever
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(60));
+                        let _ = tx.send(Reply::Now(Ok(json!("done"))));
+                    });
+                }
+                "echo" => {
+                    let _ = tx.send(Reply::Now(Ok(json!("ok"))));
+                }
+                _ => {
+                    let _ = tx.send(Reply::Now(Err(BridgeError::new("unknown_method", method))));
+                }
+            }
+        })
+    }).unwrap();
+
+    let e = call(b2.port, &b2.token, "slow", json!({"timeout_ms": 200}), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(e.code, "busy_timeout");
+    assert!(e.message.contains("within 200 ms"), "real timeout message should mention time: {}", e.message);
+}
+
+#[test]
+fn oversized_header_line_is_rejected() {
+    let b = Bridge::start(echo()).unwrap();
+    let auth = format!("Authorization: Bearer {}\r\n", b.token);
+    let huge_header = format!("X-Huge: {}\r\n", "x".repeat(10000));
+    let response = raw(b.port, format!("POST /rpc HTTP/1.1\r\n{auth}{huge_header}\r\n").as_bytes());
+    assert!(response.starts_with("HTTP/1.1 431"), "oversized header should get 431");
+    // Server should survive
+    assert_eq!(call(b.port, &b.token, "echo", json!(1), Duration::from_secs(5)).unwrap(), json!(1));
+}
