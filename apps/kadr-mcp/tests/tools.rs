@@ -57,3 +57,16 @@ fn wait_idle_and_layout_text_say_what_they_really_do() {
     assert!(!d.starts_with("Type"), "layout_text does not type anything: {d}");
     assert!(d.contains("other layout"), "{d}");
 }
+
+#[test]
+fn pointer_tools_take_logical_window_coordinates() {
+    let t = tool("click_at");
+    assert_eq!(t["inputSchema"]["required"], json!(["x", "y"]));
+    assert_eq!(prop("click_at", "button")["enum"], json!(["left", "right", "middle"]));
+    assert_eq!(prop("click_at", "double")["type"], "boolean");
+    let t = tool("drag_at");
+    assert_eq!(t["inputSchema"]["required"], json!(["from", "to"]));
+    assert_eq!(prop("drag_at", "from")["required"], json!(["x", "y"]));
+    let d = tool("click_at")["description"].as_str().unwrap().to_string();
+    assert!(d.contains("logical"), "{d}");
+}

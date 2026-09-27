@@ -14,6 +14,7 @@ mod jev_ui;
 mod keys;
 mod library;
 mod mcp_env;
+mod mcp_input;
 mod mcp_state;
 mod mcp_api;
 mod multicam_ui;

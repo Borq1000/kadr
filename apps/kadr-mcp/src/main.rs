@@ -16,7 +16,10 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "\
 Tools prefixed `ui_` come from Slint's embedded UI-automation server and drive \
-real input events; call `ui_list_windows` first to get a window handle. Kadr's \
+real input events; call `ui_list_windows` first to get a window handle. Element \
+handles stay valid while their element exists (a removed clip's handle dies: \
+find it again with `ui_find_elements_by_id`). To act at a point instead of an \
+element, use `click_at` / `drag_at` (logical window pixels). Kadr's \
 own tools read and edit the project. After sending input, call `wait_idle` \
 before reading state or a frame, since edits and renders can be asynchronous. \
 Input events do not go through the OS's normal input pipeline, so \
