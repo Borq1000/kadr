@@ -144,6 +144,16 @@ fn ui_menu_allowed(id: &str) -> Result<(), BridgeError> {
     }
 }
 
+/// As [`ui_menu_allowed`], plus: `fullscreen` would bring a headless
+/// instance's off-screen window on screen, so it's rejected there.
+fn ui_menu_allowed_in(id: &str, headless: bool) -> Result<(), BridgeError> {
+    ui_menu_allowed(id)?;
+    if headless && id == "fullscreen" {
+        return Err(BridgeError::new("bad_params", "`fullscreen` is not available in a headless instance"));
+    }
+    Ok(())
+}
+
 /// Removes later duplicates, keeping each id's first occurrence in place.
 fn dedupe_keep_first(ids: &mut Vec<ClipId>) {
     let mut seen = std::collections::HashSet::new();
@@ -300,7 +310,7 @@ pub fn actions(app: &mut App, method: &str, p: Value) -> Reply {
         }
         "export_status" => ok(json!({"running": app.export.job.is_some() && !app.export.done && !app.export.failed, "done": app.export.done, "failed": app.export.failed, "status": app.export.status})),
         "ui" => match p.get("menu").and_then(Value::as_str) {
-            Some(m) => match ui_menu_allowed(m) {
+            Some(m) => match ui_menu_allowed_in(m, app.flags.headless) {
                 Ok(()) => {
                     let before = app.toasts.seq();
                     app.menu(m);
@@ -458,6 +468,25 @@ mod tests {
         for id in ["save", "save-as", "open", "import", "export", "new", "exit", "totally-unknown"] {
             let e = ui_menu_allowed(id).unwrap_err();
             assert_eq!(e.code, "bad_params", "{id} should be rejected as bad_params");
+        }
+    }
+
+    #[test]
+    fn fullscreen_is_rejected_only_when_headless() {
+        let e = ui_menu_allowed_in("fullscreen", true).unwrap_err();
+        assert_eq!(e.code, "bad_params");
+        assert!(ui_menu_allowed_in("fullscreen", false).is_ok());
+    }
+
+    #[test]
+    fn other_ids_are_unaffected_by_headless() {
+        for id in ["undo", "redo", "settings"] {
+            assert!(ui_menu_allowed_in(id, true).is_ok(), "{id} should still be allowed headless");
+            assert!(ui_menu_allowed_in(id, false).is_ok());
+        }
+        for id in ["save", "exit", "totally-unknown"] {
+            assert_eq!(ui_menu_allowed_in(id, true).unwrap_err().code, "bad_params");
+            assert_eq!(ui_menu_allowed_in(id, false).unwrap_err().code, "bad_params");
         }
     }
 }
