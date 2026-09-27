@@ -23,7 +23,13 @@ pub fn headless_exit_code(flags: Flags, allow_mcp: bool) -> Option<i32> {
 pub static UI_PORT: OnceLock<u16> = OnceLock::new();
 
 pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
-    let mut flags = Flags::default();
+    parse_flags_with_env(args, std::env::var_os(kadr_mcp_bridge::PARENT_PID_ENV))
+}
+
+/// `kadr-mcp` passes its pid in `KADR_PARENT_PID`; `--parent-pid <pid>`
+/// (what the first MCP release sent) is still understood and wins.
+fn parse_flags_with_env(args: &[OsString], env_parent: Option<OsString>) -> (Flags, Vec<OsString>) {
+    let mut flags = Flags { parent_pid: env_parent.and_then(|v| v.to_str()?.parse().ok()), ..Flags::default() };
     let mut rest = vec![];
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -36,6 +42,13 @@ pub fn parse_flags(args: &[OsString]) -> (Flags, Vec<OsString>) {
         }
     }
     (flags, rest)
+}
+
+/// The port to export as `SLINT_MCP_PORT`, or `None` to remove the variable
+/// (MCP off, or no free port found): an inherited value must never start
+/// Slint's UI server on a port we didn't choose.
+pub fn slint_ui_port(allow_mcp: bool, free: std::io::Result<u16>) -> Option<u16> {
+    if allow_mcp { free.ok() } else { None }
 }
 
 /// An OS-chosen free loopback port (bind to :0, read it, release it).
@@ -93,6 +106,25 @@ mod tests {
         assert_eq!(headless_exit_code(headless, false), Some(kadr_mcp_bridge::EXIT_MCP_DISABLED));
         assert_eq!(headless_exit_code(headless, true), None);
         assert_eq!(headless_exit_code(Flags::default(), false), None, "a normal window starts regardless");
+    }
+
+    #[test]
+    fn parent_pid_comes_from_the_environment_too() {
+        let (f, rest) = parse_flags_with_env(&["--headless".into()], Some("4242".into()));
+        assert_eq!(f.parent_pid, Some(4242));
+        assert!(rest.is_empty());
+        let (f, _) = parse_flags_with_env(&[], Some("junk".into()));
+        assert_eq!(f.parent_pid, None, "a bad value is ignored");
+        let (f, _) = parse_flags_with_env(&["--parent-pid".into(), "7".into()], Some("4242".into()));
+        assert_eq!(f.parent_pid, Some(7), "the explicit argument wins");
+    }
+
+    #[test]
+    fn slint_ui_port_only_when_mcp_is_allowed_and_a_port_was_found() {
+        let none = || Err(std::io::Error::other("no port"));
+        assert_eq!(slint_ui_port(true, Ok(5000)), Some(5000));
+        assert_eq!(slint_ui_port(true, none()), None, "no port: the inherited variable must be dropped too");
+        assert_eq!(slint_ui_port(false, Ok(5000)), None);
     }
 
     #[test]
