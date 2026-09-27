@@ -2946,6 +2946,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-mcp"
+version = "0.1.0"
+dependencies = [
+ "kadr-cache",
+ "kadr-mcp-bridge",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "kadr-mcp-bridge"
 version = "0.1.0"
 dependencies = [
