@@ -5,7 +5,7 @@
 
 use kadr_core::color::AlphaMode;
 use kadr_core::{MediaKind, Time, TimeRange};
-use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, Transition, TransitionKind};
+use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, TransitionKind};
 use kadr_scene::*;
 
 pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) -> FrameScene {
@@ -69,23 +69,34 @@ fn track_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas
     clip_layer(project, clip, t, canvas)
 }
 
-/// `[at − ⌊d/2⌋, at − ⌊d/2⌋ + d)`: centred on the cut.
-fn window(tr: &Transition) -> TimeRange {
-    let start = tr.at - Time(tr.duration.flicks() / 2);
-    TimeRange::new(start, start + tr.duration)
+/// The window of a transition over the cut at `at` whose (clamped)
+/// length is `d`: `[at − ⌊d/2⌋, at − ⌊d/2⌋ + d)`, centred on the cut.
+fn window(at: Time, d: Time) -> TimeRange {
+    let start = at - Time(d.flicks() / 2);
+    TimeRange::new(start, start + d)
 }
 
-/// The transition active on `track` at `t`, if both clips at its cut exist
-/// and are enabled. Overlapping windows: the earlier cut wins.
+/// The transition active on `track` at `t`. A transition is valid only when
+/// both clips at its cut exist and are enabled (the one ending at `at` and
+/// the one starting there); stale ones are skipped, so they never hide a
+/// valid one. Like export, its length is clamped to both neighbours —
+/// `min(duration, outgoing, incoming)` — and under two frames there is no
+/// transition. Among valid transitions whose clamped window contains `t`,
+/// the earlier cut wins.
 fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
-    let tr = seq
+    let min_len = seq.frame_rate.frame_to_time(2);
+    let (tr, outgoing, incoming, w) = seq
         .transitions
         .iter()
-        .filter(|tr| tr.track == track.id && tr.duration > Time::ZERO && window(tr).contains(t))
-        .min_by_key(|tr| tr.at)?;
-    let outgoing = track.clips.iter().find(|c| c.timeline_out == tr.at && c.enabled)?;
-    let incoming = track.clips.iter().find(|c| c.timeline_in == tr.at && c.enabled)?;
-    let w = window(tr);
+        .filter(|tr| tr.track == track.id)
+        .filter_map(|tr| {
+            let outgoing = track.clips.iter().find(|c| c.timeline_out == tr.at && c.enabled)?;
+            let incoming = track.clips.iter().find(|c| c.timeline_in == tr.at && c.enabled)?;
+            let d = tr.duration.min(outgoing.duration()).min(incoming.duration());
+            let w = window(tr.at, d);
+            (d >= min_len && w.contains(t)).then_some((tr, outgoing, incoming, w))
+        })
+        .min_by_key(|(tr, ..)| tr.at)?;
     let progress = ((t - w.start).flicks() as f64 / w.duration().flicks() as f64).clamp(0.0, 1.0) as f32;
     let op = match tr.kind {
         TransitionKind::CrossDissolve => TransitionOp::Dissolve,
@@ -420,17 +431,58 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_windows_pick_the_earlier_cut() {
+    fn adjacent_clamped_windows_touch_and_the_later_one_starts_at_its_edge() {
         let mut p = Project::new("t");
         let a = place(&mut p, 0, &hd(), 0, 0, 1_000);
         let b = place(&mut p, 0, &hd(), 0, 1_000, 400);
-        place(&mut p, 0, &hd(), 0, 1_400, 1_600);
+        let c = place(&mut p, 0, &hd(), 0, 1_400, 1_600);
         add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
         add_transition(&mut p, 0, 1_400, 1_000, TransitionKind::CrossDissolve);
-        let tr = transition(&scene_at(&p, 1_200).layers[0]).clone();
+        let tr = transition(&scene_at(&p, 1_100).layers[0]).clone();
         assert_eq!((tr.from[0].id, tr.to[0].id), (LayerId::from(a), LayerId::from(b)));
-        assert!((tr.progress - 0.7).abs() < 1e-6);
+        assert!((tr.progress - 0.75).abs() < 1e-6, "{}", tr.progress);
+        let tr = transition(&scene_at(&p, 1_200).layers[0]).clone();
+        assert_eq!((tr.from[0].id, tr.to[0].id), (LayerId::from(b), LayerId::from(c)), "[800, 1200) and [1200, 1600) only touch");
+        assert!(tr.progress.abs() < 1e-6, "{}", tr.progress);
     }
+
+    #[test]
+    fn stale_transition_does_not_hide_a_valid_one() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 1_000);
+        let b = place(&mut p, 0, &hd(), 0, 1_000, 2_000);
+        add_transition(&mut p, 0, 900, 1_000, TransitionKind::CrossDissolve); // no cut at 900 any more
+        let valid = add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
+        let s = scene_at(&p, 700);
+        assert_eq!(s.layers[0].id, LayerId::from(valid));
+        let tr = transition(&s.layers[0]);
+        assert_eq!((tr.from[0].id, tr.to[0].id), (LayerId::from(a), LayerId::from(b)));
+        assert!((tr.progress - 0.2).abs() < 1e-6, "{}", tr.progress);
+    }
+
+    #[test]
+    fn a_transition_longer_than_a_neighbour_is_clamped_to_it() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 1_000);
+        place(&mut p, 0, &hd(), 0, 1_000, 400);
+        let c = place(&mut p, 0, &hd(), 0, 1_400, 1_600);
+        add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
+        assert_eq!(scene_at(&p, 1_450).layers[0].id, LayerId::from(c), "the clamped window [800, 1200) never reaches c");
+        assert!(matches!(scene_at(&p, 1_200).layers[0].content, LayerContent::Media { .. }), "window end is exclusive");
+        assert!(matches!(scene_at(&p, 799).layers[0].content, LayerContent::Media { .. }));
+        assert!((transition(&scene_at(&p, 1_100).layers[0]).progress - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_transition_clamped_under_two_frames_is_dropped() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 1_000);
+        let b = place(&mut p, 0, &hd(), 0, 1_000, 50); // 1.5 frames at 30 fps
+        add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
+        assert_eq!(scene_at(&p, 990).layers[0].id, LayerId::from(a));
+        assert_eq!(scene_at(&p, 1_010).layers[0].id, LayerId::from(b));
+    }
+
 
     #[test]
     fn transition_kinds_map_to_render_ops() {
