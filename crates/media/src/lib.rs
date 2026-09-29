@@ -4,6 +4,7 @@
 
 pub mod export;
 pub mod ffmpeg;
+pub mod stats;
 
 use kadr_core::{CancelToken, FrameRate, MediaInfo, Time};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,7 @@ impl std::fmt::Debug for RgbaFrame {
 impl RgbaFrame {
     pub fn black(width: u32, height: u32) -> Self {
         let mut data = vec![0u8; (width * height * 4) as usize];
+        stats::note_frame_alloc();
         data.chunks_exact_mut(4).for_each(|p| p[3] = 255);
         RgbaFrame { width, height, data }
     }

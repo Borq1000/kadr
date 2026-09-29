@@ -48,6 +48,7 @@ pub(crate) fn parse_pam(buf: &[u8]) -> Option<RgbaFrame> {
     if depth != 4 || buf.len() < hdr_end + len {
         return None;
     }
+    crate::stats::note_frame_alloc();
     Some(RgbaFrame { width: w, height: h, data: buf[hdr_end..hdr_end + len].to_vec() })
 }
 
@@ -89,6 +90,7 @@ impl FfmpegStream {
 impl VideoStream for FfmpegStream {
     fn next_frame(&mut self) -> Result<Option<RgbaFrame>> {
         let mut data = vec![0u8; (self.width * self.height * 4) as usize];
+        crate::stats::note_frame_alloc();
         if read_frame(&mut self.stdout, &mut data)? {
             Ok(Some(RgbaFrame { width: self.width, height: self.height, data }))
         } else {
