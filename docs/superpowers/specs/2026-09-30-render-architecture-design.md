@@ -269,7 +269,7 @@ pub struct FramePool { /* буферы по (формат, размер); Pooled
   // AlphaMode: Opaque | Straight | Premultiplied
   ```
   Probe читает `color_primaries/transfer/space/range` и SAR; неизвестные
-  значения — правило: высота ≥ 720 → BT.709, иначе BT.601; диапазон Limited.
+  значения — правило: ширина ≥ 1280 или высота > 576 → BT.709; высота 576 → BT.601/625; иначе BT.601/525; диапазон Limited. Альфа видео — по формату пикселей (yuva*, rgba/argb/bgra/abgr, gbrap*, ya*, pal8 …) и метке `alpha_mode=1`.
 - **Первая поддерживаемая конфигурация — SDR Rec.709.** Декодер конвертирует
   YUV→RGB **с явно заданными** матрицей и диапазоном источника в Full-range
   R'G'B' (нелинейные, «гамма-кодированные» значения). HDR, float-конвейер и
