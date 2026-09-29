@@ -42,6 +42,18 @@ struct Stream {
     tags: std::collections::HashMap<String, String>,
     #[serde(default)]
     side_data_list: Vec<serde_json::Value>,
+    sample_aspect_ratio: Option<String>,
+    color_range: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+}
+
+/// "8:9" → (8, 9); "0:1", "N/A" or garbage → None.
+fn parse_ratio(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once(':')?;
+    let (a, b) = (a.parse().ok()?, b.parse().ok()?);
+    (a > 0 && b > 0).then_some((a, b))
 }
 
 const IMAGE_CODECS: &[&str] = &["png", "mjpeg", "bmp", "webp", "tiff", "gif", "jpegls", "targa"];
@@ -105,6 +117,19 @@ pub(crate) fn parse(json: &[u8]) -> Option<MediaInfo> {
             codec: v.codec_name.clone(),
             pixel_format: v.pix_fmt.clone().unwrap_or_default(),
             rotation,
+            sar: v.sample_aspect_ratio.as_deref().and_then(parse_ratio).unwrap_or((1, 1)),
+            color: Some(if is_image {
+                kadr_core::ColorInfo::IMAGE_SRGB
+            } else {
+                kadr_core::ColorInfo::from_ffprobe(
+                    v.width.unwrap_or(0),
+                    v.height.unwrap_or(0),
+                    v.color_primaries.as_deref(),
+                    v.color_transfer.as_deref(),
+                    v.color_space.as_deref(),
+                    v.color_range.as_deref(),
+                )
+            }),
         }
     });
 
@@ -173,5 +198,27 @@ mod tests {
         let v = m.video.unwrap();
         assert!(v.variable_frame_rate);
         assert_eq!(v.rotation, -90);
+    }
+
+    #[test]
+    fn reads_colour_tags_and_sample_aspect_ratio() {
+        let json = br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":720,"height":480,
+                        "sample_aspect_ratio":"8:9","color_range":"tv","color_space":"smpte170m",
+                        "color_transfer":"smpte170m","color_primaries":"smpte170m"}],
+                        "format":{"format_name":"mov","duration":"1.0"}}"#;
+        let v = parse(json).unwrap().video.unwrap();
+        assert_eq!(v.sar, (8, 9));
+        assert_eq!(v.display_size(), (640, 480));
+        let c = v.color.unwrap();
+        assert_eq!((c.matrix, c.range), (kadr_core::color::Matrix::Bt601, kadr_core::color::Range::Limited));
+
+        let untagged = br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"sample_aspect_ratio":"0:1"}],
+                            "format":{"format_name":"mov","duration":"1.0"}}"#;
+        let v = parse(untagged).unwrap().video.unwrap();
+        assert_eq!(v.sar, (1, 1));
+        assert_eq!(v.color.unwrap().matrix, kadr_core::color::Matrix::Bt709);
+
+        let png = br#"{"streams":[{"codec_type":"video","codec_name":"png","width":10,"height":10}],"format":{"format_name":"png_pipe"}}"#;
+        assert_eq!(parse(png).unwrap().video.unwrap().color, Some(kadr_core::ColorInfo::IMAGE_SRGB));
     }
 }
