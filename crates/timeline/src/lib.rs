@@ -6,6 +6,7 @@ pub mod composition;
 pub mod engine;
 pub mod multicam;
 pub mod ops;
+pub mod scene;
 pub mod snap;
 
 pub use commands::{ClipProperty, EditCommand, EditError, InsertMode, TrackFlag, TrimEdge};

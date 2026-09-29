@@ -1,0 +1,9 @@
+[package]
+name = "kadr-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kadr's evaluated scene: plain data and pure geometry (render spec §4–5)"
+
+[dependencies]
+kadr-core = { path = "../core" }
