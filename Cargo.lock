@@ -2882,6 +2882,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-bench"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-media",
+ "serde_json",
+]
+
+[[package]]
 name = "kadr-cache"
 version = "0.1.0"
 dependencies = [

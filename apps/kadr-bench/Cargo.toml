@@ -1,0 +1,16 @@
+[package]
+name = "kadr-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kadr performance harness (not shipped)"
+publish = false
+
+[[bin]]
+name = "kadr-bench"
+path = "src/main.rs"
+
+[dependencies]
+kadr-core = { path = "../../crates/core" }
+kadr-media = { path = "../../crates/media" }
+serde_json.workspace = true
