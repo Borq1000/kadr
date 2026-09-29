@@ -66,13 +66,17 @@ impl ColorInfo {
     pub const IMAGE_SRGB: ColorInfo =
         ColorInfo { primaries: Primaries::Bt709, transfer: Transfer::Srgb, matrix: Matrix::Rgb, range: Range::Full, alpha: AlphaMode::Straight };
 
-    /// Untagged video: ≥ 720 lines → Rec.709; 576 → Rec.601/625; otherwise
-    /// Rec.601/525. Limited range, opaque.
-    pub fn guess_video(_width: u32, height: u32) -> ColorInfo {
-        let (primaries, matrix) = match height {
-            h if h >= 720 => (Primaries::Bt709, Matrix::Bt709),
-            576 => (Primaries::Bt601_625, Matrix::Bt601),
-            _ => (Primaries::Bt601_525, Matrix::Bt601),
+    /// Untagged video: ≥ 1280 wide or taller than 576 lines → Rec.709; 576
+    /// lines → Rec.601/625; otherwise Rec.601/525 (the mpv/libplacebo
+    /// heuristic; cropped widescreen HD such as 1280×536 stays Rec.709).
+    /// Limited range, opaque.
+    pub fn guess_video(width: u32, height: u32) -> ColorInfo {
+        let (primaries, matrix) = if width >= 1280 || height > 576 {
+            (Primaries::Bt709, Matrix::Bt709)
+        } else if height == 576 {
+            (Primaries::Bt601_625, Matrix::Bt601)
+        } else {
+            (Primaries::Bt601_525, Matrix::Bt601)
         };
         ColorInfo { primaries, transfer: Transfer::Bt709, matrix, range: Range::Limited, alpha: AlphaMode::Opaque }
     }
@@ -127,14 +131,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn untagged_video_is_guessed_from_its_height() {
+    fn untagged_video_is_guessed_from_its_size() {
         let hd = ColorInfo::guess_video(1920, 1080);
         assert_eq!((hd.primaries, hd.transfer, hd.matrix, hd.range, hd.alpha), (Primaries::Bt709, Transfer::Bt709, Matrix::Bt709, Range::Limited, AlphaMode::Opaque));
         assert_eq!(ColorInfo::guess_video(1280, 720).matrix, Matrix::Bt709);
+        // Cropped widescreen HD stays Rec.709.
+        assert_eq!(ColorInfo::guess_video(1280, 536).matrix, Matrix::Bt709);
+        assert_eq!(ColorInfo::guess_video(1440, 600).primaries, Primaries::Bt709);
         let pal = ColorInfo::guess_video(720, 576);
         assert_eq!((pal.primaries, pal.matrix), (Primaries::Bt601_625, Matrix::Bt601));
         let ntsc = ColorInfo::guess_video(720, 480);
         assert_eq!((ntsc.primaries, ntsc.matrix), (Primaries::Bt601_525, Matrix::Bt601));
+        // Small web video stays SD.
+        assert_eq!(ColorInfo::guess_video(640, 360).primaries, Primaries::Bt601_525);
     }
 
     #[test]
