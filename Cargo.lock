@@ -2995,6 +2995,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-scene"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+]
+
+[[package]]
 name = "kadr-timeline"
 version = "0.1.0"
 dependencies = [
