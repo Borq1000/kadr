@@ -4,6 +4,7 @@
 pub mod cancel;
 pub mod id;
 pub mod media_info;
+pub mod perf;
 pub mod time;
 pub mod timecode;
 
