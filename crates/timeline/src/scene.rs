@@ -3,6 +3,7 @@
 //! references to media (not pixels). Pure: renderers and playback never see
 //! the timeline, and the timeline never sees a renderer.
 
+use kadr_core::color::AlphaMode;
 use kadr_core::{MediaKind, Time, TimeRange};
 use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, Transition, TransitionKind};
 use kadr_scene::*;
@@ -18,7 +19,46 @@ pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) ->
             scene.layers.push(layer);
         }
     }
+    cull(&mut scene);
     scene
+}
+
+/// Below this a layer cannot change an 8-bit pixel.
+const MIN_OPACITY: f32 = 0.5 / 255.0;
+
+/// Drops layers that cannot affect the frame (render spec §7.3), so nothing
+/// invisible is ever decoded or drawn.
+pub fn cull(scene: &mut FrameScene) {
+    let canvas = RectF::new(0.0, 0.0, scene.canvas.w as f32, scene.canvas.h as f32);
+    scene.layers.retain(|l| is_visible(l, &canvas));
+    if let Some(top) = scene.layers.iter().rposition(|l| covers_opaquely(l, &canvas)) {
+        scene.layers.drain(..top);
+    }
+}
+
+fn is_visible(l: &Layer, canvas: &RectF) -> bool {
+    if matches!(l.content, LayerContent::Transition(_)) {
+        return true;
+    }
+    l.opacity >= MIN_OPACITY
+        && l.placement.scale.x != 0.0
+        && l.placement.scale.y != 0.0
+        && !l.crop.is_empty()
+        && !l.placement.canvas_bounds(&l.crop).intersect(canvas).is_empty()
+}
+
+fn covers_opaquely(l: &Layer, canvas: &RectF) -> bool {
+    let opaque_content = match &l.content {
+        LayerContent::Media { media, .. } => media.kind == SourceKind::Video && media.color.alpha == AlphaMode::Opaque,
+        LayerContent::Solid(c) => c.a >= 1.0,
+        LayerContent::Transition(_) => false,
+    };
+    opaque_content
+        && l.opacity >= 1.0
+        && l.blend == BlendMode::Normal
+        && l.placement.rotation == 0.0
+        && l.crop == l.placement.full_crop()
+        && l.placement.canvas_bounds(&l.crop).contains_rect(canvas)
 }
 
 fn track_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
@@ -404,5 +444,76 @@ mod tests {
             add_transition(&mut p, 0, 2_000, 1_000, kind);
             assert_eq!(transition(&scene_at(&p, 2_000).layers[0]).op, op);
         }
+    }
+
+    fn ids(s: &FrameScene) -> Vec<LayerId> {
+        s.layers.iter().map(|l| l.id).collect()
+    }
+
+    fn two_layers(edit_upper: impl FnOnce(&mut kadr_project::Clip)) -> (Project, ClipId, ClipId) {
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let lower = place(&mut p, 0, &hd(), 0, 0, 5_000);
+        let upper = place(&mut p, v2, &hd(), 0, 0, 5_000);
+        edit_upper(&mut p.sequence_mut().tracks[v2].clips[0]);
+        (p, lower, upper)
+    }
+
+    #[test]
+    fn fully_transparent_zero_scale_and_offscreen_layers_are_dropped() {
+        for edit in [
+            (|c: &mut kadr_project::Clip| c.transform.opacity = 0.0) as fn(&mut kadr_project::Clip),
+            |c| c.transform.scale = 0.0,
+            |c| c.transform.x = 5_000.0,
+            |c| c.transform.crop_left = 1.0,
+        ] {
+            let (p, lower, _) = two_layers(edit);
+            assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(lower)]);
+        }
+    }
+
+    #[test]
+    fn an_opaque_full_frame_video_hides_everything_below() {
+        let (p, _, upper) = two_layers(|_| {});
+        assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(upper)], "nothing below is decoded");
+    }
+
+    #[test]
+    fn translucent_rotated_cropped_scaled_or_letterboxed_layers_keep_what_is_below() {
+        for edit in [
+            (|c: &mut kadr_project::Clip| c.transform.opacity = 0.99) as fn(&mut kadr_project::Clip),
+            |c| c.transform.rotation_deg = 1.0,
+            |c| c.transform.crop_top = 0.1,
+            |c| c.transform.scale = 0.5,
+            |c| c.transform.x = 10.0,
+        ] {
+            let (p, lower, upper) = two_layers(edit);
+            assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(lower), LayerId::from(upper)]);
+        }
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let lower = place(&mut p, 0, &hd(), 0, 0, 5_000);
+        let square = place(&mut p, v2, &asset(MediaKind::Video, 1080, 1080, 0, (1, 1)), 0, 0, 5_000);
+        assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(lower), LayerId::from(square)], "pillarbox bars show the lower track");
+    }
+
+    #[test]
+    fn png_logo_with_alpha_never_occludes() {
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let video = place(&mut p, 0, &hd(), 0, 0, 5_000);
+        let logo = place(&mut p, v2, &asset(MediaKind::Image, 1920, 1080, 0, (1, 1)), 0, 0, 5_000);
+        assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(video), LayerId::from(logo)]);
+    }
+
+    #[test]
+    fn transitions_are_kept_and_do_not_occlude() {
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let below = place(&mut p, 0, &hd(), 0, 0, 4_000);
+        place(&mut p, v2, &hd(), 0, 0, 2_000);
+        place(&mut p, v2, &hd(), 0, 2_000, 2_000);
+        let tid = add_transition(&mut p, v2, 2_000, 1_000, TransitionKind::DipToBlack);
+        assert_eq!(ids(&scene_at(&p, 2_000)), vec![LayerId::from(below), LayerId::from(tid)]);
     }
 }
