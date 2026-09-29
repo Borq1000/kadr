@@ -559,6 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn alpha_video_never_occludes() {
+        use kadr_core::color::AlphaMode;
+        use kadr_core::ColorInfo;
+        let alpha_video = |color: Option<ColorInfo>| {
+            let mut a = asset(MediaKind::Video, 1920, 1080, 0, (1, 1));
+            let v = a.info.video.as_mut().unwrap();
+            (v.pixel_format, v.color) = ("yuva444p10le".into(), color);
+            a
+        };
+        let tagged = ColorInfo { alpha: AlphaMode::Straight, ..ColorInfo::guess_video(1920, 1080) };
+        for (overlay, what) in [(alpha_video(None), "legacy project, colour guessed"), (alpha_video(Some(tagged)), "probed colour")] {
+            let mut p = Project::new("t");
+            let v2 = add_video_track(&mut p);
+            let below = place(&mut p, 0, &hd(), 0, 0, 5_000);
+            let above = place(&mut p, v2, &overlay, 0, 0, 5_000);
+            assert_eq!(ids(&scene_at(&p, 1_000)), vec![LayerId::from(below), LayerId::from(above)], "{what}");
+        }
+    }
+
+    #[test]
     fn transitions_are_kept_and_do_not_occlude() {
         let mut p = Project::new("t");
         let v2 = add_video_track(&mut p);

@@ -1,5 +1,6 @@
 use super::{run_capture, FfmpegCli};
 use crate::{MediaError, Result};
+use kadr_core::color::{alpha_of_pixel_format, AlphaMode};
 use kadr_core::{AudioInfo, FrameRate, MediaInfo, MediaKind, Time, VideoInfo};
 use serde::Deserialize;
 use std::path::Path;
@@ -121,14 +122,22 @@ pub(crate) fn parse(json: &[u8]) -> Option<MediaInfo> {
             color: Some(if is_image {
                 kadr_core::ColorInfo::IMAGE_SRGB
             } else {
-                kadr_core::ColorInfo::from_ffprobe(
+                let c = kadr_core::ColorInfo::from_ffprobe(
                     v.width.unwrap_or(0),
                     v.height.unwrap_or(0),
                     v.color_primaries.as_deref(),
                     v.color_transfer.as_deref(),
                     v.color_space.as_deref(),
                     v.color_range.as_deref(),
-                )
+                );
+                // VP8/VP9 in WebM keep alpha in a side stream: the pixel
+                // format says yuv420p, the `alpha_mode` tag says otherwise.
+                let alpha = if v.tags.get("alpha_mode").map(String::as_str) == Some("1") {
+                    AlphaMode::Straight
+                } else {
+                    alpha_of_pixel_format(v.pix_fmt.as_deref().unwrap_or(""))
+                };
+                kadr_core::ColorInfo { alpha, ..c }
             }),
         }
     });
@@ -220,5 +229,20 @@ mod tests {
 
         let png = br#"{"streams":[{"codec_type":"video","codec_name":"png","width":10,"height":10}],"format":{"format_name":"png_pipe"}}"#;
         assert_eq!(parse(png).unwrap().video.unwrap().color, Some(kadr_core::ColorInfo::IMAGE_SRGB));
+    }
+
+    #[test]
+    fn video_alpha_comes_from_pixel_format_or_alpha_mode_tag() {
+        use kadr_core::color::AlphaMode;
+        let alpha = |stream: &str| {
+            let json = format!(r#"{{"streams":[{stream}],"format":{{"format_name":"mov","duration":"1.0"}}}}"#);
+            parse(json.as_bytes()).unwrap().video.unwrap().color.unwrap().alpha
+        };
+        let prores = r#"{"codec_type":"video","codec_name":"prores","width":1920,"height":1080,"pix_fmt":"yuva444p10le"}"#;
+        assert_eq!(alpha(prores), AlphaMode::Straight, "ProRes 4444");
+        let webm = r#"{"codec_type":"video","codec_name":"vp9","width":1920,"height":1080,"pix_fmt":"yuv420p","tags":{"alpha_mode":"1"}}"#;
+        assert_eq!(alpha(webm), AlphaMode::Straight, "VP9 with an alpha side stream");
+        let plain = r#"{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"pix_fmt":"yuv420p"}"#;
+        assert_eq!(alpha(plain), AlphaMode::Opaque);
     }
 }

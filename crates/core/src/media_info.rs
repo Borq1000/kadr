@@ -1,7 +1,7 @@
 //! Technical description of a media file, produced by the media backend's
 //! probe and stored in the project so reopening needs no re-probe.
 
-use crate::color::ColorInfo;
+use crate::color::{alpha_of_pixel_format, ColorInfo};
 use crate::time::{FrameRate, Time};
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +47,10 @@ impl VideoInfo {
         if self.rotation.rem_euclid(180) == 90 { (self.height, w) } else { (w, self.height) }
     }
 
+    /// Probed colour, or for projects saved before colour tags a guess from
+    /// the size with alpha from the pixel format.
     pub fn color_info(&self) -> ColorInfo {
-        self.color.unwrap_or_else(|| ColorInfo::guess_video(self.width, self.height))
+        self.color.unwrap_or_else(|| ColorInfo { alpha: alpha_of_pixel_format(&self.pixel_format), ..ColorInfo::guess_video(self.width, self.height) })
     }
 }
 
@@ -136,6 +138,10 @@ mod tests {
         let v: VideoInfo = serde_json::from_str(old).unwrap();
         assert_eq!((v.sar, v.color), ((1, 1), None));
         assert_eq!(v.color_info().matrix, Matrix::Bt601);
+        assert_eq!(v.color_info().alpha, AlphaMode::Opaque);
+        let prores_4444 = VideoInfo { pixel_format: "yuva444p10le".into(), ..video(1920, 1080, (1, 1), 0) };
+        let c = prores_4444.color_info();
+        assert_eq!((c.alpha, c.matrix), (AlphaMode::Straight, Matrix::Bt709), "alpha from the pixel format, the rest guessed");
     }
 
     #[test]

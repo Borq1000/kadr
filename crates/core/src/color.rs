@@ -126,6 +126,18 @@ impl ColorInfo {
     }
 }
 
+/// Whether frames in `pix_fmt` (FFmpeg name) carry an alpha channel:
+/// `Straight` for alpha formats (yuva*, rgba*, argb, bgra*, abgr, gbrap*,
+/// ya8/ya16, pal8, …), otherwise `Opaque`.
+pub fn alpha_of_pixel_format(pix_fmt: &str) -> AlphaMode {
+    const WITH_ALPHA: [&str; 10] = ["yuva", "rgba", "argb", "bgra", "abgr", "gbrap", "ya", "vuya", "ayuv", "pal8"];
+    if WITH_ALPHA.iter().any(|p| pix_fmt.starts_with(p)) {
+        AlphaMode::Straight
+    } else {
+        AlphaMode::Opaque
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +184,15 @@ mod tests {
         assert_eq!((w.primaries, w.transfer, w.matrix, w.range, w.alpha), (Primaries::Bt709, Transfer::Bt709, Matrix::Rgb, Range::Full, AlphaMode::Premultiplied));
         assert!(w.is_supported_sdr());
         assert_eq!(ColorInfo::IMAGE_SRGB.alpha, AlphaMode::Straight);
+    }
+
+    #[test]
+    fn alpha_comes_from_the_pixel_format() {
+        for f in ["yuva444p10le", "yuva420p", "rgba", "argb", "bgra", "abgr", "gbrap", "gbrap12le", "ya8", "ya16be", "pal8", "rgba64le", "bgra64be", "vuya", "ayuv64le"] {
+            assert_eq!(alpha_of_pixel_format(f), AlphaMode::Straight, "{f}");
+        }
+        for f in ["yuv420p", "yuv444p10le", "rgb24", "nv12", "gray", "gbrp10le", "p010le", "yuyv422", ""] {
+            assert_eq!(alpha_of_pixel_format(f), AlphaMode::Opaque, "{f}");
+        }
     }
 }
