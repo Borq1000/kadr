@@ -3,8 +3,8 @@
 //! references to media (not pixels). Pure: renderers and playback never see
 //! the timeline, and the timeline never sees a renderer.
 
-use kadr_core::{MediaKind, Time};
-use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform};
+use kadr_core::{MediaKind, Time, TimeRange};
+use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, Transition, TransitionKind};
 use kadr_scene::*;
 
 pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) -> FrameScene {
@@ -21,9 +21,49 @@ pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) ->
     scene
 }
 
-fn track_layer(project: &Project, _seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
+fn track_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
+    if let Some(layer) = transition_layer(project, seq, track, t, canvas) {
+        return Some(layer);
+    }
     let clip = track.clip_at(t).filter(|c| c.enabled)?;
     clip_layer(project, clip, t, canvas)
+}
+
+/// `[at − ⌊d/2⌋, at − ⌊d/2⌋ + d)`: centred on the cut.
+fn window(tr: &Transition) -> TimeRange {
+    let start = tr.at - Time(tr.duration.flicks() / 2);
+    TimeRange::new(start, start + tr.duration)
+}
+
+/// The transition active on `track` at `t`, if both clips at its cut exist
+/// and are enabled. Overlapping windows: the earlier cut wins.
+fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
+    let tr = seq
+        .transitions
+        .iter()
+        .filter(|tr| tr.track == track.id && tr.duration > Time::ZERO && window(tr).contains(t))
+        .min_by_key(|tr| tr.at)?;
+    let outgoing = track.clips.iter().find(|c| c.timeline_out == tr.at && c.enabled)?;
+    let incoming = track.clips.iter().find(|c| c.timeline_in == tr.at && c.enabled)?;
+    let w = window(tr);
+    let progress = ((t - w.start).flicks() as f64 / w.duration().flicks() as f64).clamp(0.0, 1.0) as f32;
+    let op = match tr.kind {
+        TransitionKind::CrossDissolve => TransitionOp::Dissolve,
+        TransitionKind::DipToBlack => TransitionOp::DipToColor(Rgba::BLACK),
+        TransitionKind::Wipe => TransitionOp::Wipe { angle: 0.0, softness: 0.0 },
+    };
+    let from = clip_layer(project, outgoing, t, canvas)?;
+    let to = clip_layer(project, incoming, t, canvas)?;
+    let placement = Placement::fill(canvas);
+    Some(Layer {
+        id: LayerId::from(tr.id),
+        content: LayerContent::Transition(Box::new(TransitionLayer { op, progress, from: vec![from], to: vec![to] })),
+        crop: placement.full_crop(),
+        placement,
+        opacity: 1.0,
+        blend: BlendMode::Normal,
+        effects: vec![],
+    })
 }
 
 /// One clip at timeline time `t` (which may lie outside the clip, for
@@ -255,6 +295,114 @@ mod tests {
         match &scene_at(&p, 0).layers[0].effects[..] {
             [Effect::ColorAdjust(c)] => assert_eq!((c.saturation, c.contrast), (0.0, 1.0)),
             other => panic!("{other:?}"),
+        }
+    }
+
+    use kadr_core::TransitionId;
+    use kadr_project::{Transition, TransitionKind};
+
+    fn add_transition(p: &mut Project, track: usize, at_ms: i64, dur_ms: i64, kind: TransitionKind) -> TransitionId {
+        let id = TransitionId::new();
+        let track_id = p.sequence().tracks[track].id;
+        p.sequence_mut().transitions.push(Transition { id, kind, track: track_id, at: Time::from_millis(at_ms), duration: Time::from_millis(dur_ms) });
+        id
+    }
+
+    fn transition(l: &Layer) -> &TransitionLayer {
+        match &l.content {
+            LayerContent::Transition(t) => t,
+            other => panic!("not a transition: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dissolve_window_is_centred_on_the_cut_with_exact_progress() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 2_000);
+        let b = place(&mut p, 0, &hd(), 10_000, 2_000, 2_000);
+        let tid = add_transition(&mut p, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        for (ms, progress) in [(1_500, 0.0), (2_000, 0.5), (2_250, 0.75)] {
+            let s = scene_at(&p, ms);
+            assert_eq!(s.layers.len(), 1);
+            assert_eq!(s.layers[0].id, LayerId::from(tid));
+            let tr = transition(&s.layers[0]);
+            assert_eq!(tr.op, TransitionOp::Dissolve);
+            assert!((tr.progress - progress).abs() < 1e-6, "t={ms}: {}", tr.progress);
+            assert_eq!((tr.from[0].id, tr.to[0].id), (LayerId::from(a), LayerId::from(b)));
+        }
+        assert_eq!(scene_at(&p, 1_499).layers[0].id, LayerId::from(a));
+        assert_eq!(scene_at(&p, 2_500).layers[0].id, LayerId::from(b), "the window end is exclusive");
+    }
+
+    #[test]
+    fn progress_is_frame_exact_at_29_97() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 4_000);
+        place(&mut p, 0, &hd(), 0, 4_000, 4_000);
+        let fr = FrameRate::FPS_29_97;
+        let d = fr.frame_to_time(30);
+        let track = p.sequence().tracks[0].id;
+        p.sequence_mut().transitions.push(Transition { id: TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: Time::from_secs(4), duration: d });
+        let start = Time::from_secs(4) - Time(d.flicks() / 2);
+        for k in [0, 1, 7, 15, 29] {
+            let t = start + fr.frame_to_time(k);
+            let s = evaluate(&p, p.sequence(), t, &OutputSpec::new(SizeU::new(960, 540), RenderQuality::Export));
+            assert!((transition(&s.layers[0]).progress - k as f32 / 30.0).abs() < 1e-6, "frame {k}");
+        }
+    }
+
+    #[test]
+    fn transition_source_times_extend_past_the_clip_and_clamp_at_zero() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 2_000);
+        place(&mut p, 0, &hd(), 0, 2_000, 2_000); // incoming media has nothing before its in-point
+        add_transition(&mut p, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        let before_cut = scene_at(&p, 1_750);
+        assert_eq!(media(&transition(&before_cut.layers[0]).to[0]).1, Time::ZERO, "clamped, not negative");
+        let after_cut = scene_at(&p, 2_250);
+        assert_eq!(media(&transition(&after_cut.layers[0]).from[0]).1, Time::from_millis(2_250), "outgoing handle past its out-point");
+    }
+
+    #[test]
+    fn missing_neighbour_or_disabled_clip_means_no_transition() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 2_000);
+        place(&mut p, 0, &hd(), 0, 2_500, 2_000); // gap after the cut
+        add_transition(&mut p, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        assert_eq!(scene_at(&p, 1_750).layers[0].id, LayerId::from(a));
+        assert!(scene_at(&p, 2_100).layers.is_empty(), "gap stays a gap");
+        let mut q = Project::new("t");
+        let a = place(&mut q, 0, &hd(), 0, 0, 2_000);
+        place(&mut q, 0, &hd(), 0, 2_000, 2_000);
+        q.sequence_mut().tracks[0].clips[1].enabled = false;
+        add_transition(&mut q, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        assert_eq!(scene_at(&q, 1_750).layers[0].id, LayerId::from(a));
+    }
+
+    #[test]
+    fn overlapping_windows_pick_the_earlier_cut() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 1_000);
+        let b = place(&mut p, 0, &hd(), 0, 1_000, 400);
+        place(&mut p, 0, &hd(), 0, 1_400, 1_600);
+        add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
+        add_transition(&mut p, 0, 1_400, 1_000, TransitionKind::CrossDissolve);
+        let tr = transition(&scene_at(&p, 1_200).layers[0]).clone();
+        assert_eq!((tr.from[0].id, tr.to[0].id), (LayerId::from(a), LayerId::from(b)));
+        assert!((tr.progress - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transition_kinds_map_to_render_ops() {
+        for (kind, op) in [
+            (TransitionKind::DipToBlack, TransitionOp::DipToColor(Rgba::BLACK)),
+            (TransitionKind::Wipe, TransitionOp::Wipe { angle: 0.0, softness: 0.0 }),
+        ] {
+            let mut p = Project::new("t");
+            place(&mut p, 0, &hd(), 0, 0, 2_000);
+            place(&mut p, 0, &hd(), 0, 2_000, 2_000);
+            add_transition(&mut p, 0, 2_000, 1_000, kind);
+            assert_eq!(transition(&scene_at(&p, 2_000).layers[0]).op, op);
         }
     }
 }
