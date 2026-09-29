@@ -201,6 +201,39 @@ fn export_dissolve_blends_across_the_cut_and_keeps_duration() {
     assert!(late < 20.0, "second dissolve finished into black: {late}");
 }
 
+/// Plain cuts are concatenated before the transition (concat outputs a 1/1000000 time
+/// base, xfade needs both inputs on the same one) and another run follows it.
+#[test]
+fn export_with_cuts_before_a_dissolve_succeeds_and_keeps_frame_count() {
+    let Some(ff) = backend() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let clip = make_clip(dir.path());
+    let output = dir.path().join("out.mp4");
+    let source = |start_ms| Some(ExportVideoSource { path: clip.clone(), source_start: Time::from_millis(start_ms), speed: 1.0, look: VideoLook::default() });
+    let dissolve = Some(ExportTransition { kind: ExportTransitionKind::Dissolve, duration: Time::from_millis(800) });
+    let plan = ExportPlan {
+        output: output.clone(),
+        total: Time::from_millis(4_000),
+        video: vec![
+            ExportVideo { duration: Time::from_millis(1_000), source: source(0), transition_in: None },
+            ExportVideo { duration: Time::from_millis(1_000), source: None, transition_in: None },
+            ExportVideo { duration: Time::from_millis(1_000), source: source(2_000), transition_in: dissolve },
+            ExportVideo { duration: Time::from_millis(1_000), source: source(3_000), transition_in: None },
+        ],
+        audio: vec![],
+        settings: ExportSettings { width: 320, height: 180, rate: FrameRate::FPS_25, preset: "ultrafast".into(), ..Default::default() },
+    };
+    ff.export(&plan, &|_| {}, &CancelToken::new()).unwrap();
+
+    let frames = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    // Transitions use handles around the cut, so the length is the sum of the segments: 4 x 25 frames.
+    assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "100", "a dissolve must not change the length");
+}
+
 /// Same loop as the editor's analysis job: 4 fps grey proxy → stats.
 fn video_overview(ff: &FfmpegCli, path: &Path) -> kadr_analysis::video::VideoOverview {
     use kadr_analysis::video::*;
