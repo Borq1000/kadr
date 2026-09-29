@@ -3007,6 +3007,7 @@ version = "0.1.0"
 dependencies = [
  "kadr-core",
  "kadr-project",
+ "kadr-scene",
  "serde",
  "thiserror 2.0.21",
  "tracing",
