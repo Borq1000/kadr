@@ -6,6 +6,7 @@
 
 mod alloc;
 mod baseline;
+mod live;
 mod media;
 mod report;
 
@@ -17,6 +18,13 @@ fn main() {
     let flag = |name: &str| args.iter().any(|a| a == name);
     let result = match args.first().map(String::as_str) {
         Some("baseline") => baseline::run(flag("--quick")),
+        Some("live") => {
+            let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+            match value("--clip") {
+                Some(c) => live::run(std::path::Path::new(&c), value("--seconds").and_then(|s| s.parse().ok()).unwrap_or(20)),
+                None => Err("live needs --clip <file>".to_string()),
+            }
+        }
         _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N]".to_string()),
     };
     match result {
