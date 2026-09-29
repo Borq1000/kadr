@@ -57,6 +57,12 @@ pub fn kadr_tools() -> Vec<Value> {
             &["at_ms"],
         ),
         tool(
+            "get_perf",
+            "Preview performance over the last frames (up to 600): percentiles (ms) of frame time, decode, composite and present; dropped frames (late or superseded); seek latency from a playhead change to the frame shown; frame-sized allocations and copies per frame. `reset: true` clears the window after reading, so the next read measures only what happens afterwards.",
+            json!({"reset": {"type": "boolean", "description": "Clear the window after reading."}}),
+            &[],
+        ),
+        tool(
             "layout_text",
             "Map text to the characters the same physical keys produce on the other layout (ЙЦУКЕН ↔ QWERTY). Returns the mapped string; it does not type anything — send the result with `ui_dispatch_key_event` to test layout-independent shortcuts.",
             json!({
