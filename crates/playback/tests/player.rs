@@ -298,7 +298,14 @@ fn continuous_scrubbing_presents_frames_while_dragging() {
     let after = presented_until(&r.events, last, ms(3000));
     assert_eq!(after.last().map(|s| s.0), Some(last));
     assert!(after.len() <= 2, "{after:?}");
-    let summary = r.perf.summary();
+    // The player records a frame's telemetry just after the sink presented
+    // it: the final frame's entry may land a moment after its event.
+    let deadline = Instant::now() + ms(2000);
+    let mut summary = r.perf.summary();
+    while summary.seek.count == 0 && Instant::now() < deadline {
+        std::thread::sleep(ms(5));
+        summary = r.perf.summary();
+    }
     assert!(summary.seek.count <= 2 && summary.seek.count >= 1, "seek latency only on final frames: {summary:?}");
 }
 
