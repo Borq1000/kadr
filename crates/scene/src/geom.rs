@@ -110,8 +110,12 @@ impl Affine2 {
         Some(Affine2 { a, b, c, d, tx: -(a * self.tx + c * self.ty), ty: -(b * self.tx + d * self.ty) })
     }
 
-    /// Axis-aligned bounds of `r` after the map.
+    /// Axis-aligned bounds of `r` after the map; an empty `r` (including an
+    /// inverted one) stays empty instead of spanning its corners.
     pub fn map_bounds(&self, r: &RectF) -> RectF {
+        if r.is_empty() {
+            return RectF::new(0.0, 0.0, 0.0, 0.0);
+        }
         let corners = [(r.x0, r.y0), (r.x1, r.y0), (r.x0, r.y1), (r.x1, r.y1)].map(|(x, y)| self.apply(x as f64, y as f64));
         let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
         for (x, y) in corners {
@@ -217,6 +221,14 @@ mod tests {
         assert!(rect_close(p.canvas_bounds(&p.full_crop()), RectF::new(400.0, 450.0, 600.0, 550.0)));
         let right_half = RectF::new(100.0, 0.0, 200.0, 100.0);
         assert!(rect_close(p.canvas_bounds(&right_half), RectF::new(500.0, 450.0, 600.0, 550.0)), "no re-centring");
+    }
+
+    #[test]
+    fn an_empty_crop_never_maps_to_a_non_empty_box() {
+        let p = Placement { size: Vec2::new(200.0, 100.0), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(500.0, 500.0), scale: Vec2::new(1.0, 1.0), rotation: 0.3 };
+        let inverted = RectF::new(150.0, 0.0, 50.0, 100.0); // x1 < x0
+        assert!(p.canvas_bounds(&inverted).is_empty(), "{:?}", p.canvas_bounds(&inverted));
+        assert!(Affine2::IDENTITY.map_bounds(&RectF::new(0.0, 10.0, 10.0, 10.0)).is_empty());
     }
 
     #[test]
