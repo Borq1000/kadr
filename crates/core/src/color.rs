@@ -127,15 +127,26 @@ impl ColorInfo {
 }
 
 /// Whether frames in `pix_fmt` (FFmpeg name) carry an alpha channel:
-/// `Straight` for alpha formats (yuva*, rgba*, argb, bgra*, abgr, gbrap*,
-/// ya8/ya16, pal8, …), otherwise `Opaque`.
+/// `Opaque` only for formats known to have none; anything else — alpha
+/// formats, `pal8`, unknown or empty names — is `Straight`. Fail-safe
+/// (Ruling R13): a missed opaque format costs an extra decode, never a
+/// wrong frame.
 pub fn alpha_of_pixel_format(pix_fmt: &str) -> AlphaMode {
-    const WITH_ALPHA: [&str; 10] = ["yuva", "rgba", "argb", "bgra", "abgr", "gbrap", "ya", "vuya", "ayuv", "pal8"];
-    if WITH_ALPHA.iter().any(|p| pix_fmt.starts_with(p)) {
-        AlphaMode::Straight
-    } else {
-        AlphaMode::Opaque
-    }
+    const OPAQUE: [&str; 20] = [
+        "nv12", "nv16", "nv21", "nv24", "nv42", "yuyv422", "uyvy422", "yvyu422", "uyyvyy411", "vuyx", "monow", "monob", "rgb24", "bgr24", "rgb8", "bgr8", "0rgb",
+        "rgb0", "0bgr", "bgr0",
+    ];
+    const OPAQUE_PREFIX: [&str; 26] = [
+        "nv20", "p010", "p012", "p016", "p210", "p216", "p410", "p416", "y210", "y212", "xv30", "xv36", "gray", "xyz12", "rgb48", "bgr48", "rgb565", "bgr565",
+        "rgb555", "bgr555", "rgb444", "bgr444", "rgb4", "bgr4", "x2rgb10", "x2bgr10",
+    ];
+    let f = pix_fmt;
+    let opaque = (f.starts_with("yuv") && !f.starts_with("yuva"))
+        // gbrp* (planar RGB, float included); gbrap* has alpha and does not match.
+        || f.starts_with("gbrp")
+        || OPAQUE.contains(&f)
+        || OPAQUE_PREFIX.iter().any(|p| f.starts_with(p));
+    if opaque { AlphaMode::Opaque } else { AlphaMode::Straight }
 }
 
 #[cfg(test)]
@@ -188,11 +199,19 @@ mod tests {
 
     #[test]
     fn alpha_comes_from_the_pixel_format() {
-        for f in ["yuva444p10le", "yuva420p", "rgba", "argb", "bgra", "abgr", "gbrap", "gbrap12le", "ya8", "ya16be", "pal8", "rgba64le", "bgra64be", "vuya", "ayuv64le"] {
+        for f in ["yuva444p10le", "yuva420p", "rgba", "argb", "bgra", "abgr", "gbrap", "gbrap12le", "gbrap10le", "ya8", "ya16be", "pal8", "rgba64le", "bgra64be", "vuya", "ayuv64le", "uyva"] {
             assert_eq!(alpha_of_pixel_format(f), AlphaMode::Straight, "{f}");
         }
-        for f in ["yuv420p", "yuv444p10le", "rgb24", "nv12", "gray", "gbrp10le", "p010le", "yuyv422", ""] {
+        for f in ["yuv420p", "yuvj420p", "yuv444p10le", "rgb24", "bgr0", "nv12", "gray", "gbrp10le", "p010le", "yuyv422"] {
             assert_eq!(alpha_of_pixel_format(f), AlphaMode::Opaque, "{f}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_missing_pixel_formats_may_have_alpha() {
+        // Fail-safe (Ruling R13): a miss costs an extra decode, never a wrong frame.
+        for f in ["weird_new_fmt", ""] {
+            assert_eq!(alpha_of_pixel_format(f), AlphaMode::Straight, "{f:?}");
         }
     }
 }
