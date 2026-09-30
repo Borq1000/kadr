@@ -921,7 +921,8 @@ mod tests {
         for y in [0, 1, 18, 19] {
             assert_eq!(px(&fast, 24, 5, y), [0, 0, 0, 255], "row {y}: margin");
         }
-        let first_canvas_px: [u8; 4] = f.row(2)[5 * 4..5 * 4 + 4].try_into().unwrap();
+        // Output row 2 is the first canvas row (two margin rows above it): frame row 0.
+        let first_canvas_px: [u8; 4] = f.row(0)[5 * 4..5 * 4 + 4].try_into().unwrap();
         assert_eq!(px(&fast, 24, 5, 2), first_canvas_px, "first canvas row is the frame");
         let mut sampled = s.clone();
         sampled.layers[0].opacity = 0.999_999_9; // just below 1: the general path
