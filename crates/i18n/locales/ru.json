@@ -337,6 +337,7 @@
   "export.eta": " · осталось около {time}",
   "export.done": "Готово за {time} · {size}",
   "export.failed": "Экспорт не удался: {error}",
+  "export.err.missing_media": "Медиафайл недоступен или не читается: {path} (на {time})",
   "export.cancelled": "Экспорт отменён",
   "settings.title": "Настройки",
   "settings.tab.general": "Общие",

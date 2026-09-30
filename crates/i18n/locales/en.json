@@ -325,6 +325,7 @@
   "export.eta": " · about {time} left",
   "export.done": "Done in {time} · {size}",
   "export.failed": "Export failed: {error}",
+  "export.err.missing_media": "Media is offline or unreadable: {path} (at {time})",
   "export.cancelled": "Export cancelled",
   "settings.title": "Settings",
   "settings.tab.general": "General",
