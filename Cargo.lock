@@ -2888,6 +2888,7 @@ dependencies = [
  "kadr-core",
  "kadr-media",
  "kadr-project",
+ "kadr-render",
  "kadr-scene",
  "kadr-timeline",
  "serde_json",
