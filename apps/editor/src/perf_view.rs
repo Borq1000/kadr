@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(value("dev.cache"), "75 %");
         assert!(value("dev.dropped").starts_with("1/2"), "{}", value("dev.dropped"));
         assert_eq!(value("dev.renderer"), "cpu");
-        let empty = dev_rows(&PerfRing::new(4).summary(), &[], 0, None, "legacy");
+        let empty = dev_rows(&PerfRing::new(4).summary(), &[], 0, None, "cpu");
         assert!(empty.iter().filter(|r| r.1 == "—").count() >= 3, "no data yet: dashes, not zeros: {empty:?}");
         assert_eq!(cache_hit_pct(&[]), None);
     }

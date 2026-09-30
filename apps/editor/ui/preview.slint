@@ -25,7 +25,7 @@ export component Preview inherits Rectangle {
     in property <string> duration;
     in property <string> info;
     in property <string> clip-name;
-    in property <int> empty-kind; // 0 has content, 1 empty timeline, 2 gap (over the black frame when there is one), 3 offline (legacy)
+    in property <int> empty-kind; // 0 has content, 1 empty timeline, 2 gap (over the black frame when there is one)
     /// Media under the playhead is offline: its frame shows the MISSING colour, this adds the caption as a badge.
     in property <bool> offline;
     /// DEV overlay (Ctrl+Shift+D / View menu): performance numbers in the top-right corner.
@@ -85,15 +85,15 @@ export component Preview inherits Rectangle {
                     HorizontalLayout {
                         alignment: center;
                         Icon {
-                            icon: root.empty-kind == 3 ? Icons.close : Icons.film;
+                            icon: Icons.film;
                             width: 28px; height: 28px;
-                            color: root.empty-kind == 3 ? Theme.danger : #ffffff30;
+                            color: #ffffff30;
                         }
                     }
                     Text {
                         horizontal-alignment: center;
-                        text: root.empty-kind == 1 ? Tr.t("preview.empty.timeline") : root.empty-kind == 3 ? Tr.t("preview.empty.offline") : Tr.t("preview.empty.gap");
-                        color: root.empty-kind == 3 ? Theme.danger : #ffffff60;
+                        text: root.empty-kind == 1 ? Tr.t("preview.empty.timeline") : Tr.t("preview.empty.gap");
+                        color: #ffffff60;
                         font-size: Theme.font;
                     }
                 }
