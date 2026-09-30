@@ -11,19 +11,32 @@
 //!
 //! # Scrubbing
 //!
-//! At most one show is in flight. A newer `show` does not cancel it: the
-//! frame being prepared is finished and presented, then the newest pending
-//! show is next (the ones in between are skipped, never attempted). So a
-//! continuous drag of the playhead shows frames at seek speed instead of
-//! nothing until the pointer stops, frames are presented in request order,
-//! and after a burst of shows at most one frame older than the last request
-//! is presented. `play`, `stop` (and dropping the player) do cancel an
-//! in-flight show, at the resolver too: no frame of an older generation is
+//! At most one show is in flight. A newer `show` does not cancel it at
+//! once: the frame being prepared is finished and presented, then the
+//! newest pending show is next (the ones in between are skipped, never
+//! attempted). So a continuous drag of the playhead shows frames at seek
+//! speed instead of nothing until the pointer stops, frames are presented
+//! in request order, and after a burst of shows at most one frame older
+//! than the last request is presented. A show still waiting for decoding
+//! [`PlayerConfig::show_patience`] after it began while a newer show is
+//! pending is abandoned (a slow open must not hold the newest request
+//! back). `play`, `stop` (and dropping the player) cancel an in-flight show
+//! at once, at the resolver too: no frame of an older generation is
 //! presented once one of them returned. `set_source`/`set_output` do not:
 //! live inspector drags replace the source on every step and must keep
 //! frames coming just like scrubbing. `seek_latency` is recorded on frames
 //! that were the newest request when presented (the final frame of a
 //! scrub), measured from that request.
+//!
+//! # Playback slower than real time
+//!
+//! A media layer not decoded by its frame's deadline shows the newest frame
+//! its decoder already produced (at most [`PlayerConfig::max_behind`]
+//! earlier), so the picture keeps moving at whatever rate decoding allows
+//! instead of freezing. A frame is presented only if some layer shows newer
+//! content than the frame before it; otherwise it is dropped (the picture
+//! on screen is the same). Presented frames stay within one frame of the
+//! clock; only their content lags.
 //!
 //! # Pre-roll
 //!
@@ -31,20 +44,22 @@
 //! `None`), the player prepares and renders the play's first frame first,
 //! waiting for decoding up to [`PlayerConfig::preroll`], then calls
 //! [`FrameSink::ready`]: that is the moment to start the clock (the audio).
-//! The pre-rolled frame is presented when the clock reaches it. The app
+//! The pre-rolled frame is presented when the clock reaches it — unless the
+//! source or output changed meanwhile, then it is rendered again. The app
 //! starts the clock on `ready` or after its own timeout, whichever comes
 //! first, so a slow open never holds playback for more than that.
 
+use crate::cache::FrameKey;
 use crate::pace::{duration_of, Clock, Pace, PlaySchedule, Step};
-use crate::resolver::{Mode, Resolver};
+use crate::resolver::{decode_size, Mode, Resolver};
 use crate::source::SceneSource;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use kadr_core::perf::{FramePerf, PerfRing};
-use kadr_core::Time;
+use kadr_core::{AssetId, Time};
 use kadr_render::{CpuTarget, LayerInput, MissingReason, PreparedFrame, RenderInputs, RenderTarget, Renderer};
-use kadr_scene::{FrameScene, OutputSpec, SizeU};
-use parking_lot::Mutex;
-use std::collections::VecDeque;
+use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, OutputSpec, SizeU};
+use parking_lot::{Condvar, Mutex};
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,16 +110,31 @@ pub struct PlayerConfig {
     /// During playback the scene this far ahead is prefetched, so the next
     /// clip's decoder is open before the cut. `Time::ZERO` disables it.
     pub lookahead: Time,
+    /// The lookahead scene is prefetched when its media change, and at
+    /// least every this many frames (to keep its sessions warm).
+    pub prefetch_every: u32,
     /// How often to look at a clock that is not running yet.
     pub clock_poll: Duration,
     /// Longest wait for the first frame of a play started with the clock
     /// stopped before [`FrameSink::ready`] is called anyway.
     pub preroll: Duration,
+    /// A show still waiting this long while a newer show is pending is abandoned.
+    pub show_patience: Duration,
+    /// Playback: a layer not decoded in time may show a frame of its media
+    /// at most this much older (source time) instead.
+    pub max_behind: Time,
 }
 
 impl Default for PlayerConfig {
     fn default() -> Self {
-        PlayerConfig { lookahead: Time::from_millis(750), clock_poll: Duration::from_millis(5), preroll: Duration::from_millis(250) }
+        PlayerConfig {
+            lookahead: Time::from_millis(750),
+            prefetch_every: 12,
+            clock_poll: Duration::from_millis(5),
+            preroll: Duration::from_millis(250),
+            show_patience: Duration::from_millis(200),
+            max_behind: Time::from_secs(1),
+        }
     }
 }
 
@@ -147,12 +177,59 @@ impl Generation {
     }
 }
 
+/// The show being prepared, watched so a slow one can be abandoned for a newer one.
+#[derive(Default)]
+struct WatchState {
+    in_flight: Option<(u64, Instant)>,
+    quit: bool,
+}
+
+#[derive(Default)]
+struct ShowWatch {
+    state: Mutex<WatchState>,
+    cv: Condvar,
+}
+
+impl ShowWatch {
+    fn set(&self, v: Option<(u64, Instant)>) {
+        self.state.lock().in_flight = v;
+        self.cv.notify_all();
+    }
+
+    /// Thread body: abandons (at the resolver) a show that has waited
+    /// `patience` while a newer request is pending.
+    fn run(&self, generation: &Generation, resolver: &Resolver, patience: Duration) {
+        let mut st = self.state.lock();
+        loop {
+            if st.quit {
+                return;
+            }
+            match st.in_flight {
+                Some((g, started)) if generation.current() > g => {
+                    let due = started + patience;
+                    if Instant::now() >= due {
+                        resolver.supersede(generation.current());
+                        st.in_flight = None;
+                    } else {
+                        self.cv.wait_until(&mut st, due);
+                    }
+                }
+                _ => {
+                    self.cv.wait(&mut st);
+                }
+            }
+        }
+    }
+}
+
 pub struct PreviewPlayer {
     tx: Sender<Cmd>,
     generation: Arc<Generation>,
     resolver: Arc<Resolver>,
     perf: Arc<PerfRing>,
+    watch: Arc<ShowWatch>,
     thread: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<()>>,
 }
 
 impl PreviewPlayer {
@@ -171,6 +248,11 @@ impl PreviewPlayer {
         let (tx, rx) = crossbeam_channel::unbounded();
         let g = resolver.generation();
         let generation = Arc::new(Generation { lock: Mutex::new(()), value: AtomicU64::new(g), barrier: AtomicU64::new(g) });
+        let watch = Arc::new(ShowWatch::default());
+        let watcher = {
+            let (w, g, r, p) = (watch.clone(), generation.clone(), resolver.clone(), config.show_patience);
+            std::thread::Builder::new().name("kadr-player-watch".into()).spawn(move || w.run(&g, &r, p)).expect("spawn player watch thread")
+        };
         let worker = Worker {
             rx,
             generation: generation.clone(),
@@ -184,9 +266,10 @@ impl PreviewPlayer {
             output,
             stash: VecDeque::new(),
             render_estimate: Duration::from_millis(5),
+            watch: watch.clone(),
         };
         let thread = std::thread::Builder::new().name("kadr-player".into()).spawn(move || worker.run()).expect("spawn player thread");
-        PreviewPlayer { tx, generation, resolver, perf, thread: Some(thread) }
+        PreviewPlayer { tx, generation, resolver, perf, watch, thread: Some(thread), watcher: Some(watcher) }
     }
 
     /// Scenes and media from now on (an edit replaces the snapshot). Does
@@ -206,6 +289,8 @@ impl PreviewPlayer {
     pub fn show(&self, t: Time) -> u64 {
         let generation = self.bump(false);
         let _ = self.tx.send(Cmd::Show { generation, t, asked: Instant::now() });
+        // The watch re-checks the show in flight against the newer request.
+        self.watch.cv.notify_all();
         generation
     }
 
@@ -271,6 +356,11 @@ impl Drop for PreviewPlayer {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.watch.state.lock().quit = true;
+        self.watch.cv.notify_all();
+        if let Some(t) = self.watcher.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -278,16 +368,40 @@ impl Drop for PreviewPlayer {
 enum Preroll {
     /// Not attempted yet (the clock was not running when the play began).
     Pending,
-    /// Rendered into the sink's target, to be presented when the clock gets there.
-    Ready { perf: FramePerf, t0: Instant },
+    /// Rendered into the sink's target, to be presented when the clock gets
+    /// there — with the source and output it was rendered for.
+    Ready(Box<Prerolled>),
     /// Done, or not needed.
     Done,
+}
+
+struct Prerolled {
+    perf: FramePerf,
+    t0: Instant,
+    source: Arc<dyn SceneSource>,
+    output: OutputSpec,
+    shows: Vec<(LayerId, i64)>,
+}
+
+/// A play in progress.
+struct Play {
+    from: Time,
+    /// Built at the first step, from the source current then (a `Source`
+    /// queued right after the `Play` counts).
+    sched: Option<PlaySchedule>,
+    preroll: Preroll,
+    /// Per media layer, the source frame last presented.
+    shown: HashMap<LayerId, i64>,
+    /// The media (and decode sizes) of the last prefetched lookahead scene,
+    /// and frames since that prefetch.
+    prefetched: Vec<(AssetId, SizeU)>,
+    since_prefetch: u32,
 }
 
 enum Job {
     Idle,
     Show { generation: u64, t: Time, asked: Instant },
-    Play { generation: u64, sched: PlaySchedule, preroll: Preroll },
+    Play { generation: u64, play: Box<Play> },
 }
 
 struct Worker {
@@ -305,6 +419,7 @@ struct Worker {
     stash: VecDeque<Cmd>,
     /// Recent render time, kept free before a playback frame's deadline.
     render_estimate: Duration,
+    watch: Arc<ShowWatch>,
 }
 
 impl Worker {
@@ -332,12 +447,14 @@ impl Worker {
             job = match job {
                 Job::Idle => Job::Idle,
                 Job::Show { generation, t, asked } => {
+                    self.watch.set(Some((generation, Instant::now())));
                     self.show(generation, t, asked);
+                    self.watch.set(None);
                     Job::Idle
                 }
-                Job::Play { generation, mut sched, mut preroll } => {
-                    if self.play_step(generation, &mut sched, &mut preroll) {
-                        Job::Play { generation, sched, preroll }
+                Job::Play { generation, mut play } => {
+                    if self.play_step(generation, &mut play) {
+                        Job::Play { generation, play }
                     } else {
                         Job::Idle
                     }
@@ -353,13 +470,9 @@ impl Worker {
             Cmd::Output(o) => self.output = o,
             Cmd::Show { generation, t, asked } => *job = Job::Show { generation, t, asked },
             Cmd::Play { generation, from } => {
-                *job = match &self.source {
-                    Some(s) => {
-                        let preroll = if self.clock.now().is_none() { Preroll::Pending } else { Preroll::Done };
-                        Job::Play { generation, sched: PlaySchedule::new(from, s.frame_rate(), s.duration()), preroll }
-                    }
-                    None => Job::Idle,
-                }
+                let preroll = if self.clock.now().is_none() { Preroll::Pending } else { Preroll::Done };
+                let play = Play { from, sched: None, preroll, shown: HashMap::new(), prefetched: vec![], since_prefetch: 0 };
+                *job = Job::Play { generation, play: Box::new(play) };
             }
             Cmd::Stop => *job = Job::Idle,
             Cmd::Quit => return false,
@@ -402,129 +515,197 @@ impl Worker {
         let scene = source.scene_at(t, &self.output);
         perf.evaluate = t0.elapsed();
         let inputs = self.resolver.prepare(&scene, &*source, Mode::Scrub { generation }, &mut perf);
-        if self.cancelled(generation) || !self.render(&scene, &inputs, &mut perf) {
+        // Not ready in scrub mode = abandoned for a newer request.
+        if self.cancelled(generation) || any_not_ready(&inputs.layers) || !self.render(&scene, &inputs, &mut perf) {
             return self.dropped(perf, t0);
         }
         self.present(generation, t, false, perf, Some(asked), t0);
     }
 
     /// One scheduling step of a play; false when it ended.
-    fn play_step(&mut self, generation: u64, sched: &mut PlaySchedule, preroll: &mut Preroll) -> bool {
+    fn play_step(&mut self, generation: u64, play: &mut Play) -> bool {
         let Some(source) = self.source.clone() else { return false };
+        let sched = play.sched.get_or_insert_with(|| PlaySchedule::new(play.from, source.frame_rate(), source.duration())).clone();
         let Some(now) = self.clock.now() else {
-            if matches!(preroll, Preroll::Pending) {
-                *preroll = self.preroll(generation, sched, &*source);
+            if matches!(play.preroll, Preroll::Pending) {
+                play.preroll = self.preroll(generation, &sched, &*source, play);
             } else {
                 self.wait(self.config.clock_poll);
             }
             return true;
         };
-        if let Preroll::Ready { perf, t0 } = std::mem::replace(preroll, Preroll::Done) {
+        let mut sched = sched;
+        let step = if let Preroll::Ready(p) = std::mem::replace(&mut play.preroll, Preroll::Done) {
+            let Prerolled { perf, t0, source: rendered_for, output, shows } = *p;
             if self.superseded(generation) {
                 self.dropped(perf, t0);
-                return true;
+            } else if !Arc::ptr_eq(&rendered_for, &source) || output != self.output {
+                // The picture it holds is out of date: render the frame again.
+                self.dropped(perf, t0);
+            } else if self.pace_and_present(generation, &mut sched, 0, play.from, perf, t0) {
+                play.shown.extend(shows);
             }
-            self.pace_and_present(generation, sched, 0, sched.time_of(0), perf, t0);
-            return true;
-        }
-        *preroll = Preroll::Done;
-        match sched.poll(now) {
-            Step::End => {
+            None
+        } else {
+            Some(sched.poll(now))
+        };
+        let go_on = match step {
+            None => true,
+            Some(Step::End) => {
                 self.sink.finished(generation, source.duration());
                 false
             }
-            Step::Wait(d) => {
+            Some(Step::Wait(d)) => {
                 self.wait(duration_of(d).min(Duration::from_millis(50)));
                 true
             }
-            Step::Render { index, time, skipped } => {
+            Some(Step::Render { index, time, skipped }) => {
                 for _ in 0..skipped {
                     self.perf.push(FramePerf { dropped: true, ..Default::default() });
                 }
-                self.play_frame(generation, sched, &*source, index, time, now);
+                self.play_frame(generation, &mut sched, play, &*source, index, time, now);
                 true
             }
-        }
+        };
+        play.sched = Some(sched);
+        go_on
     }
 
-    /// Prefetches the scene one lookahead after `time`.
-    fn prefetch_ahead(&self, source: &dyn SceneSource, time: Time) {
-        if self.config.lookahead > Time::ZERO {
-            let ahead = time + self.config.lookahead;
-            if ahead < source.duration() {
-                self.resolver.prefetch(&source.scene_at(ahead, &self.output), source);
+    /// Prefetches the scene one lookahead after `time` when its media
+    /// changed since the last prefetch, or every `prefetch_every` frames.
+    fn prefetch_ahead(&self, play: &mut Play, source: &dyn SceneSource, time: Time) {
+        if self.config.lookahead <= Time::ZERO {
+            return;
+        }
+        let ahead = time + self.config.lookahead;
+        if ahead >= source.duration() {
+            return;
+        }
+        let scene = source.scene_at(ahead, &self.output);
+        let mut media = vec![];
+        visit_media(&scene.layers, &mut |l| {
+            if let LayerContent::Media { media: m, .. } = &l.content
+                && let Some(ms) = source.media(m.media)
+            {
+                media.push((m.media, decode_size(&l.placement, scene.canvas, scene.output.size, ms.display_size)));
             }
+        });
+        media.sort_by_key(|(id, s)| (id.0, s.w, s.h));
+        media.dedup();
+        play.since_prefetch += 1;
+        if media != play.prefetched || play.since_prefetch >= self.config.prefetch_every.max(1) {
+            self.resolver.prefetch(&scene, source);
+            play.prefetched = media;
+            play.since_prefetch = 0;
         }
     }
 
     /// Renders the play's first frame while the clock is stopped, then
     /// tells the sink to start the clock.
-    fn preroll(&mut self, generation: u64, sched: &PlaySchedule, source: &dyn SceneSource) -> Preroll {
+    fn preroll(&mut self, generation: u64, sched: &PlaySchedule, source: &dyn SceneSource, play: &mut Play) -> Preroll {
         let t0 = Instant::now();
         let time = sched.time_of(0);
         if time >= source.duration() {
             self.sink.ready(generation);
             return Preroll::Done;
         }
-        self.prefetch_ahead(source, time);
+        self.prefetch_ahead(play, source, time);
         let mut perf = FramePerf::default();
         let scene = source.scene_at(time, &self.output);
         perf.evaluate = t0.elapsed();
-        let inputs = self.resolver.prepare(&scene, source, Mode::Deadline(t0 + self.config.preroll), &mut perf);
+        let mut inputs = self.resolver.prepare(&scene, source, Mode::Deadline(t0 + self.config.preroll), &mut perf);
         if self.superseded(generation) {
             return Preroll::Done;
         }
+        let shows = self.fill_behind(&scene, source, &mut inputs.layers, &play.shown);
         // Not decoded in time: the clock starts anyway and the schedule
         // renders the frame again (it is not counted twice).
-        let ready = !any_not_ready(&inputs.layers) && self.render(&scene, &inputs, &mut perf);
+        let ready = shows.is_some() && self.render(&scene, &inputs, &mut perf);
         self.sink.ready(generation);
-        if ready {
-            self.render_estimate = (self.render_estimate * 3 + perf.composite) / 4;
-            Preroll::Ready { perf, t0 }
-        } else {
-            Preroll::Done
+        match (ready, self.source.clone()) {
+            (true, Some(current)) => {
+                self.render_estimate = (self.render_estimate * 3 + perf.composite + perf.effects) / 4;
+                Preroll::Ready(Box::new(Prerolled { perf, t0, source: current, output: self.output, shows: shows.unwrap_or_default() }))
+            }
+            _ => Preroll::Done,
         }
     }
 
-    fn play_frame(&mut self, generation: u64, sched: &mut PlaySchedule, source: &dyn SceneSource, index: i64, time: Time, now: Time) {
+    #[allow(clippy::too_many_arguments)]
+    fn play_frame(&mut self, generation: u64, sched: &mut PlaySchedule, play: &mut Play, source: &dyn SceneSource, index: i64, time: Time, now: Time) {
         let t0 = Instant::now();
         let fd = sched.frame_duration();
-        self.prefetch_ahead(source, time);
+        self.prefetch_ahead(play, source, time);
         let mut perf = FramePerf::default();
         let e0 = Instant::now();
         let scene = source.scene_at(time, &self.output);
         perf.evaluate = e0.elapsed();
-        // Wait for decoding at most until the frame would be late, keeping time to render it.
-        let left = duration_of(time + fd - now).saturating_sub(self.render_estimate);
-        let inputs = self.resolver.prepare(&scene, source, Mode::Deadline(t0 + left), &mut perf);
+        // Wait for decoding at most until half the frame's period is over,
+        // keeping time to render it: a layer still not decoded then shows an
+        // older frame, and waking up late (timer granularity) still leaves
+        // time to present within the period.
+        let left = duration_of(time + Time(fd.flicks() / 2) - now).saturating_sub(self.render_estimate);
+        let mut inputs = self.resolver.prepare(&scene, source, Mode::Deadline(t0 + left), &mut perf);
         if self.superseded(generation) {
             return self.dropped(perf, t0);
         }
-        // A layer not decoded in time: keep the previous picture rather than flash MISSING.
-        if any_not_ready(&inputs.layers) || !self.render(&scene, &inputs, &mut perf) {
+        // A layer with nothing to show (not even an older frame), or nothing
+        // newer than what is on screen: keep the previous picture.
+        let Some(shows) = self.fill_behind(&scene, source, &mut inputs.layers, &play.shown) else {
+            sched.drop_frame(index);
+            return self.dropped(perf, t0);
+        };
+        if !self.render(&scene, &inputs, &mut perf) {
             sched.drop_frame(index);
             return self.dropped(perf, t0);
         }
-        self.render_estimate = (self.render_estimate * 3 + perf.composite) / 4;
-        self.pace_and_present(generation, sched, index, time, perf, t0);
+        self.render_estimate = (self.render_estimate * 3 + perf.composite + perf.effects) / 4;
+        if self.pace_and_present(generation, sched, index, time, perf, t0) {
+            play.shown.extend(shows);
+        }
     }
 
-    /// Presents rendered frame `index` when the clock reaches it (or drops it when late).
-    fn pace_and_present(&mut self, generation: u64, sched: &mut PlaySchedule, index: i64, time: Time, perf: FramePerf, t0: Instant) {
+    /// Playback inputs made presentable: a media layer not decoded in time
+    /// gets the newest frame of its media (at its decode size) already in
+    /// the cache, at most `max_behind` earlier. Returns the source frame each
+    /// media layer shows, or `None` when a layer has nothing to show or when
+    /// a substitute was needed and no layer shows anything newer than `shown`.
+    fn fill_behind(&self, scene: &FrameScene, source: &dyn SceneSource, inputs: &mut [LayerInput], shown: &HashMap<LayerId, i64>) -> Option<Vec<(LayerId, i64)>> {
+        let mut shows = vec![];
+        let mut substituted = false;
+        let mut missing = false;
+        fill(self, scene, source, &scene.layers, inputs, &mut shows, &mut substituted, &mut missing);
+        if missing {
+            return None;
+        }
+        if substituted && !shows.iter().any(|(id, f)| shown.get(id).is_none_or(|s| f > s)) {
+            return None;
+        }
+        Some(shows)
+    }
+
+    /// Presents rendered frame `index` when the clock reaches it (or drops
+    /// it when late); true when presented.
+    fn pace_and_present(&mut self, generation: u64, sched: &mut PlaySchedule, index: i64, time: Time, perf: FramePerf, t0: Instant) -> bool {
         loop {
             let Some(now) = self.clock.now() else {
                 sched.drop_frame(index);
-                return self.dropped(perf, t0);
+                self.dropped(perf, t0);
+                return false;
             };
             match sched.after_render(index, now) {
                 Pace::Wait(d) => {
                     self.wait(duration_of(d));
                     if self.superseded(generation) {
-                        return self.dropped(perf, t0);
+                        self.dropped(perf, t0);
+                        return false;
                     }
                 }
                 Pace::Present => return self.present(generation, time, true, perf, None, t0),
-                Pace::Drop => return self.dropped(perf, t0),
+                Pace::Drop => {
+                    self.dropped(perf, t0);
+                    return false;
+                }
             }
         }
     }
@@ -553,8 +734,8 @@ impl Worker {
     }
 
     /// A play frame is presented only while its play is the newest request;
-    /// a show (`asked` is set) while no play or stop came after it.
-    fn present(&mut self, generation: u64, time: Time, playing: bool, perf: FramePerf, asked: Option<Instant>, t0: Instant) {
+    /// a show (`asked` is set) while no play or stop came after it. True when presented.
+    fn present(&mut self, generation: u64, time: Time, playing: bool, perf: FramePerf, asked: Option<Instant>, t0: Instant) -> bool {
         let p0 = Instant::now();
         let shown = {
             let _l = self.generation.lock.lock();
@@ -574,8 +755,69 @@ impl Worker {
                 p.seek_latency = asked.filter(|_| latest).map(|a| a.elapsed());
                 p.total = t0.elapsed();
                 self.perf.push(p);
+                true
             }
-            Err(p) => self.dropped(p, t0),
+            Err(p) => {
+                self.dropped(p, t0);
+                false
+            }
+        }
+    }
+}
+
+/// [`Worker::fill_behind`] over a layer tree (transitions recursively).
+#[allow(clippy::too_many_arguments)]
+fn fill(
+    w: &Worker,
+    scene: &FrameScene,
+    source: &dyn SceneSource,
+    layers: &[Layer],
+    inputs: &mut [LayerInput],
+    shows: &mut Vec<(LayerId, i64)>,
+    substituted: &mut bool,
+    missing: &mut bool,
+) {
+    for (l, input) in layers.iter().zip(inputs.iter_mut()) {
+        match (&l.content, input) {
+            (LayerContent::Transition(t), LayerInput::Transition { from, to }) => {
+                fill(w, scene, source, &t.from, from, shows, substituted, missing);
+                fill(w, scene, source, &t.to, to, shows, substituted, missing);
+            }
+            (LayerContent::Media { media, source_time }, input) => {
+                let Some(m) = source.media(media.media) else { continue };
+                let size = decode_size(&l.placement, scene.canvas, scene.output.size, m.display_size);
+                let want = m.frame_at(*source_time);
+                match input {
+                    LayerInput::Cpu(_) => shows.push((l.id, want)),
+                    LayerInput::Missing(MissingReason::NotReady) => {
+                        let behind = if m.rate.num > 0 && m.rate.den > 0 { m.rate.time_to_frame(w.config.max_behind).max(1) } else { 1 };
+                        let cache = w.resolver.cache();
+                        let found = (1..=behind.min(want)).find_map(|k| cache.get(&FrameKey { media: media.media, size, frame: want - k }).map(|f| (want - k, f)));
+                        match found {
+                            Some((frame, f)) => {
+                                *input = LayerInput::Cpu(f);
+                                shows.push((l.id, frame));
+                                *substituted = true;
+                            }
+                            None => *missing = true,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn visit_media(layers: &[Layer], f: &mut impl FnMut(&Layer)) {
+    for l in layers {
+        match &l.content {
+            LayerContent::Transition(t) => {
+                visit_media(&t.from, f);
+                visit_media(&t.to, f);
+            }
+            _ => f(l),
         }
     }
 }

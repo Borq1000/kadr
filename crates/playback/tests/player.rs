@@ -491,3 +491,124 @@ fn prefetch_opens_the_next_clip_before_the_cut() {
     assert_eq!((tag, frame), (2, FrameRate::FPS_25.time_to_frame(time - cut)));
     assert_eq!(hits, 1, "its frame was decoded before it was needed");
 }
+
+/// Decoding at ~60 % of real time (a 66 ms frame at 25 fps): the picture
+/// keeps moving at the rate decoding allows instead of freezing.
+#[test]
+fn decoding_slower_than_real_time_keeps_the_picture_moving() {
+    let fake = Arc::new(FakeDecoders::new(ms(5), ms(66)));
+    fake.add("a.mp4", FakeMedia { tag: 6, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    let duration = Time::from_secs(3);
+    r.player.set_source(source(vec![(a, m.clone())], duration, one_clip(a, m.clone(), Time::ZERO)));
+    r.clock.start(Time::ZERO);
+    let started = Instant::now();
+    let g = r.player.play(Time::ZERO);
+    let fd = FrameRate::FPS_25.frame_duration();
+    let mut shown = vec![];
+    loop {
+        match next_event(&r.events, ms(3000)).expect("playback finishes") {
+            Event::Presented { generation, time, pixel, .. } => {
+                assert_eq!(generation, g);
+                let clock = Time::from_micros(started.elapsed().as_micros() as i64);
+                // Presented within one frame of the clock (a few ms of channel delay allowed).
+                assert!(clock + Time::from_millis(3) >= time && clock < time + fd + Time::from_millis(15), "{time:?} shown at {clock:?}");
+                shown.push((time, read_fake_pixel(&pixel).1));
+            }
+            Event::Finished(_) => break,
+            Event::Ready(_) => panic!("no pre-roll with the clock running"),
+        }
+    }
+    let total = 75;
+    eprintln!("slow decoding: {} of {total} frames presented", shown.len());
+    assert!(shown.len() * 100 >= total * 40, "{} of {total} frames presented", shown.len());
+    assert!(shown.windows(2).all(|w| w[0].0 < w[1].0), "in order");
+    assert!(shown.windows(2).all(|w| w[0].1 < w[1].1), "every presented frame shows newer content: {shown:?}");
+    for (time, frame) in &shown {
+        let due = m.frame_at(*time);
+        assert!(*frame <= due && *frame >= due - 25, "frame {frame} at {time:?} (due {due}): at most 1 s behind");
+    }
+    let perf = r.perf.snapshot();
+    assert_eq!(perf.iter().filter(|p| !p.dropped).count(), shown.len());
+}
+
+#[test]
+fn a_show_stuck_in_a_slow_open_is_abandoned_for_a_newer_one() {
+    let fake = Arc::new(FakeDecoders::new(ms(3000), ms(5)));
+    fake.add("a.mp4", FakeMedia { tag: 7, ..Default::default() });
+    fake.add("b.mp4", FakeMedia { tag: 8, ..Default::default() });
+    let (a, b) = (AssetId::new(), AssetId::new());
+    let ma = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let mb = video_source("b.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let r = rig(fake.clone(), PlayerConfig::default());
+    let (ma2, mb2) = (ma.clone(), mb.clone());
+    // a before 50 s, b after: the second show needs another media.
+    let scene: SceneFn = Box::new(move |t, out| {
+        let layer = if t < Time::from_secs(50) { media_layer(1, a, &ma2, t, CANVAS) } else { media_layer(2, b, &mb2, t, CANVAS) };
+        FrameScene { layers: vec![layer], ..FrameScene::empty(t, CANVAS, *out) }
+    });
+    r.player.set_source(source(vec![(a, ma), (b, mb)], Time::from_secs(600), scene));
+    let g1 = r.player.show(Time::from_secs(10));
+    std::thread::sleep(ms(50));
+    fake.set_delays(ms(5), ms(5));
+    let asked = Instant::now();
+    let g2 = r.player.show(Time::from_secs(100));
+    match next_event(&r.events, ms(2000)) {
+        Some(Event::Presented { generation, pixel, .. }) => {
+            assert_eq!(generation, g2, "the stuck show is not presented first");
+            assert_eq!(read_fake_pixel(&pixel), (8, 2500));
+        }
+        other => panic!("expected the newer show, got {other:?}"),
+    }
+    assert!(asked.elapsed() < ms(1000), "the newer show waited for the stuck open: {:?}", asked.elapsed());
+    assert!(r.perf.snapshot().iter().any(|p| p.dropped), "the stuck show counts as dropped");
+    assert!(g2 > g1);
+}
+
+#[test]
+fn a_prerolled_frame_is_rendered_again_after_a_source_change() {
+    let fake = Arc::new(FakeDecoders::new(ms(5), ms(1)));
+    fake.add("a.mp4", FakeMedia { tag: 9, ..Default::default() });
+    fake.add("b.mp4", FakeMedia { tag: 10, ..Default::default() });
+    let (a, b) = (AssetId::new(), AssetId::new());
+    let ma = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let mb = video_source("b.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    r.player.set_source(source(vec![(a, ma.clone())], Time::from_secs(60), one_clip(a, ma, Time::ZERO)));
+    let g = r.player.play(Time::ZERO);
+    assert!(matches!(next_event(&r.events, ms(2000)), Some(Event::Ready(x)) if x == g));
+    // An edit before the clock starts: the pre-rolled picture is out of date.
+    r.player.set_source(source(vec![(b, mb.clone())], Time::from_secs(60), one_clip(b, mb, Time::ZERO)));
+    std::thread::sleep(ms(30));
+    r.clock.start(Time::ZERO);
+    match next_event(&r.events, ms(2000)) {
+        Some(Event::Presented { generation, pixel, .. }) => {
+            assert_eq!(generation, g);
+            assert_eq!(read_fake_pixel(&pixel).0, 10, "the new source's picture");
+        }
+        other => panic!("expected a frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_play_uses_a_source_queued_right_after_it() {
+    let fake = Arc::new(FakeDecoders::new(ms(5), ms(1)));
+    fake.add("a.mp4", FakeMedia { tag: 11, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(60), one_clip(a, m.clone(), Time::ZERO)));
+    r.clock.start(Time::ZERO);
+    let g = r.player.play(Time::ZERO);
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_millis(200), one_clip(a, m, Time::ZERO)));
+    let deadline = Instant::now() + ms(2000);
+    loop {
+        assert!(Instant::now() < deadline, "the play kept the 60 s source");
+        if let Some(Event::Finished(x)) = next_event(&r.events, ms(100)) {
+            assert_eq!(x, g);
+            break;
+        }
+    }
+}
