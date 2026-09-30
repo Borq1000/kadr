@@ -59,7 +59,13 @@ impl Renderer for CpuRenderer {
             return Ok(stats);
         }
         let grid = Grid::new(scene);
-        fill_base(t.data, t.stride, &grid, premul(scene.background));
+        // A first layer that paints the whole canvas opaquely (the fast path's
+        // plain row copy of an opaque frame) overwrites every canvas pixel, so
+        // the canvas half of the base fill would be written and then thrown
+        // away; only the margins still need it (none at all when the canvas
+        // fills the output — the common export case).
+        let canvas_overdrawn = scene.layers.iter().zip(&frame.inputs.layers).next().is_some_and(|(l, i)| covers_canvas(&grid, l, i));
+        fill_base(t.data, t.stride, &grid, premul(scene.background), canvas_overdrawn);
         for (layer, input) in scene.layers.iter().zip(&frame.inputs.layers) {
             match self.draw_layer(t.data, t.stride, &grid, layer, input) {
                 Drawn::Nothing => {}
@@ -241,16 +247,50 @@ fn par_rows(data: &mut [u8], stride: usize, rows: (usize, usize), f: impl Fn(usi
     data[rows.0 * stride..end].par_chunks_mut(stride).enumerate().for_each(|(n, row)| f(rows.0 + n, row));
 }
 
-/// Margins opaque black, the canvas the premultiplied background.
-fn fill_base(data: &mut [u8], stride: usize, g: &Grid, bg: [f32; 4]) {
+/// Margins opaque black, the canvas the premultiplied background — or, when
+/// `canvas_overdrawn` (the first layer covers the canvas opaquely), the
+/// canvas pixels are left as they are: every one of them is overwritten
+/// before anything reads the buffer.
+fn fill_base(data: &mut [u8], stride: usize, g: &Grid, bg: [f32; 4], canvas_overdrawn: bool) {
     let bg = bg.map(store);
     const MARGIN: [u8; 4] = [0, 0, 0, 255];
-    par_rows(data, stride, (0, g.h), |j, row| {
-        let inside = j >= g.y0 && j < g.y1;
-        for (i, px) in row[..g.w * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            *px = if inside && i >= g.x0 && i < g.x1 { bg } else { MARGIN };
+    let fill = |row: &mut [u8], colour: [u8; 4]| {
+        for px in row.as_chunks_mut::<4>().0 {
+            *px = colour;
         }
+    };
+    par_rows(data, stride, (0, g.h), |j, row| {
+        if j < g.y0 || j >= g.y1 {
+            fill(&mut row[..g.w * 4], MARGIN);
+            return;
+        }
+        fill(&mut row[..g.x0 * 4], MARGIN);
+        if !canvas_overdrawn {
+            fill(&mut row[g.x0 * 4..g.x1 * 4], bg);
+        }
+        fill(&mut row[g.x1 * 4..g.w * 4], MARGIN);
     });
+}
+
+/// Whether the layer draws the entire canvas opaquely with a plain texel copy
+/// (the fast path's full-canvas case in [`draw_frame`]): every canvas pixel is
+/// then overwritten and the base fill's canvas half is dead work. This must
+/// predict [`draw_frame`] exactly — the same plan, the same fast-path
+/// conditions, plus the copied rectangle covering the whole canvas — because
+/// the skip leaves whatever the fill didn't write in the buffer.
+fn covers_canvas(g: &Grid, layer: &Layer, input: &LayerInput) -> bool {
+    let LayerInput::Cpu(f) = input else { return false };
+    let Some(mut plan) = Plan::new(g, layer) else { return false };
+    if f.color.alpha != AlphaMode::Opaque || plan.fx.is_some() || plan.opacity != 1.0 || layer.blend != BlendMode::Normal {
+        return false;
+    }
+    let (sx, sy) = (layer.placement.size.x as f64, layer.placement.size.y as f64);
+    let (tw, th) = (f.width as f64, f.height as f64);
+    plan.tex = Affine2::scale(tw / sx, th / sy).after(&plan.inv);
+    let Some(a) = grid_aligned(&plan.tex, layer.crop, tw / sx, th / sy, tw, th) else { return false };
+    let (i0, i1) = texel_span(a.x0, a.x1, a.dx, g.x0, g.x1);
+    let (r0, r1) = texel_span(a.y0, a.y1, a.dy, g.y0, g.y1);
+    (i0, i1) == (g.x0, g.x1) && (r0, r1) == (g.y0, g.y1)
 }
 
 /// A layer's effect chain as one affine map on unpremultiplied RGB. Every
@@ -609,11 +649,16 @@ fn grid_aligned(tex: &Affine2, crop: kadr_scene::RectF, sx: f64, sy: f64, tw: f6
     (0 <= x0 && x0 < x1 && x1 as f64 <= tw && 0 <= y0 && y0 < y1 && y1 as f64 <= th).then_some(Aligned { dx, dy, x0, x1, y0, y1 })
 }
 
+/// The output indices `lo - d..hi - d` clipped into `c0..c1`: the canvas
+/// columns (or rows) a texel range `lo..hi` lands on at output = texel − `d`.
+fn texel_span(lo: isize, hi: isize, d: isize, c0: usize, c1: usize) -> (usize, usize) {
+    ((lo - d).clamp(c0 as isize, c1 as isize) as usize, (hi - d).clamp(c0 as isize, c1 as isize) as usize)
+}
+
 /// Opaque texels straight into the output (alpha 255), within the canvas.
 fn copy_texels(data: &mut [u8], stride: usize, g: &Grid, frame: &CpuFrame, a: Aligned) {
-    let span = |lo: isize, hi: isize, d: isize, c0: usize, c1: usize| ((lo - d).clamp(c0 as isize, c1 as isize) as usize, (hi - d).clamp(c0 as isize, c1 as isize) as usize);
-    let (i0, i1) = span(a.x0, a.x1, a.dx, g.x0, g.x1);
-    let rows = span(a.y0, a.y1, a.dy, g.y0, g.y1);
+    let (i0, i1) = texel_span(a.x0, a.x1, a.dx, g.x0, g.x1);
+    let rows = texel_span(a.y0, a.y1, a.dy, g.y0, g.y1);
     if i0 >= i1 {
         return;
     }
@@ -859,6 +904,70 @@ mod tests {
         assert_eq!(fast, general);
         assert_eq!(px(&fast, 24, 6, 1), [0, 0, 255, 255], "left of the crop: background");
         assert_eq!(px(&fast, 24, 7, 1), px(&general, 24, 7, 1));
+    }
+
+    #[test]
+    fn a_full_canvas_first_layer_skips_the_base_fill_and_stays_identical() {
+        // Letterboxed output (canvas 24×16 in 24×20, k = 1): the margins still
+        // need their fill, and the background is not black — `render_with`
+        // also poisons the buffer with 7s — so a wrong skip would show either
+        // through. The fast path must produce the general path's bytes.
+        let c = SizeU::new(24, 16);
+        let f = gradient(24, 16);
+        let bg = Rgba { r: 0.2, g: 0.6, b: 0.9, a: 1.0 };
+        let s = scene((24, 16), (24, 20), bg, vec![media(Placement::fill(c))]);
+        let (fast, stats) = render_with(&mut CpuRenderer::new(), &s, vec![LayerInput::Cpu(f.clone())]);
+        assert_eq!((stats.fast_paths, stats.layers_drawn), (1, 1));
+        for y in [0, 1, 18, 19] {
+            assert_eq!(px(&fast, 24, 5, y), [0, 0, 0, 255], "row {y}: margin");
+        }
+        let first_canvas_px: [u8; 4] = f.row(2)[5 * 4..5 * 4 + 4].try_into().unwrap();
+        assert_eq!(px(&fast, 24, 5, 2), first_canvas_px, "first canvas row is the frame");
+        let mut sampled = s.clone();
+        sampled.layers[0].opacity = 0.999_999_9; // just below 1: the general path
+        let (general, stats) = render_with(&mut CpuRenderer::new(), &sampled, vec![LayerInput::Cpu(f)]);
+        assert_eq!(stats.fast_paths, 0);
+        assert_eq!(fast, general);
+    }
+
+    #[test]
+    fn only_a_full_canvas_opaque_copy_makes_the_base_fill_skippable() {
+        let c = SizeU::new(24, 16);
+        let s = scene((24, 16), (24, 20), Rgba::BLACK, vec![]);
+        let g = Grid::new(&s);
+        let f = gradient(24, 16);
+        let opaque = || media(Placement::fill(c));
+        assert!(covers_canvas(&g, &opaque(), &LayerInput::Cpu(f.clone())));
+
+        // Shifted, scaled, half-sized, cropped, transparent, faded, blended,
+        // colour-adjusted, missing, nested: all keep the fill.
+        let mut shifted = opaque();
+        shifted.placement.position = Vec2::new(1.0, 0.0);
+        assert!(!covers_canvas(&g, &shifted, &LayerInput::Cpu(f.clone())));
+        let mut scaled = opaque();
+        scaled.placement.scale = Vec2::new(1.5, 1.5);
+        assert!(!covers_canvas(&g, &scaled, &LayerInput::Cpu(f.clone())));
+        let mut half = opaque();
+        half.placement.size = Vec2::new(12.0, 16.0);
+        assert!(!covers_canvas(&g, &half, &LayerInput::Cpu(f.clone())));
+        let mut cropped = opaque();
+        cropped.crop = RectF::new(0.0, 0.0, 12.0, 16.0);
+        assert!(!covers_canvas(&g, &cropped, &LayerInput::Cpu(f.clone())));
+        let mut faded = opaque();
+        faded.opacity = 0.5;
+        assert!(!covers_canvas(&g, &faded, &LayerInput::Cpu(f.clone())));
+        let mut blended = opaque();
+        blended.blend = BlendMode::Add;
+        assert!(!covers_canvas(&g, &blended, &LayerInput::Cpu(f.clone())));
+        let mut adjusted = opaque();
+        adjusted.effects.push(Effect::ColorAdjust(ColorAdjust { exposure: 1.0, ..ColorAdjust::NEUTRAL }));
+        assert!(!covers_canvas(&g, &adjusted, &LayerInput::Cpu(f.clone())));
+        let straight = frame(24, 16, AlphaMode::Straight, |_, _| [255, 255, 255, 255]);
+        assert!(!covers_canvas(&g, &opaque(), &LayerInput::Cpu(straight)));
+        assert!(!covers_canvas(&g, &opaque(), &LayerInput::Missing(MissingReason::Offline)));
+        // A canvas that maps to no output pixel: nothing is drawn, the fill decides.
+        let empty = Grid::new(&scene((0, 16), (24, 20), Rgba::BLACK, vec![]));
+        assert!(!covers_canvas(&empty, &opaque(), &LayerInput::Cpu(f)));
     }
 
     #[test]
