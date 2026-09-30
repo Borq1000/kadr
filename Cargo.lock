@@ -2889,6 +2889,7 @@ dependencies = [
  "kadr-media",
  "kadr-playback",
  "kadr-project",
+ "kadr-project-scenes",
  "kadr-render",
  "kadr-scene",
  "kadr-timeline",
@@ -2931,6 +2932,7 @@ dependencies = [
  "kadr-media",
  "kadr-playback",
  "kadr-project",
+ "kadr-project-scenes",
  "kadr-render",
  "kadr-scene",
  "kadr-timeline",
@@ -3023,6 +3025,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "kadr-project-scenes"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-playback",
+ "kadr-project",
+ "kadr-scene",
+ "kadr-timeline",
+ "tempfile",
 ]
 
 [[package]]

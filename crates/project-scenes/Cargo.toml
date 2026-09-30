@@ -1,0 +1,16 @@
+[package]
+name = "kadr-project-scenes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kadr: SceneSource over a project snapshot, shared by the editor's preview/export and the bench"
+
+[dependencies]
+kadr-core = { path = "../core" }
+kadr-project = { path = "../project" }
+kadr-timeline = { path = "../timeline" }
+kadr-scene = { path = "../scene" }
+kadr-playback = { path = "../playback" }
+
+[dev-dependencies]
+tempfile.workspace = true
