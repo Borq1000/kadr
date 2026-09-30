@@ -80,8 +80,9 @@ pub enum Mode {
     /// Sessions read ahead.
     Deadline(Instant),
     /// Wait for every frame, never drop (use a resolver of its own: nothing
-    /// supersedes it). A failed decode is retried (see
-    /// [`ResolverConfig::export_retry_backoff`]) before it is `DecodeFailed`.
+    /// supersedes it but a cancel, `supersede(u64::MAX)`). A failed decode
+    /// is retried (see [`ResolverConfig::export_retry_backoff`]) before it
+    /// is `DecodeFailed`.
     Export,
 }
 
@@ -204,7 +205,9 @@ impl Resolver {
     }
 
     /// Makes `generation` the newest (if it is newer): waiters and session
-    /// work of older generations are abandoned. Cheap; any thread.
+    /// work of older generations are abandoned. `u64::MAX` cancels for
+    /// good (export cancel): every wait, including one that starts later,
+    /// returns `NotReady` at once. Cheap; any thread.
     pub fn supersede(&self, generation: u64) {
         let prev = self.env.latest.fetch_max(generation, Ordering::AcqRel);
         if generation > prev {
@@ -425,7 +428,11 @@ impl Resolver {
                     if pending.is_empty() {
                         return;
                     }
-                    let superseded = self.env.latest.load(Ordering::Acquire) > generation;
+                    let latest = self.env.latest.load(Ordering::Acquire);
+                    // A wait that began after `supersede(u64::MAX)` took MAX as
+                    // its own generation, so `latest > generation` never holds
+                    // for it: the cancel must be seen on its own.
+                    let superseded = latest > generation || latest == u64::MAX;
                     let late = matches!(mode, Mode::Deadline(d) if now >= d);
                     if superseded || late {
                         for &i in &pending {

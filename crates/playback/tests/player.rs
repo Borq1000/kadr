@@ -303,19 +303,42 @@ fn continuous_scrubbing_presents_frames_while_dragging() {
 }
 
 #[test]
-fn play_and_stop_cancel_a_show_in_flight() {
+fn stop_cancels_a_show_in_flight() {
+    cancel_a_show_in_flight(PreviewPlayer::stop);
+}
+
+#[test]
+fn play_cancels_a_show_in_flight() {
+    // The clock never starts: the play pre-rolls and presents nothing (a
+    // pre-rolled frame waits for the clock, its perf is not recorded yet).
+    cancel_a_show_in_flight(|p| p.play(Time::from_secs(100)));
+}
+
+/// `cancel` (play or stop) during a show's slow open: the show's wait is
+/// abandoned at once at the resolver and nothing of it is presented.
+fn cancel_a_show_in_flight(cancel: impl Fn(&PreviewPlayer) -> u64) {
     let fake = Arc::new(FakeDecoders::new(ms(300), ms(5)));
     fake.add("a.mp4", FakeMedia { tag: 3, ..Default::default() });
     let a = AssetId::new();
     let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
-    let r = rig(fake, PlayerConfig::default());
+    let r = rig(fake.clone(), PlayerConfig::default());
     r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(600), one_clip(a, m.clone(), Time::ZERO)));
     let g1 = r.player.show(Time::from_secs(100));
-    std::thread::sleep(ms(20));
-    let g2 = r.player.stop();
-    assert!(!r.player.accepts(g1), "stop makes the show stale");
+    // Cancel only once the show is really in flight (its 300 ms open has
+    // begun): a fixed sleep let a loaded machine stop it before it started,
+    // and a show superseded before it starts rightly records nothing.
+    let asked = Instant::now();
+    while fake.open_calls() == 0 {
+        assert!(asked.elapsed() < ms(5000), "the show never reached the decoder");
+        std::thread::sleep(ms(1));
+    }
+    let g2 = cancel(&r.player);
+    assert!(!r.player.accepts(g1), "play/stop makes the show stale");
     assert!(r.player.accepts(g2) && g2 > g1);
-    assert!(next_event(&r.events, ms(600)).is_none(), "a stopped show was presented");
+    let deadline = Instant::now() + ms(600);
+    while let Some(e) = next_event(&r.events, deadline.saturating_duration_since(Instant::now())) {
+        assert!(!matches!(e, Event::Presented { .. }), "presented after play/stop with the clock stopped: {e:?}");
+    }
     let perf = r.perf.snapshot();
     // Its wait was abandoned at once (resolver-level supersession), well before the 300 ms open.
     assert_eq!(perf.len(), 1, "{perf:?}");

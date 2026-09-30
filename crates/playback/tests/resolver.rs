@@ -595,3 +595,21 @@ fn decode_time_excludes_idle_time_after_an_open() {
     assert_eq!(fake.opens(), 1, "the stream opened for the first request serves the second");
     assert!(perf.decode[0].time < ms(250), "open + one frame, not the idle time since: {:?}", perf.decode[0].time);
 }
+
+/// Export cancel supersedes `u64::MAX`: that abandons waits already running
+/// and also those that start after it (the cancel may land between the
+/// export's per-frame check and its `prepare`).
+#[test]
+fn superseding_u64_max_abandons_later_waits_too() {
+    let fake = fake(300, 1);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = source(vec![(a, m.clone())]);
+    let r = resolver(&fake, ResolverConfig::default());
+    r.supersede(u64::MAX);
+    let t0 = Instant::now();
+    let (inputs, _) = prepare(&r, &scene(vec![media_layer(1, a, &m, Time::from_secs(1), CANVAS)]), &src, Mode::Export);
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::NotReady)), "{:?}", inputs.layers[0]);
+    assert!(t0.elapsed() < ms(200), "waited {:?} for a cancelled export's frame", t0.elapsed());
+}

@@ -90,7 +90,9 @@ impl FakeDecoders {
         self.faults.lock().entry(path.into()).or_default().reads = n;
     }
 
-    /// Calls to open (and still decode), failed ones included.
+    /// Calls to open (and still decode), failed ones included, counted as
+    /// each call begins (before its open delay): a test can wait for this
+    /// to see that a decode is in flight.
     pub fn open_calls(&self) -> u64 {
         self.counts.open_calls.load(Ordering::SeqCst)
     }
@@ -114,8 +116,15 @@ impl FakeDecoders {
         self.counts.live.load(Ordering::SeqCst)
     }
 
-    fn get(&self, path: &Path) -> Result<FakeMedia, MediaError> {
+    /// Counts a call as it begins, then waits the open delay.
+    fn begin(&self) -> Duration {
         self.counts.open_calls.fetch_add(1, Ordering::SeqCst);
+        let (open, frame) = *self.delays.lock();
+        std::thread::sleep(open);
+        frame
+    }
+
+    fn get(&self, path: &Path) -> Result<FakeMedia, MediaError> {
         if take_fault(&self.faults, path, |f| &mut f.opens) {
             return Err(MediaError::Unsupported(format!("{}: fake transient open failure", path.display())));
         }
@@ -129,8 +138,7 @@ impl FakeDecoders {
 
 impl Decoders for FakeDecoders {
     fn open(&self, media: &MediaSource, start_frame: i64, _size: SizeU) -> Result<Box<dyn SourceStream>, MediaError> {
-        let (open, frame) = *self.delays.lock();
-        std::thread::sleep(open);
+        let frame = self.begin();
         let m = self.get(&media.path)?;
         self.counts.opens.fetch_add(1, Ordering::SeqCst);
         self.counts.live.fetch_add(1, Ordering::SeqCst);
@@ -146,8 +154,7 @@ impl Decoders for FakeDecoders {
     }
 
     fn still(&self, media: &MediaSource, _size: SizeU, out: &mut [u8]) -> Result<(), MediaError> {
-        let (open, _) = *self.delays.lock();
-        std::thread::sleep(open);
+        self.begin();
         let m = self.get(&media.path)?;
         self.counts.stills.fetch_add(1, Ordering::SeqCst);
         fill(out, fake_pixel(m.tag, 0));
