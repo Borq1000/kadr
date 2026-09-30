@@ -21,6 +21,7 @@ fn ms(v: u64) -> Duration {
 enum Event {
     Presented { generation: u64, time: Time, pixel: [u8; 4], playing: bool, cache_hits: u32 },
     Finished(u64),
+    Ready(u64),
 }
 
 struct Sink {
@@ -39,6 +40,9 @@ impl FrameSink for Sink {
     }
     fn finished(&mut self, generation: u64, _at: Time) {
         let _ = self.tx.send(Event::Finished(generation));
+    }
+    fn ready(&mut self, generation: u64) {
+        let _ = self.tx.send(Event::Ready(generation));
     }
 }
 
@@ -104,6 +108,7 @@ fn plays_the_exact_frames_on_time_and_records_telemetry() {
                 assert_eq!(generation, g);
                 break;
             }
+            Event::Ready(_) => panic!("no pre-roll: the clock was running when the play began"),
         }
     }
     // Real time on a shared machine: most frames, not all (the simulated-clock test is exact).
@@ -188,8 +193,27 @@ fn random_requests_never_deadlock_and_the_last_one_wins() {
     assert!(r.perf.snapshot().iter().filter(|p| p.seek_latency.is_some()).all(|p| !p.dropped));
 }
 
+/// Presented shows, in arrival order, until `last` is presented or `timeout` passes.
+fn presented_until(events: &Receiver<Event>, last: u64, timeout: Duration) -> Vec<(u64, Time, [u8; 4])> {
+    let deadline = Instant::now() + timeout;
+    let mut out = vec![];
+    while Instant::now() < deadline {
+        if let Some(Event::Presented { generation, time, pixel, .. }) = next_event(events, ms(50)) {
+            out.push((generation, time, pixel));
+            if generation == last {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn presented_now(events: &Receiver<Event>) -> Vec<u64> {
+    events.try_iter().filter_map(|e| if let Event::Presented { generation, .. } = e { Some(generation) } else { None }).collect()
+}
+
 #[test]
-fn a_superseded_show_never_presents_its_frame() {
+fn a_show_in_flight_is_finished_and_presented_before_the_newer_one() {
     let fake = Arc::new(FakeDecoders::new(ms(150), ms(5)));
     fake.add("a.mp4", FakeMedia { tag: 3, ..Default::default() });
     let a = AssetId::new();
@@ -200,48 +224,171 @@ fn a_superseded_show_never_presents_its_frame() {
     std::thread::sleep(ms(20));
     let g2 = r.player.show(Time::from_secs(300));
     assert!(g2 > g1);
-    match next_event(&r.events, ms(3000)) {
-        Some(Event::Presented { generation, time, pixel, playing, .. }) => {
-            assert_eq!((generation, time, playing), (g2, Time::from_secs(300), false));
-            assert_eq!(read_fake_pixel(&pixel), (3, 7500));
-        }
-        other => panic!("expected the second show, got {other:?}"),
-    }
-    assert!(next_event(&r.events, ms(300)).is_none(), "nothing else, the first show least of all");
+    assert!(r.player.accepts(g1), "a newer show does not make the one in flight stale");
+    let shown = presented_until(&r.events, g2, ms(3000));
+    assert_eq!(shown.last().map(|s| (s.0, s.1)), Some((g2, Time::from_secs(300))), "the newest show is presented last: {shown:?}");
+    assert_eq!(read_fake_pixel(&shown.last().unwrap().2), (3, 7500));
+    // The first show was in flight (picked up at once): it is finished, not thrown away.
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    assert_eq!((shown[0].0, shown[0].1), (g1, Time::from_secs(100)));
+    assert_eq!(read_fake_pixel(&shown[0].2), (3, 2500));
+    assert!(next_event(&r.events, ms(300)).is_none(), "nothing after the newest");
     let perf = r.perf.snapshot();
-    // The first show is dropped (or, if the second arrived before it started, never attempted).
-    let (shown, dropped): (Vec<_>, Vec<_>) = perf.iter().partition(|p| !p.dropped);
-    assert!(dropped.len() <= 1 && dropped.iter().all(|p| p.seek_latency.is_none()), "dropped frames carry no seek latency: {dropped:?}");
-    assert_eq!(shown.len(), 1);
-    assert!(shown[0].seek_latency.is_some_and(|s| s >= ms(150)), "{:?}", shown[0].seek_latency);
-    assert_eq!(r.perf.summary().seek.count, 1);
+    assert!(perf.iter().all(|p| !p.dropped), "{perf:?}");
+    // Seek latency is measured on the final frame only, from its own request.
+    let seeks: Vec<_> = perf.iter().filter_map(|p| p.seek_latency).collect();
+    assert_eq!(seeks.len(), 1, "{perf:?}");
+    assert!(seeks[0] >= ms(150), "{seeks:?}");
 }
 
 #[test]
-fn rapid_shows_present_only_the_newest() {
+fn rapid_shows_present_in_order_ending_with_the_newest() {
     let fake = Arc::new(FakeDecoders::new(ms(30), ms(5)));
     fake.add("a.mp4", FakeMedia { tag: 3, ..Default::default() });
     let a = AssetId::new();
     let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
     let r = rig(fake.clone(), PlayerConfig::default());
     r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(600), one_clip(a, m.clone(), Time::ZERO)));
-    let mut last = 0;
+    let mut asked = vec![];
     for i in 0..40 {
-        last = r.player.show(Time::from_secs(i * 13 % 500));
+        let t = Time::from_secs(i * 13 % 500);
+        asked.push((r.player.show(t), t));
         std::thread::sleep(ms(2));
     }
-    let deadline = Instant::now() + ms(3000);
-    let mut final_seen = false;
-    while Instant::now() < deadline && !final_seen {
-        if let Some(Event::Presented { generation, pixel, .. }) = next_event(&r.events, ms(100)) {
-            // Anything presented was current when presented; only the last can be current now.
-            assert_eq!(generation, last, "a stale show was presented");
-            assert_eq!(read_fake_pixel(&pixel).1, FrameRate::FPS_25.time_to_frame(Time::from_secs(39 * 13 % 500)));
-            final_seen = true;
+    let last = asked.last().unwrap().0;
+    // Presented before the burst ended may be any requests, in order; afterwards at most one stale frame.
+    let during = presented_now(&r.events);
+    let after = presented_until(&r.events, last, ms(3000));
+    let all: Vec<u64> = during.iter().copied().chain(after.iter().map(|s| s.0)).collect();
+    assert!(all.windows(2).all(|w| w[0] < w[1]), "presented in request order: {all:?}");
+    assert_eq!(all.last(), Some(&last), "the last request is presented last");
+    assert!(after.iter().filter(|s| s.0 != last).count() <= 1, "at most one stale frame after the burst: {after:?}");
+    for (g, time, pixel) in &after {
+        let t = asked.iter().find(|a| a.0 == *g).unwrap().1;
+        assert_eq!(*time, t);
+        assert_eq!(read_fake_pixel(pixel).1, FrameRate::FPS_25.time_to_frame(t), "each frame is the one its request asked for");
+    }
+    assert!(next_event(&r.events, ms(200)).is_none(), "nothing after the newest");
+    assert!(fake.opens() < 20, "{} opens for 40 shows", fake.opens());
+}
+
+/// The playhead dragged continuously (a show every 10 ms for 1.2 s, each
+/// seek costing ~45 ms): frames keep appearing during the drag.
+#[test]
+fn continuous_scrubbing_presents_frames_while_dragging() {
+    let fake = Arc::new(FakeDecoders::new(ms(40), ms(5)));
+    fake.add("a.mp4", FakeMedia { tag: 4, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(600), one_clip(a, m.clone(), Time::ZERO)));
+    let started = Instant::now();
+    let mut last = 0;
+    let mut i = 0;
+    // Far jumps every time: every show needs a fresh open.
+    while started.elapsed() < ms(1200) {
+        last = r.player.show(Time::from_secs(i * 37 % 590));
+        i += 1;
+        std::thread::sleep(ms(10));
+    }
+    let during = presented_now(&r.events);
+    // ~45 ms per seek → ~25 frames with the machine to itself; demand a few under load.
+    assert!(during.len() >= 4, "only {} frames presented during a 1.2 s drag", during.len());
+    assert!(during.windows(2).all(|w| w[0] < w[1]), "{during:?}");
+    let after = presented_until(&r.events, last, ms(3000));
+    assert_eq!(after.last().map(|s| s.0), Some(last));
+    assert!(after.len() <= 2, "{after:?}");
+    let summary = r.perf.summary();
+    assert!(summary.seek.count <= 2 && summary.seek.count >= 1, "seek latency only on final frames: {summary:?}");
+}
+
+#[test]
+fn play_and_stop_cancel_a_show_in_flight() {
+    let fake = Arc::new(FakeDecoders::new(ms(300), ms(5)));
+    fake.add("a.mp4", FakeMedia { tag: 3, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(600), one_clip(a, m.clone(), Time::ZERO)));
+    let g1 = r.player.show(Time::from_secs(100));
+    std::thread::sleep(ms(20));
+    let g2 = r.player.stop();
+    assert!(!r.player.accepts(g1), "stop makes the show stale");
+    assert!(r.player.accepts(g2) && g2 > g1);
+    assert!(next_event(&r.events, ms(600)).is_none(), "a stopped show was presented");
+    let perf = r.perf.snapshot();
+    // Its wait was abandoned at once (resolver-level supersession), well before the 300 ms open.
+    assert_eq!(perf.len(), 1, "{perf:?}");
+    assert!(perf[0].dropped && perf[0].seek_latency.is_none(), "{perf:?}");
+    assert!(perf[0].total < ms(250), "{perf:?}");
+}
+
+#[test]
+fn preroll_renders_the_first_frame_before_the_clock_starts() {
+    // A slow open (120 ms): the first frame is ready before the clock runs, then shown on time.
+    let fake = Arc::new(FakeDecoders::new(ms(120), ms(1)));
+    fake.add("a.mp4", FakeMedia { tag: 5, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(60), one_clip(a, m.clone(), Time::ZERO)));
+    let from = Time::from_secs(7);
+    let asked = Instant::now();
+    let g = r.player.play(from);
+    match next_event(&r.events, ms(3000)) {
+        Some(Event::Ready(generation)) => assert_eq!(generation, g),
+        other => panic!("expected ready before any frame, got {other:?}"),
+    }
+    let waited = asked.elapsed();
+    assert!(waited >= ms(100), "ready only after the first frame was decoded ({waited:?})");
+    assert!(next_event(&r.events, ms(100)).is_none(), "nothing is presented before the clock runs");
+    r.clock.start(from);
+    let clock_started = Instant::now();
+    match next_event(&r.events, ms(1000)) {
+        Some(Event::Presented { generation, time, pixel, playing, .. }) => {
+            assert_eq!((generation, time, playing), (g, from, true));
+            assert_eq!(read_fake_pixel(&pixel), (5, m.frame_at(from)));
+            assert!(clock_started.elapsed() < ms(40), "the pre-rolled frame is shown as soon as the clock starts: {:?}", clock_started.elapsed());
+        }
+        other => panic!("expected the first frame, got {other:?}"),
+    }
+    let mut shown = 1;
+    while shown < 10 {
+        match next_event(&r.events, ms(1000)) {
+            Some(Event::Presented { generation, .. }) => {
+                assert_eq!(generation, g);
+                shown += 1;
+            }
+            other => panic!("playback stalled after {shown} frames: {other:?}"),
         }
     }
-    assert!(final_seen);
-    assert!(fake.opens() < 15, "{} opens for 40 shows", fake.opens());
+    r.player.stop();
+    r.clock.stop();
+    let first = r.perf.snapshot()[0].clone();
+    assert!(!first.dropped && first.decode.len() == 1, "the pre-rolled frame is the first one pushed: {first:?}");
+}
+
+#[test]
+fn preroll_gives_up_after_its_timeout() {
+    let fake = Arc::new(FakeDecoders::new(ms(600), ms(1)));
+    fake.add("a.mp4", FakeMedia { tag: 5, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = rig(fake, PlayerConfig { preroll: ms(100), ..Default::default() });
+    r.player.set_source(source(vec![(a, m.clone())], Time::from_secs(60), one_clip(a, m, Time::ZERO)));
+    let asked = Instant::now();
+    let g = r.player.play(Time::ZERO);
+    match next_event(&r.events, ms(3000)) {
+        Some(Event::Ready(generation)) => assert_eq!(generation, g),
+        other => panic!("expected ready, got {other:?}"),
+    }
+    assert!(asked.elapsed() < ms(450), "ready after the pre-roll timeout, not after the open: {:?}", asked.elapsed());
+    r.clock.start(Time::ZERO);
+    // Frames follow once decoding catches up.
+    match next_event(&r.events, ms(3000)) {
+        Some(Event::Presented { generation, .. }) => assert_eq!(generation, g),
+        other => panic!("expected a frame, got {other:?}"),
+    }
 }
 
 #[test]

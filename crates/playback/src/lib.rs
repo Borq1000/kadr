@@ -14,8 +14,10 @@
 //! - Decoder sessions: one thread and one stream per (media, decode size,
 //!   position); read forward within a window, reopen otherwise; always
 //!   towards the newest target; close when idle.
-//! - Generations: every show/play/stop is a new generation; waiters and
-//!   session work of older ones are abandoned.
+//! - Generations: every show/play/stop is a new generation; play/stop
+//!   abandon waiters and session work of older ones. A newer show lets the
+//!   show in flight finish (continuous scrubbing keeps presenting frames;
+//!   see [`player`]).
 //! - [`PreviewPlayer`]: paces rendered frames against a [`Clock`] with the
 //!   pure [`pace()`] / [`PlaySchedule`], drops late frames, prefetches the
 //!   scene ahead, records [`kadr_core::perf::FramePerf`] per frame.
@@ -25,15 +27,18 @@
 //!
 //! # Threads
 //!
-//! - `PreviewPlayer::{show, play, stop, set_source, set_output, generation}`:
-//!   any thread (the UI thread), never block on rendering or decoding —
-//!   except that `show`/`play`/`stop` wait for a `FrameSink::present` in
-//!   progress (so none of an older generation follows them).
+//! - `PreviewPlayer::{show, play, stop, set_source, set_output, generation,
+//!   accepts}`: any thread (the UI thread), never block on rendering or
+//!   decoding — except that `show`/`play`/`stop` wait for a
+//!   `FrameSink::present` in progress (so no frame of an older play, and
+//!   after `play`/`stop` no older frame at all, follows them).
 //! - `FrameSink`, `Clock::now`, `SceneSource`: the player thread
 //!   (`kadr-player`). Decoding: one `kadr-decode` thread per session.
 //! - Audio sync: implement [`Clock`] over the audio engine's clock (timeline
-//!   time from samples played, `None` when stopped); start the audio at
-//!   `from`, then call `play(from)`; `stop()` both.
+//!   time from samples played, `None` when stopped). Either start the audio
+//!   at `from`, then call `play(from)`; or (pre-roll) call `play(from)` with
+//!   the audio stopped and start it on `FrameSink::ready` — or after a
+//!   timeout of your own, whichever is first. `stop()` both.
 
 pub mod cache;
 pub mod decoders;
