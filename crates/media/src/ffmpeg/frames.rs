@@ -38,8 +38,7 @@ pub(crate) fn parse_pam(buf: &[u8]) -> Option<RgbaFrame> {
 
 /// Size and RGBA pixels of a PAM image (`DEPTH 4`), borrowed from `buf`.
 pub(crate) fn pam_payload(buf: &[u8]) -> Option<(u32, u32, &[u8])> {
-    const END: &[u8] = b"ENDHDR
-";
+    const END: &[u8] = b"ENDHDR\n";
     let hdr_end = buf.windows(END.len()).position(|w| w == END)? + END.len();
     let header = std::str::from_utf8(&buf[..hdr_end]).ok()?;
     let (mut w, mut h, mut depth) = (0u32, 0u32, 0u32);

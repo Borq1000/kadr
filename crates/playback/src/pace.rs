@@ -128,10 +128,6 @@ impl PlaySchedule {
         self.presented
     }
 
-    pub fn next_index(&self) -> i64 {
-        self.next
-    }
-
     pub fn poll(&mut self, now: Time) -> Step {
         let fd = self.frame_duration();
         let mut skipped = 0;

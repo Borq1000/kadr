@@ -55,17 +55,6 @@ impl RgbaFrame {
     }
 }
 
-/// Output size fitting `(w, h)` inside `max_w × max_h`, even dimensions.
-pub fn fit_size(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    if w == 0 || h == 0 {
-        return (max_w & !1, max_h & !1);
-    }
-    let s = (max_w as f64 / w as f64).min(max_h as f64 / h as f64).min(1.0);
-    let ow = ((w as f64 * s).round() as u32).max(2) & !1;
-    let oh = ((h as f64 * s).round() as u32).max(2) & !1;
-    (ow, oh)
-}
-
 /// Sequential decoder for playback: yields frames at a fixed output rate.
 pub trait VideoStream: Send {
     /// Next frame, `Ok(None)` at end of stream.
