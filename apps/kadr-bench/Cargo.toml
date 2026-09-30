@@ -17,4 +17,5 @@ kadr-project = { path = "../../crates/project" }
 kadr-timeline = { path = "../../crates/timeline" }
 kadr-scene = { path = "../../crates/scene" }
 kadr-render = { path = "../../crates/render" }
+kadr-playback = { path = "../../crates/playback" }
 serde_json.workspace = true

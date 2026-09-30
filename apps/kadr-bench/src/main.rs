@@ -5,6 +5,7 @@
 //!   kadr-bench live --clip <file> [--seconds N]    the real app, headless, through kadr-mcp
 //!   kadr-bench scene                               cost of the scene evaluator (M1)
 //!   kadr-bench render                              CpuRenderer at 1080p and 4K, 1-3 layers and a transition (M2)
+//!   kadr-bench playback [--quick]                 seek latency and sequential decode through Resolver + CpuRenderer (M3)
 //!   kadr-bench avsync-selftest                    A/V sync harness on its own 60 s source (spec §8)
 //!   kadr-bench avsync-analyze <file> [--fps N/D]   flash/click offsets of any file (default 30000/1001)
 
@@ -13,6 +14,7 @@ mod avsync;
 mod baseline;
 mod live;
 mod media;
+mod playback_bench;
 mod render_bench;
 mod report;
 mod scene_bench;
@@ -34,6 +36,7 @@ fn main() {
         }
         Some("scene") => scene_bench::run(),
         Some("render") => render_bench::run(),
+        Some("playback") => playback_bench::run(flag("--quick")),
         Some("avsync-selftest") => avsync::selftest(),
         Some("avsync-analyze") => {
             let fps = args.iter().position(|a| a == "--fps").and_then(|i| args.get(i + 1)).map_or(Some(kadr_core::FrameRate::FPS_29_97), |s| kadr_core::FrameRate::parse(s));
@@ -43,7 +46,7 @@ fn main() {
                 (_, None) => Err("avsync-analyze: bad --fps".to_string()),
             }
         }
-        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene | render | avsync-selftest | avsync-analyze <file> [--fps N/D]".to_string()),
+        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene | render | playback [--quick] | avsync-selftest | avsync-analyze <file> [--fps N/D]".to_string()),
     };
     match result {
         Ok(r) => {
