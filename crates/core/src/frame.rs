@@ -24,13 +24,27 @@ impl PixelFormat {
     }
 }
 
+/// Free buffers by exact byte length. One lock guards the lists and the
+/// byte count, so the budget holds under concurrent returns.
+#[derive(Default)]
+struct FreeLists {
+    /// Per length: when it was last taken or returned (`clock`), and its free buffers.
+    by_len: HashMap<usize, (u64, Vec<Vec<u8>>)>,
+    bytes: usize,
+    clock: u64,
+}
+
 struct PoolInner {
-    /// Free buffers by exact byte length.
-    free: Mutex<HashMap<usize, Vec<Vec<u8>>>>,
-    /// Free bytes kept at most; beyond that a returned buffer is released.
+    free: Mutex<FreeLists>,
+    /// Free bytes kept at most.
     max_free_bytes: usize,
-    free_bytes: AtomicU64,
     allocations: AtomicU64,
+}
+
+impl PoolInner {
+    fn lists(&self) -> std::sync::MutexGuard<'_, FreeLists> {
+        self.free.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Reusable frame buffers. Cheap to clone (shared).
@@ -49,7 +63,7 @@ impl FramePool {
     /// A pool keeping at most `max_free_bytes` of unused buffers.
     pub fn new(max_free_bytes: usize) -> Self {
         FramePool {
-            inner: Arc::new(PoolInner { free: Mutex::new(HashMap::new()), max_free_bytes, free_bytes: AtomicU64::new(0), allocations: AtomicU64::new(0) }),
+            inner: Arc::new(PoolInner { free: Mutex::new(FreeLists::default()), max_free_bytes, allocations: AtomicU64::new(0) }),
         }
     }
 
@@ -57,19 +71,22 @@ impl FramePool {
     /// contents (callers overwrite it); only a fresh one is zeroed.
     pub fn take(&self, len: usize) -> PooledBuf {
         let reused = {
-            let mut free = self.inner.free.lock().unwrap_or_else(|e| e.into_inner());
-            free.get_mut(&len).and_then(Vec::pop)
-        };
-        let data = match reused {
-            Some(v) => {
-                self.inner.free_bytes.fetch_sub(len as u64, Ordering::Relaxed);
-                v
+            let mut free = self.inner.lists();
+            free.clock += 1;
+            let now = free.clock;
+            let reused = free.by_len.get_mut(&len).and_then(|(used, bufs)| {
+                *used = now;
+                bufs.pop()
+            });
+            if reused.is_some() {
+                free.bytes -= len;
             }
-            None => {
-                self.inner.allocations.fetch_add(1, Ordering::Relaxed);
-                vec![0u8; len]
-            }
+            reused
         };
+        let data = reused.unwrap_or_else(|| {
+            self.inner.allocations.fetch_add(1, Ordering::Relaxed);
+            vec![0u8; len]
+        });
         PooledBuf { data, pool: Arc::downgrade(&self.inner) }
     }
 
@@ -80,7 +97,7 @@ impl FramePool {
 
     /// Bytes currently waiting for reuse.
     pub fn free_bytes(&self) -> u64 {
-        self.inner.free_bytes.load(Ordering::Relaxed)
+        self.inner.lists().bytes as u64
     }
 }
 
@@ -111,15 +128,39 @@ impl DerefMut for PooledBuf {
 }
 
 impl Drop for PooledBuf {
+    /// Back to the pool. When the budget is full, free buffers of other
+    /// lengths go first, least recently used length first — so buffers of a
+    /// size nobody asks for any more (an old preview size) make room instead
+    /// of turning every return of the current size into a release. A length
+    /// whose own free buffers fill the budget releases the returned one.
     fn drop(&mut self) {
         let Some(pool) = self.pool.upgrade() else { return };
         let len = self.data.len();
-        if pool.free_bytes.load(Ordering::Relaxed) + len as u64 > pool.max_free_bytes as u64 {
+        let mut free = pool.lists();
+        let own = free.by_len.get(&len).map_or(0, |(_, bufs)| bufs.len() * len);
+        if own + len > pool.max_free_bytes {
             return;
         }
-        pool.free_bytes.fetch_add(len as u64, Ordering::Relaxed);
-        let mut free = pool.free.lock().unwrap_or_else(|e| e.into_inner());
-        free.entry(len).or_default().push(std::mem::take(&mut self.data));
+        let mut released = Vec::new();
+        while free.bytes + len > pool.max_free_bytes {
+            let stalest = free.by_len.iter().filter(|(l, (_, bufs))| **l != len && !bufs.is_empty()).min_by_key(|(_, (used, _))| *used).map(|(l, _)| *l);
+            let Some(l) = stalest else { break };
+            let (_, bufs) = free.by_len.get_mut(&l).expect("a listed length");
+            released.extend(bufs.pop());
+            if bufs.is_empty() {
+                free.by_len.remove(&l);
+            }
+            free.bytes -= l;
+        }
+        free.clock += 1;
+        let now = free.clock;
+        free.bytes += len;
+        let (used, bufs) = free.by_len.entry(len).or_default();
+        *used = now;
+        bufs.push(std::mem::take(&mut self.data));
+        // Released buffers are freed after the lock.
+        drop(free);
+        drop(released);
     }
 }
 
@@ -196,6 +237,29 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(pool.free_bytes(), 1000, "the second buffer would exceed the budget and is released");
+    }
+
+    #[test]
+    fn a_full_pool_makes_room_by_dropping_the_least_recently_used_size() {
+        // Two 1000-byte buffers from an old output size fill most of the budget; the new size must still be reused.
+        let pool = FramePool::new(2500);
+        let (a, b) = (pool.take(1000), pool.take(1000));
+        drop((a, b));
+        let c = pool.take(600);
+        drop(c);
+        assert_eq!(pool.free_bytes(), 2600 - 1000, "one old buffer made room");
+        for _ in 0..3 {
+            drop(pool.take(1200));
+        }
+        assert_eq!(pool.allocations(), 4, "after its first allocation the new size is reused, not reallocated");
+        assert_eq!(pool.free_bytes(), 600 + 1200, "the older 1000-byte size went before the more recent 600-byte one");
+        // A size whose own free buffers fill the budget releases the returned one instead of evicting others.
+        let (d, e, f) = (pool.take(1200), pool.take(1200), pool.take(1200));
+        drop((d, e));
+        drop(pool.take(100));
+        assert_eq!(pool.free_bytes(), 2500);
+        drop(f);
+        assert_eq!(pool.free_bytes(), 2500, "the 100-byte buffer stays");
     }
 
     #[test]
