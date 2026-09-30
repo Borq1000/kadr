@@ -3,12 +3,14 @@
 //!
 //!   kadr-bench baseline [--quick]                  legacy decode, seek, copy and export numbers
 //!   kadr-bench live --clip <file> [--seconds N]    the real app, headless, through kadr-mcp
+//!   kadr-bench scene                               cost of the scene evaluator (M1)
 
 mod alloc;
 mod baseline;
 mod live;
 mod media;
 mod report;
+mod scene_bench;
 
 #[global_allocator]
 static ALLOC: alloc::Counting = alloc::Counting;
@@ -25,7 +27,8 @@ fn main() {
                 None => Err("live needs --clip <file>".to_string()),
             }
         }
-        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N]".to_string()),
+        Some("scene") => scene_bench::run(),
+        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene".to_string()),
     };
     match result {
         Ok(r) => {

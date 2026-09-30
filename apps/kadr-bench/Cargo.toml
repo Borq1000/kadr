@@ -13,4 +13,7 @@ path = "src/main.rs"
 [dependencies]
 kadr-core = { path = "../../crates/core" }
 kadr-media = { path = "../../crates/media" }
+kadr-project = { path = "../../crates/project" }
+kadr-timeline = { path = "../../crates/timeline" }
+kadr-scene = { path = "../../crates/scene" }
 serde_json.workspace = true
