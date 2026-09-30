@@ -97,7 +97,8 @@ pub enum TransitionOp {
     /// `angle` 0 = the edge moves left → right (the incoming picture appears
     /// on the left); π = right → left (incoming from the right, like
     /// FFmpeg's `wipeleft`); π/2 = top → bottom. `softness` is the width of
-    /// the blended band, in canvas pixels.
+    /// the blended band, in canvas pixels. Exact mask: crate docs,
+    /// "Rendering contract".
     Wipe { angle: f32, softness: f32 },
 }
 
