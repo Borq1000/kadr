@@ -1,5 +1,6 @@
 use super::{run_capture, FfmpegCli};
 use crate::{MediaError, Result};
+use kadr_core::color::AlphaMode;
 use kadr_core::{AudioInfo, FrameRate, MediaInfo, MediaKind, Time, VideoInfo};
 use serde::Deserialize;
 use std::path::Path;
@@ -42,6 +43,18 @@ struct Stream {
     tags: std::collections::HashMap<String, String>,
     #[serde(default)]
     side_data_list: Vec<serde_json::Value>,
+    sample_aspect_ratio: Option<String>,
+    color_range: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+}
+
+/// "8:9" → (8, 9); "0:1", "N/A" or garbage → None.
+fn parse_ratio(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once(':')?;
+    let (a, b) = (a.parse().ok()?, b.parse().ok()?);
+    (a > 0 && b > 0).then_some((a, b))
 }
 
 const IMAGE_CODECS: &[&str] = &["png", "mjpeg", "bmp", "webp", "tiff", "gif", "jpegls", "targa"];
@@ -105,6 +118,27 @@ pub(crate) fn parse(json: &[u8]) -> Option<MediaInfo> {
             codec: v.codec_name.clone(),
             pixel_format: v.pix_fmt.clone().unwrap_or_default(),
             rotation,
+            sar: v.sample_aspect_ratio.as_deref().and_then(parse_ratio).unwrap_or((1, 1)),
+            color: Some(if is_image {
+                kadr_core::ColorInfo::IMAGE_SRGB
+            } else {
+                let c = kadr_core::ColorInfo::from_ffprobe(
+                    v.width.unwrap_or(0),
+                    v.height.unwrap_or(0),
+                    v.pix_fmt.as_deref().unwrap_or(""),
+                    v.color_primaries.as_deref(),
+                    v.color_transfer.as_deref(),
+                    v.color_space.as_deref(),
+                    v.color_range.as_deref(),
+                );
+                // VP8/VP9 in WebM keep alpha in a side stream: the pixel
+                // format says yuv420p, the `alpha_mode` tag says otherwise.
+                if v.tags.get("alpha_mode").map(String::as_str) == Some("1") {
+                    kadr_core::ColorInfo { alpha: AlphaMode::Straight, ..c }
+                } else {
+                    c
+                }
+            }),
         }
     });
 
@@ -173,5 +207,58 @@ mod tests {
         let v = m.video.unwrap();
         assert!(v.variable_frame_rate);
         assert_eq!(v.rotation, -90);
+    }
+
+    #[test]
+    fn reads_colour_tags_and_sample_aspect_ratio() {
+        let json = br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":720,"height":480,
+                        "sample_aspect_ratio":"8:9","color_range":"tv","color_space":"smpte170m",
+                        "color_transfer":"smpte170m","color_primaries":"smpte170m"}],
+                        "format":{"format_name":"mov","duration":"1.0"}}"#;
+        let v = parse(json).unwrap().video.unwrap();
+        assert_eq!(v.sar, (8, 9));
+        assert_eq!(v.display_size(), (640, 480));
+        let c = v.color.unwrap();
+        assert_eq!((c.matrix, c.range), (kadr_core::color::Matrix::Bt601, kadr_core::color::Range::Limited));
+
+        let untagged = br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"sample_aspect_ratio":"0:1"}],
+                            "format":{"format_name":"mov","duration":"1.0"}}"#;
+        let v = parse(untagged).unwrap().video.unwrap();
+        assert_eq!(v.sar, (1, 1));
+        assert_eq!(v.color.unwrap().matrix, kadr_core::color::Matrix::Bt709);
+
+        let png = br#"{"streams":[{"codec_type":"video","codec_name":"png","width":10,"height":10}],"format":{"format_name":"png_pipe"}}"#;
+        assert_eq!(parse(png).unwrap().video.unwrap().color, Some(kadr_core::ColorInfo::IMAGE_SRGB));
+    }
+
+    #[test]
+    fn video_alpha_comes_from_pixel_format_or_alpha_mode_tag() {
+        use kadr_core::color::AlphaMode;
+        let alpha = |stream: &str| {
+            let json = format!(r#"{{"streams":[{stream}],"format":{{"format_name":"mov","duration":"1.0"}}}}"#);
+            parse(json.as_bytes()).unwrap().video.unwrap().color.unwrap().alpha
+        };
+        let prores = r#"{"codec_type":"video","codec_name":"prores","width":1920,"height":1080,"pix_fmt":"yuva444p10le"}"#;
+        assert_eq!(alpha(prores), AlphaMode::Straight, "ProRes 4444");
+        let webm = r#"{"codec_type":"video","codec_name":"vp9","width":1920,"height":1080,"pix_fmt":"yuv420p","tags":{"alpha_mode":"1"}}"#;
+        assert_eq!(alpha(webm), AlphaMode::Straight, "VP9 with an alpha side stream");
+        let plain = r#"{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"pix_fmt":"yuv420p"}"#;
+        assert_eq!(alpha(plain), AlphaMode::Opaque);
+    }
+
+    #[test]
+    fn untagged_rgb_video_is_rgb_full_range() {
+        use kadr_core::color::{AlphaMode, Matrix, Range};
+        let colour = |stream: &str| {
+            let json = format!(r#"{{"streams":[{stream}],"format":{{"format_name":"mov","duration":"1.0"}}}}"#);
+            let c = parse(json.as_bytes()).unwrap().video.unwrap().color.unwrap();
+            (c.matrix, c.range, c.alpha)
+        };
+        let qtrle = r#"{"codec_type":"video","codec_name":"qtrle","width":1920,"height":1080,"pix_fmt":"argb"}"#;
+        assert_eq!(colour(qtrle), (Matrix::Rgb, Range::Full, AlphaMode::Straight));
+        let rgb24 = r#"{"codec_type":"video","codec_name":"qtrle","width":1920,"height":1080,"pix_fmt":"rgb24"}"#;
+        assert_eq!(colour(rgb24), (Matrix::Rgb, Range::Full, AlphaMode::Opaque));
+        let tagged_yuv = r#"{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"pix_fmt":"yuv420p","color_space":"bt709","color_range":"tv"}"#;
+        assert_eq!(colour(tagged_yuv), (Matrix::Bt709, Range::Limited, AlphaMode::Opaque));
     }
 }

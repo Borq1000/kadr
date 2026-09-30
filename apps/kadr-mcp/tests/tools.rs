@@ -70,3 +70,13 @@ fn pointer_tools_take_logical_window_coordinates() {
     let d = tool("click_at")["description"].as_str().unwrap().to_string();
     assert!(d.contains("logical"), "{d}");
 }
+
+#[test]
+fn get_perf_reports_and_can_reset() {
+    let t = tool("get_perf");
+    assert_eq!(prop("get_perf", "reset")["type"], "boolean");
+    let d = t["description"].as_str().unwrap();
+    for word in ["dropped", "seek", "reset"] {
+        assert!(d.contains(word), "get_perf description lacks {word}: {d}");
+    }
+}

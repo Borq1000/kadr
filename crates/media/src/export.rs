@@ -260,7 +260,8 @@ pub fn build_graph(plan: &ExportPlan) -> (Vec<String>, String) {
             if run.len() == 1 {
                 let _ = writeln!(graph, "{}null{out};", run[0]);
             } else {
-                let _ = writeln!(graph, "{}concat=n={}:v=1:a=0{out};", run.concat(), run.len());
+                // concat always outputs a 1/1000000 time base and xfade requires both inputs on the same one, so put it back on 1/fps.
+                let _ = writeln!(graph, "{}concat=n={}:v=1:a=0,fps={rate}{out};", run.concat(), run.len());
             }
             run.clear();
             run.push(out.to_string());

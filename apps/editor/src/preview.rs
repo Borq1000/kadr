@@ -11,6 +11,7 @@ use crate::app::{post, App};
 use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
 use kadr_audio::{AudioClock, MixSource};
+use kadr_core::perf::{FramePerf, LayerTiming, PerfRing};
 use kadr_core::{FrameRate, Time, TimeRange};
 use kadr_media::export::VideoLook;
 use kadr_media::{MediaBackend, RgbaFrame, StreamRequest};
@@ -19,7 +20,7 @@ use kadr_timeline::composition::{audio_segments, video_segments, VideoSource};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Seg {
@@ -38,6 +39,10 @@ pub struct PreviewController {
     tx: Sender<Cmd>,
     generation: Arc<AtomicU64>,
     pub quality: i32,
+    /// Last 600 preview frames (MCP `get_perf`, DEV overlay later).
+    pub perf: Arc<PerfRing>,
+    /// Generation and start time of the pending paused-frame request.
+    pub seek_started: Option<(u64, Instant)>,
 }
 
 pub fn look_of(t: &Transform, c: &ColorAdjust, bypass: bool) -> VideoLook {
@@ -71,11 +76,13 @@ impl PreviewController {
     pub fn new(media: Option<Arc<dyn MediaBackend>>, clock: AudioClock) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let generation = Arc::new(AtomicU64::new(0));
+        let perf = Arc::new(PerfRing::new(600));
         if let Some(m) = media {
             let g = generation.clone();
-            std::thread::Builder::new().name("kadr-preview".into()).spawn(move || worker(m, rx, clock, g)).expect("preview thread");
+            let p = perf.clone();
+            std::thread::Builder::new().name("kadr-preview".into()).spawn(move || worker(m, rx, clock, g, p)).expect("preview thread");
         }
-        PreviewController { tx, generation, quality: 1 }
+        PreviewController { tx, generation, quality: 1, perf, seek_started: None }
     }
 
     fn next_gen(&self) -> u64 {
@@ -137,22 +144,38 @@ impl App {
         }
         let (w, h, px) = self.preview.size(&self.project);
         let generation = self.preview.next_gen();
+        self.preview.seek_started = Some((generation, Instant::now()));
         self.ui().set_preview_loading(true);
         let rate = seq.frame_rate;
         let _ = self.preview.tx.send(Cmd::Show { generation, t, seg, w, h, rate, px_scale: px });
     }
 
-    pub fn on_preview_frame(&mut self, generation: u64, frame: RgbaFrame, show_loading_done: bool) {
+    pub fn on_preview_frame(&mut self, generation: u64, frame: RgbaFrame, show_loading_done: bool, mut perf: FramePerf) {
         if generation != self.preview.current_gen() {
-            return; // stale
+            // Decoded for a request nobody wants any more: wasted work.
+            perf.dropped = true;
+            perf.total = perf.decode_total();
+            self.preview.perf.push(perf);
+            return;
         }
         let ui = self.ui();
+        let shown = Instant::now();
         let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&frame.data, frame.width, frame.height);
+        // clone_from_slice allocates a new frame buffer and copies into it, on the UI thread.
+        perf.frame_allocs += 1;
+        perf.frame_copies += 1;
+        perf.bytes_copied += frame.data.len() as u64;
         ui.set_preview_frame(slint::Image::from_rgba8(buf));
         ui.set_preview_has_frame(true);
+        perf.present = shown.elapsed();
         if show_loading_done {
             ui.set_preview_loading(false);
+            if let Some((_, asked)) = self.preview.seek_started.take_if(|(g, _)| *g == generation) {
+                perf.seek_latency = Some(asked.elapsed());
+            }
         }
+        perf.total = perf.decode_total() + perf.present;
+        self.preview.perf.push(perf);
     }
 
     pub fn start_playback(&mut self) {
@@ -313,7 +336,7 @@ impl App {
     }
 }
 
-fn worker(media: Arc<dyn MediaBackend>, rx: Receiver<Cmd>, clock: AudioClock, current: Arc<AtomicU64>) {
+fn worker(media: Arc<dyn MediaBackend>, rx: Receiver<Cmd>, clock: AudioClock, current: Arc<AtomicU64>, perf: Arc<PerfRing>) {
     let mut pending: Option<Cmd> = None;
     loop {
         let cmd = match pending.take() {
@@ -329,8 +352,16 @@ fn worker(media: Arc<dyn MediaBackend>, rx: Receiver<Cmd>, clock: AudioClock, cu
             Cmd::Quit => return,
             Cmd::Stop => {}
             Cmd::Show { generation, t, seg, w, h, rate, px_scale } => {
-                if let Some(f) = decode_one(&*media, t, &seg, w, h, rate, px_scale) {
-                    post(move |app| app.on_preview_frame(generation, f, true));
+                let allocs = kadr_media::stats::frame_allocs_on_this_thread();
+                let started = Instant::now();
+                let frame = decode_one(&*media, t, &seg, w, h, rate, px_scale);
+                let pf = FramePerf {
+                    decode: vec![LayerTiming { layer: 0, time: started.elapsed() }],
+                    frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32,
+                    ..Default::default()
+                };
+                if let Some(f) = frame {
+                    post(move |app| app.on_preview_frame(generation, f, true, pf));
                 } else {
                     post(move |app| {
                         if generation == app.preview.current_gen() {
@@ -340,7 +371,7 @@ fn worker(media: Arc<dyn MediaBackend>, rx: Receiver<Cmd>, clock: AudioClock, cu
                 }
             }
             Cmd::Play { generation, from, segs, w, h, rate, px_scale } => {
-                pending = play(&*media, &rx, &clock, &current, generation, from, &segs, w, h, rate, px_scale);
+                pending = play(&*media, &rx, &clock, &current, &perf, generation, from, &segs, w, h, rate, px_scale);
             }
         }
     }
@@ -361,6 +392,7 @@ fn play(
     rx: &Receiver<Cmd>,
     clock: &AudioClock,
     current: &AtomicU64,
+    perf: &PerfRing,
     generation: u64,
     from: Time,
     segs: &[Seg],
@@ -378,8 +410,10 @@ fn play(
         }
         match &seg.src {
             None => {
+                let allocs = kadr_media::stats::frame_allocs_on_this_thread();
                 let black = RgbaFrame::black(w, h);
-                post(move |app| app.on_preview_frame(generation, black, true));
+                let pf = FramePerf { frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32, ..Default::default() };
+                post(move |app| app.on_preview_frame(generation, black, true, pf));
                 // Wait out the gap.
                 loop {
                     if let Ok(c) = rx.try_recv() {
@@ -416,9 +450,16 @@ fn play(
                     if current.load(Ordering::Acquire) != generation {
                         return None;
                     }
+                    let allocs = kadr_media::stats::frame_allocs_on_this_thread();
+                    let started = Instant::now();
                     let frame = match stream.next_frame() {
                         Ok(Some(f)) => f,
                         _ => break,
+                    };
+                    let mut pf = FramePerf {
+                        decode: vec![LayerTiming { layer: 0, time: started.elapsed() }],
+                        frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32,
+                        ..Default::default()
                     };
                     i += 1;
                     // Pace against the audio clock.
@@ -430,8 +471,12 @@ fn play(
                         }
                     }
                     let late = now().is_some_and(|t| t > ts + Time(fd.flicks() * 2));
-                    if !late {
-                        post(move |app| app.on_preview_frame(generation, frame, false));
+                    if late {
+                        pf.dropped = true;
+                        pf.total = pf.decode_total();
+                        perf.push(pf);
+                    } else {
+                        post(move |app| app.on_preview_frame(generation, frame, false, pf));
                     }
                 }
             }

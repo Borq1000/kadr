@@ -147,7 +147,7 @@ mod tests {
     }
 
     fn asset(kind: MediaKind, w: u32, h: u32, rotation: i32) -> kadr_project::MediaAsset {
-        let video = (kind == MediaKind::Video).then(|| kadr_core::VideoInfo { width: w, height: h, frame_rate: None, variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation });
+        let video = (kind == MediaKind::Video).then(|| kadr_core::VideoInfo { width: w, height: h, frame_rate: None, variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation, sar: (1, 1), color: None });
         kadr_project::MediaAsset::new("a.mp4", MediaInfo { kind, duration: Time::from_secs(10), container: "mp4".into(), size_bytes: 0, video, audio: None, timecode: None })
     }
 

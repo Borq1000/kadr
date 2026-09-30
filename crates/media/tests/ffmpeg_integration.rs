@@ -201,6 +201,59 @@ fn export_dissolve_blends_across_the_cut_and_keeps_duration() {
     assert!(late < 20.0, "second dissolve finished into black: {late}");
 }
 
+/// Exports cut, gap, dissolve-in, cut (segment lengths in ms) at `rate`;
+/// returns the frame count ffprobe reads back.
+fn export_cuts_then_dissolve(ff: &FfmpegCli, rate: FrameRate, segments_ms: [i64; 4]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = make_clip(dir.path());
+    let output = dir.path().join("out.mp4");
+    let source = |start_ms| Some(ExportVideoSource { path: clip.clone(), source_start: Time::from_millis(start_ms), speed: 1.0, look: VideoLook::default() });
+    let dissolve = Some(ExportTransition { kind: ExportTransitionKind::Dissolve, duration: Time::from_millis(800) });
+    let [a, gap, b, c] = segments_ms.map(Time::from_millis);
+    let plan = ExportPlan {
+        output: output.clone(),
+        total: a + gap + b + c,
+        video: vec![
+            ExportVideo { duration: a, source: source(0), transition_in: None },
+            ExportVideo { duration: gap, source: None, transition_in: None },
+            ExportVideo { duration: b, source: source(2_000), transition_in: dissolve },
+            ExportVideo { duration: c, source: source(3_000), transition_in: None },
+        ],
+        audio: vec![],
+        settings: ExportSettings { width: 320, height: 180, rate, preset: "ultrafast".into(), ..Default::default() },
+    };
+    ff.export(&plan, &|_| {}, &CancelToken::new()).unwrap();
+
+    let frames = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&frames.stdout).trim().to_string()
+}
+
+/// Plain cuts are concatenated before the transition (concat outputs a 1/1000000 time
+/// base, xfade needs both inputs on the same one) and another run follows it.
+#[test]
+fn export_with_cuts_before_a_dissolve_succeeds_and_keeps_frame_count() {
+    let Some(ff) = backend() else { return };
+    // Transitions use handles around the cut, so the length is the sum of the segments: 4 x 25 frames.
+    assert_eq!(export_cuts_then_dissolve(&ff, FrameRate::FPS_25, [1_000; 4]), "100", "a dissolve must not change the length");
+}
+
+/// The same at 29.97 fps, where segment lengths are not whole frames: the
+/// output has exactly the frames `build_graph` counts, each segment rounded
+/// to the nearest frame.
+#[test]
+fn export_with_cuts_before_a_dissolve_keeps_frame_count_at_29_97() {
+    let Some(ff) = backend() else { return };
+    let rate = FrameRate::FPS_29_97;
+    let segments_ms = [1_000, 700, 1_300, 1_000];
+    let expected: i64 = segments_ms.iter().map(|&ms| rate.time_to_frame_round(Time::from_millis(ms)).max(1)).sum();
+    assert_eq!(expected, 30 + 21 + 39 + 30);
+    assert_eq!(export_cuts_then_dissolve(&ff, rate, segments_ms), expected.to_string(), "a dissolve must not change the length");
+}
+
 /// Same loop as the editor's analysis job: 4 fps grey proxy → stats.
 fn video_overview(ff: &FfmpegCli, path: &Path) -> kadr_analysis::video::VideoOverview {
     use kadr_analysis::video::*;

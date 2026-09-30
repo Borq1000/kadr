@@ -15,6 +15,7 @@ mod keys;
 mod library;
 mod mcp_env;
 mod mcp_input;
+mod perf_view;
 mod mcp_state;
 mod mcp_api;
 mod multicam_ui;

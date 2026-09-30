@@ -43,6 +43,13 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
                 Err(e) => Reply::Now(Err(e)),
             }
         }
+        "get_perf" => {
+            let v = crate::perf_view::summary_json(&app.preview.perf.summary());
+            if p.get("reset").and_then(Value::as_bool) == Some(true) {
+                app.preview.perf.clear();
+            }
+            Reply::Now(Ok(v))
+        }
         "get_frame" => match ms(&p, "at_ms") {
             Some(t) => {
                 let dim = |k: &str| p.get(k).and_then(Value::as_u64).map(|v| v.clamp(2, 8192) as u32);

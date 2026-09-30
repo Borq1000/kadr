@@ -2882,6 +2882,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-bench"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-media",
+ "kadr-project",
+ "kadr-scene",
+ "kadr-timeline",
+ "serde_json",
+]
+
+[[package]]
 name = "kadr-cache"
 version = "0.1.0"
 dependencies = [
@@ -2995,11 +3007,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-scene"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+]
+
+[[package]]
 name = "kadr-timeline"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
  "kadr-project",
+ "kadr-scene",
  "serde",
  "thiserror 2.0.21",
  "tracing",

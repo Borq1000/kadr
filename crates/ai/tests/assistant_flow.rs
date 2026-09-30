@@ -19,7 +19,7 @@ fn project() -> Project {
         duration: s(60),
         container: "mp4".into(),
         size_bytes: 0,
-        video: Some(VideoInfo { width: 1920, height: 1080, frame_rate: Some(FrameRate::FPS_25), variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation: 0 }),
+        video: Some(VideoInfo { width: 1920, height: 1080, frame_rate: Some(FrameRate::FPS_25), variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation: 0, sar: (1, 1), color: None }),
         audio: Some(AudioInfo { sample_rate: 48000, channels: 2, codec: "aac".into(), channel_layout: String::new() }),
         timecode: None,
     };
