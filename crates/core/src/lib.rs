@@ -3,6 +3,7 @@
 
 pub mod cancel;
 pub mod color;
+pub mod ease;
 pub mod frame;
 pub mod id;
 pub mod media_info;
