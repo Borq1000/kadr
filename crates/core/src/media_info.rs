@@ -1,7 +1,7 @@
 //! Technical description of a media file, produced by the media backend's
 //! probe and stored in the project so reopening needs no re-probe.
 
-use crate::color::{alpha_of_pixel_format, ColorInfo};
+use crate::color::ColorInfo;
 use crate::time::{FrameRate, Time};
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +48,9 @@ impl VideoInfo {
     }
 
     /// Probed colour, or for projects saved before colour tags a guess from
-    /// the size with alpha from the pixel format.
+    /// the size and the pixel format (RGB family, alpha).
     pub fn color_info(&self) -> ColorInfo {
-        self.color.unwrap_or_else(|| ColorInfo { alpha: alpha_of_pixel_format(&self.pixel_format), ..ColorInfo::guess_video(self.width, self.height) })
+        self.color.unwrap_or_else(|| ColorInfo::guess_video_format(self.width, self.height, &self.pixel_format))
     }
 }
 
@@ -142,6 +142,18 @@ mod tests {
         let prores_4444 = VideoInfo { pixel_format: "yuva444p10le".into(), ..video(1920, 1080, (1, 1), 0) };
         let c = prores_4444.color_info();
         assert_eq!((c.alpha, c.matrix), (AlphaMode::Straight, Matrix::Bt709), "alpha from the pixel format, the rest guessed");
+    }
+
+    #[test]
+    fn legacy_rgb_sources_are_rgb_full_range() {
+        use crate::color::Range;
+        let colour = |pix_fmt: &str| {
+            let c = VideoInfo { pixel_format: pix_fmt.into(), ..video(1920, 1080, (1, 1), 0) }.color_info();
+            (c.matrix, c.range, c.alpha)
+        };
+        assert_eq!(colour("argb"), (Matrix::Rgb, Range::Full, AlphaMode::Straight), "QuickTime Animation");
+        assert_eq!(colour("rgb24"), (Matrix::Rgb, Range::Full, AlphaMode::Opaque));
+        assert_eq!(colour("yuv420p"), (Matrix::Bt709, Range::Limited, AlphaMode::Opaque));
     }
 
     #[test]

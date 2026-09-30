@@ -81,11 +81,36 @@ impl ColorInfo {
         ColorInfo { primaries, transfer: Transfer::Bt709, matrix, range: Range::Limited, alpha: AlphaMode::Opaque }
     }
 
-    /// From ffprobe's `color_primaries`, `color_transfer`, `color_space` and
-    /// `color_range`; each unknown or missing field falls back to
-    /// [`ColorInfo::guess_video`].
-    pub fn from_ffprobe(width: u32, height: u32, primaries: Option<&str>, transfer: Option<&str>, space: Option<&str>, range: Option<&str>) -> ColorInfo {
+    /// Untagged video stored in `pix_fmt` (FFmpeg name): [`ColorInfo::guess_video`],
+    /// except that RGB-family formats (see [`is_rgb_pixel_format`]) are
+    /// R'G'B' (`Matrix::Rgb`) and full range; alpha from the pixel format.
+    pub fn guess_video_format(width: u32, height: u32, pix_fmt: &str) -> ColorInfo {
+        Self::from_ffprobe(width, height, pix_fmt, None, None, None, None)
+    }
+
+    /// From ffprobe's `pix_fmt`, `color_primaries`, `color_transfer`,
+    /// `color_space` and `color_range`; each unknown or missing field falls
+    /// back to [`ColorInfo::guess_video`]. An RGB-family `pix_fmt` without a
+    /// known `color_space` is `Matrix::Rgb` and `Range::Full` (FFmpeg treats
+    /// RGB as full range). Alpha comes from the pixel format.
+    pub fn from_ffprobe(
+        width: u32,
+        height: u32,
+        pix_fmt: &str,
+        primaries: Option<&str>,
+        transfer: Option<&str>,
+        space: Option<&str>,
+        range: Option<&str>,
+    ) -> ColorInfo {
         let g = Self::guess_video(width, height);
+        let tagged_matrix = match space {
+            Some("bt709") => Some(Matrix::Bt709),
+            Some("bt470bg" | "smpte170m") => Some(Matrix::Bt601),
+            Some("bt2020nc") => Some(Matrix::Bt2020Ncl),
+            Some("gbr") => Some(Matrix::Rgb),
+            _ => None,
+        };
+        let untagged_rgb = tagged_matrix.is_none() && is_rgb_pixel_format(pix_fmt);
         ColorInfo {
             primaries: match primaries {
                 Some("bt709") => Primaries::Bt709,
@@ -103,19 +128,18 @@ impl ColorInfo {
                 Some("arib-std-b67") => Transfer::Hlg,
                 _ => g.transfer,
             },
-            matrix: match space {
-                Some("bt709") => Matrix::Bt709,
-                Some("bt470bg" | "smpte170m") => Matrix::Bt601,
-                Some("bt2020nc") => Matrix::Bt2020Ncl,
-                Some("gbr") => Matrix::Rgb,
-                _ => g.matrix,
+            matrix: match tagged_matrix {
+                Some(m) => m,
+                None if untagged_rgb => Matrix::Rgb,
+                None => g.matrix,
             },
             range: match range {
+                _ if untagged_rgb => Range::Full,
                 Some("pc") => Range::Full,
                 Some("tv") => Range::Limited,
                 _ => g.range,
             },
-            alpha: g.alpha,
+            alpha: alpha_of_pixel_format(pix_fmt),
         }
     }
 
@@ -124,6 +148,14 @@ impl ColorInfo {
         matches!(self.primaries, Primaries::Bt709 | Primaries::Bt601_625 | Primaries::Bt601_525)
             && matches!(self.transfer, Transfer::Bt709 | Transfer::Srgb)
     }
+}
+
+/// Whether `pix_fmt` (FFmpeg name) stores R'G'B' rather than Y'CbCr:
+/// rgb*, bgr*, argb, abgr, 0rgb, 0bgr, gbr* (planar), x2rgb10*, x2bgr10*
+/// and pal8.
+pub fn is_rgb_pixel_format(pix_fmt: &str) -> bool {
+    const RGB_PREFIX: [&str; 10] = ["rgb", "bgr", "argb", "abgr", "0rgb", "0bgr", "gbr", "x2rgb10", "x2bgr10", "pal8"];
+    RGB_PREFIX.iter().any(|p| pix_fmt.starts_with(p))
 }
 
 /// Whether frames in `pix_fmt` (FFmpeg name) carry an alpha channel:
@@ -171,22 +203,38 @@ mod tests {
 
     #[test]
     fn ffprobe_tags_win_over_the_guess() {
-        let c = ColorInfo::from_ffprobe(720, 480, Some("bt709"), Some("bt709"), Some("bt709"), Some("pc"));
+        let c = ColorInfo::from_ffprobe(720, 480, "yuv420p", Some("bt709"), Some("bt709"), Some("bt709"), Some("pc"));
         assert_eq!((c.primaries, c.transfer, c.matrix, c.range), (Primaries::Bt709, Transfer::Bt709, Matrix::Bt709, Range::Full));
-        let hdr = ColorInfo::from_ffprobe(3840, 2160, Some("bt2020"), Some("smpte2084"), Some("bt2020nc"), Some("tv"));
+        let hdr = ColorInfo::from_ffprobe(3840, 2160, "yuv420p", Some("bt2020"), Some("smpte2084"), Some("bt2020nc"), Some("tv"));
         assert_eq!((hdr.primaries, hdr.transfer, hdr.matrix), (Primaries::Bt2020, Transfer::Pq, Matrix::Bt2020Ncl));
         assert!(!hdr.is_supported_sdr());
-        let sd = ColorInfo::from_ffprobe(1920, 1080, Some("smpte170m"), Some("smpte170m"), Some("smpte170m"), None);
+        let sd = ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("smpte170m"), Some("smpte170m"), Some("smpte170m"), None);
         assert_eq!((sd.primaries, sd.transfer, sd.matrix, sd.range), (Primaries::Bt601_525, Transfer::Bt709, Matrix::Bt601, Range::Limited));
-        let pal = ColorInfo::from_ffprobe(1920, 1080, Some("bt470bg"), None, Some("bt470bg"), None);
+        let pal = ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("bt470bg"), None, Some("bt470bg"), None);
         assert_eq!((pal.primaries, pal.matrix), (Primaries::Bt601_625, Matrix::Bt601));
-        assert_eq!(ColorInfo::from_ffprobe(1920, 1080, None, Some("iec61966-2-1"), Some("gbr"), None).matrix, Matrix::Rgb);
+        assert_eq!(ColorInfo::from_ffprobe(1920, 1080, "yuv420p", None, Some("iec61966-2-1"), Some("gbr"), None).matrix, Matrix::Rgb);
     }
 
     #[test]
     fn unknown_or_missing_tags_fall_back_per_field() {
-        let c = ColorInfo::from_ffprobe(1920, 1080, Some("unknown"), None, Some("reserved"), Some("unknown"));
+        let c = ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("unknown"), None, Some("reserved"), Some("unknown"));
         assert_eq!(c, ColorInfo::guess_video(1920, 1080));
+    }
+
+    #[test]
+    fn untagged_rgb_formats_are_rgb_full_range() {
+        let argb = ColorInfo::from_ffprobe(1920, 1080, "argb", None, None, None, None);
+        assert_eq!((argb.matrix, argb.range, argb.alpha), (Matrix::Rgb, Range::Full, AlphaMode::Straight));
+        assert_eq!((argb.primaries, argb.transfer), (Primaries::Bt709, Transfer::Bt709), "primaries and transfer from the guess");
+        let rgb24 = ColorInfo::guess_video_format(720, 480, "rgb24");
+        assert_eq!((rgb24.matrix, rgb24.range, rgb24.alpha, rgb24.primaries), (Matrix::Rgb, Range::Full, AlphaMode::Opaque, Primaries::Bt601_525));
+        for f in ["rgba", "bgr24", "bgra", "abgr", "0rgb", "bgr0", "rgb48le", "gbrp10le", "gbrap", "x2rgb10le", "x2bgr10le", "pal8"] {
+            let c = ColorInfo::guess_video_format(1920, 1080, f);
+            assert_eq!((c.matrix, c.range), (Matrix::Rgb, Range::Full), "{f}");
+        }
+        let tagged_yuv = ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("bt709"), Some("bt709"), Some("bt709"), Some("tv"));
+        assert_eq!((tagged_yuv.matrix, tagged_yuv.range, tagged_yuv.alpha), (Matrix::Bt709, Range::Limited, AlphaMode::Opaque));
+        assert_eq!(ColorInfo::guess_video_format(1920, 1080, "yuv420p"), ColorInfo::guess_video(1920, 1080), "untagged YUV unaffected");
     }
 
     #[test]
