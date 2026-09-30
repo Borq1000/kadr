@@ -49,7 +49,10 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
             } else {
                 app.preview.perf.summary()
             };
-            Reply::Now(Ok(crate::perf_view::summary_json(&summary)))
+            let mut v = crate::perf_view::summary_json(&summary);
+            // Numbers of the two backends differ in meaning (see docs/mcp.md): say which.
+            v["renderer"] = app.preview.kind.name().into();
+            Reply::Now(Ok(v))
         }
         "get_frame" => match ms(&p, "at_ms") {
             Some(t) => {

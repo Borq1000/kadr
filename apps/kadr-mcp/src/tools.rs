@@ -58,8 +58,8 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "get_perf",
-            "Preview performance over the last frames (up to 600): percentiles (ms) of frame time, decode, composite and present; dropped frames (late or superseded); seek latency from a playhead change to the frame shown; frame-sized allocations and copies per frame. `reset: true` clears the window after reading, so the next read measures only what happens afterwards.",
-            json!({"reset": {"type": "boolean", "description": "Clear the window after reading."}}),
+            "Preview performance over the last frames (up to 600): percentiles (ms) of frame time, decode, composite and present; dropped frames (late or superseded) in the window, plus `total_frames`/`total_dropped`/`dropped_pct` since the last reset; seek latency from a playhead change to the frame shown; frame-sized allocations and copies per frame; `renderer` (`cpu` or `legacy`). With `cpu`, present is the hand-off of the finished buffer to the UI thread (no copy) and a copy means the display still held a ring buffer. `reset: true` reads and clears the window and the totals at once, so the next read measures only what happens afterwards.",
+            json!({"reset": {"type": "boolean", "description": "Clear the window and the totals after reading."}}),
             &[],
         ),
         tool(
