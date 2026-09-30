@@ -6,6 +6,11 @@
 
 **Exit criterion (stage table):** full test suite green; no perf regression > 10 % vs the M4/M5 numbers.
 
+## Also (from the M4 review)
+
+- `EditCommand::AddTransition` snaps `at` to the cut it names: when `|at − boundary| ≤ half a frame` for exactly one adjacent clip pair on the track (their `timeline_out`/`timeline_in`), it snaps there; otherwise it stays as given (the evaluator's stale rule still applies). UI paths are already exact; this makes MCP clients with ms-rounded times work. Test both sides.
+- `docs/mcp.md`: `AddTransition` documents the snap.
+
 ## Delete
 
 - `kadr-media`: `VideoLook`, `look_filter`, the video half of `build_graph` and the legacy `export::run`, `ExportPlan`/`ExportVideo`/`ExportVideoSource`/`ExportTransition*`, `MediaBackend::export`; `StreamRequest.look` and `px_scale` (the stream keeps scaling + letterbox for video analysis, the only remaining user). Keep `ExportAudio`, `ExportSettings`, the audio graph and the encoder.
