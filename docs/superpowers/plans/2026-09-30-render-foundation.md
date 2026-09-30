@@ -24,6 +24,8 @@ Detailed tasks below cover **M0 and M1**. The plans for M2–M6 are written when
 | M5 Export switch | `ExportRunner` → rawvideo stdin encoder; audio still via the FFmpeg audio graph | PSNR ≥ 40 dB vs legacy export on a single-track reference; A/V sync test (20 min, ≥ 50 cuts, ≥ 10 transitions) within ±1 frame; export fps 1080p/4K vs M0 |
 | M6 Remove legacy | Delete `look_filter`, video part of `build_graph`, `StreamRequest.look`, `video_at`-driven preview | Full test suite green; no perf regression > 10 % vs M4/M5 numbers |
 
+**Status:** M0 and M1 are done; M2–M5 are done (numbers: [M2](../../perf/2026-09-30-m2-render.md), [M3](../../perf/2026-09-30-m3-playback.md), [M5](../../perf/2026-09-30-m5-export.md); M4 is recorded in its plan, `2026-09-30-render-foundation-m4.md`); M6 is done (legacy paths deleted, see `2026-09-30-render-foundation-m6.md`; its final measurements are still to come in `docs/perf/2026-09-30-m6-final.md`). The `KADR_RENDERER` switch from M4/M5 no longer exists: there is one CPU path.
+
 ## Global Constraints
 
 - Rust edition 2024, `rust-version = 1.88`; workspace dependencies only; **no new external crates in M0–M1**.
