@@ -265,6 +265,92 @@ fn invalid_jobs_are_rejected_before_anything_starts() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+// ---- 5. audio at sample 0 ------------------------------------------------------
+
+/// A 3 s clip (320×180, 25 fps) whose audio is a loud 1 kHz burst for the first
+/// 100 samples (~2 ms), silence after — plus the same burst at 1 s as a
+/// reference. Shorter than one AAC granule, so a dropped priming granule takes
+/// the whole first burst with it.
+fn burst_clip(dir: &Path) -> PathBuf {
+    let out = dir.join("burst.mp4");
+    let audio =
+        "aevalsrc=if(lt(n\\,100)\\,0.9*cos(2*PI*1000*n/48000)\\,if(between(n\\,48000\\,48099)\\,0.9*cos(2*PI*1000*(n-48000)/48000)\\,0)):s=48000:d=3";
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=320x180:rate=25:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        audio,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-g",
+        "25",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-shortest",
+        out.to_str().unwrap(),
+    ]);
+    out
+}
+
+/// Decodes `path`'s audio to mono 48 kHz f32.
+fn decode_audio(path: &Path) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "decode audio: {}", String::from_utf8_lossy(&out.stderr));
+    out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+}
+
+/// Audio that starts at sample 0 must survive the export. An input-side
+/// `-ss 0` made FFmpeg drop the source's AAC priming samples (about one
+/// granule) instead of reading from the beginning, silencing whatever starts
+/// at sample 0 — the missing click at t = 0 of the M5 A/V sync report
+/// (docs/perf/2026-09-30-m5-export.md §6).
+#[test]
+fn audio_starting_at_sample_zero_is_not_trimmed() {
+    let Some(ff) = backend() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let clip = burst_clip(dir.path());
+    let out = dir.path().join("out.mp4");
+    let audio = vec![ExportAudio {
+        path: clip,
+        source_start: Time::ZERO,
+        timeline_start: Time::ZERO,
+        duration: Time::from_secs(3),
+        speed: 1.0,
+        gain_db: 0.0,
+        pan: 0.0,
+        fade_in: Time::ZERO,
+        fade_out: Time::ZERO,
+    }];
+    let mut enc = ff.start_encode(&job(&out, 320, 180, FrameRate::FPS_25, 75, audio)).unwrap();
+    let frame = vec![0u8; (320 * 180 * 4) as usize];
+    for _ in 0..75 {
+        enc.write_frame(&frame).unwrap();
+    }
+    enc.finish().unwrap();
+
+    let samples = decode_audio(&out);
+    assert!(samples.len() >= 48_600, "only {} samples decoded", samples.len());
+    let peak = |from: usize, to: usize| samples[from..to].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let reference = peak(48_000, 48_600);
+    let head = peak(0, 480);
+    eprintln!("peak in the first 480 samples: {head:.3}, reference burst at 1 s: {reference:.3}");
+    assert!(reference > 0.3, "the reference burst at 1 s is missing (peak {reference:.3})");
+    assert!(head > 0.3, "audio at sample 0 was trimmed by the input-side seek (peak {head:.3} in the first 480 samples)");
+}
+
 #[test]
 fn a_dying_encoder_reports_ffmpegs_message_and_leaves_no_output() {
     let Some(ff) = backend() else { return };

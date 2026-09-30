@@ -203,7 +203,15 @@ pub(crate) fn audio_graph(audio: &[ExportAudio], first_input: usize, total: Time
         let n_in = first_input + i;
         let speed = if a.speed > 0.0 { a.speed } else { 1.0 };
         let src_dur = Time::from_secs_f64(a.duration.as_secs_f64() * speed) + Time::from_millis(500);
-        inputs.extend(["-ss".into(), a.source_start.max(Time::ZERO).to_ffmpeg_arg(), "-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
+        let start = a.source_start.max(Time::ZERO);
+        // No input seek at zero: FFmpeg's seek on an AAC/MP4 source drops the
+        // priming samples of the first granule, silencing audio that starts at
+        // sample 0 (the missing click at t = 0 of the M5 A/V sync report).
+        // Reading from the beginning needs no seek.
+        if start > Time::ZERO {
+            inputs.extend(["-ss".into(), start.to_ffmpeg_arg()]);
+        }
+        inputs.extend(["-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
         inputs.push(a.path.to_string_lossy().into_owned());
         let d = a.duration.as_secs_f64();
         let mut chain = format!("[{n_in}:a:0]asetpts=PTS-STARTPTS");
@@ -463,10 +471,13 @@ mod tests {
 
     /// Frozen output of the pre-refactor `build_graph` (audio half factored
     /// out into `audio_graph`): the legacy export must stay byte-identical.
+    /// The one deliberate change since: an audio clip whose `source_start` is
+    /// zero no longer carries an input `-ss 0` (the AAC priming-sample fix;
+    /// see `audio_graph`), so `b.wav`'s input has no `-ss`.
     #[test]
     fn build_graph_is_unchanged_with_audio() {
         let (inputs, graph) = build_graph(&sample_plan(true));
-        let expected_inputs: Vec<&str> = vec!["-ss", "1.000000", "-t", "3.266667", "-i", "v1.mp4", "-ss", "0.766667", "-t", "3.233333", "-i", "v2.mp4", "-ss", "2.000000", "-t", "1.250000", "-i", "a.wav", "-ss", "0.000000", "-t", "2.500000", "-i", "b.wav"];
+        let expected_inputs: Vec<&str> = vec!["-ss", "1.000000", "-t", "3.266667", "-i", "v1.mp4", "-ss", "0.766667", "-t", "3.233333", "-i", "v2.mp4", "-ss", "2.000000", "-t", "1.250000", "-i", "a.wav", "-t", "2.500000", "-i", "b.wav"];
         assert_eq!(inputs, expected_inputs);
         assert_eq!(graph, r#"[0:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,pad=640:360:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=68,setpts=PTS-STARTPTS[v0];
 [1:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,scale=trunc(iw*0.5000/2)*2:trunc(ih*0.5000/2)*2,format=rgba,rotate=0.26180:ow=rotw(0.26180):oh=roth(0.26180):c=none,colorchannelmixer=aa=0.8000,pad=w=iw+720:h=ih+360:x=(ow-iw)/2+40:y=(oh-ih)/2+0:color=black@0,crop=640:360:(iw-640)/2:(ih-360)/2,premultiply=inplace=1,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=67,setpts=PTS-STARTPTS[v1];
@@ -495,5 +506,31 @@ color=c=black:s=640x360:r=30/1,format=yuv420p,trim=end_frame=60,setpts=PTS-START
 [x1][v2]concat=n=2:v=1:a=0,fps=30/1[vout];
 anullsrc=r=48000:cl=stereo,atrim=duration=6.000000[aout]
 "#);
+    }
+
+    /// An audio input whose `source_start` is zero (or negative) reads from
+    /// the beginning: no input seek, so the source's AAC priming samples are
+    /// handled by its edit list instead of being dropped. Any nonzero start
+    /// still seeks.
+    #[test]
+    fn audio_input_at_source_zero_has_no_seek_and_a_nonzero_one_does() {
+        let clip = |source_start: Time| ExportAudio {
+            path: "a.wav".into(),
+            source_start,
+            timeline_start: Time::ZERO,
+            duration: Time::from_secs(1),
+            speed: 1.0,
+            gain_db: 0.0,
+            pan: 0.0,
+            fade_in: Time::ZERO,
+            fade_out: Time::ZERO,
+        };
+        for start in [Time::ZERO, Time::from_millis(-500)] {
+            let (inputs, graph) = audio_graph(&[clip(start)], 0, Time::from_secs(2), 48_000);
+            assert_eq!(inputs, vec!["-t", "1.500000", "-i", "a.wav"], "source_start {start:?}");
+            assert!(graph.starts_with("[0:a:0]asetpts"), "{graph}");
+        }
+        let (inputs, _) = audio_graph(&[clip(Time::from_millis(250))], 0, Time::from_secs(2), 48_000);
+        assert_eq!(inputs, vec!["-ss", "0.250000", "-t", "1.500000", "-i", "a.wav"]);
     }
 }
