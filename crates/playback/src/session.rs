@@ -170,8 +170,9 @@ struct Worker {
     opened_at: i64,
     /// The target the stream was opened for: read forward to it whatever the window.
     open_for: i64,
-    /// Set by `Open`: the first frame's decode time includes the open.
-    open_started: Option<Instant>,
+    /// Set by `Open` to what the open took: the first frame's decode time
+    /// includes it (not the time the open stream then waited for work).
+    open_cost: Option<Duration>,
     /// After a stream ended without a single frame: open this far before the target.
     back: i64,
     est_open: Option<f64>,
@@ -194,7 +195,7 @@ impl Worker {
             pos: 0,
             opened_at: 0,
             open_for: 0,
-            open_started: None,
+            open_cost: None,
             back: 0,
             est_open: None,
             est_frame: None,
@@ -278,7 +279,7 @@ impl Worker {
                 self.pos = start;
                 self.opened_at = start;
                 self.open_for = target;
-                self.open_started = Some(t0);
+                self.open_cost = Some(t0.elapsed());
             }
             Err(e) => self.fail(e, target),
         }
@@ -287,12 +288,12 @@ impl Worker {
     fn read(&mut self) {
         let Some(stream) = self.stream.as_mut() else { return };
         let mut frame = CpuFrame::rgba8(&self.env.pool, self.key.size.w, self.key.size.h, self.color);
-        let with_open = self.open_started.take();
-        let t0 = with_open.unwrap_or_else(Instant::now);
+        let open_cost = self.open_cost.take();
+        let t0 = Instant::now();
         match stream.read_into(&mut frame.data) {
             Ok(true) => {
-                let spent = t0.elapsed();
-                let est = if with_open.is_some() { &mut self.est_open } else { &mut self.est_frame };
+                let spent = t0.elapsed() + open_cost.unwrap_or_default();
+                let est = if open_cost.is_some() { &mut self.est_open } else { &mut self.est_frame };
                 *est = Some(est.map_or(spent.as_secs_f64(), |p| p * 0.8 + spent.as_secs_f64() * 0.2));
                 let key = self.frame_key(self.pos);
                 self.pos += 1;

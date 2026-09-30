@@ -463,3 +463,30 @@ fn a_relink_during_a_decode_never_serves_the_old_files_frame_or_failure() {
     let (inputs, _) = prepare(&r, &s, &source(vec![(b, good)]), Mode::Export);
     assert_eq!(which(&inputs.layers[0]), (4, 0), "the old file's failure is not the new file's");
 }
+
+/// The decode time of the first frame after an open is the open plus that
+/// frame — not the time the open stream then sat idle (a scrub moved on
+/// during the open and came back later).
+#[test]
+fn decode_time_excludes_idle_time_after_an_open() {
+    let fake = fake(40, 1);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = Arc::new(source(vec![(a, m.clone())]));
+    let r = Arc::new(resolver(&fake, ResolverConfig::default()));
+    let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(100), CANVAS)]);
+    // Superseded while the stream opens: the open completes, its frame is not read.
+    let waiter = {
+        let (r, src, s) = (r.clone(), src.clone(), s.clone());
+        std::thread::spawn(move || prepare(&r, &s, &*src, Mode::Scrub { generation: 1 }).0)
+    };
+    std::thread::sleep(ms(10));
+    r.supersede(2);
+    assert!(matches!(waiter.join().unwrap().layers[0], LayerInput::Missing(MissingReason::NotReady)));
+    std::thread::sleep(ms(400));
+    let (inputs, perf) = prepare(&r, &s, &*src, Mode::Scrub { generation: 3 });
+    assert_eq!(which(&inputs.layers[0]), (1, 100));
+    assert_eq!(fake.opens(), 1, "the stream opened for the first request serves the second");
+    assert!(perf.decode[0].time < ms(250), "open + one frame, not the idle time since: {:?}", perf.decode[0].time);
+}
