@@ -47,14 +47,18 @@ impl Renderer for CpuRenderer {
         let scene = frame.scene;
         let RenderTarget::Cpu(t) = target;
         let (w, h) = (scene.output.size.w, scene.output.size.h);
-        let needed = if h == 0 { 0 } else { (h as usize - 1) * t.stride + w as usize * 4 };
-        if t.width != w || t.height != h || t.stride < w as usize * 4 || t.data.len() < needed {
+        if t.width != w || t.height != h || !fits(w, h, t.stride, t.data.len()) {
             return Err(RenderError::TargetMismatch { expected: (w, h), got: (t.width, t.height) });
         }
         check_inputs(&scene.layers, &frame.inputs.layers, "")?;
 
-        let grid = Grid::new(scene);
         let mut stats = RenderStats::default();
+        // No pixels: nothing to draw (and a zero stride would be a zero chunk size for the row split).
+        if w == 0 || h == 0 {
+            stats.composite = start.elapsed();
+            return Ok(stats);
+        }
+        let grid = Grid::new(scene);
         fill_base(t.data, t.stride, &grid, premul(scene.background));
         for (layer, input) in scene.layers.iter().zip(&frame.inputs.layers) {
             match self.draw_layer(t.data, t.stride, &grid, layer, input) {
@@ -102,10 +106,19 @@ fn check_inputs(layers: &[Layer], inputs: &[LayerInput], within: &'static str) -
     Ok(())
 }
 
+/// Whether `len` bytes hold `h` rows of `w` RGBA8 pixels, `stride` bytes apart.
+fn fits(w: u32, h: u32, stride: usize, len: usize) -> bool {
+    let row = w as usize * 4;
+    let needed = match (h as usize).checked_sub(1) {
+        None => Some(0),
+        Some(rows) => rows.checked_mul(stride).and_then(|n| n.checked_add(row)),
+    };
+    stride >= row && needed.is_some_and(|n| n <= len)
+}
+
 fn check_frame(f: &CpuFrame) -> Result<(), String> {
-    let (w, h) = (f.width as usize, f.height as usize);
-    if w == 0 || h == 0 || f.stride < w * 4 || f.data.len() < (h - 1) * f.stride + w * 4 {
-        return Err(format!("a {w}x{h} frame with stride {} has {} bytes", f.stride, f.data.len()));
+    if f.width == 0 || f.height == 0 || !fits(f.width, f.height, f.stride, f.data.len()) {
+        return Err(format!("a {}x{} frame with stride {} has {} bytes", f.width, f.height, f.stride, f.data.len()));
     }
     Ok(())
 }
@@ -998,6 +1011,30 @@ mod tests {
         assert!(matches!(go(&t, vec![nested_wrong], 4, 64), Err(RenderError::InputMismatch(_))));
         assert!(matches!(go(&t, vec![LayerInput::None], 4, 64), Err(RenderError::InputMismatch(_))));
         assert!(go(&t, vec![LayerInput::Transition { from: vec![LayerInput::None], to: vec![] }], 4, 64).is_ok());
+    }
+
+    #[test]
+    fn empty_outputs_and_absurd_strides_are_handled_without_panics() {
+        let c = SizeU::new(4, 4);
+        let t = transition(TransitionOp::Dissolve, 0.5, c, vec![solid(RED, Placement::fill(c))], vec![]);
+        let inputs = RenderInputs { layers: vec![LayerInput::Transition { from: vec![LayerInput::None], to: vec![] }] };
+        let mut r = CpuRenderer::new();
+        for (w, h) in [(0, 5), (5, 0), (0, 0)] {
+            let s = scene((4, 4), (w, h), Rgba::BLACK, vec![t.clone()]);
+            let target = CpuTarget { width: w, height: h, stride: w as usize * 4, data: &mut [] };
+            let stats = r.render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(target)).unwrap();
+            assert_eq!(stats.layers_drawn, 0, "{w}x{h}");
+        }
+        let s = scene((4, 4), (4, 4), Rgba::BLACK, vec![]);
+        let mut buf = [0u8; 64];
+        let target = CpuTarget { width: 4, height: 4, stride: usize::MAX / 2, data: &mut buf };
+        let empty = RenderInputs::default();
+        assert!(matches!(r.render(&PreparedFrame { scene: &s, inputs: &empty }, &mut RenderTarget::Cpu(target)), Err(RenderError::TargetMismatch { .. })));
+        let mut f = CpuFrame::from_rgba8(1, 2, ColorInfo::WORKING_SDR, vec![0; 8]);
+        f.stride = usize::MAX / 2;
+        let s = scene((4, 4), (4, 4), Rgba::BLACK, vec![media(Placement::fill(c))]);
+        let inputs = RenderInputs { layers: vec![LayerInput::Cpu(Arc::new(f))] };
+        assert!(matches!(r.render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(4, 4, &mut buf))), Err(RenderError::InputMismatch(_))));
     }
 
     #[test]
