@@ -29,13 +29,30 @@ pub struct VideoInfo {
     /// Sample (pixel) aspect ratio; (1, 1) for square pixels.
     #[serde(default = "square_pixels")]
     pub sar: (u32, u32),
-    /// Colour metadata from probe; `None` for projects saved before it was read.
-    #[serde(default)]
+    /// Colour metadata from probe; `None` for projects saved before it was
+    /// read, or when the stored value cannot be read (then it is guessed).
+    #[serde(default, deserialize_with = "lenient_color")]
     pub color: Option<ColorInfo>,
 }
 
 fn square_pixels() -> (u32, u32) {
     (1, 1)
+}
+
+/// A stored colour this build cannot read (a value from a newer format, a
+/// missing field) becomes `None`, so the colour is guessed again instead of
+/// the whole project failing to load.
+fn lenient_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ColorInfo>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Readable(ColorInfo),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(match Stored::deserialize(d)? {
+        Stored::Readable(c) => Some(c),
+        Stored::Unreadable(_) => None,
+    })
 }
 
 impl VideoInfo {
@@ -142,6 +159,34 @@ mod tests {
         let prores_4444 = VideoInfo { pixel_format: "yuva444p10le".into(), ..video(1920, 1080, (1, 1), 0) };
         let c = prores_4444.color_info();
         assert_eq!((c.alpha, c.matrix), (AlphaMode::Straight, Matrix::Bt709), "alpha from the pixel format, the rest guessed");
+    }
+
+    #[test]
+    fn stored_colour_names_are_pinned() {
+        use crate::color::{Primaries, Range, Transfer};
+        let json = r#"{"primaries":"bt709","transfer":"bt709","matrix":"bt709","range":"limited","alpha":"opaque"}"#;
+        let c: ColorInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(c, ColorInfo { primaries: Primaries::Bt709, transfer: Transfer::Bt709, matrix: Matrix::Bt709, range: Range::Limited, alpha: AlphaMode::Opaque });
+        assert_eq!(serde_json::to_string(&c).unwrap(), json);
+    }
+
+    #[test]
+    fn unreadable_stored_colour_falls_back_to_the_guess() {
+        let base = r#""width":1920,"height":1080,"frame_rate":null,"variable_frame_rate":false,"codec":"h264","pixel_format":"yuv420p","rotation":0,"sar":[1,1]"#;
+        for colour in [
+            r#"{"primaries":"future_thing","transfer":"bt709","matrix":"bt709","range":"limited","alpha":"opaque"}"#,
+            r#"{"primaries":"bt709","transfer":"bt709","matrix":"bt709","range":"limited"}"#,
+            r#""bt709""#,
+        ] {
+            let v: VideoInfo = serde_json::from_str(&format!("{{{base},\"color\":{colour}}}")).unwrap_or_else(|e| panic!("{colour}: {e}"));
+            assert_eq!(v.color, None, "{colour}");
+            assert_eq!(v.color_info(), ColorInfo::guess_video(1920, 1080));
+        }
+        let v: VideoInfo = serde_json::from_str(&format!("{{{base},\"color\":null}}")).unwrap();
+        assert_eq!(v.color, None);
+        let tagged = r#"{"primaries":"bt709","transfer":"bt709","matrix":"bt709","range":"full","alpha":"opaque"}"#;
+        let v: VideoInfo = serde_json::from_str(&format!("{{{base},\"color\":{tagged}}}")).unwrap();
+        assert_eq!(v.color.map(|c| c.range), Some(crate::color::Range::Full), "a readable colour is kept");
     }
 
     #[test]
