@@ -44,11 +44,12 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
             }
         }
         "get_perf" => {
-            let v = crate::perf_view::summary_json(&app.preview.perf.summary());
-            if p.get("reset").and_then(Value::as_bool) == Some(true) {
-                app.preview.perf.clear();
-            }
-            Reply::Now(Ok(v))
+            let summary = if p.get("reset").and_then(Value::as_bool) == Some(true) {
+                app.preview.perf.take_summary()
+            } else {
+                app.preview.perf.summary()
+            };
+            Reply::Now(Ok(crate::perf_view::summary_json(&summary)))
         }
         "get_frame" => match ms(&p, "at_ms") {
             Some(t) => {

@@ -11,7 +11,7 @@ use crate::app::{post, App};
 use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
 use kadr_audio::{AudioClock, MixSource};
-use kadr_core::perf::{FramePerf, LayerTiming, PerfRing};
+use kadr_core::perf::{FramePerf, LayerTiming, PerfRing, PERF_RING_FRAMES};
 use kadr_core::{FrameRate, Time, TimeRange};
 use kadr_media::export::VideoLook;
 use kadr_media::{MediaBackend, RgbaFrame, StreamRequest};
@@ -76,7 +76,7 @@ impl PreviewController {
     pub fn new(media: Option<Arc<dyn MediaBackend>>, clock: AudioClock) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let generation = Arc::new(AtomicU64::new(0));
-        let perf = Arc::new(PerfRing::new(600));
+        let perf = Arc::new(PerfRing::new(PERF_RING_FRAMES));
         if let Some(m) = media {
             let g = generation.clone();
             let p = perf.clone();
