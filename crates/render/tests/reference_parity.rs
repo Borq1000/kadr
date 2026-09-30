@@ -227,6 +227,27 @@ fn sanity_missing_media_is_drawn_as_missing_colour_and_singular_placement_draws_
 }
 
 #[test]
+fn sanity_empty_crops_and_non_positive_sizes_draw_nothing() {
+    let cv = (4, 4);
+    let white = rgba(1.0, 1.0, 1.0, 1.0);
+    let mut inverted = solid(cv, white);
+    inverted.crop = RectF::new(4.0, 0.0, 0.0, 4.0);
+    let mut sizeless = solid(cv, white);
+    sizeless.placement.size.x = 0.0;
+    sizeless.placement.anchor = Vec2::new(0.0, 0.0);
+    sizeless.placement.position = Vec2::new(0.0, 0.0);
+    for l in [inverted, sizeless] {
+        let s = scene(cv, cv, Rgba::BLACK, vec![l.clone()]);
+        let expected = [0, 0, 0, 255].repeat(16);
+        assert_eq!(reference_of(&s), expected, "{:?}", (l.crop, l.placement.size));
+        let mut out = vec![0; 64];
+        let inputs = RenderInputs { layers: vec![LayerInput::None] };
+        CpuRenderer::new().render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(4, 4, &mut out))).unwrap();
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
 fn sanity_layer_edge_coverage_is_antialiased_over_one_pixel() {
     // A 8×8 white square whose right edge lies half way through pixel 5: coverage 0.5 there.
     let cv = (8, 8);
@@ -337,6 +358,8 @@ impl Gen {
         let random_mode = [AlphaMode::Opaque, AlphaMode::Straight, AlphaMode::Premultiplied][self.rng.int(0, 2) as usize];
         let mode = forced.unwrap_or(random_mode);
         let flat = self.rng.chance(0.15).then(|| [self.rng.byte(), self.rng.byte(), self.rng.byte(), self.rng.byte()]);
+        // Premultiplied texels brighter than their alpha ("additive", including rgb > 0 at a = 0) now and then.
+        let additive = mode == AlphaMode::Premultiplied && self.rng.chance(0.15);
         let mut data = Vec::with_capacity((w * h * 4) as usize);
         for _ in 0..w * h {
             let (r, g, b) = match flat {
@@ -353,7 +376,7 @@ impl Gen {
             };
             match mode {
                 // Premultiplied texels must have rgb ≤ a.
-                AlphaMode::Premultiplied => data.extend([(r as u32 * a as u32 / 255) as u8, (g as u32 * a as u32 / 255) as u8, (b as u32 * a as u32 / 255) as u8, a]),
+                AlphaMode::Premultiplied if !additive => data.extend([(r as u32 * a as u32 / 255) as u8, (g as u32 * a as u32 / 255) as u8, (b as u32 * a as u32 / 255) as u8, a]),
                 _ => data.extend([r, g, b, a]),
             }
         }
@@ -403,6 +426,9 @@ impl Gen {
             if r.chance(0.015) {
                 return 0.0f32; // singular: the layer draws nothing
             }
+            if r.chance(0.01) {
+                return 1e-6; // squeezed to a sliver, but invertible
+            }
             let mag = if r.chance(0.2) { 1.0 } else { r.range(0.1, 2.0) } as f32;
             if r.chance(0.15) { -mag } else { mag }
         };
@@ -419,7 +445,9 @@ impl Gen {
     fn crop(&mut self, size: Vec2) -> RectF {
         let (w, h) = (size.x as f64, size.y as f64);
         let r = &mut self.rng;
-        match r.int(0, 19) {
+        match r.int(0, 20) {
+            // Empty (inverted): draws nothing.
+            20 => RectF::new(size.x * 0.7, 0.0, size.x * 0.3, size.y),
             0..=7 => RectF::new(0.0, 0.0, size.x, size.y),
             8..=16 => {
                 let (x0, y0) = (r.range(0.0, 0.8), r.range(0.0, 0.8));
@@ -475,8 +503,11 @@ impl Gen {
             let layer = Layer { id: self.id(), content: LayerContent::Media { media, source_time: Time::ZERO }, crop, placement, opacity, blend, effects };
             return (layer, LayerInput::Cpu(frame));
         }
-        let placement = self.placement();
+        let mut placement = self.placement();
         let crop = self.crop(placement.size);
+        if self.rng.chance(0.01) {
+            placement.size.y = 0.0; // with a non-empty crop still: draws nothing
+        }
         let (opacity, blend, effects) = (self.opacity(), self.blend(0.6), self.effects());
         let (content, input) = if kind < 0.65 {
             let (w, h) = (self.rng.int(1, 64), self.rng.int(1, 64));

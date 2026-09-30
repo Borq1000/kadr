@@ -164,6 +164,11 @@ impl Grid {
     fn canvas_to_output(&self) -> Affine2 {
         Affine2 { a: self.k, b: 0.0, c: 0.0, d: self.k, tx: self.ox, ty: self.oy }
     }
+
+    /// The inverse of [`Grid::canvas_to_output`] (`k > 0` whenever the grid is not empty).
+    fn output_to_canvas(&self) -> Affine2 {
+        Affine2 { a: 1.0 / self.k, b: 0.0, c: 0.0, d: 1.0 / self.k, tx: -self.ox / self.k, ty: -self.oy / self.k }
+    }
 }
 
 /// The pixels `i` of `0..n` whose centre `i + 0.5` lies in `[lo, hi]` (the
@@ -336,13 +341,17 @@ fn index_in(v: f64, lo: usize, hi: usize) -> usize {
 
 impl Plan {
     fn new(g: &Grid, layer: &Layer) -> Option<Plan> {
-        let crop = layer.crop;
-        // Opacity 0 and an empty crop both leave every pixel as it is.
-        if g.is_empty() || layer.opacity == 0.0 || crop.is_empty() {
+        let (crop, size) = (layer.crop, layer.placement.size);
+        // Opacity 0 leaves every pixel as it is; an empty crop, a non-positive size and a singular
+        // transform draw nothing by the contract.
+        if g.is_empty() || layer.opacity == 0.0 || crop.is_empty() || !(size.x > 0.0 && size.y > 0.0) {
             return None;
         }
-        let m = g.canvas_to_output().after(&layer.placement.to_canvas());
-        let inv = m.inverse()?;
+        // Whether the layer has an inverse is the placement's (the contract's) call, not that of the
+        // output map composed with it, which scales the determinant by k².
+        let to_canvas = layer.placement.to_canvas();
+        let m = g.canvas_to_output().after(&to_canvas);
+        let inv = to_canvas.inverse()?.after(&g.output_to_canvas());
         let (x0, y0, x1, y1) = (crop.x0 as f64, crop.y0 as f64, crop.x1 as f64, crop.y1 as f64);
         // local.x = inv.a·x + inv.c·y + inv.tx, so its level lines are |∇| = hypot(inv.a, inv.c) apart per output pixel.
         let (gx, gy) = (inv.a.hypot(inv.c), inv.b.hypot(inv.d));
@@ -521,11 +530,8 @@ fn whole(v: f64) -> Option<isize> {
 }
 
 fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &CpuFrame) -> Drawn {
-    let size = layer.placement.size;
-    if !(size.x > 0.0 && size.y > 0.0) {
-        return Drawn::Nothing;
-    }
     let Some(mut plan) = Plan::new(g, layer) else { return Drawn::Nothing };
+    let size = layer.placement.size;
     let (tw, th) = (frame.width as f64, frame.height as f64);
     let (sx, sy) = (size.x as f64, size.y as f64);
     plan.tex = Affine2::scale(tw / sx, th / sy).after(&plan.inv);
@@ -1053,6 +1059,29 @@ mod tests {
             assert_eq!(stats.layers_drawn, 1);
         }
         assert_eq!(r.pool_allocations(), warm);
+    }
+
+    #[test]
+    fn layers_without_a_positive_size_draw_nothing_whatever_their_content() {
+        // The contract's "non-positive size" rule holds for solids and missing media too, not only for frames.
+        let p = Placement { size: Vec2::new(0.0, 4.0), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(0.0, 0.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+        let crop = RectF::new(0.0, 0.0, 4.0, 4.0);
+        let mut white = solid(WHITE, p);
+        let mut missing = media(p);
+        (white.crop, missing.crop) = (crop, crop);
+        let s = scene((4, 4), (4, 4), Rgba::BLACK, vec![white, missing]);
+        let out = render(&s, vec![LayerInput::None, LayerInput::Missing(MissingReason::Offline)]);
+        assert!(out.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]), "{:?}", &out[..8]);
+    }
+
+    #[test]
+    fn invertibility_is_the_placements_not_the_output_maps() {
+        // A layer squeezed to 1e-9 of its height is invertible (det 1e-9) and lies across row 0's centres, so it
+        // covers them by half; composed with k = 0.01 the determinant would be 1e-13, below `Affine2::inverse`'s cut-off.
+        let p = Placement { size: Vec2::new(1000.0, 1000.0), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(0.0, 50.0), scale: Vec2::new(1.0, 1e-9), rotation: 0.0 };
+        let out = render(&scene((1000, 1000), (10, 10), Rgba::BLACK, vec![solid(WHITE, p)]), vec![LayerInput::None]);
+        assert_eq!(px(&out, 10, 3, 0), [128, 128, 128, 255]);
+        assert_eq!(px(&out, 10, 3, 1), [0, 0, 0, 255]);
     }
 
     #[test]

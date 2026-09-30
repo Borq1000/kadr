@@ -179,6 +179,12 @@ enum Source<'a> {
 }
 
 fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
+    // "A layer draws nothing when its crop is empty, its placement.size has a non-positive side, or its
+    // transform has no inverse."
+    let size = layer.placement.size;
+    if layer.crop.is_empty() || !(size.x > 0.0 && size.y > 0.0) {
+        return;
+    }
     let fwd = layer.placement.to_canvas();
     let Some(inv) = fwd.inverse() else { return };
     let source = match (&layer.content, input) {
@@ -281,8 +287,9 @@ fn apply_effects(effects: &[Effect], s: Px) -> Px {
         return s;
     }
     let a = s[3];
-    if a <= 0.0 {
-        return [0.0; 4];
+    // "A sample with a = 0 stays as it is (the chain is skipped)."
+    if a == 0.0 {
+        return s;
     }
     let mut c = [s[0] / a, s[1] / a, s[2] / a];
     for e in effects {
