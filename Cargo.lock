@@ -3032,6 +3032,7 @@ name = "kadr-project-scenes"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
+ "kadr-media",
  "kadr-playback",
  "kadr-project",
  "kadr-scene",

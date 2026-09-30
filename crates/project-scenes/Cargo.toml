@@ -13,4 +13,5 @@ kadr-scene = { path = "../scene" }
 kadr-playback = { path = "../playback" }
 
 [dev-dependencies]
+kadr-media = { path = "../media" }
 tempfile.workspace = true
