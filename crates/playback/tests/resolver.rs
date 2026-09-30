@@ -4,9 +4,9 @@ use kadr_core::perf::FramePerf;
 use kadr_core::{AssetId, CpuFrame, FrameRate, Time};
 use kadr_playback::testing::{media_layer, read_fake_pixel, video_source, FakeDecoders, FakeMedia, FnSceneSource};
 use kadr_playback::{MediaSource, Mode, Resolver, ResolverConfig, SceneSource};
-use kadr_render::{LayerInput, MissingReason, RenderInputs};
+use kadr_render::{CpuRenderer, CpuTarget, LayerInput, MissingReason, PreparedFrame, RenderInputs, RenderTarget, Renderer};
 use kadr_scene::{
-    BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, RenderQuality, Rgba, SizeU, SourceKind, TransitionLayer, TransitionOp,
+    BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, RectF, RenderQuality, Rgba, SizeU, SourceKind, TransitionLayer, TransitionOp, Vec2,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,13 +273,112 @@ fn a_failing_decoder_is_missing_and_not_retried_in_a_loop() {
     let started = Instant::now();
     let (inputs, _) = prepare(&r, &s, &src, Mode::Export);
     assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)));
-    assert!(started.elapsed() < ms(500), "Export does not wait forever on a failure");
+    let waited = started.elapsed();
+    // Export retries after 50, 200 and 500 ms, then gives up.
+    assert!(waited >= ms(750) && waited < ms(2000), "Export retries a bounded number of times: {waited:?}");
+    assert_eq!(fake.open_calls(), 4, "the first open and three retries");
+    // Preview: the failure is remembered, nothing is retried.
     for g in 1..20 {
+        let t0 = Instant::now();
         let (inputs, _) = prepare(&r, &s, &src, Mode::Scrub { generation: g });
         assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)));
+        assert!(t0.elapsed() < ms(50), "answered at once: {:?}", t0.elapsed());
     }
     std::thread::sleep(ms(50));
+    assert_eq!(fake.open_calls(), 4, "scrubbing did not retry");
     assert_eq!(r.stats().streams_opened, 0);
+    // Export gave up on this media: a later frame is tried once, without retries.
+    let t0 = Instant::now();
+    let (inputs, _) = prepare(&r, &scene(vec![media_layer(1, a, &m, Time::from_secs(1), CANVAS)]), &src, Mode::Export);
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)));
+    assert!(t0.elapsed() < ms(300), "{:?}", t0.elapsed());
+    assert_eq!(fake.open_calls(), 5);
+}
+
+/// A transient failure: preview reports it (and keeps reporting it for a
+/// while without retrying); export, in that same window, reopens the
+/// stream at the frame and gets it.
+#[test]
+fn export_retries_a_transient_failure_that_preview_reports() {
+    let fake = fake(1, 0);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    fake.fail_opens("a.mp4", 1);
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = source(vec![(a, m.clone())]);
+    let r = resolver(&fake, ResolverConfig::default());
+    let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(10), CANVAS)]);
+    let (inputs, _) = prepare(&r, &s, &src, Mode::Scrub { generation: 1 });
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)));
+    let calls = fake.open_calls();
+    let t0 = Instant::now();
+    let (inputs, _) = prepare(&r, &s, &src, Mode::Scrub { generation: 2 });
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)), "within the 2 s window");
+    assert!(t0.elapsed() < ms(50), "{:?}", t0.elapsed());
+    assert_eq!(fake.open_calls(), calls, "preview does not retry");
+    let (inputs, _) = prepare(&r, &s, &src, Mode::Export);
+    assert_eq!(which(&inputs.layers[0]), (1, 10), "export is not short-circuited by the failure memory");
+
+    // Two failed reads in a row at another frame: two retries, then the frame.
+    fake.fail_reads("a.mp4", 2);
+    let t0 = Instant::now();
+    let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(900), CANVAS)]);
+    let (inputs, _) = prepare(&r, &s, &src, Mode::Export);
+    assert_eq!(which(&inputs.layers[0]), (1, 900));
+    let waited = t0.elapsed();
+    assert!(waited >= ms(250) && waited < ms(2000), "backoffs of 50 and 200 ms: {waited:?}");
+}
+
+/// Media layers inside a transition that draw nothing whatever their input
+/// (opacity 0, zero scale, empty crop, zero size) are never decoded; their
+/// input is a frame the renderer accepts and draws nothing with.
+#[test]
+fn invisible_layers_inside_a_transition_are_not_decoded() {
+    let fake = fake(1, 0);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    fake.add("bad.mp4", FakeMedia { tag: 2, frames: None, fail: true });
+    let (a, bad) = (AssetId::new(), AssetId::new());
+    let ma = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let mb = video_source("bad.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = source(vec![(a, ma.clone()), (bad, mb.clone())]);
+    let r = resolver(&fake, ResolverConfig::default());
+    let hidden = |id: u128, f: &dyn Fn(&mut Layer)| {
+        let mut l = media_layer(id, bad, &mb, Time::ZERO, CANVAS);
+        f(&mut l);
+        l
+    };
+    let t = TransitionLayer {
+        op: TransitionOp::Dissolve,
+        progress: 0.5,
+        from: vec![media_layer(1, a, &ma, Time::from_secs(10), CANVAS), hidden(2, &|l| l.opacity = 0.0), hidden(3, &|l| l.opacity = f32::NAN)],
+        to: vec![
+            hidden(4, &|l| l.placement.scale = Vec2::new(0.0, 1.0)),
+            hidden(5, &|l| l.crop = RectF::new(10.0, 0.0, 10.0, 36.0)),
+            hidden(6, &|l| l.placement.size = Vec2::new(0.0, 36.0)),
+        ],
+    };
+    let tl = Layer {
+        id: LayerId(9),
+        content: LayerContent::Transition(Box::new(t)),
+        placement: Placement::fill(CANVAS),
+        crop: Placement::fill(CANVAS).full_crop(),
+        opacity: 1.0,
+        blend: BlendMode::Normal,
+        effects: vec![],
+    };
+    let s = scene(vec![tl]);
+    let (inputs, perf) = prepare(&r, &s, &src, Mode::Export);
+    let LayerInput::Transition { from, to } = &inputs.layers[0] else { panic!("{:?}", inputs.layers[0]) };
+    assert_eq!(which(&from[0]), (1, 250));
+    for input in from[1..].iter().chain(to) {
+        let f = frame_of(input);
+        assert_eq!((f.width, f.height), (1, 1), "a blank frame, not a decode");
+    }
+    assert_eq!(fake.open_calls(), 1, "only the visible layer was decoded");
+    assert_eq!(perf.decode.len(), 1);
+    let mut buf = vec![0u8; CANVAS.w as usize * CANVAS.h as usize * 4];
+    let mut target = RenderTarget::Cpu(CpuTarget::packed(CANVAS.w, CANVAS.h, &mut buf));
+    CpuRenderer::new().render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut target).expect("the renderer accepts the blank inputs");
 }
 
 #[test]

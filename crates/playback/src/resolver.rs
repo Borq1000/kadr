@@ -9,13 +9,14 @@ use crate::decoders::Decoders;
 use crate::session::{Counters, Env, Session, SessionKey, Work};
 use crate::source::{MediaSource, SceneSource};
 use kadr_core::perf::{FramePerf, LayerTiming};
-use kadr_core::{AssetId, FramePool, Time};
+use kadr_core::color::AlphaMode;
+use kadr_core::{AssetId, ColorInfo, CpuFrame, FramePool, Time};
 use kadr_render::{LayerInput, MissingReason, RenderInputs};
 use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, Placement, SizeU, SourceKind};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -37,9 +38,15 @@ pub struct ResolverConfig {
     pub readahead: Time,
     /// A session without work for this long closes (its process exits).
     pub idle_close: Duration,
-    /// After a decode failure, requests for that media answer `DecodeFailed`
-    /// at once for this long instead of retrying.
+    /// Preview modes: after a decode failure, requests for that media answer
+    /// `DecodeFailed` at once for this long instead of retrying (no retry
+    /// storms while scrubbing or playing). [`Mode::Export`] ignores it.
     pub retry_failed_after: Duration,
+    /// [`Mode::Export`]: after a failed decode of a frame, wait this long
+    /// and reopen the stream at that frame, once per entry, before
+    /// answering `DecodeFailed`. A media that used up its retries is tried
+    /// once per later frame (no retries) until a frame of it decodes again.
+    pub export_retry_backoff: Vec<Duration>,
     /// A session claimed by a layer this recently is not taken by another
     /// layer (or by prefetch) unless the scene needs it at the same frame.
     pub claim_hold: Duration,
@@ -56,6 +63,7 @@ impl Default for ResolverConfig {
             readahead: Time::from_millis(500),
             idle_close: Duration::from_secs(5),
             retry_failed_after: Duration::from_secs(2),
+            export_retry_backoff: vec![Duration::from_millis(50), Duration::from_millis(200), Duration::from_millis(500)],
             claim_hold: Duration::from_millis(500),
         }
     }
@@ -71,7 +79,9 @@ pub enum Mode {
     /// Playback: frames not ready by the deadline are `Missing(NotReady)`.
     /// Sessions read ahead.
     Deadline(Instant),
-    /// Wait for every frame, never drop (use a resolver of its own: nothing supersedes it).
+    /// Wait for every frame, never drop (use a resolver of its own: nothing
+    /// supersedes it). A failed decode is retried (see
+    /// [`ResolverConfig::export_retry_backoff`]) before it is `DecodeFailed`.
     Export,
 }
 
@@ -121,6 +131,11 @@ struct Req {
     decode: Duration,
     pinned: bool,
     hit: bool,
+    /// Export: retries used, the failure sequence number already counted,
+    /// and the end of the backoff before the next retry.
+    retries: usize,
+    seen_failures: u64,
+    retry_at: Option<Instant>,
 }
 
 /// The scene's layer tree with each media layer pointing at its `Req`.
@@ -231,8 +246,11 @@ impl Resolver {
     }
 
     /// Real inputs for `scene`, parallel to its layers. Offline media →
-    /// `Missing(Offline)`, a failed decode → `Missing(DecodeFailed)`, not
-    /// ready when the mode stops waiting → `Missing(NotReady)`. Fills
+    /// `Missing(Offline)`, a failed decode → `Missing(DecodeFailed)` (in
+    /// export after its retries), not ready when the mode stops waiting →
+    /// `Missing(NotReady)`. A media layer that draws nothing whatever its
+    /// input (see [`draws_nothing`]) is not decoded: it gets a 1×1
+    /// transparent frame. Fills
     /// `resolve`, `decode` (per media layer: the time its session spent
     /// producing the frame, reported once), cache hits/misses and
     /// `frame_allocs` (pool buffers allocated since the previous call).
@@ -246,12 +264,13 @@ impl Resolver {
             _ => self.generation(),
         };
         let reading = !matches!(mode, Mode::Scrub { .. });
+        let export = mode == Mode::Export;
         let (slots, mut reqs) = self.collect_scene(scene, source);
         let mut pending = vec![];
         let fail_seq = {
             let mut b = self.env.cache.lock();
             for (i, r) in reqs.iter_mut().enumerate() {
-                if b.failed_recently(r.want.media, self.config.retry_failed_after) {
+                if !export && b.failed_recently(r.want.media, self.config.retry_failed_after) {
                     r.result = Some(LayerInput::Missing(MissingReason::DecodeFailed));
                     continue;
                 }
@@ -351,6 +370,11 @@ impl Resolver {
 
     fn wait(&self, reqs: &mut [Req], mut pending: Vec<usize>, mode: Mode, generation: u64, fail_seq: u64) {
         let reading = !matches!(mode, Mode::Scrub { .. });
+        let export = mode == Mode::Export;
+        let backoff = &self.config.export_retry_backoff;
+        for &i in &pending {
+            reqs[i].seen_failures = fail_seq;
+        }
         let mut asserted = Instant::now();
         loop {
             let mut again = false;
@@ -358,9 +382,26 @@ impl Resolver {
             {
                 let mut b = self.env.cache.lock();
                 loop {
+                    let now = Instant::now();
                     pending.retain(|&i| {
                         let r = &mut reqs[i];
-                        if b.failed_since(r.want.media, fail_seq) {
+                        if export {
+                            // Per frame: its session failed producing it since that was last counted.
+                            if b.key_failed_since(&r.key, r.seen_failures) {
+                                r.seen_failures = b.fail_seq();
+                                let allowed = if b.gave_up(r.key.media) { 0 } else { backoff.len() };
+                                if r.retries >= allowed {
+                                    b.give_up(r.key.media);
+                                    tracing::warn!(path = %r.media.path.display(), frame = r.key.frame, retries = r.retries, "export: decode failed, giving up");
+                                    r.result = Some(LayerInput::Missing(MissingReason::DecodeFailed));
+                                    return false;
+                                }
+                                let delay = backoff[r.retries];
+                                r.retries += 1;
+                                r.retry_at = Some(now + delay);
+                                tracing::info!(path = %r.media.path.display(), frame = r.key.frame, retry = r.retries, ?delay, "export: decode failed, retrying");
+                            }
+                        } else if b.failed_since(r.want.media, fail_seq) {
                             r.result = Some(LayerInput::Missing(MissingReason::DecodeFailed));
                             return false;
                         }
@@ -384,7 +425,6 @@ impl Resolver {
                     if pending.is_empty() {
                         return;
                     }
-                    let now = Instant::now();
                     let superseded = self.env.latest.load(Ordering::Acquire) > generation;
                     let late = matches!(mode, Mode::Deadline(d) if now >= d);
                     if superseded || late {
@@ -393,18 +433,37 @@ impl Resolver {
                         }
                         return;
                     }
+                    // Backoffs that ended: re-assert those requests now.
+                    let mut next_retry: Option<Instant> = None;
+                    for &i in &pending {
+                        match reqs[i].retry_at {
+                            Some(t) if t <= now => {
+                                reqs[i].retry_at = None;
+                                again = true;
+                            }
+                            Some(t) => next_retry = Some(next_retry.map_or(t, |n| n.min(t))),
+                            None => {}
+                        }
+                    }
                     if again || now >= asserted + REASSERT {
                         break;
                     }
-                    let until = match mode {
-                        Mode::Deadline(d) => d.min(asserted + REASSERT),
-                        _ => asserted + REASSERT,
-                    };
+                    let mut until = asserted + REASSERT;
+                    if let Some(t) = next_retry {
+                        until = until.min(t);
+                    }
+                    if let Mode::Deadline(d) = mode {
+                        until = until.min(d);
+                    }
                     self.env.cache.wait_until(&mut b, until);
                 }
             }
             drop(dropped);
-            self.assign(reqs, &pending, &[], generation, false, reading);
+            // Requests in a backoff wait; their sessions stay without a target.
+            let ready: Vec<usize> = pending.iter().copied().filter(|&i| reqs[i].retry_at.is_none()).collect();
+            if !ready.is_empty() {
+                self.assign(reqs, &ready, &[], generation, false, reading);
+            }
             asserted = Instant::now();
         }
     }
@@ -621,6 +680,22 @@ fn reap(reg: &mut Registry) {
     reg.retired.retain(|h| !h.is_finished());
 }
 
+/// Whether `l` draws nothing whatever its input, by the scene contract
+/// (`kadr_scene`: an empty crop, a non-positive `placement.size` side, a
+/// transform without inverse — e.g. a zero scale — or an opacity that
+/// sanitises to 0). The evaluator culls such layers at the top level only;
+/// inside a transition's `from`/`to` they reach the resolver.
+pub fn draws_nothing(l: &Layer) -> bool {
+    let size = l.placement.size;
+    !(l.opacity.is_finite() && l.opacity > 0.0) || l.crop.is_empty() || !(size.x > 0.0 && size.y > 0.0) || l.placement.to_canvas().inverse().is_none()
+}
+
+/// The input of a media layer that draws nothing: one transparent pixel, so
+/// the renderer's input check passes, nothing is decoded and export does
+/// not count the layer as missing.
+static BLANK: LazyLock<Arc<CpuFrame>> =
+    LazyLock::new(|| Arc::new(CpuFrame::from_rgba8(1, 1, ColorInfo { alpha: AlphaMode::Straight, ..ColorInfo::WORKING_SDR }, vec![0; 4])));
+
 fn collect(
     layers: &[Layer],
     scene: &FrameScene,
@@ -638,6 +713,7 @@ fn collect(
                 let to = collect(&t.to, scene, source, medias, reqs, index);
                 Slot::Transition { from, to }
             }
+            LayerContent::Media { .. } if draws_nothing(l) => Slot::Input(LayerInput::Cpu(BLANK.clone())),
             LayerContent::Media { media, source_time } => {
                 let m = medias.entry(media.media).or_insert_with(|| source.media(media.media).filter(|m| m.online).map(Arc::new)).clone();
                 match m {
@@ -646,7 +722,19 @@ fn collect(
                         let size = decode_size(&l.placement, scene.canvas, scene.output.size, m.display_size);
                         let want = FrameKey { media: media.media, size, frame: m.frame_at(*source_time) };
                         let req = *index.entry(want).or_insert_with(|| {
-                            reqs.push(Req { want, key: want, media: m, layer: l.id, result: None, decode: Duration::ZERO, pinned: false, hit: false });
+                            reqs.push(Req {
+                                want,
+                                key: want,
+                                media: m,
+                                layer: l.id,
+                                result: None,
+                                decode: Duration::ZERO,
+                                pinned: false,
+                                hit: false,
+                                retries: 0,
+                                seen_failures: 0,
+                                retry_at: None,
+                            });
                             reqs.len() - 1
                         });
                         Slot::Req { req, layer: l.id }

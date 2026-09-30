@@ -137,16 +137,19 @@ enum Action {
 struct ExitGuard {
     shared: Arc<Shared>,
     cache: Arc<FrameCache>,
-    media: AssetId,
+    key: SessionKey,
     epoch: u64,
 }
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            let target = self.shared.state.lock().target.map(|w| w.frame);
+            let key = self.key;
+            let keys: Vec<FrameKey> = target.map(|frame| FrameKey { media: key.media, size: key.size, frame }).into_iter().collect();
             self.cache.update(|b| {
-                if b.epoch(self.media) == self.epoch {
-                    b.record_failure(self.media);
+                if b.epoch(key.media) == self.epoch {
+                    b.record_failure_at(key.media, &keys);
                 }
                 ((), vec![])
             });
@@ -205,7 +208,7 @@ impl Worker {
     }
 
     fn run(mut self) {
-        let _guard = ExitGuard { shared: self.shared.clone(), cache: self.env.cache.clone(), media: self.key.media, epoch: self.epoch };
+        let _guard = ExitGuard { shared: self.shared.clone(), cache: self.env.cache.clone(), key: self.key, epoch: self.epoch };
         loop {
             match self.decide() {
                 Action::Exit => break,
@@ -356,14 +359,20 @@ impl Worker {
         }
     }
 
+    /// `frame`: where the open or read failed. The failure is recorded for
+    /// it and for the target the session was working towards.
     fn fail(&mut self, e: MediaError, frame: i64) {
         tracing::warn!(path = %self.media.path.display(), frame, error = %e, "decode failed");
         self.stream = None;
-        if !self.record(|b, media| b.record_failure(media)) {
+        let target = self.shared.state.lock().target.map(|w| w.frame);
+        let mut keys = vec![self.frame_key(frame)];
+        keys.extend(target.filter(|&t| t != frame).map(|t| self.frame_key(t)));
+        if !self.record(|b, media| b.record_failure_at(media, &keys)) {
             return self.forgotten();
         }
-        // Every waiter of this media now answers `DecodeFailed` (and new
-        // requests do for a while), so no target is worth retrying.
+        // Preview waiters of this media now answer `DecodeFailed` (and new
+        // preview requests do for a while); an export waiter re-asserts its
+        // target after a backoff, which reopens the stream there.
         let mut st = self.shared.state.lock();
         st.position = None;
         st.target = None;

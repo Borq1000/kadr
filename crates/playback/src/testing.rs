@@ -36,23 +36,40 @@ pub struct FakeMedia {
 
 #[derive(Default)]
 struct Counts {
+    open_calls: AtomicU64,
     opens: AtomicU64,
     frames: AtomicU64,
     stills: AtomicU64,
     live: AtomicI64,
 }
 
+/// Transient failures still to inject for one path.
+#[derive(Clone, Copy, Default)]
+struct Faults {
+    opens: u32,
+    reads: u32,
+}
+
+type FaultMap = Arc<Mutex<HashMap<PathBuf, Faults>>>;
+
 /// [`Decoders`] producing [`fake_pixel`] frames, with configurable open and
-/// per-frame delays (sleeps, to simulate slow decoding) and counters.
+/// per-frame delays (sleeps, to simulate slow decoding), injected transient
+/// failures and counters.
 pub struct FakeDecoders {
     media: Mutex<HashMap<PathBuf, FakeMedia>>,
     delays: Mutex<(Duration, Duration)>,
+    faults: FaultMap,
     counts: Arc<Counts>,
 }
 
 impl FakeDecoders {
     pub fn new(open_delay: Duration, frame_delay: Duration) -> Self {
-        FakeDecoders { media: Mutex::new(HashMap::new()), delays: Mutex::new((open_delay, frame_delay)), counts: Arc::new(Counts::default()) }
+        FakeDecoders {
+            media: Mutex::new(HashMap::new()),
+            delays: Mutex::new((open_delay, frame_delay)),
+            faults: Arc::new(Mutex::new(HashMap::new())),
+            counts: Arc::new(Counts::default()),
+        }
     }
 
     pub fn add(&self, path: impl Into<PathBuf>, media: FakeMedia) {
@@ -61,6 +78,21 @@ impl FakeDecoders {
 
     pub fn set_delays(&self, open: Duration, frame: Duration) {
         *self.delays.lock() = (open, frame);
+    }
+
+    /// The next `n` opens (and still decodes) of `path` fail, then it works again.
+    pub fn fail_opens(&self, path: impl Into<PathBuf>, n: u32) {
+        self.faults.lock().entry(path.into()).or_default().opens = n;
+    }
+
+    /// The next `n` frame reads of `path` (any of its streams) fail, then it works again.
+    pub fn fail_reads(&self, path: impl Into<PathBuf>, n: u32) {
+        self.faults.lock().entry(path.into()).or_default().reads = n;
+    }
+
+    /// Calls to open (and still decode), failed ones included.
+    pub fn open_calls(&self) -> u64 {
+        self.counts.open_calls.load(Ordering::SeqCst)
     }
 
     /// Streams opened so far.
@@ -83,6 +115,10 @@ impl FakeDecoders {
     }
 
     fn get(&self, path: &Path) -> Result<FakeMedia, MediaError> {
+        self.counts.open_calls.fetch_add(1, Ordering::SeqCst);
+        if take_fault(&self.faults, path, |f| &mut f.opens) {
+            return Err(MediaError::Unsupported(format!("{}: fake transient open failure", path.display())));
+        }
         match self.media.lock().get(path) {
             Some(m) if !m.fail => Ok(*m),
             Some(_) => Err(MediaError::Unsupported(format!("{}: fake failure", path.display()))),
@@ -98,7 +134,15 @@ impl Decoders for FakeDecoders {
         let m = self.get(&media.path)?;
         self.counts.opens.fetch_add(1, Ordering::SeqCst);
         self.counts.live.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(FakeStream { tag: m.tag, next: start_frame, end: m.frames, delay: frame, counts: self.counts.clone() }))
+        Ok(Box::new(FakeStream {
+            tag: m.tag,
+            path: media.path.clone(),
+            next: start_frame,
+            end: m.frames,
+            delay: frame,
+            faults: self.faults.clone(),
+            counts: self.counts.clone(),
+        }))
     }
 
     fn still(&self, media: &MediaSource, _size: SizeU, out: &mut [u8]) -> Result<(), MediaError> {
@@ -111,6 +155,18 @@ impl Decoders for FakeDecoders {
     }
 }
 
+/// Uses up one injected failure of `path` (the counter `which` picks), if any is left.
+fn take_fault(faults: &FaultMap, path: &Path, which: impl Fn(&mut Faults) -> &mut u32) -> bool {
+    let mut map = faults.lock();
+    match map.get_mut(path).map(which) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn fill(out: &mut [u8], px: [u8; 4]) {
     for p in out.as_chunks_mut::<4>().0 {
         *p = px;
@@ -119,15 +175,20 @@ fn fill(out: &mut [u8], px: [u8; 4]) {
 
 struct FakeStream {
     tag: u8,
+    path: PathBuf,
     next: i64,
     end: Option<i64>,
     delay: Duration,
+    faults: FaultMap,
     counts: Arc<Counts>,
 }
 
 impl SourceStream for FakeStream {
     fn read_into(&mut self, buf: &mut [u8]) -> Result<bool, MediaError> {
         std::thread::sleep(self.delay);
+        if take_fault(&self.faults, &self.path, |f| &mut f.reads) {
+            return Err(MediaError::Io(std::io::Error::other("fake transient read failure")));
+        }
         if self.end.is_some_and(|e| self.next >= e) {
             return Ok(false);
         }

@@ -16,7 +16,7 @@
 use kadr_core::{AssetId, CpuFrame};
 use kadr_scene::SizeU;
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,12 @@ pub(crate) struct Board {
     eof: HashMap<AssetId, i64>,
     /// Per media: the last decode failure (sequence number, when).
     failures: HashMap<AssetId, (u64, Instant)>,
+    /// Per frame a session was producing when it failed: that failure's
+    /// sequence number (export counts its retries per frame by it).
+    key_failures: HashMap<FrameKey, u64>,
+    /// Media an export gave up on after retrying: its later requests are
+    /// tried once, without retries, until a frame of it decodes again.
+    gave_up: HashSet<AssetId>,
     fail_seq: u64,
     /// Per media: how often it was forgotten; plus how often everything was.
     epochs: HashMap<AssetId, u64>,
@@ -95,6 +101,8 @@ impl Board {
             // A frame beyond a recorded end: that record was wrong (a glitch), forget it.
             self.eof.remove(&key.media);
         }
+        // It decodes again.
+        self.gave_up.remove(&key.media);
         self.tick += 1;
         self.bytes += frame.byte_len();
         self.lru.insert(self.tick, key);
@@ -169,6 +177,28 @@ impl Board {
         self.failures.insert(media, (self.fail_seq, Instant::now()));
     }
 
+    /// A failure of `media` (as [`Board::record_failure`]) while producing
+    /// the frames in `keys` (all of `media`).
+    pub(crate) fn record_failure_at(&mut self, media: AssetId, keys: &[FrameKey]) {
+        self.record_failure(media);
+        for k in keys {
+            self.key_failures.insert(*k, self.fail_seq);
+        }
+    }
+
+    /// Producing `key` failed after sequence number `seq` was current.
+    pub(crate) fn key_failed_since(&self, key: &FrameKey, seq: u64) -> bool {
+        self.key_failures.get(key).is_some_and(|&s| s > seq)
+    }
+
+    pub(crate) fn give_up(&mut self, media: AssetId) {
+        self.gave_up.insert(media);
+    }
+
+    pub(crate) fn gave_up(&self, media: AssetId) -> bool {
+        self.gave_up.contains(&media)
+    }
+
     pub(crate) fn fail_seq(&self) -> u64 {
         self.fail_seq
     }
@@ -223,6 +253,8 @@ impl FrameCache {
                 pins: HashMap::new(),
                 eof: HashMap::new(),
                 failures: HashMap::new(),
+                key_failures: HashMap::new(),
+                gave_up: HashSet::new(),
                 fail_seq: 0,
                 epochs: HashMap::new(),
                 clears: 0,
@@ -325,6 +357,8 @@ impl FrameCache {
             *b.epochs.entry(media).or_default() += 1;
             b.eof.remove(&media);
             b.failures.remove(&media);
+            b.key_failures.retain(|k, _| k.media != media);
+            b.gave_up.remove(&media);
             ((), b.remove_where(|k| k.media != media))
         });
     }
@@ -335,6 +369,8 @@ impl FrameCache {
             b.clears += 1;
             b.eof.clear();
             b.failures.clear();
+            b.key_failures.clear();
+            b.gave_up.clear();
             ((), b.remove_where(|_| false))
         });
     }

@@ -170,19 +170,10 @@ fn no_progress() -> impl Fn(f32) + Sync {
 
 // ---- tests ---------------------------------------------------------------------
 
-#[test]
-fn every_frame_in_order_with_the_right_source_frame_and_mixed_transitions() {
-    let rec = Recorder::default();
-    let progress = Mutex::new(vec![]);
-    let req = ExportRequest::new(Timeline::new(b_media()).source(), job(FRAMES));
-    let stats = export(req, fake(), &rec, &|p| progress.lock().push(p), &CancelToken::new()).expect("export");
-
-    let r = rec.rec.lock();
-    assert_eq!((r.starts, r.job_frames), (1, FRAMES));
-    assert!(r.finished && !r.aborted);
-    assert_eq!(r.frames.len() as i64, FRAMES, "exactly job.frames frames");
-    assert_eq!(stats.frames, FRAMES);
-    for (n, (px, _)) in r.frames.iter().enumerate() {
+/// The frames of [`Timeline`], each the right source frame, the dissolve mixed.
+fn assert_timeline_frames(frames: &[([u8; 4], u64)]) {
+    assert_eq!(frames.len() as i64, FRAMES, "exactly job.frames frames");
+    for (n, (px, _)) in frames.iter().enumerate() {
         let n = n as i64;
         assert_eq!(px[3], 255, "frame {n} opaque");
         match n {
@@ -197,8 +188,22 @@ fn every_frame_in_order_with_the_right_source_frame_and_mixed_transitions() {
         }
     }
     // Mixed frames really differ from each other and from both ends.
-    let reds: Vec<u8> = r.frames[40..51].iter().map(|(px, _)| px[0]).collect();
+    let reds: Vec<u8> = frames[40..51].iter().map(|(px, _)| px[0]).collect();
     assert!(reds.windows(2).all(|w| w[0] > w[1]), "the dissolve moves monotonically from B to A: {reds:?}");
+}
+
+#[test]
+fn every_frame_in_order_with_the_right_source_frame_and_mixed_transitions() {
+    let rec = Recorder::default();
+    let progress = Mutex::new(vec![]);
+    let req = ExportRequest::new(Timeline::new(b_media()).source(), job(FRAMES));
+    let stats = export(req, fake(), &rec, &|p| progress.lock().push(p), &CancelToken::new()).expect("export");
+
+    let r = rec.rec.lock();
+    assert_eq!((r.starts, r.job_frames), (1, FRAMES));
+    assert!(r.finished && !r.aborted);
+    assert_eq!(stats.frames, FRAMES);
+    assert_timeline_frames(&r.frames);
 
     let p = progress.lock();
     assert!(p.windows(2).all(|w| w[0] <= w[1]), "progress is monotonic");
@@ -280,10 +285,51 @@ fn undecodable_media_fails_the_export() {
     fake.add("b.mp4", FakeMedia { tag: TAG_B, fail: true, ..Default::default() });
     let rec = Recorder::default();
     let req = ExportRequest::new(Timeline::new(b_media()).source(), job(FRAMES));
+    let t0 = Instant::now();
     let err = export(req, fake, &rec, &no_progress(), &CancelToken::new()).expect_err("decode failure fails");
-    assert!(matches!(err, ExportError::MissingMedia { reason: MissingReason::DecodeFailed, .. }), "{err:?}");
+    assert!(matches!(err, ExportError::MissingMedia { reason: MissingReason::DecodeFailed, frame: 25, .. }), "{err:?}");
     assert!(err.to_string().contains("b.mp4"), "{err}");
     assert!(rec.rec.lock().aborted);
+    assert!(t0.elapsed() < Duration::from_secs(3), "a few bounded retries, then it fails: {:?}", t0.elapsed());
+}
+
+/// Transient failures (two failed opens of A, a failed read of B — the
+/// latter hit by the prefetch that opens B ahead of its cut) are retried:
+/// the export completes with the right frames, nothing missing.
+#[test]
+fn transient_decode_failures_are_retried_and_the_export_completes() {
+    let fake = fake();
+    fake.fail_opens("a.mp4", 2);
+    fake.fail_reads("b.mp4", 1);
+    let rec = Recorder::default();
+    let req = ExportRequest::new(Timeline::new(b_media()).source(), job(FRAMES));
+    let stats = export(req, fake.clone(), &rec, &no_progress(), &CancelToken::new()).expect("transient failures are retried");
+    assert_eq!(stats.frames, FRAMES);
+    assert_eq!(fake.open_calls() - fake.opens(), 2, "both failed opens happened");
+    let r = rec.rec.lock();
+    assert!(r.finished && !r.aborted);
+    assert_timeline_frames(&r.frames);
+}
+
+/// With placeholders, a media that never decodes costs its retries once;
+/// later frames of it are tried once each (not 750 ms of backoff per frame).
+#[test]
+fn undecodable_media_with_placeholders_gives_up_once() {
+    let fake = fake();
+    fake.add("b.mp4", FakeMedia { tag: TAG_B, fail: true, ..Default::default() });
+    let rec = Recorder::default();
+    let req = ExportRequest::new(Timeline::new(b_media()).source(), job(FRAMES)).with_missing(MissingPolicy::DrawPlaceholder);
+    let t0 = Instant::now();
+    let stats = export(req, fake, &rec, &no_progress(), &CancelToken::new()).expect("placeholders allowed");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    assert_eq!(stats.frames, FRAMES);
+    let r = rec.rec.lock();
+    for n in 25..=40 {
+        let px = r.frames[n].0;
+        assert!(px[0].abs_diff(115) <= 1 && px[1].abs_diff(13) <= 1 && px[2].abs_diff(20) <= 1, "frame {n}: {px:?}");
+    }
+    assert_eq!(read_fake_pixel(&r.frames[10].0), (TAG_A, 60));
+    assert_eq!(read_fake_pixel(&r.frames[60].0), (TAG_A, 270));
 }
 
 #[test]
