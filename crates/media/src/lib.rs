@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use encode::{EncodeJob, FrameEncoder};
-pub use export::{ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo};
+pub use export::{ExportAudio, ExportSettings};
 
 #[derive(Debug, Error)]
 pub enum MediaError {
@@ -83,10 +83,6 @@ pub struct StreamRequest {
     pub rate: FrameRate,
     /// Source seconds per output second.
     pub speed: f64,
-    /// Clip look, applied with the same filter as export (WYSIWYG).
-    pub look: export::VideoLook,
-    /// Sequence-pixel → output-pixel factor for positional transforms.
-    pub px_scale: f64,
 }
 
 /// A decode of a source's own frames (render spec §4.2, §9): no
@@ -146,7 +142,6 @@ pub trait MediaBackend: Send + Sync {
         progress: Progress,
         cancel: &CancelToken,
     ) -> Result<()>;
-    fn export(&self, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()>;
     /// Starts encoding rendered RGBA frames plus the job's audio into
     /// `job.output` (see [`EncodeJob`]).
     fn start_encode(&self, job: &EncodeJob) -> Result<Box<dyn FrameEncoder>>;
