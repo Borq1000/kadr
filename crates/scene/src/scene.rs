@@ -91,7 +91,13 @@ pub enum Effect {
 pub enum TransitionOp {
     Dissolve,
     DipToColor(Rgba),
-    /// Edge moving along `angle` (radians, 0 = left → right); `softness` in canvas pixels.
+    /// A straight edge sweeping across the canvas. The edge moves along the
+    /// unit vector `(cos angle, sin angle)` in canvas pixels (y points down);
+    /// the region the edge has already passed shows `to`, the rest `from`.
+    /// `angle` 0 = the edge moves left → right (the incoming picture appears
+    /// on the left); π = right → left (incoming from the right, like
+    /// FFmpeg's `wipeleft`); π/2 = top → bottom. `softness` is the width of
+    /// the blended band, in canvas pixels.
     Wipe { angle: f32, softness: f32 },
 }
 

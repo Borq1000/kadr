@@ -101,7 +101,9 @@ fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, c
     let op = match tr.kind {
         TransitionKind::CrossDissolve => TransitionOp::Dissolve,
         TransitionKind::DipToBlack => TransitionOp::DipToColor(Rgba::BLACK),
-        TransitionKind::Wipe => TransitionOp::Wipe { angle: 0.0, softness: 0.0 },
+        // Edge moves right → left, the incoming clip enters from the right:
+        // the same picture as export's `xfade=wipeleft`.
+        TransitionKind::Wipe => TransitionOp::Wipe { angle: std::f32::consts::PI, softness: 0.0 },
     };
     let from = clip_layer(project, outgoing, t, canvas)?;
     let to = clip_layer(project, incoming, t, canvas)?;
@@ -488,7 +490,8 @@ mod tests {
     fn transition_kinds_map_to_render_ops() {
         for (kind, op) in [
             (TransitionKind::DipToBlack, TransitionOp::DipToColor(Rgba::BLACK)),
-            (TransitionKind::Wipe, TransitionOp::Wipe { angle: 0.0, softness: 0.0 }),
+            // Edge right → left, incoming from the right: export's `xfade=wipeleft`.
+            (TransitionKind::Wipe, TransitionOp::Wipe { angle: std::f32::consts::PI, softness: 0.0 }),
         ] {
             let mut p = Project::new("t");
             place(&mut p, 0, &hd(), 0, 0, 2_000);
