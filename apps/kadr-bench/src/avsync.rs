@@ -7,13 +7,13 @@
 //!   `16 + (s mod 40)·2` (limited range); the ONE flash frame per second, the first frame whose
 //!   start time is ≥ `s` seconds, is bright, `190 + (s mod 45)`.
 //! * audio: silence, and a 5 ms 1 kHz burst (cosine, so full level from the very first sample)
-//!   starting at sample `s·48000`.
+//!   starting at the flash frame's start sample, `round(frame_start_time · 48000)`, so the source
+//!   itself has an offset of ~0 (at 29.97 the flash frame starts up to a frame after second `s`).
 //!
 //! Analysis (see `analyze`): flash = run of frames whose mean luma is above the threshold (first
 //! frame of the run), click = first sample above the threshold after ≥ 0.5 s since the previous
 //! click. Each flash is paired with the nearest click; offset = click start − flash frame start.
-//! A source made at 30000/1001 has offsets in (−1 frame, 0] by construction, because the flash
-//! frame starts up to one frame after the whole second where the click sits.
+//! A source made by `generate_source` has offsets of ~0 (a sample or so) by construction.
 
 use crate::report::Report;
 use kadr_core::FrameRate;
@@ -58,6 +58,16 @@ pub struct AvSync {
 }
 
 impl AvSync {
+    /// Flash times (s) that have no click within the pairing window.
+    pub fn unpaired_flashes(&self) -> Vec<f64> {
+        self.flash_times.iter().copied().filter(|f| !self.click_times.iter().any(|c| (c - f).abs() <= PAIR_WINDOW_SECS)).collect()
+    }
+
+    /// Click times (s) that no flash claims.
+    pub fn unpaired_clicks(&self) -> Vec<f64> {
+        self.click_times.iter().copied().filter(|c| !self.flash_times.iter().any(|f| (c - f).abs() <= PAIR_WINDOW_SECS)).collect()
+    }
+
     /// Report rows for `kadr-bench`.
     pub fn report(&self, title: &str, case: &str) -> Report {
         let mut r = Report::new(title);
@@ -97,6 +107,23 @@ fn flash_expr(fps: FrameRate) -> (String, String) {
     (format!("gt({},{})", sec("N"), sec("N-1")), sec("N"))
 }
 
+/// lavfi expression over the sample number `n`: 1 kHz burst of 5 ms starting on the start sample of
+/// second `s`'s flash frame (`s = floor(n/48000)`; the frame is `ceil(s·num/den)`, it starts at
+/// `frame·den/num` s). The burst is shorter than a second and starts less than a frame after `s`,
+/// so it never leaves its own second.
+pub fn click_expr(fps: FrameRate) -> String {
+    let (num, den) = (fps.num, fps.den);
+    let start = format!("round(ceil(floor(n/{SAMPLE_RATE})*{num}/{den})*{den}*{SAMPLE_RATE}/{num})");
+    format!("if(between(n-{start},0,{}),0.8*cos(2*PI*1000*(n-{start})/{SAMPLE_RATE}),0)", SAMPLE_RATE / 200 - 1)
+}
+
+/// First sample of the click for second `s` (what `click_expr` computes), for tests and planning.
+#[allow(dead_code)]
+pub fn click_start_sample(s: i64, fps: FrameRate) -> i64 {
+    let frame = (s * fps.num as i64 + fps.den as i64 - 1) / fps.den as i64;
+    (frame as f64 * fps.den as f64 * SAMPLE_RATE as f64 / fps.num as f64).round() as i64
+}
+
 /// Writes an H.264 + AAC (48 kHz stereo) mp4 of `secs` seconds, with a flash frame and a click
 /// at the start of every whole second (see the module docs). Video is made at 16×16 by `geq`
 /// (cheap) and scaled up, so the cost is the encode, not the generator.
@@ -110,8 +137,7 @@ pub fn generate_source(path: &Path, secs: u32, width: u32, height: u32, fps: Fra
         "color=c=black:s=16x16:r={}/{}:d={secs},format=yuv420p,geq=lum='{lum}':cb=128:cr=128,scale={width}:{height}:flags=neighbor,setsar=1,format=yuv420p",
         fps.num, fps.den
     );
-    // `n` is the sample number, so the click starts on sample s·48000 with no float drift.
-    let click = format!("if(lt(mod(n,{SAMPLE_RATE}),{}),0.8*cos(2*PI*1000*mod(n,{SAMPLE_RATE})/{SAMPLE_RATE}),0)", SAMPLE_RATE / 200);
+    let click = click_expr(fps);
     let audio = format!("aevalsrc=exprs='{click}|{click}':s={SAMPLE_RATE}:d={secs}");
     let gop = (fps.as_f64().round() as u32 * 2).to_string();
     let part = path.with_extension("part");
@@ -245,6 +271,9 @@ pub fn selftest() -> Result<Report, String> {
 /// `kadr-bench avsync-analyze <file> [--fps N/D]`.
 pub fn analyze_file(path: &Path, fps: FrameRate) -> Result<Report, String> {
     let m = analyze(path, fps)?;
+    if !m.within_one_frame() {
+        eprintln!("kadr-bench: flashes without a click at {:?} s; clicks without a flash at {:?} s", m.unpaired_flashes(), m.unpaired_clicks());
+    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(m.report("avsync-analyze", &name))
 }
@@ -288,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn click_starts_on_the_flash_frames_first_sample() {
+        // 29.97: second 1 → frame 30 starts at 1.001 s = sample 48048; second 2 → frame 60 (2.002 s).
+        assert_eq!(click_start_sample(0, FrameRate::FPS_29_97), 0);
+        assert_eq!(click_start_sample(1, FrameRate::FPS_29_97), 48_048);
+        assert_eq!(click_start_sample(2, FrameRate::FPS_29_97), 96_096);
+        // Whole-frame rates: exactly the second.
+        assert_eq!(click_start_sample(7, FrameRate::FPS_25), 7 * 48_000);
+        for s in 0..2000 {
+            let start = click_start_sample(s, FrameRate::FPS_29_97);
+            assert!(start >= s * 48_000 && start < s * 48_000 + 1602, "{s}: {start}");
+        }
+    }
+
+    #[test]
     fn source_has_one_flash_and_one_click_per_second_within_a_frame() {
         if !have_ffmpeg() {
             return;
@@ -300,8 +343,8 @@ mod tests {
             assert_eq!((m.flashes, m.clicks, m.pairs), (12, 12, 12), "{m:?}");
             assert_eq!((m.unmatched_flashes, m.unmatched_clicks), (0, 0));
             assert!(m.within_one_frame(), "max offset {:.3} ms = {:.3} frames: {:?}", m.max_abs_offset_ms, m.offsets_frames_max, m.offsets_ms);
-            // The flash frame starts at or after its second, so audio is never late in the source.
-            assert!(m.offsets_ms.iter().all(|o| *o < 1.0), "{:?}", m.offsets_ms);
+            // The click starts on the flash frame's first sample: the source has no offset of its own.
+            assert!(m.offsets_ms.iter().all(|o| o.abs() < 0.5), "{:?}", m.offsets_ms);
             std::fs::remove_dir_all(&dir).ok();
         }
     }

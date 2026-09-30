@@ -216,6 +216,24 @@ fn every_frame_in_order_with_the_right_source_frame_and_mixed_transitions() {
 }
 
 #[test]
+fn a_full_frame_opaque_layer_is_drawn_by_the_fast_path() {
+    let rec = Recorder::default();
+    let (asset, media, canvas) = (AssetId::new(), video_source("a.mp4", RATE, Time::from_secs(60), CANVAS), CANVAS);
+    let src = Arc::new(FnSceneSource {
+        media: [(asset, media.clone())].into_iter().collect(),
+        rate: RATE,
+        duration: RATE.frame_to_time(FRAMES),
+        canvas,
+        scene: move |t: Time, out: &OutputSpec| {
+            FrameScene { layers: vec![media_layer(1, asset, &media, t, canvas)], ..FrameScene::empty(t, canvas, *out) }
+        },
+    });
+    let stats = export(ExportRequest::new(src, job(FRAMES)), fake(), &rec, &|_| {}, &CancelToken::new()).expect("export");
+    assert_eq!(stats.layers_drawn, FRAMES as u64, "{stats:?}");
+    assert_eq!(stats.fast_paths, FRAMES as u64, "every frame is a plain row copy: {stats:?}");
+}
+
+#[test]
 fn same_scene_same_output_bytes() {
     let run = || {
         let rec = Recorder::default();

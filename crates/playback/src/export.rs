@@ -105,6 +105,10 @@ pub struct ExportStats {
     /// Rendering (`CpuRenderer::render`) per frame.
     pub render: Stats,
     pub render_total: Duration,
+    /// Top-level layers drawn over all frames, and how many of those took the
+    /// renderer's fast path (a row copy instead of per-pixel sampling).
+    pub layers_drawn: u64,
+    pub fast_paths: u64,
     /// Time spent in `Resolver::prepare`, waiting for decoded frames.
     pub decode_wait: Duration,
     /// Time the renderer waited for a free output buffer (encoder back-pressure).
@@ -361,7 +365,10 @@ impl Runner<'_> {
             let mut target = RenderTarget::Cpu(CpuTarget::packed(w, h, &mut buf));
             let renderer = &mut self.renderer;
             match std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(&frame, &mut target))) {
-                Ok(Ok(_)) => {}
+                Ok(Ok(rs)) => {
+                    self.stats.layers_drawn += u64::from(rs.layers_drawn);
+                    self.stats.fast_paths += u64::from(rs.fast_paths);
+                }
                 Ok(Err(e)) => return Err(ExportError::Render(e)),
                 Err(_) => return Err(ExportError::Internal(format!("the renderer panicked at frame {n}"))),
             }
