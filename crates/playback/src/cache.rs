@@ -417,13 +417,15 @@ mod tests {
         let pool = FramePool::new(1 << 20);
         let cache = FrameCache::new(1 << 20);
         let (m, other) = (AssetId::new(), AssetId::new());
-        let (e, e_other) = (cache.lock().epoch(m), cache.lock().epoch(other));
+        let e = cache.lock().epoch(m);
+        let e_other = cache.lock().epoch(other);
         assert!(cache.insert_from(e, key(m, 0), frame(&pool), Duration::ZERO));
         cache.remove_media(m);
         assert!(!cache.contains(&key(m, 0)));
         assert!(!cache.insert_from(e, key(m, 1), frame(&pool), Duration::ZERO), "in flight before the relink");
         assert!(!cache.contains(&key(m, 1)));
-        assert!(cache.insert_from(cache.lock().epoch(m), key(m, 1), frame(&pool), Duration::ZERO));
+        let e = cache.lock().epoch(m);
+        assert!(cache.insert_from(e, key(m, 1), frame(&pool), Duration::ZERO));
         assert!(cache.insert_from(e_other, key(other, 0), frame(&pool), Duration::ZERO), "other media unaffected");
         cache.clear();
         assert!(!cache.insert_from(e_other, key(other, 1), frame(&pool), Duration::ZERO), "clear forgets everything");
