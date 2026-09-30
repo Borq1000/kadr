@@ -156,7 +156,7 @@ fn cancelled_export_leaves_no_output() {
 }
 
 fn mean_luma(f: &RgbaFrame) -> f64 {
-    let px = f.data.chunks_exact(4);
+    let px = f.data.as_chunks::<4>().0.iter();
     let n = px.len() as f64;
     px.map(|p| 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64).sum::<f64>() / n
 }

@@ -48,7 +48,7 @@ impl RgbaFrame {
     pub fn black(width: u32, height: u32) -> Self {
         let mut data = vec![0u8; (width * height * 4) as usize];
         stats::note_frame_alloc();
-        data.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+        data.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[3] = 255);
         RgbaFrame { width, height, data }
     }
 }
@@ -95,7 +95,9 @@ pub struct SourceRequest {
     /// Constant rate the stream is normalised to (the source's own rate).
     pub rate: FrameRate,
     /// Frame `n` read from the stream is source frame `start_frame + n`;
-    /// source frame `k` is the one shown at `rate.frame_to_time(k)`.
+    /// source frame `k` is the one shown at `rate.frame_to_time(k)` (a frame
+    /// stamped up to a quarter frame later still counts, for container
+    /// timestamp rounding). Must not be negative.
     pub start_frame: i64,
     /// Exact output size, upright (rotation metadata applied) with the
     /// sample aspect ratio absorbed.
@@ -131,6 +133,7 @@ pub trait MediaBackend: Send + Sync {
     /// Fast, keyframe-accurate thumbnails at the given source times.
     fn thumbnails(&self, path: &Path, times: &[Time], height: u32, cancel: &CancelToken) -> Result<Vec<RgbaFrame>>;
     /// Decodes the audio to interleaved s16le PCM at `rate`/`channels` into `out`.
+    #[allow(clippy::too_many_arguments)]
     fn extract_pcm(
         &self,
         path: &Path,
