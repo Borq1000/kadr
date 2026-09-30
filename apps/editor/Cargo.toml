@@ -14,6 +14,9 @@ kadr-core = { path = "../../crates/core" }
 kadr-project = { path = "../../crates/project" }
 kadr-timeline = { path = "../../crates/timeline" }
 kadr-media = { path = "../../crates/media" }
+kadr-scene = { path = "../../crates/scene" }
+kadr-render = { path = "../../crates/render" }
+kadr-playback = { path = "../../crates/playback" }
 kadr-audio = { path = "../../crates/audio" }
 kadr-analysis = { path = "../../crates/analysis" }
 kadr-jobs = { path = "../../crates/jobs" }
