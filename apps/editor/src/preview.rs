@@ -278,6 +278,9 @@ impl App {
         match &mut self.preview.cpu {
             Some(cpu) => {
                 cpu.set_output(out);
+                if cpu.offline_media_returned() {
+                    cpu.dirty = true;
+                }
                 match &cpu.scenes {
                     Some(s) if !cpu.dirty && s.bypass() == bypass => s.clone(),
                     _ => {
@@ -428,9 +431,9 @@ impl App {
             // Pre-roll: the player renders the first frame, then the audio starts.
             let generation = cpu.player().play(from);
             cpu.pending = Some(PendingPlay { generation, from, sources });
-            slint::Timer::single_shot(PREROLL_FALLBACK, move || {
-                crate::app::with_app(|app| app.start_pending_audio(generation));
-            });
+            // Through `post`: if the app is busy when the timer fires (a modal
+            // dialog pumping events), it retries instead of never starting the audio.
+            slint::Timer::single_shot(PREROLL_FALLBACK, move || post(move |app| app.start_pending_audio(generation)));
         } else {
             let segs: Vec<Seg> = video_segments(seq, range).iter().map(|s| to_seg(&self.project, s.range, s.source.as_ref(), bypass)).collect();
             let (w, h, px) = self.preview.size(&self.project);

@@ -183,6 +183,13 @@ impl CpuPreview {
         self.dirty = false;
     }
 
+    /// A file the snapshot found missing exists again (drive reconnected,
+    /// file moved back): the snapshot is stale though nothing was edited.
+    /// Checks only the offline media, so it is cheap enough per request.
+    pub fn offline_media_returned(&self) -> bool {
+        self.scenes.as_ref().is_some_and(|s| s.media_sources().values().any(|m| !m.online && m.path.exists()))
+    }
+
     pub fn set_output(&mut self, out: OutputSpec) {
         if self.output != Some(out) {
             self.player.set_output(out);
