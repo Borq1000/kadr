@@ -2,7 +2,8 @@
 //! Not shipped.
 //!
 //!   kadr-bench baseline [--quick]                  seek, decode and buffer-copy numbers (scaling stream)
-//!   kadr-bench live --clip <file> [--seconds N]    the real app, headless, through kadr-mcp
+//!   kadr-bench live --clip <file> [--seconds N] [--layers 1|3] [--quality full|half|quarter]
+//!                                                  the real app, headless, through kadr-mcp (3 layers: clip + rotated 4K PiP + logo)
 //!   kadr-bench scene                               cost of the scene evaluator (M1)
 //!   kadr-bench render                              CpuRenderer at 1080p and 4K, 1-3 layers and a transition (M2)
 //!   kadr-bench playback [--quick]                 seek latency and sequential decode through Resolver + CpuRenderer (M3)
@@ -33,7 +34,10 @@ fn main() {
         Some("live") => {
             let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
             match value("--clip") {
-                Some(c) => live::run(std::path::Path::new(&c), value("--seconds").and_then(|s| s.parse().ok()).unwrap_or(20)),
+                Some(c) => match (value("--layers").map_or(Some(1), |s| s.parse::<u32>().ok().filter(|n| [1, 3].contains(n))), value("--quality").map_or(Some(1), |s| live::parse_quality(&s))) {
+                    (Some(layers), Some(quality)) => live::run(std::path::Path::new(&c), value("--seconds").and_then(|s| s.parse().ok()).unwrap_or(20), &live::Options { layers, quality }),
+                    _ => Err("live: --layers is 1 or 3, --quality is full|half|quarter".to_string()),
+                },
                 None => Err("live needs --clip <file>".to_string()),
             }
         }
@@ -51,7 +55,7 @@ fn main() {
                 (_, None) => Err("avsync-analyze: bad --fps".to_string()),
             }
         }
-        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene | render | playback [--quick] | export [--diag] | avsync-export | avsync-selftest | avsync-analyze <file> [--fps N/D]".to_string()),
+        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] [--layers 1|3] [--quality full|half|quarter] | scene | render | playback [--quick] | export [--diag] | avsync-export | avsync-selftest | avsync-analyze <file> [--fps N/D]".to_string()),
     };
     match result {
         Ok(r) => {

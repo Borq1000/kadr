@@ -32,7 +32,7 @@ fn new_project(name: &str, w: u32, h: u32, fps: FrameRate) -> Project {
     p
 }
 
-fn probe(media: &FfmpegCli, path: &Path) -> Result<MediaAsset, String> {
+pub fn probe(media: &FfmpegCli, path: &Path) -> Result<MediaAsset, String> {
     Ok(MediaAsset::new(path, media.probe(path).map_err(|e| format!("probe {}: {e}", path.display()))?))
 }
 
@@ -103,7 +103,7 @@ fn three_layer_project(clip: &MediaAsset, uhd: &MediaAsset, logo: &MediaAsset) -
 }
 
 /// A 512×512 straight-alpha PNG: a colour gradient disc with a 56 px soft edge.
-fn ensure_logo(dir: &Path) -> Result<PathBuf, String> {
+pub fn ensure_logo(dir: &Path) -> Result<PathBuf, String> {
     let path = dir.join("logo512.png");
     if path.exists() {
         return Ok(path);
