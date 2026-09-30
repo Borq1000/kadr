@@ -9,7 +9,7 @@ use kadr_core::color::AlphaMode;
 use kadr_core::{AssetId, ColorInfo, CpuFrame, Time};
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, MissingReason, PreparedFrame, RenderInputs, RenderTarget, Renderer};
 use kadr_scene::*;
-use reference::render_reference;
+use reference::{render_reference, render_reference_with_ties};
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::sync::Arc;
 
@@ -305,11 +305,11 @@ impl Gen {
         let canvas = SizeU::new(rng.int(16, 96), rng.int(16, 96));
         let out = loop {
             let r = rng.f();
-            let cand = if r < 0.15 {
+            let cand = if r < 0.25 {
                 canvas
-            } else if r < 0.25 {
+            } else if r < 0.33 {
                 SizeU::new(canvas.w * 2, canvas.h * 2)
-            } else if r < 0.65 {
+            } else if r < 0.70 {
                 let s = rng.range(0.5, 1.5);
                 SizeU::new(((canvas.w as f64 * s).round() as u32).max(1), ((canvas.h as f64 * s).round() as u32).max(1))
             } else {
@@ -333,8 +333,9 @@ impl Gen {
         Rgba { r, g, b, a }
     }
 
-    fn frame(&mut self, w: u32, h: u32) -> CpuFrame {
-        let mode = [AlphaMode::Opaque, AlphaMode::Straight, AlphaMode::Premultiplied][self.rng.int(0, 2) as usize];
+    fn frame(&mut self, w: u32, h: u32, forced: Option<AlphaMode>) -> CpuFrame {
+        let random_mode = [AlphaMode::Opaque, AlphaMode::Straight, AlphaMode::Premultiplied][self.rng.int(0, 2) as usize];
+        let mode = forced.unwrap_or(random_mode);
         let flat = self.rng.chance(0.15).then(|| [self.rng.byte(), self.rng.byte(), self.rng.byte(), self.rng.byte()]);
         let mut data = Vec::with_capacity((w * h * 4) as usize);
         for _ in 0..w * h {
@@ -446,12 +447,32 @@ impl Gen {
         let kind = self.rng.f();
         // Full-frame fast-path candidates: a frame as big as the output, placed to fill the canvas.
         if kind < 0.15 {
-            let frame = Arc::new(self.frame(self.out.w, self.out.h));
+            let forced = self.rng.chance(0.6).then_some(AlphaMode::Opaque);
+            let frame = Arc::new(self.frame(self.out.w, self.out.h, forced));
             let placement = Placement::fill(self.canvas);
-            let (opacity, blend) = (if self.rng.chance(0.7) { 1.0 } else { self.opacity() }, self.blend(0.7));
-            let effects = if self.rng.chance(0.7) { vec![] } else { self.effects() };
+            let (opacity, blend) = (if self.rng.chance(0.8) { 1.0 } else { self.opacity() }, self.blend(0.8));
+            let effects = if self.rng.chance(0.85) { vec![] } else { self.effects() };
             let media = MediaRef { media: AssetId::new(), stream: 0, kind: SourceKind::Video, display_size: self.canvas, color: frame.color };
             let layer = Layer { id: self.id(), content: LayerContent::Media { media, source_time: Time::ZERO }, crop: placement.full_crop(), placement, opacity, blend, effects };
+            return (layer, LayerInput::Cpu(frame));
+        }
+        // A pixel-aligned sprite: frame-sized, unscaled, unrotated, on integer canvas positions.
+        if kind < 0.27 {
+            let (w, h) = (self.rng.int(1, 64), self.rng.int(1, 64));
+            let forced = self.rng.chance(0.6).then_some(AlphaMode::Opaque);
+            let frame = Arc::new(self.frame(w, h, forced));
+            let (px, py) = (self.rng.int(0, self.canvas.w) as f32 - 8.0, self.rng.int(0, self.canvas.h) as f32 - 8.0);
+            let placement = Placement { size: Vec2::new(w as f32, h as f32), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(px, py), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+            let crop = if self.rng.chance(0.6) {
+                placement.full_crop()
+            } else {
+                let (x0, y0) = (self.rng.int(0, w - 1), self.rng.int(0, h - 1));
+                RectF::new(x0 as f32, y0 as f32, self.rng.int(x0 + 1, w) as f32, self.rng.int(y0 + 1, h) as f32)
+            };
+            let (opacity, blend) = (if self.rng.chance(0.8) { 1.0 } else { self.opacity() }, self.blend(0.8));
+            let effects = if self.rng.chance(0.85) { vec![] } else { self.effects() };
+            let media = MediaRef { media: AssetId::new(), stream: 0, kind: SourceKind::Image, display_size: SizeU::new(w, h), color: frame.color };
+            let layer = Layer { id: self.id(), content: LayerContent::Media { media, source_time: Time::ZERO }, crop, placement, opacity, blend, effects };
             return (layer, LayerInput::Cpu(frame));
         }
         let placement = self.placement();
@@ -459,7 +480,7 @@ impl Gen {
         let (opacity, blend, effects) = (self.opacity(), self.blend(0.6), self.effects());
         let (content, input) = if kind < 0.65 {
             let (w, h) = (self.rng.int(1, 64), self.rng.int(1, 64));
-            let frame = Arc::new(self.frame(w, h));
+            let frame = Arc::new(self.frame(w, h, None));
             let media = MediaRef { media: AssetId::new(), stream: 0, kind: SourceKind::Image, display_size: SizeU::new(w, h), color: frame.color };
             (LayerContent::Media { media, source_time: Time::ZERO }, LayerInput::Cpu(frame))
         } else if kind < 0.85 {
@@ -539,19 +560,22 @@ fn env_num(name: &str) -> Option<u64> {
 const BASE_SEED: u64 = 0x4B41_4452_5245_4E44;
 
 /// Renders random scenes with `CpuRenderer` and with the reference; every byte must agree
-/// within 1 LSB. `PARITY_SCENES=n` changes the count, `PARITY_ONLY=i` runs just scene `i`.
+/// within 1 LSB (one more per rounding tie the reference passed through at that pixel: an f32
+/// and an f64 renderer may split a value that is exactly `k + 0.5` either way, and the flip
+/// carries through the later blends — e.g. `s.rgb + d·(1 − s.a)` with a flipped `s.a`).
+/// `PARITY_SCENES=n` changes the count, `PARITY_ONLY=i` runs just scene `i`.
 #[test]
 fn cpu_renderer_matches_the_reference_on_random_scenes() {
     let count = env_num("PARITY_SCENES").unwrap_or(400);
     let only = env_num("PARITY_ONLY");
     let mut renderer = CpuRenderer::new();
-    let (mut max_diff, mut failing, mut fast_paths, mut drawn, mut rendered) = (0u8, 0usize, 0u64, 0u64, 0usize);
+    let (mut max_diff, mut max_diff_no_tie, mut tie_widened, mut failing, mut fast_paths, mut drawn, mut rendered) = (0u8, 0u8, 0usize, 0usize, 0u64, 0u64, 0usize);
     let mut reports = Vec::new();
 
     for index in (0..count).filter(|i| only.is_none_or(|o| o == *i)) {
         let seed = scene_seed(BASE_SEED, index);
         let (scene, inputs) = Gen::new(seed).scene();
-        let expected = render_reference(&scene, &inputs);
+        let (expected, ties) = render_reference_with_ties(&scene, &inputs);
 
         let (w, h) = (scene.output.size.w, scene.output.size.h);
         let mut actual = vec![0xAAu8; w as usize * h as usize * 4];
@@ -561,23 +585,40 @@ fn cpu_renderer_matches_the_reference_on_random_scenes() {
         drawn += stats.layers_drawn as u64;
         rendered += 1;
 
-        let worst = expected.iter().zip(&actual).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
-        max_diff = max_diff.max(worst);
-        if worst > 1 {
+        // 1 LSB, plus 1 per rounding tie the reference passed through at that pixel.
+        let allowed = |at: usize| 1 + ties[at / 4].min(7);
+        let mut bad_bytes = 0;
+        let mut first_bad = None;
+        for (at, (e, a)) in expected.iter().zip(&actual).enumerate() {
+            let d = e.abs_diff(*a);
+            max_diff = max_diff.max(d);
+            if ties[at / 4] == 0 {
+                max_diff_no_tie = max_diff_no_tie.max(d);
+            } else if d > 1 {
+                tie_widened += 1;
+            }
+            if d > allowed(at) {
+                bad_bytes += 1;
+                first_bad.get_or_insert(at);
+            }
+        }
+        if let Some(at) = first_bad {
             failing += 1;
             if reports.len() < 3 {
-                let (at, (e, a)) = expected.iter().zip(&actual).enumerate().find(|(_, (e, a))| e.abs_diff(**a) > 1).unwrap();
                 let (pix, ch) = (at / 4, at % 4);
-                let bad = expected.iter().zip(&actual).filter(|(e, a)| e.abs_diff(**a) > 1).count();
                 reports.push(format!(
-                    "scene {index} (seed {seed:#x}, output {w}x{h}, canvas {}x{}): first bad pixel ({}, {}) channel {} reference {} renderer {} (max diff {worst}, {bad} bad bytes)\n  reference px {:?}, renderer px {:?}\n  scene: {:?}\n  inputs: {:?}",
+                    "scene {index} (seed {seed:#x}, output {w}x{h}, canvas {}x{}): first bad pixel ({}, {}) channel {} reference {} renderer {} ({bad_bytes} bad bytes, {} ties at that pixel)
+  reference px {:?}, renderer px {:?}
+  scene: {:?}
+  inputs: {:?}",
                     scene.canvas.w,
                     scene.canvas.h,
                     pix % w as usize,
                     pix / w as usize,
                     ["r", "g", "b", "a"][ch],
-                    e,
-                    a,
+                    expected[at],
+                    actual[at],
+                    ties[pix],
                     &expected[pix * 4..pix * 4 + 4],
                     &actual[pix * 4..pix * 4 + 4],
                     scene,
@@ -587,11 +628,14 @@ fn cpu_renderer_matches_the_reference_on_random_scenes() {
         }
     }
 
-    println!("parity: {rendered} scenes, {drawn} layers drawn, {fast_paths} by a fast path, max byte difference {max_diff}, {failing} scenes over tolerance");
+    println!(
+        "parity: {rendered} scenes, {drawn} layers drawn, {fast_paths} by a fast path; max byte difference {max_diff} ({max_diff_no_tie} at pixels without a rounding tie; {tie_widened} bytes at tie pixels differ by more than 1); {failing} scenes over tolerance"
+    );
     for r in &reports {
-        eprintln!("{r}\n");
+        eprintln!("{r}
+");
     }
-    assert_eq!(failing, 0, "{failing} of {rendered} scenes differ from the reference by more than 1 LSB (max diff {max_diff}); first ones above");
+    assert_eq!(failing, 0, "{failing} of {rendered} scenes differ from the reference beyond tolerance (max diff {max_diff}); first ones above");
 }
 
 /// The generator itself is deterministic and covers what the parity test claims to cover.

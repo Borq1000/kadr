@@ -12,6 +12,10 @@
 //!   canvas rectangle (a centre exactly on the boundary counts as inside).
 //! - A transition layer ignores its placement, crop and effects (the contract
 //!   composites it "pixel for pixel, coverage 1"); opacity and blend apply.
+//! - Every store that lands within 1e-3 LSB of a rounding tie is recorded per
+//!   output pixel (`render_reference_with_ties`): an f32 and an f64 implementation may
+//!   legitimately round such a value differently, and the flip then passes through
+//!   the later `s + d·(1 − s.a)` blends, so parity allows one extra LSB per tie.
 //! - Missing / mismatching inputs: `Media` without a `Cpu` input is drawn as
 //!   `Rgba::MISSING`; a `Transition` without matching inputs gets no inputs.
 
@@ -21,6 +25,7 @@ use kadr_core::CpuFrame;
 use kadr_core::color::AlphaMode;
 use kadr_render::{LayerInput, RenderInputs};
 use kadr_scene::{BlendMode, Effect, FrameScene, Layer, LayerContent, Rgba, TransitionOp};
+use std::cell::RefCell;
 
 /// Premultiplied RGBA, components in [0, 1].
 type Px = [f64; 4];
@@ -34,6 +39,8 @@ struct Geo {
     k: f64,
     ox: f64,
     oy: f64,
+    /// Per output pixel: how many stores there were within 1e-3 LSB of a rounding tie.
+    ties: RefCell<Vec<u8>>,
 }
 
 impl Geo {
@@ -41,12 +48,24 @@ impl Geo {
         let (ow, oh) = (scene.output.size.w as f64, scene.output.size.h as f64);
         let (cw, ch) = (scene.canvas.w as f64, scene.canvas.h as f64);
         let k = (ow / cw).min(oh / ch);
-        Geo { ow: ow as usize, oh: oh as usize, cw, ch, k, ox: (ow - k * cw) / 2.0, oy: (oh - k * ch) / 2.0 }
+        Geo { ow: ow as usize, oh: oh as usize, cw, ch, k, ox: (ow - k * cw) / 2.0, oy: (oh - k * ch) / 2.0, ties: RefCell::new(vec![0; ow as usize * oh as usize]) }
     }
 
     fn in_canvas(&self, i: usize, j: usize) -> bool {
         let (x, y) = (i as f64 + 0.5, j as f64 + 0.5);
         !(x < self.ox || x > self.ox + self.k * self.cw || y < self.oy || y > self.oy + self.k * self.ch)
+    }
+
+    /// Rounds `p` into a buffer pixel `n`, noting near-ties.
+    fn store4(&self, n: usize, p: Px) -> [u8; 4] {
+        if p.iter().any(|v| {
+            let x = v.clamp(0.0, 1.0) * 255.0 + 0.5;
+            (x - x.round()).abs() < 1e-3
+        }) {
+            let mut ties = self.ties.borrow_mut();
+            ties[n] = ties[n].saturating_add(1);
+        }
+        store4(p)
     }
 
     /// Canvas position of the centre of output pixel `(i, j)`.
@@ -57,11 +76,17 @@ impl Geo {
 
 /// Tightly packed premultiplied RGBA8 of `scene.output.size`.
 pub fn render_reference(scene: &FrameScene, inputs: &RenderInputs) -> Vec<u8> {
+    render_reference_with_ties(scene, inputs).0
+}
+
+/// [`render_reference`] plus, per output pixel, the number of stores that fell (almost)
+/// exactly on a rounding tie.
+pub fn render_reference_with_ties(scene: &FrameScene, inputs: &RenderInputs) -> (Vec<u8>, Vec<u8>) {
     let g = Geo::new(scene);
     let bg = premul(scene.background);
     let mut buf: Vec<[u8; 4]> = (0..g.ow * g.oh).map(|n| if g.in_canvas(n % g.ow, n / g.ow) { store4(bg) } else { [0, 0, 0, 255] }).collect();
     draw_layers(&g, &scene.layers, &inputs.layers, &mut buf);
-    buf.into_iter().flatten().collect()
+    (buf.into_iter().flatten().collect(), g.ties.into_inner())
 }
 
 fn premul(c: Rgba) -> Px {
@@ -117,7 +142,7 @@ fn draw_layers(g: &Geo, layers: &[Layer], inputs: &[LayerInput], buf: &mut [[u8;
                         let n = j * g.ow + i;
                         let mixed = mix(g, &t.op, t.progress as f64, load4(from[n]), load4(to[n]), g.canvas_pos(i, j));
                         let s = mixed.map(|v| v * layer.opacity as f64);
-                        buf[n] = store4(blend(layer.blend, s, load4(buf[n])));
+                        buf[n] = g.store4(n, blend(layer.blend, s, load4(buf[n])));
                     }
                 }
             }
@@ -187,7 +212,7 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
             sample = apply_effects(&layer.effects, sample);
             let s = sample.map(|v| v * layer.opacity as f64 * coverage);
             let n = j * g.ow + i;
-            buf[n] = store4(blend(layer.blend, s, load4(buf[n])));
+            buf[n] = g.store4(n, blend(layer.blend, s, load4(buf[n])));
         }
     }
 }
