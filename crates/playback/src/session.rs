@@ -5,9 +5,11 @@
 //! the newest target: between two frames it re-reads its target, so a
 //! superseded seek is abandoned after at most one frame (a blocking read or
 //! open itself cannot be interrupted). Frames go into the shared
-//! [`FrameCache`]; buffers come from the shared pool.
+//! [`FrameCache`]; buffers come from the shared pool. A session belongs to
+//! the cache epoch of its media it started in: once the media is forgotten
+//! (relink), the cache refuses what it delivers and the session ends.
 
-use crate::cache::{FrameCache, FrameKey};
+use crate::cache::{Board, FrameCache, FrameKey};
 use crate::decoders::Decoders;
 use crate::source::MediaSource;
 use kadr_core::{AssetId, ColorInfo, CpuFrame, FramePool, Time};
@@ -102,7 +104,8 @@ impl Session {
             }),
             cv: Condvar::new(),
         });
-        let worker = Worker::new(key, media, shared.clone(), env, max_window);
+        let epoch = env.cache.lock().epoch(key.media);
+        let worker = Worker::new(key, media, shared.clone(), env, max_window, epoch);
         let thread = std::thread::Builder::new().name("kadr-decode".into()).spawn(move || worker.run()).expect("spawn decoder session thread");
         Session { id, key, shared, thread: Some(thread) }
     }
@@ -135,13 +138,16 @@ struct ExitGuard {
     shared: Arc<Shared>,
     cache: Arc<FrameCache>,
     media: AssetId,
+    epoch: u64,
 }
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.cache.update(|b| {
-                b.record_failure(self.media);
+                if b.epoch(self.media) == self.epoch {
+                    b.record_failure(self.media);
+                }
                 ((), vec![])
             });
         }
@@ -171,10 +177,12 @@ struct Worker {
     est_open: Option<f64>,
     est_frame: Option<f64>,
     max_window: i64,
+    /// The cache epoch of the media this session decodes for.
+    epoch: u64,
 }
 
 impl Worker {
-    fn new(key: SessionKey, media: Arc<MediaSource>, shared: Arc<Shared>, env: Arc<Env>, max_window: i64) -> Self {
+    fn new(key: SessionKey, media: Arc<MediaSource>, shared: Arc<Shared>, env: Arc<Env>, max_window: i64, epoch: u64) -> Self {
         Worker {
             key,
             color: media.frame_color(),
@@ -191,11 +199,12 @@ impl Worker {
             est_open: None,
             est_frame: None,
             max_window,
+            epoch,
         }
     }
 
     fn run(mut self) {
-        let _guard = ExitGuard { shared: self.shared.clone(), cache: self.env.cache.clone(), media: self.key.media };
+        let _guard = ExitGuard { shared: self.shared.clone(), cache: self.env.cache.clone(), media: self.key.media, epoch: self.epoch };
         loop {
             match self.decide() {
                 Action::Exit => break,
@@ -289,7 +298,9 @@ impl Worker {
                 self.pos += 1;
                 self.back = 0;
                 self.env.counters.frames.fetch_add(1, Ordering::Relaxed);
-                self.env.cache.insert(key, Arc::new(frame), spent);
+                if !self.env.cache.insert_from(self.epoch, key, Arc::new(frame), spent) {
+                    return self.forgotten();
+                }
                 let window = self.window();
                 let mut st = self.shared.state.lock();
                 st.position = Some(self.pos);
@@ -310,10 +321,9 @@ impl Worker {
                     self.back = if self.back == 0 { second } else { self.back.saturating_mul(2) };
                 }
                 tracing::debug!(path = %self.media.path.display(), end, "source stream ended before its duration");
-                self.env.cache.update(|b| {
-                    b.record_eof(self.key.media, end);
-                    ((), vec![])
-                });
+                if !self.record(|b, media| b.record_eof(media, end)) {
+                    return self.forgotten();
+                }
                 self.shared.state.lock().position = None;
             }
             Err(e) => {
@@ -329,7 +339,9 @@ impl Worker {
         match self.env.decoders.still(&self.media, self.key.size, &mut frame.data) {
             Ok(()) => {
                 self.env.counters.stills.fetch_add(1, Ordering::Relaxed);
-                self.env.cache.insert(self.frame_key(0), Arc::new(frame), t0.elapsed());
+                if !self.env.cache.insert_from(self.epoch, self.frame_key(0), Arc::new(frame), t0.elapsed()) {
+                    self.forgotten();
+                }
             }
             Err(e) => self.fail(e, 0),
         }
@@ -346,15 +358,38 @@ impl Worker {
     fn fail(&mut self, e: MediaError, frame: i64) {
         tracing::warn!(path = %self.media.path.display(), frame, error = %e, "decode failed");
         self.stream = None;
-        self.env.cache.update(|b| {
-            b.record_failure(self.key.media);
-            ((), vec![])
-        });
+        if !self.record(|b, media| b.record_failure(media)) {
+            return self.forgotten();
+        }
         // Every waiter of this media now answers `DecodeFailed` (and new
         // requests do for a while), so no target is worth retrying.
         let mut st = self.shared.state.lock();
         st.position = None;
         st.target = None;
         st.ahead_until = i64::MIN;
+    }
+
+    /// Records what this session learned about its media, unless the media
+    /// was forgotten since the session started (false).
+    fn record(&self, f: impl FnOnce(&mut Board, AssetId)) -> bool {
+        let (media, epoch) = (self.key.media, self.epoch);
+        self.env.cache.update(|b| {
+            let current = b.epoch(media) == epoch;
+            if current {
+                f(b, media);
+            }
+            (current, vec![])
+        })
+    }
+
+    /// The media was forgotten (relinked) while this session worked: nothing
+    /// it produces counts any more, so it ends (a waiter re-asserting its
+    /// request gets a session of the new epoch).
+    fn forgotten(&mut self) {
+        self.stream = None;
+        let mut st = self.shared.state.lock();
+        st.quit = true;
+        st.position = None;
+        st.target = None;
     }
 }

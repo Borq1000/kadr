@@ -215,13 +215,19 @@ impl Resolver {
     /// records. Call after relinking or replacing a file.
     pub fn invalidate_media(&self, media: AssetId) {
         self.known.lock().remove(&media);
+        self.forget(media);
+    }
+
+    /// Forgets `media` in the cache (a new epoch: what its sessions still
+    /// deliver is refused), then retires its sessions. In this order, every
+    /// session of the old epoch exists when the retiring looks for them.
+    fn forget(&self, media: AssetId) {
+        self.env.cache.remove_media(media);
         let mut reg = self.registry.lock();
         let ids: Vec<u64> = reg.sessions.iter().filter(|s| s.key.media == media).map(|s| s.id).collect();
         for id in ids {
             retire(&mut reg, id);
         }
-        drop(reg);
-        self.env.cache.remove_media(media);
     }
 
     /// Real inputs for `scene`, parallel to its layers. Offline media →
@@ -338,13 +344,7 @@ impl Resolver {
         };
         for id in changed {
             tracing::debug!(media = %id, "media changed: dropping its frames and sessions");
-            let mut reg = self.registry.lock();
-            let ids: Vec<u64> = reg.sessions.iter().filter(|s| s.key.media == id).map(|s| s.id).collect();
-            for sid in ids {
-                retire(&mut reg, sid);
-            }
-            drop(reg);
-            self.env.cache.remove_media(id);
+            self.forget(id);
         }
         (slots, reqs)
     }

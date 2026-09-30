@@ -6,6 +6,12 @@
 //!
 //! Evicted frames drop their `Arc`; the buffer returns to its `FramePool`
 //! as soon as nobody else (renderer, display) holds it.
+//!
+//! Forgetting a media (relink, replaced file) starts a new *epoch* for it.
+//! A decoder session writes with the epoch it started in, and what it
+//! produces or learns after its media was forgotten — a frame whose read was
+//! in flight, an end of stream, a failure — is refused, so the old file
+//! never speaks for the new one.
 
 use kadr_core::{AssetId, CpuFrame};
 use kadr_scene::SizeU;
@@ -48,6 +54,9 @@ pub(crate) struct Board {
     /// Per media: the last decode failure (sequence number, when).
     failures: HashMap<AssetId, (u64, Instant)>,
     fail_seq: u64,
+    /// Per media: how often it was forgotten; plus how often everything was.
+    epochs: HashMap<AssetId, u64>,
+    clears: u64,
 }
 
 impl Board {
@@ -164,6 +173,12 @@ impl Board {
         self.fail_seq
     }
 
+    /// The current epoch of `media`: it changes whenever the media is
+    /// forgotten ([`FrameCache::remove_media`], [`FrameCache::clear`]).
+    pub(crate) fn epoch(&self, media: AssetId) -> u64 {
+        self.clears + self.epochs.get(&media).copied().unwrap_or(0)
+    }
+
     /// Failed within the last `window` (requests then answer at once instead of retrying).
     pub(crate) fn failed_recently(&self, media: AssetId, window: Duration) -> bool {
         self.failures.get(&media).is_some_and(|(_, at)| at.elapsed() < window)
@@ -209,6 +224,8 @@ impl FrameCache {
                 eof: HashMap::new(),
                 failures: HashMap::new(),
                 fail_seq: 0,
+                epochs: HashMap::new(),
+                clears: 0,
             }),
             cv: Condvar::new(),
         }
@@ -256,6 +273,12 @@ impl FrameCache {
         self.update(|b| ((), b.insert(key, frame, decode)));
     }
 
+    /// [`FrameCache::insert`] by a producer that started in `epoch` of the
+    /// key's media: refused (false) if the media was forgotten since.
+    pub(crate) fn insert_from(&self, epoch: u64, key: FrameKey, frame: Arc<CpuFrame>, decode: Duration) -> bool {
+        self.update(|b| if b.epoch(key.media) == epoch { (true, b.insert(key, frame, decode)) } else { (false, vec![frame]) })
+    }
+
     /// Waits until `key` is cached, or until `deadline` (`None` = forever).
     pub fn wait_for(&self, key: &FrameKey, deadline: Option<Instant>) -> Option<Arc<CpuFrame>> {
         let mut b = self.board.lock();
@@ -295,18 +318,21 @@ impl FrameCache {
         self.board.lock().max_bytes
     }
 
-    /// Forgets everything about `media` (relinked or replaced file).
+    /// Forgets everything about `media` (relinked or replaced file),
+    /// including what decoding in flight for it would still deliver.
     pub fn remove_media(&self, media: AssetId) {
         self.update(|b| {
+            *b.epochs.entry(media).or_default() += 1;
             b.eof.remove(&media);
             b.failures.remove(&media);
             ((), b.remove_where(|k| k.media != media))
         });
     }
 
-    /// Forgets everything.
+    /// Forgets everything, including what decoding in flight would still deliver.
     pub fn clear(&self) {
         self.update(|b| {
+            b.clears += 1;
             b.eof.clear();
             b.failures.clear();
             ((), b.remove_where(|_| false))
@@ -384,6 +410,23 @@ mod tests {
         assert_eq!(cache.lock().clamp_eof(key(m, 50)).frame, 50);
         cache.insert(key(m, 91), frame(&pool), Duration::ZERO);
         assert!(!cache.lock().beyond_eof(m, 120));
+    }
+
+    #[test]
+    fn a_forgotten_media_refuses_frames_of_its_old_epoch() {
+        let pool = FramePool::new(1 << 20);
+        let cache = FrameCache::new(1 << 20);
+        let (m, other) = (AssetId::new(), AssetId::new());
+        let (e, e_other) = (cache.lock().epoch(m), cache.lock().epoch(other));
+        assert!(cache.insert_from(e, key(m, 0), frame(&pool), Duration::ZERO));
+        cache.remove_media(m);
+        assert!(!cache.contains(&key(m, 0)));
+        assert!(!cache.insert_from(e, key(m, 1), frame(&pool), Duration::ZERO), "in flight before the relink");
+        assert!(!cache.contains(&key(m, 1)));
+        assert!(cache.insert_from(cache.lock().epoch(m), key(m, 1), frame(&pool), Duration::ZERO));
+        assert!(cache.insert_from(e_other, key(other, 0), frame(&pool), Duration::ZERO), "other media unaffected");
+        cache.clear();
+        assert!(!cache.insert_from(e_other, key(other, 1), frame(&pool), Duration::ZERO), "clear forgets everything");
     }
 
     #[test]

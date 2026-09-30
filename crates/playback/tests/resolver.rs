@@ -426,3 +426,40 @@ fn a_changed_media_path_drops_stale_frames() {
     let (inputs, _) = prepare(&r, &s, &source(vec![(a, new)]), Mode::Export);
     assert_eq!(which(&inputs.layers[0]), (2, 0), "relinked: decoded from the new file");
 }
+
+/// A relink while the old file's session is inside a read: that frame, and
+/// what the old session learns (a failure, an early end), must not outlive
+/// the relink — the new file's frames and records are its own.
+#[test]
+fn a_relink_during_a_decode_never_serves_the_old_files_frame_or_failure() {
+    let fake = fake(0, 150);
+    fake.add("old.mp4", FakeMedia { tag: 1, ..Default::default() });
+    fake.add("new.mp4", FakeMedia { tag: 2, ..Default::default() });
+    let a = AssetId::new();
+    let old = video_source("old.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let new = video_source("new.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = resolver(&fake, ResolverConfig::default());
+    let s = scene(vec![media_layer(1, a, &old, Time::ZERO, CANVAS)]);
+    // The old file's session starts reading frame 0 (150 ms); the request gives up first.
+    let (inputs, _) = prepare(&r, &s, &source(vec![(a, old.clone())]), Mode::Deadline(Instant::now() + ms(10)));
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::NotReady)));
+    // Relinked while that read is in flight; the old read finishes first.
+    let (inputs, _) = prepare(&r, &s, &source(vec![(a, new.clone())]), Mode::Export);
+    assert_eq!(which(&inputs.layers[0]), (2, 0), "relinked: decoded from the new file");
+    let (inputs, _) = prepare(&r, &s, &source(vec![(a, new)]), Mode::Export);
+    assert_eq!(which(&inputs.layers[0]), (2, 0), "and the cache holds the new file's frame");
+
+    // The old file fails (to open, 150 ms) after the relink to a good file.
+    let slow_open = Arc::new(FakeDecoders::new(ms(150), ms(0)));
+    slow_open.add("bad.mp4", FakeMedia { tag: 3, frames: None, fail: true });
+    slow_open.add("good.mp4", FakeMedia { tag: 4, ..Default::default() });
+    let b = AssetId::new();
+    let bad = video_source("bad.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let good = video_source("good.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let r = resolver(&slow_open, ResolverConfig::default());
+    let s = scene(vec![media_layer(1, b, &bad, Time::ZERO, CANVAS)]);
+    let (inputs, _) = prepare(&r, &s, &source(vec![(b, bad)]), Mode::Deadline(Instant::now() + ms(10)));
+    assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::NotReady)));
+    let (inputs, _) = prepare(&r, &s, &source(vec![(b, good)]), Mode::Export);
+    assert_eq!(which(&inputs.layers[0]), (4, 0), "the old file's failure is not the new file's");
+}
