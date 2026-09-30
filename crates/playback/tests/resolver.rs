@@ -308,49 +308,53 @@ fn prefetch_opens_the_next_clip_before_it_is_needed() {
     let r = resolver(&fake, ResolverConfig::default());
     let s = scene(vec![media_layer(5, a, &m, Time::from_secs(40), CANVAS)]);
     r.prefetch(&s, &src);
-    std::thread::sleep(ms(100));
+    // Decoded with no one asking for it.
+    let key = kadr_playback::FrameKey { media: a, size: CANVAS, frame: 1000 };
+    assert!(r.cache().wait_for(&key, Some(Instant::now() + Duration::from_secs(5))).is_some());
     let (inputs, perf) = prepare(&r, &s, &src, Mode::Deadline(Instant::now() + ms(5)));
     assert_eq!(which(&inputs.layers[0]), (1, 1000));
     assert_eq!((perf.cache_hits, perf.cache_misses), (1, 0));
 }
 
-/// 50 rapid scrubs to far-apart positions while opening takes 50 ms and each
-/// frame 20 ms: superseded requests return at once, sessions give up
-/// superseded targets, and the last request gets its frame.
+/// 50 rapid scrubs to far-apart positions while opening takes 300 ms and each
+/// frame 50 ms: superseded requests return at once (well before their frame
+/// could be ready), sessions give up superseded targets, and the last
+/// request gets its frame.
 #[test]
 fn scrubbing_abandons_superseded_requests() {
-    let fake = fake(50, 20);
+    let fake = fake(300, 50);
     fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
     let a = AssetId::new();
     let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(3600), CANVAS);
     let src = Arc::new(source(vec![(a, m.clone())]));
     let r = Arc::new(resolver(&fake, ResolverConfig::default()));
     let frame_for = |g: u64| (g as i64 * 7919) % 60_000; // the fake pixel holds 16 bits
-    let mut issued = vec![];
     let mut threads = vec![];
     for g in 1..=50u64 {
         let (r, src, m) = (r.clone(), src.clone(), m.clone());
-        issued.push(Instant::now());
         threads.push(std::thread::spawn(move || {
             let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(frame_for(g)), CANVAS)]);
+            let started = Instant::now();
             let (inputs, _) = prepare(&r, &s, &*src, Mode::Scrub { generation: g });
-            (Instant::now(), inputs)
+            (started, Instant::now(), inputs)
         }));
         std::thread::sleep(ms(3));
     }
-    let results: Vec<(Instant, RenderInputs)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-    for (i, (returned, inputs)) in results.iter().enumerate().take(49) {
-        // Generation i+1 is superseded when generation i+2 is issued.
-        let late = returned.saturating_duration_since(issued[i + 1]);
-        assert!(late < ms(30), "generation {} returned {late:?} after being superseded", i + 1);
+    let results: Vec<(Instant, Instant, RenderInputs)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for (i, (started, returned, inputs)) in results.iter().enumerate().take(49) {
+        // Superseded once a newer generation has started (threads may start out of order).
+        let superseded = results[i + 1..].iter().map(|r| r.0).min().unwrap().max(*started);
+        let late = returned.saturating_duration_since(superseded);
+        // Waiting for its frame would take ≥ 350 ms (open + frame); anything here is scheduling slack.
+        assert!(late < ms(200), "generation {} returned {late:?} after being superseded", i + 1);
         if let LayerInput::Cpu(_) = &inputs.layers[0] {
             assert_eq!(which(&inputs.layers[0]).1, frame_for(i as u64 + 1), "a frame, if any, is the right one");
         }
     }
-    assert_eq!(which(&results[49].1.layers[0]), (1, frame_for(50)), "the last request is served");
+    assert_eq!(which(&results[49].2.layers[0]), (1, frame_for(50)), "the last request is served");
     let (opens, frames) = (fake.opens(), fake.frames());
-    assert!(opens <= 8, "{opens} streams opened for 50 requests");
-    assert!(frames <= 8, "{frames} frames decoded for 50 requests");
+    assert!(opens <= 5, "{opens} streams opened for 50 requests");
+    assert!(frames <= 5, "{frames} frames decoded for 50 requests");
     assert_eq!(r.stats().sessions, 1, "one layer, one session");
 }
 
@@ -368,6 +372,11 @@ fn steady_state_playback_allocates_no_new_frame_buffers() {
     let mut after_warmup = 0;
     let mut misses = 0;
     for f in 0..300 {
+        if f > 0 {
+            // Read-ahead produces the next frame before it is asked for.
+            let key = kadr_playback::FrameKey { media: a, size: CANVAS, frame: f };
+            assert!(r.cache().wait_for(&key, Some(Instant::now() + Duration::from_secs(5))).is_some(), "frame {f} was not read ahead");
+        }
         let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(f), CANVAS)]);
         let (inputs, perf) = prepare(&r, &s, &src, Mode::Deadline(Instant::now() + Duration::from_secs(2)));
         assert_eq!(which(&inputs.layers[0]), (1, f));
@@ -375,12 +384,11 @@ fn steady_state_playback_allocates_no_new_frame_buffers() {
         if f == 100 {
             after_warmup = r.pool().allocations();
         }
-        std::thread::sleep(ms(2)); // playback pace: the session reads ahead meanwhile
     }
     assert_eq!(r.pool().allocations(), after_warmup, "no new buffers after warm-up");
     assert!(r.cache().bytes() <= frame_bytes * 48);
     assert_eq!(fake.opens(), 1, "one stream read forward all the way");
-    assert!(misses < 30, "read-ahead keeps playback in the cache ({misses} misses)");
+    assert_eq!(misses, 1, "after the first frame playback runs from the cache");
 }
 
 #[test]
