@@ -48,7 +48,7 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "get_frame",
-            "Render a preview frame at a given timeline position.",
+            "Render the frame at a timeline position exactly as the preview shows it (all layers, transitions, crop/rotation/opacity/colour, bypass). A gap or audio-only time is a black frame (`layers: 0`); an empty timeline or a time past the end is an error.",
             json!({
                 "at_ms": {"type": "integer", "description": "Timeline position in milliseconds."},
                 "max_w": {"type": "integer", "description": "Max width in pixels (default 960); the frame keeps its aspect and is never upscaled."},

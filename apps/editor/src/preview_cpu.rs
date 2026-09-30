@@ -2,7 +2,7 @@
 //! (`ProjectScenes`) → `PreviewPlayer` (resolver + `CpuRenderer`) → a Slint
 //! sink that renders straight into the buffer the UI displays.
 //!
-//! - The sink hands the renderer a `SharedPixelBuffer` from a ring of three
+//! - The sink hands the renderer a `SharedPixelBuffer` from a ring of four
 //!   on the player thread; the UI thread only wraps it in an `Image` (no
 //!   pixel copy there). A buffer is reused only when Slint no longer holds
 //!   it: `make_mut_bytes` would copy a shared one, and that copy is detected
@@ -54,6 +54,8 @@ pub struct SlintSink {
     drawing: Option<usize>,
     /// The last two presented slots: on screen, or posted and about to be.
     recent: [Option<usize>; 2],
+    /// Per slot, the `seq` it was last presented with (0 = never).
+    presented_at: Vec<u64>,
     /// Allocations and copies the last `target` made.
     allocs: u32,
     copies: u32,
@@ -65,12 +67,14 @@ pub struct SlintSink {
 
 impl SlintSink {
     pub fn new(slots: usize, deliver: Box<dyn Fn(PlayerFrame) + Send>, ready: Box<dyn Fn(u64) + Send>) -> Self {
-        SlintSink { ring: vec![None; slots.max(3)], drawing: None, recent: [None; 2], allocs: 0, copies: 0, copied_bytes: 0, seq: 0, deliver, ready }
+        let n = slots.max(3);
+        SlintSink { ring: vec![None; n], drawing: None, recent: [None; 2], presented_at: vec![0; n], allocs: 0, copies: 0, copied_bytes: 0, seq: 0, deliver, ready }
     }
 
-    /// The least recently presented slot that is neither on screen nor just posted.
+    /// The least recently presented slot that is neither on screen nor just
+    /// posted: the one the display most likely let go of.
     fn pick(&self) -> usize {
-        (0..self.ring.len()).find(|i| !self.recent.contains(&Some(*i)) && self.drawing != Some(*i)).or(self.drawing).unwrap_or(0)
+        (0..self.ring.len()).filter(|i| !self.recent.contains(&Some(*i))).min_by_key(|&i| self.presented_at[i]).unwrap_or(0)
     }
 }
 
@@ -113,6 +117,7 @@ impl FrameSink for SlintSink {
         info.perf.bytes_copied += std::mem::take(&mut self.copied_bytes);
         self.recent = [Some(i), self.recent[0]];
         self.seq += 1;
+        self.presented_at[i] = self.seq;
         (self.deliver)(PlayerFrame { generation: info.generation, seq: self.seq, buf, posted: Instant::now() });
     }
 
@@ -144,7 +149,7 @@ impl CpuPreview {
     pub fn new(media: Arc<dyn MediaBackend>, clock: AudioClock, perf: Arc<PerfRing>) -> Self {
         let resolver = Arc::new(Resolver::new(Arc::new(FfmpegDecoders::new(media)), ResolverConfig::default()));
         let sink = SlintSink::new(
-            3,
+            4,
             Box::new(|f| post(move |app| app.on_player_frame(f))),
             Box::new(|g| post(move |app| app.start_pending_audio(g))),
         );
@@ -163,12 +168,12 @@ impl CpuPreview {
     pub fn set_scenes(&mut self, scenes: Arc<ProjectScenes>, also: Option<&Resolver>) {
         if let Some(old) = &self.scenes {
             for (id, m) in scenes.media_sources() {
-                if let Some(o) = old.media_sources().get(id) {
-                    if o.path != m.path || (!o.online && m.online) {
-                        self.resolver.invalidate_media(*id);
-                        if let Some(r) = also {
-                            r.invalidate_media(*id);
-                        }
+                if let Some(o) = old.media_sources().get(id)
+                    && (o.path != m.path || (!o.online && m.online))
+                {
+                    self.resolver.invalidate_media(*id);
+                    if let Some(r) = also {
+                        r.invalidate_media(*id);
                     }
                 }
             }
