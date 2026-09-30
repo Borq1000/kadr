@@ -23,6 +23,13 @@ pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) ->
     scene
 }
 
+/// Whether any video is visible at `t` (the evaluator's answer, so it agrees
+/// with preview and export: muted tracks, disabled clips and gaps show none).
+pub fn has_video_at(project: &Project, seq: &Sequence, t: Time) -> bool {
+    let size = SizeU::new(seq.width.max(1), seq.height.max(1));
+    !evaluate(project, seq, t, &OutputSpec::new(size, RenderQuality::PreviewFast)).layers.is_empty()
+}
+
 /// Below this a layer cannot change an 8-bit pixel.
 const MIN_OPACITY: f32 = 0.5 / 255.0;
 
@@ -378,6 +385,34 @@ mod tests {
             LayerContent::Transition(t) => t,
             other => panic!("not a transition: {other:?}"),
         }
+    }
+
+    #[test]
+    fn has_video_at_follows_gaps_mute_and_disabled_clips() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 3_000);
+        place(&mut p, 0, &hd(), 0, 5_000, 3_000);
+        let at = |p: &Project, ms: i64| has_video_at(p, p.sequence(), Time::from_millis(ms));
+        assert!(at(&p, 1_000) && !at(&p, 4_000) && at(&p, 6_000) && !at(&p, 9_000));
+        p.sequence_mut().tracks[0].clips[1].enabled = false;
+        assert!(!at(&p, 6_000), "a disabled clip is a gap");
+        p.sequence_mut().tracks[0].muted = true;
+        assert!(!at(&p, 1_000), "a muted only track shows nothing");
+    }
+
+    #[test]
+    fn muted_or_disabled_upper_clips_let_the_track_below_show() {
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let lower = place(&mut p, 0, &hd(), 0, 0, 10_000);
+        let upper = place(&mut p, v2, &hd(), 30_000, 2_000, 3_000);
+        let ids = |p: &Project| scene_at(p, 3_000).layers.iter().map(|l| l.id).collect::<Vec<_>>();
+        assert_eq!(ids(&p), vec![LayerId::from(upper)], "the opaque upper clip hides the lower");
+        p.sequence_mut().tracks[v2].clips[0].enabled = false;
+        assert_eq!(ids(&p), vec![LayerId::from(lower)]);
+        p.sequence_mut().tracks[v2].clips[0].enabled = true;
+        p.sequence_mut().tracks[v2].muted = true;
+        assert_eq!(ids(&p), vec![LayerId::from(lower)]);
     }
 
     #[test]

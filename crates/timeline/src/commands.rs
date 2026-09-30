@@ -313,9 +313,18 @@ impl EditCommand {
             }
 
             EditCommand::AddTransition(tr) => {
-                unlocked_mut(seq, tr.track)?;
+                let track = unlocked_mut(seq, tr.track)?;
+                // Snap to the cut the caller names: when exactly one adjacent
+                // clip pair has its boundary within half a frame of `at`
+                // (MCP clients send ms-rounded times), use that boundary.
+                let half = Time(fr.frame_duration().flicks() / 2);
+                let mut cuts = track.clips.windows(2).filter(|w| w[0].timeline_out == w[1].timeline_in).map(|w| w[0].timeline_out).filter(|c| (*c - tr.at).abs() <= half);
+                let mut tr = tr.clone();
+                if let (Some(cut), None) = (cuts.next(), cuts.next()) {
+                    tr.at = cut;
+                }
                 seq.transitions.retain(|t| !(t.track == tr.track && t.at == tr.at));
-                seq.transitions.push(tr.clone());
+                seq.transitions.push(tr);
                 Ok(())
             }
             EditCommand::RemoveTransition(id) => {

@@ -25,7 +25,7 @@ const EDIT_DESCRIPTION: &str = "Apply an undoable batch of timeline edit ops (un
 - \"change_speed\": clip_id, speed (number, 1.0 = normal)
 - \"set_audio_gain\": clip_id, gain_db (number)
 - \"add_marker\": at_ms, name
-- \"add_transition\": at_ms, kind (\"cross_dissolve\"|\"dip_to_black\"|\"wipe\"), duration_ms
+- \"add_transition\": at_ms, kind (\"cross_dissolve\"|\"dip_to_black\"|\"wipe\"), duration_ms (at_ms snaps to the cut within half a frame of it, if exactly one; else stays as given)
 - \"select_camera\": start_ms, end_ms, angle (multicam angle label, e.g. \"CAM2\")
 - \"add_caption\": start_ms, end_ms, text (not supported yet: rejected)
 - \"unlink\": clips (array of clip ids; their linked partners are unlinked too)
