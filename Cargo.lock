@@ -3007,6 +3007,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-render"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-scene",
+ "png 0.17.16",
+ "rayon",
+]
+
+[[package]]
 name = "kadr-scene"
 version = "0.1.0"
 dependencies = [

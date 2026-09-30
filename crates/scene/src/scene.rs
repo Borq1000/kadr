@@ -53,6 +53,9 @@ pub struct Rgba {
 impl Rgba {
     pub const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
     pub const TRANSPARENT: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    /// Drawn in place of a media frame that cannot be had (offline, decode
+    /// error): an opaque dark red, like «Media Offline» in other editors.
+    pub const MISSING: Rgba = Rgba { r: 0.45, g: 0.05, b: 0.08, a: 1.0 };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

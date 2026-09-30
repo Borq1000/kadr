@@ -20,8 +20,12 @@
 //!   channel, premultiplied. A value `v` is stored as
 //!   `floor(clamp(v, 0, 1) · 255 + 0.5)` (nearest, half up); it is read back
 //!   as `stored / 255`. Arithmetic in between is f32 or better. Fusing steps
-//!   (keeping an intermediate in float instead of storing it) is allowed:
-//!   the ±1 LSB tolerance covers it.
+//!   (keeping an intermediate in float instead of storing it) is allowed
+//!   only **within one layer** — sample → effects → opacity and coverage →
+//!   composite — and the ±1 LSB tolerance covers that. Between layers
+//!   nothing is fused: the output buffer is stored (rounded) after every
+//!   top-level layer, and each transition buffer (`from`, `to`) is stored
+//!   after its last layer, before the two are mixed.
 //! - Straight-alpha sources (images, alpha video) are premultiplied per
 //!   texel **before** filtering.
 //!
@@ -52,15 +56,22 @@
 //! One bilinear sample per output pixel, no mipmaps or area filtering. For
 //! the texel point `(u, v)`: clamp `u` to `[kx0 + 0.5, kx1 − 0.5]` and `v` to
 //! `[ky0 + 0.5, ky1 − 0.5]`, where the crop in whole texels is
-//! `kx0 = floor(cx0 + 0.5)`, `kx1 = max(floor(cx1 + 0.5), kx0 + 1)` (same for
-//! y) and `(cx0, cy0, cx1, cy1)` is the crop rectangle in texels. Then with
+//! `kx0 = min(floor(cx0 + 0.5), tw − 1)`,
+//! `kx1 = min(max(floor(cx1 + 0.5), kx0 + 1), tw)` (same for y with `th`)
+//! and `(cx0, cy0, cx1, cy1)` is the crop rectangle in texels **intersected
+//! with the decoded frame** `[0, tw] × [0, th]` (so `0 ≤ kx0 < kx1 ≤ tw`:
+//! at least one texel, never one outside the frame). Then with
 //! `i = floor(u − 0.5)`, `f = (u − 0.5) − i`, `j = floor(v − 0.5)`,
 //! `g = (v − 0.5) − j` the sample is the bilinear mix of texels `(i, j)`, `(i+1, j)`, `(i, j+1)`,
 //! `(i+1, j+1)` with weights `(1−f)(1−g)`, `f(1−g)`, `(1−f)g`, `fg`; an index
-//! outside `[kx0, kx1 − 1]` (or `[ky0, ky1 − 1]`) is clamped into it. So
+//! outside `[kx0, kx1 − 1]` (or `[ky0, ky1 − 1]`) is clamped into it, which
+//! also caps it at `tw − 1` (or `th − 1`). So
 //! nothing outside the crop is ever read (no bleeding). A
 //! [`LayerContent::Solid`] layer has no texels: its sample is its
-//! premultiplied colour.
+//! premultiplied colour. A [`LayerContent::Media`] layer whose frame is
+//! missing (offline media, a failed decode) is drawn exactly like a `Solid`
+//! layer of [`Rgba::MISSING`] with the same placement, crop, opacity, blend
+//! and effects; the scene itself never changes because of it.
 //!
 //! Effects (point operations, formulas in the effects spec «Примитивы цвета»)
 //! apply to that sample in `effects` order, on unpremultiplied colour:

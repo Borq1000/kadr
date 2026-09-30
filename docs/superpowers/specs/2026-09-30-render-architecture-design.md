@@ -147,7 +147,7 @@ pub struct FrameScene {
     pub time: Time,                 // время таймлайна
     pub canvas: SizeU,              // логический холст = размер последовательности, квадратные пиксели
     pub output: OutputSpec,         // размер, качество, цветовое пространство вывода
-    pub background: Rgba,           // значение в рабочем пространстве (§6)
+    pub background: Rgba,           // прямой (straight) цвет; рендерер премультиплицирует его (§6)
     pub layers: Vec<Layer>,         // снизу вверх, уже после отсечения невидимого (§7.3)
 }
 
