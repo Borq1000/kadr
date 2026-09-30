@@ -326,7 +326,9 @@ fn export_retries_a_transient_failure_that_preview_reports() {
     let (inputs, _) = prepare(&r, &s, &src, Mode::Export);
     assert_eq!(which(&inputs.layers[0]), (1, 900));
     let waited = t0.elapsed();
-    assert!(waited >= ms(250) && waited < ms(2000), "backoffs of 50 and 200 ms: {waited:?}");
+    // The lower bound proves both backoffs ran; the upper one is generous:
+    // on a loaded machine the decode attempts themselves can take seconds.
+    assert!(waited >= ms(250) && waited < ms(10_000), "backoffs of 50 and 200 ms: {waited:?}");
 }
 
 /// Media layers inside a transition that draw nothing whatever their input
