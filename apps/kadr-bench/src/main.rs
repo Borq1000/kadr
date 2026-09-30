@@ -4,8 +4,11 @@
 //!   kadr-bench baseline [--quick]                  legacy decode, seek, copy and export numbers
 //!   kadr-bench live --clip <file> [--seconds N]    the real app, headless, through kadr-mcp
 //!   kadr-bench scene                               cost of the scene evaluator (M1)
+//!   kadr-bench avsync-selftest                     A/V sync harness on its own 60 s source (spec §8)
+//!   kadr-bench avsync-analyze <file> [--fps N/D]   flash/click offsets of any file (default 30000/1001)
 
 mod alloc;
+mod avsync;
 mod baseline;
 mod live;
 mod media;
@@ -28,7 +31,16 @@ fn main() {
             }
         }
         Some("scene") => scene_bench::run(),
-        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene".to_string()),
+        Some("avsync-selftest") => avsync::selftest(),
+        Some("avsync-analyze") => {
+            let fps = args.iter().position(|a| a == "--fps").and_then(|i| args.get(i + 1)).map_or(Some(kadr_core::FrameRate::FPS_29_97), |s| kadr_core::FrameRate::parse(s));
+            match (args.get(1).filter(|a| !a.starts_with("--")), fps) {
+                (Some(f), Some(fps)) => avsync::analyze_file(std::path::Path::new(f), fps),
+                (None, _) => Err("avsync-analyze needs <file>".to_string()),
+                (_, None) => Err("avsync-analyze: bad --fps".to_string()),
+            }
+        }
+        _ => Err("usage: kadr-bench baseline [--quick] | live --clip <file> [--seconds N] | scene | avsync-selftest | avsync-analyze <file> [--fps N/D]".to_string()),
     };
     match result {
         Ok(r) => {
