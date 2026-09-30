@@ -30,7 +30,7 @@ Detailed tasks below cover **M0 and M1**. The plans for M2–M6 are written when
 - `kadr-core` stays std + `serde` + `uuid`; `kadr-scene` depends only on `kadr-core` (data + pure geometry, no pixels, no I/O).
 - Internal time is `kadr_core::Time` (i64 flicks) and integer frame numbers via `FrameRate`; no accumulation of f32/f64 seconds (spec §8). A single f64 ratio for a transition's progress is allowed.
 - Coordinates are canvas pixels (sequence pixels, square); normalized UV only for sampling; crop is a rectangle in local layer space and never re-centres the remaining image (spec §5).
-- Colour metadata is explicit everywhere a source or output is described (spec §6); untagged video: width ≥ 1280 or height > 576 → BT.709; height 576 → BT.601/625; otherwise BT.601/525 (Ruling R7); limited range; video alpha from the pixel format and the `alpha_mode` tag (Ruling R10).
+- Colour metadata is explicit everywhere a source or output is described (spec §6); untagged video: width ≥ 1280 or height > 576 → BT.709; height 576 → BT.601/625; otherwise BT.601/525 (Ruling R7); limited range; video alpha from the pixel format and the `alpha_mode` tag — only known-opaque formats are opaque, unknown formats count as having alpha (Rulings R10, R13); untagged RGB-family video is matrix Rgb, full range.
 - Tests never touch the user's running `kadr.exe` or `%LOCALAPPDATA%\Kadr`: headless runs use `KADR_DATA_DIR` in a temp dir.
 - Before rebuilding the editor in `target/debug`: `mv target/debug/kadr.exe target/debug/kadr-old-$RANDOM.exe 2>/dev/null` (the user may be running it); delete `kadr-old-*` at the end of the task.
 - Every user-visible string goes through `kadr_i18n` with RU and EN (none are expected in M0–M1; MCP output is English JSON).
