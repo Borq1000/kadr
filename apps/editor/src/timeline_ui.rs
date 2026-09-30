@@ -735,7 +735,7 @@ impl App {
                 self.refresh_status();
             }
             // Show what was just placed instead of "no clip under playhead".
-            if asset.kind() != MediaKind::Audio && kadr_timeline::composition::video_at(self.project.sequence(), self.playhead).is_none() {
+            if asset.kind() != MediaKind::Audio && !kadr_timeline::scene::has_video_at(&self.project, self.project.sequence(), self.playhead) {
                 self.set_playhead(at);
             }
             self.refresh_timeline();
