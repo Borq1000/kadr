@@ -236,10 +236,10 @@ fade(t)     = fade_in(t) · fade_out(t)
 | Команда | Источник |
 |---|---|
 | `SetKeyframe { clip, param, at: SourceTime, value, ease: Option<Ease> }` | `◆`; отпускание ползунка анимированного свойства; `None` → правило вставки |
-| `RemoveKeyframe { clip, param, at }` | повторный клик по `◆`, меню ромбика |
+| `RemoveKeyframe { clip, param, at, keep: Option<f64> }` | повторный клик по `◆`, меню ромбика; `keep` — значение в плейхеде, которое станет статическим, если кадр был последним (§3.2) |
 | `MoveKeyframes { clip, moves: Vec<(AnimParam, SourceTime, SourceTime)> }` | перетаскивание ромбика; при совпадении времени с существующим кадром того же свойства — отказ с понятным сообщением, без слияния |
 | `SetKeyframeEase { clip, param, at, ease }` | меню интерполяции |
-| `ClearAnimation { clip, params: Vec<AnimParam>, reset_to_defaults: bool }` | «Сбросить анимацию свойства» (`false`), «Сброс» секции (`true`) |
+| `ClearAnimation { clip, statics: Vec<(AnimParam, f64)> }` | удаляет дорожки перечисленных свойств и задаёт их статические значения: «Сбросить анимацию свойства» — значение в плейхеде (картинка не меняется), «Сброс» секции — значения по умолчанию |
 | `SetClipProperty(VideoFade(EdgeFades))`, `SetClipProperty(Audio(..))` | ручки и поля fade |
 
 - **Кадр «в плейхеде»** — кадр, у которого `|timeline_time_of(k.at) − playhead| <
