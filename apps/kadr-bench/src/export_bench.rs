@@ -1,23 +1,22 @@
-//! M5: export on the render pipeline (`kadr-playback::export`) against the legacy FFmpeg-graph
-//! exporter: fps on the M0 scenario, at 4K and with three layers; PSNR of the two on a
-//! cuts-only single track; and the 20-minute A/V sync export (spec §8).
+//! M5: export on the render pipeline (`kadr-playback::export`): fps on the M0 scenario, at 4K and
+//! with three layers, fast-path diagnosis, and the 20-minute A/V sync export (spec §8). The legacy
+//! FFmpeg-graph exporter these were compared with was deleted in M6; the comparison (legacy fps,
+//! PSNR of the two on a cuts-only track, >= 40 dB) is recorded in `docs/perf/2026-09-30-m5-export.md`.
 
 use crate::avsync;
 use crate::media::{self, TestClip};
 use crate::report::Report;
 use kadr_core::{AssetId, CancelToken, FrameRate, LinkId, Time, TimeRange, TransitionId};
-use kadr_media::export::{ExportVideoSource, VideoLook};
 use kadr_media::ffmpeg::FfmpegCli;
-use kadr_media::{EncodeJob, ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo, MediaBackend};
+use kadr_media::{EncodeJob, ExportAudio, ExportSettings, MediaBackend};
 use kadr_media::{FrameEncoder, MediaError};
 use kadr_playback::{EncoderFactory, ExportRequest, ExportStats, FfmpegDecoders, MissingPolicy};
 use kadr_project::{Clip, MediaAsset, Project, Sequence, Track, TrackKind, Transition, TransitionKind};
 use kadr_project_scenes::ProjectScenes;
-use kadr_timeline::composition::{audio_segments, transitions_into, video_segments};
+use kadr_timeline::composition::audio_segments;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Runs of every fps row; the run with the median fps is reported.
 const RUNS: usize = 3;
@@ -124,7 +123,7 @@ fn settings(w: u32, h: u32, rate: FrameRate) -> ExportSettings {
     ExportSettings { width: w, height: h, rate, crf: 21, preset: "fast".into(), ..Default::default() }
 }
 
-/// The encode job the app builds (`encode_job`): even size, frames as the legacy exporter rounds them.
+/// The encode job the app builds (`encode_job`): even size, frames rounded to the nearest frame.
 fn encode_job(p: &Project, output: PathBuf, audio: Vec<ExportAudio>) -> EncodeJob {
     let seq = p.sequence();
     let total = seq.duration();
@@ -156,37 +155,6 @@ fn export_audio(p: &Project) -> Vec<ExportAudio> {
 fn export_new(media: &Arc<dyn MediaBackend>, p: &Project, job: EncodeJob, progress: &(dyn Fn(f32) + Sync)) -> Result<ExportStats, String> {
     let req = ExportRequest::new(Arc::new(ProjectScenes::new(p, false)), job).with_missing(MissingPolicy::Fail);
     kadr_playback::export::export(req, Arc::new(FfmpegDecoders::new(media.clone())), &**media, progress, &CancelToken::new()).map_err(|e| e.to_string())
-}
-
-/// The legacy plan of a project with no look (a cuts/dissolves-only timeline), as `build_export_plan`.
-fn legacy_plan(p: &Project, output: PathBuf, audio: Vec<ExportAudio>) -> ExportPlan {
-    let seq = p.sequence();
-    let total = seq.duration();
-    let segs = video_segments(seq, TimeRange::new(Time::ZERO, total));
-    let transitions = transitions_into(seq, &segs);
-    let video = segs
-        .into_iter()
-        .zip(transitions)
-        .map(|(s, tr)| ExportVideo {
-            transition_in: tr.map(|t| ExportTransition {
-                kind: match t.kind {
-                    TransitionKind::CrossDissolve => ExportTransitionKind::Dissolve,
-                    TransitionKind::DipToBlack => ExportTransitionKind::DipToBlack,
-                    TransitionKind::Wipe => ExportTransitionKind::Wipe,
-                },
-                duration: t.duration,
-            }),
-            duration: s.range.duration(),
-            source: s.source.and_then(|v| Some(ExportVideoSource { path: p.asset(v.asset)?.path.clone(), source_start: v.source_start, speed: v.speed, look: VideoLook::default() })),
-        })
-        .collect();
-    ExportPlan { output, total, video, audio, settings: settings(seq.width & !1, seq.height & !1, seq.frame_rate) }
-}
-
-fn export_legacy(ff: &FfmpegCli, plan: &ExportPlan) -> Result<f64, String> {
-    let started = Instant::now();
-    ff.export(plan, &|_| {}, &CancelToken::new()).map_err(|e| e.to_string())?;
-    Ok(started.elapsed().as_secs_f64())
 }
 
 /// An encoder that drops the frames: the export without the cost (and the CPU contention) of x264.
@@ -269,22 +237,8 @@ pub fn run(diag_only: bool) -> Result<Report, String> {
     let out = dir.join("export-new.mp4");
     let mut r = Report::new("m5-export");
 
-    // Same-run legacy figure for the M0 scenario (M0 §6: 133.30 fps), repeated like the new one.
-    let m0 = m0_project(&hd);
-    let plan = legacy_plan(&m0, dir.join("export-legacy.mp4"), vec![]);
-    let mut legacy: Vec<f64> = vec![];
-    for _ in 0..if diag_only { 0 } else { RUNS } {
-        legacy.push(600.0 / export_legacy(&ff, &plan)?);
-    }
-    let _ = std::fs::remove_file(&plan.output);
-    legacy.sort_by(f64::total_cmp);
     let case = "1080p30 20 s, 10 cuts, 2 dissolves, crf 21 fast";
-    if !diag_only {
-        r.push("export_legacy", case, "fps", legacy[RUNS / 2], "fps");
-        r.push("export_legacy", case, "fps min of runs", legacy[0], "fps");
-        r.push("export_legacy", case, "fps max of runs", legacy[RUNS - 1], "fps");
-    }
-
+    let m0 = m0_project(&hd);
     let cases: [(&str, Project); 3] = [
         (case, m0),
         ("4K 10 s, 3 cuts, 3840x2160, crf 21 fast", uhd_project(&uhd)),
@@ -326,74 +280,7 @@ pub fn run(diag_only: bool) -> Result<Report, String> {
         push_stats(&mut r, name, &runs[RUNS / 2], &fps);
     }
 
-    if !diag_only {
-        psnr_rows(&mut r, &ff, &media, &hd, &dir)?;
-    }
     Ok(r)
-}
-
-// ---------------------------------------------------------------- PSNR
-
-/// `[psnr]` line of `ffmpeg -i a -i b -lavfi psnr`: (y, u, v, average) in dB (`inf` when identical).
-pub fn parse_psnr(stderr: &str) -> Option<[f64; 4]> {
-    let line = stderr.lines().rev().find(|l| l.contains("PSNR y:"))?;
-    let field = |key: &str| -> Option<f64> {
-        let rest = line.split(key).nth(1)?;
-        let tok = rest.split_whitespace().next()?;
-        if tok == "inf" { Some(f64::INFINITY) } else { tok.parse().ok() }
-    };
-    Some([field("y:")?, field("u:")?, field("v:")?, field("average:")?])
-}
-
-fn frame_count(path: &Path) -> Result<u64, String> {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("ffprobe: {e}"))?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().map_err(|_| format!("ffprobe frame count of {}", path.display()))
-}
-
-fn psnr_of(a: &Path, b: &Path) -> Result<[f64; 4], String> {
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-i"])
-        .arg(a)
-        .arg("-i")
-        .arg(b)
-        .args(["-lavfi", "[0:v][1:v]psnr", "-f", "null", "-"])
-        .output()
-        .map_err(|e| format!("ffmpeg: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stderr);
-    parse_psnr(&text).ok_or_else(|| format!("no PSNR in ffmpeg output: {}", text.lines().last().unwrap_or("")))
-}
-
-/// Single track, cuts only (legacy rounds transitions differently by design), a BT.709-tagged 1080p
-/// source, no look: legacy and new export with the same settings, PSNR of the two.
-fn psnr_rows(r: &mut Report, ff: &FfmpegCli, media: &Arc<dyn MediaBackend>, hd: &MediaAsset, dir: &Path) -> Result<(), String> {
-    let mut p = new_project("psnr", 1920, 1080, FrameRate::FPS_30);
-    let segs: Vec<_> = (0..5).map(|i| (Time::from_secs(i * 10 + 1), Time::from_secs(2))).collect();
-    cuts_on_v1(p.sequence_mut(), hd.id, &segs);
-    p.assets.push(hd.clone());
-    let (legacy, new) = (dir.join("psnr-legacy.mp4"), dir.join("psnr-new.mp4"));
-    export_legacy(ff, &legacy_plan(&p, legacy.clone(), vec![]))?;
-    export_new(media, &p, encode_job(&p, new.clone(), vec![]), &|_| {})?;
-    let (nl, nn) = (frame_count(&legacy)?, frame_count(&new)?);
-    let case = "1080p30 10 s, 5 cuts, no transitions, no look, BT.709 tagged";
-    r.push("psnr", case, "frames legacy", nl as f64, "n");
-    r.push("psnr", case, "frames new", nn as f64, "n");
-    if nl != nn {
-        return Err(format!("frame counts differ: legacy {nl}, new {nn}\n{}", crate::report::markdown(r)));
-    }
-    let [y, u, v, avg] = psnr_of(&new, &legacy)?;
-    r.push("psnr", case, "y", y, "dB");
-    r.push("psnr", case, "u", u, "dB");
-    r.push("psnr", case, "v", v, "dB");
-    r.push("psnr", case, "average", avg, "dB");
-    r.push("psnr", case, "exit criterion >= 40 dB", if avg >= 40.0 { 1.0 } else { 0.0 }, "pass");
-    for f in [legacy, new] {
-        let _ = std::fs::remove_file(f);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------- 20-minute A/V sync export
@@ -518,15 +405,6 @@ pub fn run_avsync() -> Result<Report, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn psnr_line_is_parsed() {
-        let text = "[Parsed_psnr_0 @ 000] PSNR y:44.58 u:47.05 v:inf average:45.12 min:40.00 max:60.10\nframe=  300 fps=0.0";
-        let [y, u, v, avg] = parse_psnr(text).unwrap();
-        assert_eq!((y, u, avg), (44.58, 47.05, 45.12));
-        assert!(v.is_infinite());
-        assert!(parse_psnr("nothing").is_none());
-    }
 
     #[test]
     fn sync_plan_has_the_cuts_dissolves_and_handles_the_exit_criterion_asks_for() {
