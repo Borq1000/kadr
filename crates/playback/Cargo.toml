@@ -1,0 +1,18 @@
+[package]
+name = "kadr-playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kadr playback: decoder sessions, frame cache, resolver and the preview player (render spec §4.2, §8–10)"
+
+[dependencies]
+kadr-core = { path = "../core" }
+kadr-scene = { path = "../scene" }
+kadr-render = { path = "../render" }
+kadr-media = { path = "../media" }
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

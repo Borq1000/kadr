@@ -2995,6 +2995,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-playback"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "kadr-core",
+ "kadr-media",
+ "kadr-render",
+ "kadr-scene",
+ "parking_lot",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "kadr-project"
 version = "0.1.0"
 dependencies = [
