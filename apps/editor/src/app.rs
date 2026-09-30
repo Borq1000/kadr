@@ -518,6 +518,8 @@ impl App {
             self.playhead = dur;
         }
         self.preview.invalidate();
+        // The first clip placed sets the sequence format (size, aspect).
+        self.update_preview_info();
         if self.playing {
             self.restart_playback();
         }
