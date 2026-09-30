@@ -33,7 +33,6 @@ const CLICK_GAP_SECS: f64 = 0.5;
 const PAIR_WINDOW_SECS: f64 = 0.5;
 
 /// Result of measuring one file. The time vectors are for the M5 export test (cut mapping).
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AvSync {
     pub flashes: usize,
@@ -118,7 +117,7 @@ pub fn click_expr(fps: FrameRate) -> String {
 }
 
 /// First sample of the click for second `s` (what `click_expr` computes), for tests and planning.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn click_start_sample(s: i64, fps: FrameRate) -> i64 {
     let frame = (s * fps.num as i64 + fps.den as i64 - 1) / fps.den as i64;
     (frame as f64 * fps.den as f64 * SAMPLE_RATE as f64 / fps.num as f64).round() as i64
@@ -255,13 +254,14 @@ pub fn selftest() -> Result<Report, String> {
     let report = m.report("avsync-selftest", "source 60 s 1280x720 29.97");
     if m.flashes != 60 || m.clicks != 60 || !m.within_one_frame() {
         return Err(format!(
-            "self-test failed: {} flashes, {} clicks, {} unmatched flashes, {} unmatched clicks, max offset {:.2} ms ({:.2} frames)\n{}",
+            "self-test failed: {} flashes, {} clicks, {} unmatched flashes, {} unmatched clicks, max offset {:.2} ms ({:.2} frames), offsets (ms) {:?}\n{}",
             m.flashes,
             m.clicks,
             m.unmatched_flashes,
             m.unmatched_clicks,
             m.max_abs_offset_ms,
             m.offsets_frames_max,
+            m.offsets_ms,
             crate::report::markdown(&report)
         ));
     }

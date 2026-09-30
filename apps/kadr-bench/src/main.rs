@@ -7,7 +7,7 @@
 //!   kadr-bench scene                               cost of the scene evaluator (M1)
 //!   kadr-bench render                              CpuRenderer at 1080p and 4K, 1-3 layers and a transition (M2)
 //!   kadr-bench playback [--quick]                 seek latency and sequential decode through Resolver + CpuRenderer (M3)
-//!   kadr-bench export                             export on the render pipeline: fps rows and fast-path diagnosis (M5)
+//!   kadr-bench export [--diag]                    export on the render pipeline: fps rows and fast-path diagnosis (M5)
 //!   kadr-bench avsync-export                      20-minute cut-up timeline exported and analyzed for A/V sync (M5)
 //!   kadr-bench avsync-selftest                    A/V sync harness on its own 60 s source (spec §8)
 //!   kadr-bench avsync-analyze <file> [--fps N/D]   flash/click offsets of any file (default 30000/1001)
