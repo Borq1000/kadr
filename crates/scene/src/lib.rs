@@ -43,7 +43,10 @@
 //!   canvas rectangle `[o.x, o.x + k·canvas.w] × [o.y, o.y + k·canvas.h]` are
 //!   margins: opaque black `(0, 0, 0, 1)`, nothing is drawn there.
 //! - Canvas → local: `placement.to_canvas().inverse()` (a layer whose
-//!   transform has no inverse draws nothing).
+//!   transform has no inverse — [`Affine2::inverse`], `|det| < 1e-12` —
+//!   draws nothing; decided on the placement alone, never on it composed
+//!   with the output map, whose `k²` would move the cut-off with the output
+//!   size).
 //! - Local → texel: the local content rectangle `[0, size.x] × [0, size.y]`
 //!   maps onto the whole decoded frame `[0, tw] × [0, th]` (`tw × th` texels):
 //!   `texel = (local.x · tw / size.x, local.y · th / size.y)` with

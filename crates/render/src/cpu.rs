@@ -1076,11 +1076,12 @@ mod tests {
 
     #[test]
     fn invertibility_is_the_placements_not_the_output_maps() {
-        // A layer squeezed to 1e-9 of its height is invertible (det 1e-9) and lies across row 0's centres, so it
-        // covers them by half; composed with k = 0.01 the determinant would be 1e-13, below `Affine2::inverse`'s cut-off.
-        let p = Placement { size: Vec2::new(1000.0, 1000.0), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(0.0, 50.0), scale: Vec2::new(1.0, 1e-9), rotation: 0.0 };
+        // A 1000 × 1e11 layer squeezed by 1e-9 is 100 canvas pixels tall — one output row at k = 0.01. Its
+        // placement is invertible (det 1e-9); composed with the output map the determinant would be 1e-13, below
+        // `Affine2::inverse`'s cut-off.
+        let p = Placement { size: Vec2::new(1000.0, 1e11), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(0.0, 0.0), scale: Vec2::new(1.0, 1e-9), rotation: 0.0 };
         let out = render(&scene((1000, 1000), (10, 10), Rgba::BLACK, vec![solid(WHITE, p)]), vec![LayerInput::None]);
-        assert_eq!(px(&out, 10, 3, 0), [128, 128, 128, 255]);
+        assert_eq!(px(&out, 10, 3, 0), [255, 255, 255, 255]);
         assert_eq!(px(&out, 10, 3, 1), [0, 0, 0, 255]);
     }
 
