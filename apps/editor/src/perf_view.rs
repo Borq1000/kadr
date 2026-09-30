@@ -1,6 +1,8 @@
-//! JSON view of preview telemetry for MCP `get_perf` (render spec §10).
+//! Views of preview telemetry (render spec §10): JSON for MCP `get_perf`
+//! and the rows of the DEV overlay.
 
-use kadr_core::perf::{PerfSummary, Stats};
+use kadr_core::perf::{FramePerf, PerfSummary, Stats};
+use kadr_i18n::{t, tf};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -43,6 +45,36 @@ pub fn summary_json(s: &PerfSummary) -> Value {
     })
 }
 
+/// Share of layer frames served from the cache, in percent; `None` before any.
+pub fn cache_hit_pct(frames: &[FramePerf]) -> Option<f64> {
+    let (hits, misses) = frames.iter().fold((0u64, 0u64), |(h, m), f| (h + f.cache_hits as u64, m + f.cache_misses as u64));
+    (hits + misses > 0).then(|| hits as f64 * 100.0 / (hits + misses) as f64)
+}
+
+fn ms1(d: Duration) -> String {
+    tf("dev.ms", &[("v", &format!("{:.1}", ms(d)))])
+}
+
+/// The DEV overlay's rows (label, value): frames shown in the last second,
+/// composite / decode p50, player → screen p50, drops (window and since the
+/// reset), cache hits, renderer.
+pub fn dev_rows(s: &PerfSummary, frames: &[FramePerf], fps: usize, present: Option<Duration>, renderer: &str) -> Vec<(String, String)> {
+    let dash = || "—".to_string();
+    let stat = |st: &Stats| if st.count == 0 { dash() } else { ms1(st.p50) };
+    vec![
+        (t("dev.fps"), fps.to_string()),
+        (t("dev.render"), stat(&s.composite)),
+        (t("dev.decode"), stat(&s.decode)),
+        (t("dev.present"), present.map_or_else(dash, ms1)),
+        (
+            t("dev.dropped"),
+            tf("dev.dropped_value", &[("n", &s.dropped.to_string()), ("of", &s.frames.to_string()), ("total", &s.total_dropped.to_string()), ("total_of", &s.total_frames.to_string())]),
+        ),
+        (t("dev.cache"), cache_hit_pct(frames).map_or_else(dash, |p| format!("{p:.0} %"))),
+        (t("dev.renderer"), renderer.to_string()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +96,25 @@ mod tests {
         assert_eq!(v["frame_copies_per_frame"], 0.5);
         assert_eq!(v["mb_copied_per_frame"], 1.0);
         assert_eq!(v["seek_ms"]["count"], 0);
+    }
+
+    #[test]
+    fn dev_rows_show_medians_drops_and_cache_hits() {
+        let ring = PerfRing::new(10);
+        ring.push(FramePerf { composite: Duration::from_micros(4_250), cache_hits: 3, cache_misses: 1, decode: vec![kadr_core::perf::LayerTiming { layer: 1, time: Duration::from_millis(9) }], ..Default::default() });
+        ring.push(FramePerf { dropped: true, cache_misses: 0, ..Default::default() });
+        let rows = dev_rows(&ring.summary(), &ring.snapshot(), 24, Some(Duration::from_millis(3)), "cpu");
+        let value = |label: &str| rows.iter().find(|r| r.0 == t(label)).map(|r| r.1.clone()).unwrap();
+        assert_eq!(value("dev.fps"), "24");
+        // Units come from the catalog of the current language.
+        assert_eq!(value("dev.render"), tf("dev.ms", &[("v", "4.2")]));
+        assert_eq!(value("dev.present"), tf("dev.ms", &[("v", "3.0")]));
+        assert_eq!(value("dev.cache"), "75 %");
+        assert!(value("dev.dropped").starts_with("1/2"), "{}", value("dev.dropped"));
+        assert_eq!(value("dev.renderer"), "cpu");
+        let empty = dev_rows(&PerfRing::new(4).summary(), &[], 0, None, "legacy");
+        assert!(empty.iter().filter(|r| r.1 == "—").count() >= 3, "no data yet: dashes, not zeros: {empty:?}");
+        assert_eq!(cache_hit_pct(&[]), None);
     }
 
     #[test]

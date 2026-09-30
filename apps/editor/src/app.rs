@@ -173,7 +173,8 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         }
     }
     let cache = Cache::new(dirs.cache());
-    let mut preview = PreviewController::new(media.clone(), clock);
+    let renderer = crate::preview::RendererKind::from_env(std::env::var("KADR_RENDERER").ok().as_deref());
+    let mut preview = PreviewController::new(media.clone(), clock, renderer);
     preview.quality = settings.preview_quality;
     let mut tl = TimelineUi::default();
     tl.snapping = settings.snapping;
@@ -315,6 +316,12 @@ fn start_timers() {
     let t = slint::Timer::default();
     t.start(slint::TimerMode::Repeated, Duration::from_millis(150), || {
         with_app(|app| app.tick_status());
+    });
+    std::mem::forget(t);
+    // DEV overlay numbers (2 Hz, only while it is open).
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, Duration::from_millis(500), || {
+        with_app(|app| app.tick_dev_overlay());
     });
     std::mem::forget(t);
     // Autosave check.
@@ -492,6 +499,7 @@ impl App {
         if self.playhead > dur {
             self.playhead = dur;
         }
+        self.preview.invalidate();
         if self.playing {
             self.restart_playback();
         }
@@ -533,6 +541,7 @@ impl App {
         self.refresh_status();
         self.refresh_ai();
         self.update_preview_info();
+        self.preview.invalidate();
         self.request_frame();
     }
 

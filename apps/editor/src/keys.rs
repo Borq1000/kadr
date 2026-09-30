@@ -52,6 +52,7 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
         r("'", "keys.safe"),
         r("F", "keys.fullscreen"),
         r("Ctrl+Shift+A", "keys.ai_panel"),
+        r("Ctrl+Shift+D", "keys.dev_overlay"),
         r("F1", "keys.help"),
         g("keys.g.project"),
         r("Ctrl+N", "keys.new"),
@@ -96,6 +97,7 @@ impl App {
                 ("b", false) => self.split_at_playhead(),
                 ("a", false) => self.select_all(),
                 ("a", true) => self.menu("toggle-ai"),
+                ("d", true) => self.menu("toggle-dev"),
                 (",", _) => self.menu("settings"),
                 _ => return false,
             }

@@ -4,7 +4,6 @@ use kadr_core::{ClipId, Time};
 use kadr_mcp_bridge::BridgeError;
 use kadr_project::{Project, Sequence, TrackKind};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 /// What the same key gives with Shift, on the US and the Russian (ЙЦУКЕН)
 /// layout, in the order of `keys::EN` / `keys::RU`.
@@ -25,20 +24,11 @@ pub fn layout_text(text: &str, to: &str) -> String {
     text.chars().map(|c| from.chars().position(|f| f == c).map_or(c, |i| dst[i])).collect()
 }
 
-/// What `get_frame` decodes for a timeline time.
-#[derive(Debug, PartialEq)]
-pub struct FrameSource {
-    pub path: PathBuf,
-    /// Time in the source file.
-    pub source: Time,
-    /// Displayed size (rotation applied), when probed.
-    pub size: Option<(u32, u32)>,
-}
-
-/// The video frame shown at `t`, or why there is none.
-pub fn frame_source(project: &Project, t: Time) -> Result<FrameSource, BridgeError> {
-    let seq = project.sequence();
-    let end = seq.duration();
+/// Whether `get_frame` has a frame at `t`: an empty timeline and times
+/// past the end have none. Anything inside the sequence renders — a gap or
+/// audio only is a black frame, exactly what the preview shows.
+pub fn frame_check(project: &Project, t: Time) -> Result<(), BridgeError> {
+    let end = project.sequence().duration();
     if t < Time::ZERO {
         return Err(BridgeError::new("bad_params", "at_ms must not be negative"));
     }
@@ -48,14 +38,7 @@ pub fn frame_source(project: &Project, t: Time) -> Result<FrameSource, BridgeErr
     if t >= end {
         return Err(BridgeError::new("not_found", format!("at_ms {} is past the end of the sequence ({} ms)", t.as_millis(), end.as_millis())));
     }
-    let Some(v) = kadr_timeline::composition::video_at(seq, t) else {
-        let audio = seq.tracks.iter().any(|tr| tr.kind == TrackKind::Audio && tr.clip_at(t).is_some());
-        let why = if audio { "only audio" } else { "a gap" };
-        return Err(BridgeError::new("not_found", format!("no video at {} ms: {why} there", t.as_millis())));
-    };
-    let asset = project.asset(v.asset).ok_or_else(|| BridgeError::new("not_found", "the clip's media is missing from the project"))?;
-    let size = asset.info.video.as_ref().map(|i| if i.rotation.rem_euclid(180) == 90 { (i.height, i.width) } else { (i.width, i.height) });
-    Ok(FrameSource { path: asset.path.clone(), source: v.source_start, size })
+    Ok(())
 }
 
 /// Output size for a frame of `src` size: at most `max_w` wide (and
@@ -169,24 +152,16 @@ mod tests {
     }
 
     #[test]
-    fn frame_source_explains_why_there_is_no_frame() {
-        let msg = |p: &Project, ms| frame_source(p, Time::from_millis(ms)).unwrap_err().message;
+    fn frame_check_explains_why_there_is_no_frame_and_lets_gaps_render() {
+        let msg = |p: &Project, ms| frame_check(p, Time::from_millis(ms)).unwrap_err().message;
         assert!(msg(&Project::new("t"), 0).contains("empty"), "{}", msg(&Project::new("t"), 0));
         let video = placed(asset(MediaKind::Video, 1920, 1080, 0), 0, 1, 4);
         assert!(msg(&video, 5000).contains("past the end"), "{}", msg(&video, 5000));
-        assert!(msg(&video, 500).contains("no video"), "{}", msg(&video, 500));
+        assert!(frame_check(&video, Time::from_millis(500)).is_ok(), "a gap renders black");
+        assert!(frame_check(&video, Time::from_millis(1500)).is_ok());
         let audio = placed(asset(MediaKind::Audio, 0, 0, 0), 1, 0, 4);
-        assert!(msg(&audio, 1000).contains("only audio"), "{}", msg(&audio, 1000));
-        assert_eq!(frame_source(&video, Time::from_millis(-1)).unwrap_err().code, "bad_params");
-    }
-
-    #[test]
-    fn frame_source_finds_the_clip_and_its_displayed_size() {
-        let p = placed(asset(MediaKind::Video, 1920, 1080, 0), 0, 1, 4);
-        let f = frame_source(&p, Time::from_millis(1500)).unwrap();
-        assert_eq!((f.source, f.size), (Time::from_millis(500), Some((1920, 1080))));
-        let phone = placed(asset(MediaKind::Video, 1920, 1080, 90), 0, 0, 4);
-        assert_eq!(frame_source(&phone, Time::from_millis(1)).unwrap().size, Some((1080, 1920)), "rotated streams display swapped");
+        assert!(frame_check(&audio, Time::from_millis(1000)).is_ok(), "audio only renders black");
+        assert_eq!(frame_check(&video, Time::from_millis(-1)).unwrap_err().code, "bad_params");
     }
 
     #[test]

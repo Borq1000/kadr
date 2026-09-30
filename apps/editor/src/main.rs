@@ -21,6 +21,8 @@ mod mcp_api;
 mod multicam_ui;
 mod persistence;
 mod preview;
+mod preview_cpu;
+mod scene_source;
 mod settings_ui;
 mod timeline_ui;
 mod toasts;

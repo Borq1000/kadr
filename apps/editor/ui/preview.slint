@@ -10,6 +10,12 @@ export struct AngleView {
     available: bool,
 }
 
+/// One line of the DEV overlay.
+export struct DevRow {
+    label: string,
+    value: string,
+}
+
 export component Preview inherits Rectangle {
     in property <image> frame;
     in property <bool> has-frame;
@@ -19,7 +25,12 @@ export component Preview inherits Rectangle {
     in property <string> duration;
     in property <string> info;
     in property <string> clip-name;
-    in property <int> empty-kind; // 0 has content, 1 empty timeline, 2 gap, 3 offline
+    in property <int> empty-kind; // 0 has content, 1 empty timeline, 2 gap (over the black frame when there is one), 3 offline (legacy)
+    /// Media under the playhead is offline: its frame shows the MISSING colour, this adds the caption as a badge.
+    in property <bool> offline;
+    /// DEV overlay (Ctrl+Shift+D / View menu): performance numbers in the top-right corner.
+    in property <bool> dev-overlay;
+    in property <[DevRow]> dev-rows;
     in property <int> quality; // 0 full, 1 half, 2 quarter
     in property <int> zoom;    // 0 fit, 1 150%, 2 250%
     in property <bool> safe-areas;
@@ -60,7 +71,8 @@ export component Preview inherits Rectangle {
                 x: (viewport.width - self.width) / 2;
                 y: (viewport.height - self.height) / 2;
                 background: #050505;
-                if root.has-frame && root.empty-kind == 0: Image {
+                // A gap shows the black frame the renderer drew, with the gap text over it.
+                if root.has-frame && (root.empty-kind == 0 || root.empty-kind == 2): Image {
                     width: parent.width;
                     height: parent.height;
                     source: root.frame;
@@ -107,9 +119,45 @@ export component Preview inherits Rectangle {
                 background: #00000090;
                 cn := Text { text: root.clip-name; font-size: Theme.font-xs; color: #ffffffc0; }
             }
+            if root.offline && root.empty-kind == 0: Rectangle {
+                x: 10px;
+                y: parent.height - self.height - 10px;
+                width: min(ob.preferred-width + 14px, parent.width - 20px);
+                height: 22px;
+                border-radius: 4px;
+                background: #000000b0;
+                border-width: 1px;
+                border-color: Theme.danger;
+                ob := HorizontalLayout {
+                    padding-left: 7px;
+                    padding-right: 7px;
+                    spacing: 5px;
+                    VerticalLayout { alignment: center; Icon { icon: Icons.close; width: 11px; height: 11px; color: Theme.danger; } }
+                    Text { text: Tr.t("preview.empty.offline"); font-size: Theme.font-xs; color: #ffffffd8; vertical-alignment: center; overflow: elide; }
+                }
+            }
             if root.loading: Rectangle {
                 x: parent.width - 18px; y: 12px; width: 8px; height: 8px; border-radius: 4px;
                 background: Theme.warning;
+            }
+            if root.dev-overlay: Rectangle {
+                x: parent.width - self.width - 10px;
+                y: 26px;
+                width: dl.preferred-width;
+                height: dl.preferred-height;
+                border-radius: 5px;
+                background: #000000b8;
+                dl := VerticalLayout {
+                    padding: 8px;
+                    padding-top: 6px;
+                    spacing: 1px;
+                    Text { text: Tr.t("dev.title"); font-size: Theme.font-xs; font-weight: 700; color: Theme.warning; }
+                    for r in root.dev-rows: HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: r.label; font-size: Theme.font-xs; color: #ffffff99; min-width: 92px; }
+                        Text { text: r.value; font-family: Theme.mono; font-size: Theme.font-xs; color: #ffffffe6; horizontal-alignment: right; min-width: 104px; }
+                    }
+                }
             }
         }
         // Multicam angle viewer: click or press 1-9 to cut to an angle.
