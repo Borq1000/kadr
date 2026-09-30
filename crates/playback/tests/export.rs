@@ -506,7 +506,7 @@ fn exports_a_real_clip_through_ffmpeg() {
         frames,
         total,
         audio: vec![audio],
-        settings: ExportSettings { width: SIZE.w, height: SIZE.h, rate: RATE, preset: "ultrafast".into(), ..ExportSettings::default() },
+        settings: ExportSettings { preset: "ultrafast".into(), ..ExportSettings::default() },
     };
     let decoders = Arc::new(FfmpegDecoders::new(backend.clone()));
     let stats = export(ExportRequest::new(source, job), decoders, &*backend, &no_progress(), &CancelToken::new()).expect("export");

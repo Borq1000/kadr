@@ -234,13 +234,13 @@ fn export_audio(project: &Project, range: TimeRange) -> Vec<ExportAudio> {
         .collect()
 }
 
-fn export_settings(seq: &kadr_project::Sequence, w: u32, h: u32, preset: i32) -> ExportSettings {
+fn export_settings(seq: &kadr_project::Sequence, preset: i32) -> ExportSettings {
     let (crf, preset_name) = match preset {
         0 => (18, "medium"),
         1 => (21, "fast"),
         _ => (26, "veryfast"),
     };
-    ExportSettings { width: w, height: h, rate: seq.frame_rate, sample_rate: seq.sample_rate, crf, preset: preset_name.into(), ..Default::default() }
+    ExportSettings { sample_rate: seq.sample_rate, crf, preset: preset_name.into(), ..Default::default() }
 }
 
 /// The encoder job: the export size, the sequence rate, its audio and the
@@ -257,7 +257,7 @@ pub(crate) fn encode_job(project: &Project, output: PathBuf, size: (u32, u32), p
         frames: seq.frame_rate.time_to_frame_round(total),
         total,
         audio: export_audio(project, TimeRange::new(Time::ZERO, total)),
-        settings: export_settings(seq, w, h, preset),
+        settings: export_settings(seq, preset),
     }
 }
 
@@ -339,6 +339,6 @@ mod tests {
         assert_eq!(job.frames, 300, "10 s at 29.97 is 299.7 → 300");
         assert_eq!(job.audio.len(), 1);
         assert_eq!((job.settings.crf, job.settings.preset.as_str()), (21, "fast"));
-        assert_eq!((job.settings.width, job.settings.height), (1280, 720));
+        assert_eq!(job.settings.sample_rate, p.sequence().sample_rate);
     }
 }

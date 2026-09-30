@@ -119,8 +119,8 @@ pub fn ensure_logo(dir: &Path) -> Result<PathBuf, String> {
 
 // ---------------------------------------------------------------- exports
 
-fn settings(w: u32, h: u32, rate: FrameRate) -> ExportSettings {
-    ExportSettings { width: w, height: h, rate, crf: 21, preset: "fast".into(), ..Default::default() }
+fn settings() -> ExportSettings {
+    ExportSettings { crf: 21, preset: "fast".into(), ..Default::default() }
 }
 
 /// The encode job the app builds (`encode_job`): even size, frames rounded to the nearest frame.
@@ -128,7 +128,7 @@ fn encode_job(p: &Project, output: PathBuf, audio: Vec<ExportAudio>) -> EncodeJo
     let seq = p.sequence();
     let total = seq.duration();
     let (w, h) = (seq.width & !1, seq.height & !1);
-    EncodeJob { output, width: w, height: h, rate: seq.frame_rate, frames: seq.frame_rate.time_to_frame_round(total), total, audio, settings: settings(w, h, seq.frame_rate) }
+    EncodeJob { output, width: w, height: h, rate: seq.frame_rate, frames: seq.frame_rate.time_to_frame_round(total), total, audio, settings: settings() }
 }
 
 fn export_audio(p: &Project) -> Vec<ExportAudio> {

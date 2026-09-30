@@ -3,7 +3,7 @@
 //! the renderer and arrives as frames; FFmpeg only encodes it.
 
 use crate::{MediaError, Result};
-use kadr_core::{FrameRate, Time};
+use kadr_core::Time;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -20,11 +20,10 @@ pub struct ExportAudio {
     pub fade_out: Time,
 }
 
+/// Encoder quality and audio settings. Frame size and rate belong to the
+/// [`EncodeJob`](crate::EncodeJob).
 #[derive(Clone, Debug)]
 pub struct ExportSettings {
-    pub width: u32,
-    pub height: u32,
-    pub rate: FrameRate,
     pub sample_rate: u32,
     pub video_codec: String,
     pub crf: u8,
@@ -35,9 +34,6 @@ pub struct ExportSettings {
 impl Default for ExportSettings {
     fn default() -> Self {
         ExportSettings {
-            width: 1920,
-            height: 1080,
-            rate: FrameRate::FPS_30,
             sample_rate: 48_000,
             video_codec: "libx264".into(),
             crf: 18,

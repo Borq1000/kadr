@@ -29,7 +29,7 @@ fn main() {
     let (w, h) = (seq.width, seq.height);
     let audio = vec![ExportAudio { path: video.path.clone(), source_start: Time::ZERO, timeline_start: Time::ZERO, duration: total, speed: 1.0, gain_db: 0.0, pan: 0.0, fade_in: Time::ZERO, fade_out: Time::ZERO }];
     p.assets.extend([video, logo]);
-    let job = EncodeJob { output: a[3].clone().into(), width: w & !1, height: h & !1, rate: fps, frames: fps.time_to_frame_round(total), total, audio, settings: ExportSettings { width: w, height: h, rate: fps, crf: 21, preset: "fast".into(), ..Default::default() } };
+    let job = EncodeJob { output: a[3].clone().into(), width: w & !1, height: h & !1, rate: fps, frames: fps.time_to_frame_round(total), total, audio, settings: ExportSettings { crf: 21, preset: "fast".into(), ..Default::default() } };
     let req = ExportRequest::new(Arc::new(ProjectScenes::new(&p, false)), job).with_missing(MissingPolicy::Fail);
     let s = kadr_playback::export::export(req, Arc::new(FfmpegDecoders::new(media.clone())), &*media, &|_| {}, &Default::default()).expect("export");
     println!("frames {} fps {:.1} elapsed {:?} render p50 {:?} decode wait {:?}", s.frames, s.fps, s.elapsed, s.render.p50, s.decode_wait);

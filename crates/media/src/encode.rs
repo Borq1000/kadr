@@ -1,6 +1,6 @@
 //! Frame encoding for the render pipeline export: the caller renders each
-//! output frame to RGBA and pushes it into an encoder; audio still goes
-//! through the FFmpeg audio graph of the legacy export (M5 plan, task 1).
+//! output frame to RGBA and pushes it into an encoder; audio goes through
+//! the FFmpeg audio graph (`export::audio_graph`).
 //!
 //! The FFmpeg command reads `-f rawvideo -pix_fmt rgba` from stdin, converts
 //! full-range R'G'B' to limited-range BT.709 `yuv420p` with an explicit
@@ -32,8 +32,7 @@ pub struct EncodeJob {
     /// Length of the sequence; the audio is padded or cut to it.
     pub total: Time,
     pub audio: Vec<ExportAudio>,
-    /// Codec, CRF, preset, audio bitrate and sample rate (its `width`,
-    /// `height` and `rate` are ignored: the job's own are used).
+    /// Codec, CRF, preset, audio bitrate and sample rate.
     pub settings: ExportSettings,
 }
 

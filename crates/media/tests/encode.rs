@@ -54,7 +54,7 @@ fn job(output: &Path, width: u32, height: u32, rate: FrameRate, frames: i64, aud
         frames,
         total,
         audio,
-        settings: ExportSettings { width, height, rate, preset: "ultrafast".into(), ..ExportSettings::default() },
+        settings: ExportSettings { preset: "ultrafast".into(), ..ExportSettings::default() },
     }
 }
 
