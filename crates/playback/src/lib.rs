@@ -42,6 +42,7 @@
 
 pub mod cache;
 pub mod decoders;
+pub mod export;
 pub mod pace;
 pub mod player;
 pub mod resolver;
@@ -51,6 +52,7 @@ pub mod testing;
 
 pub use cache::{FrameCache, FrameKey};
 pub use decoders::{Decoders, FfmpegDecoders};
+pub use export::{export, EncoderFactory, ExportError, ExportRequest, ExportStats, MissingPolicy};
 pub use pace::{pace, Clock, Pace, PlaySchedule, Step, WallClock};
 pub use player::{FrameInfo, FrameSink, PlayerConfig, PreviewPlayer};
 pub use resolver::{decode_size, Mode, Resolver, ResolverConfig, ResolverStats};
