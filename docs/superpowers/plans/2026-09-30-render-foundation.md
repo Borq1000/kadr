@@ -3070,3 +3070,32 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ## After M1
 
 Write `docs/superpowers/plans/<date>-render-foundation-m2.md` (CpuRenderer, `kadr_core::frame`, golden tests, render benchmarks) from the spec and the recorded M0/M1 numbers, then continue stage by stage. Each later plan keeps this plan's Global Constraints and ends with its row of the stage table.
+
+## Carried into later stages (from the M0–M1 reviews)
+
+Each later stage plan must include these items in its tasks.
+
+**M2 (before any golden image is recorded):**
+- Rendering contract in `crates/scene/src/lib.rs`: restrict "fusing is allowed" to steps within one layer (sample → effects → composite); the output buffer is stored (rounded) after every top-level layer, and each transition buffer before mixing.
+- Contract: intersect the crop with the decoded frame `[0, tw] × [0, th]` before rounding to whole texels, and cap texel indices at `tw − 1` / `th − 1`.
+- Renderer premultiplies straight scene colours (Solid, background, DipToColor) — per the contract; spec §4.1 wording "background in the working space" to be corrected to "straight colour, premultiplied by the renderer".
+- Benchmark: add a transition-only row (the M1 "+ transition" row dilutes transition cost).
+
+**M3:**
+- Source time equal to the media end is past the last frame: the resolver takes the last frame at or before it.
+- Colour: BT.2020 primaries must not fall back to a BT.709 matrix per field; `is_supported_sdr` must check the matrix; RGB range rule (tagged `gbr` + `tv` vs untagged RGB) made consistent.
+- Seek statistics must never include dropped frames.
+
+**M4:**
+- Telemetry: cumulative since-reset counters (frames, dropped) next to the 600-frame window; atomic read-and-reset (`take_summary`); one shared ring-size constant; re-measure the 1080p live baseline row for 60 s; correct the M0 doc wording ("costs the same", "every FFmpeg version", "single events"); state the M4 drop target's measurement setup (`kadr-bench live --seconds 60`, ½ quality, same clips).
+- Consider letting full-frame transitions occlude lower tracks (a third decode during transitions counts against the M4 target).
+- Equivalence tests with a muted track and a disabled clip.
+
+**M5:**
+- Tag the export's colour; decode with explicit matrices in the PSNR comparison (untagged HD: FFmpeg decodes BT.601, the new pipeline BT.709 — consequence of Ruling R7).
+- Reconcile transition timing with export: the evaluator clamps and applies the 2-frame minimum on exact time, export on frame-rounded values; half-frame window offset for odd frame counts; odd sequence sizes.
+
+**When a second `Effect` exists:** `Effect::may_change_alpha()` in kadr-scene, used by `cull`.
+
+**Rulings made during M0–M1 (R1–R13)** are recorded in the commit history and summarised in the M0–M1 hand-off message; the binding ones for later stages: R7 (untagged colour rule), R9 (transitions clamp like export), R10/R13 (video alpha, fail-safe), R11 (wipe direction), R12 (rendering contract in kadr-scene).
+
