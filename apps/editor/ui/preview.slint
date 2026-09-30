@@ -114,10 +114,11 @@ export component Preview inherits Rectangle {
             }
             if root.clip-name != "" && root.empty-kind == 0: Rectangle {
                 x: 10px; y: 10px;
-                width: cn.preferred-width + 14px; height: 20px;
+                // Bounded: a long name elides instead of running under the loading dot.
+                width: max(0px, min(cn.preferred-width + 14px, parent.width - 40px)); height: 20px;
                 border-radius: 4px;
                 background: #00000090;
-                cn := Text { text: root.clip-name; font-size: Theme.font-xs; color: #ffffffc0; }
+                cn := Text { width: max(0px, parent.width - 14px); text: root.clip-name; font-size: Theme.font-xs; color: #ffffffc0; overflow: elide; horizontal-alignment: center; }
             }
             if root.offline && root.empty-kind == 0: Rectangle {
                 x: 10px;
@@ -141,7 +142,7 @@ export component Preview inherits Rectangle {
                 background: Theme.warning;
             }
             if root.dev-overlay: Rectangle {
-                x: parent.width - self.width - 10px;
+                x: max(10px, parent.width - self.width - 10px);
                 y: 26px;
                 width: dl.preferred-width;
                 height: dl.preferred-height;

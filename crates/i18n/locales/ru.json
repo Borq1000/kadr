@@ -124,7 +124,7 @@
   "dev.title": "DEV",
   "dev.fps": "кадр/с",
   "dev.render": "рендер",
-  "dev.decode": "декод",
+  "dev.decode": "декодирование",
   "dev.present": "до экрана",
   "dev.dropped": "пропущено",
   "dev.dropped_value": "{n}/{of} · всего {total}/{total_of}",
