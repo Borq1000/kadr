@@ -2868,7 +2868,6 @@ name = "kadr-analysis"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
- "serde",
 ]
 
 [[package]]
@@ -2935,7 +2934,6 @@ dependencies = [
  "kadr-render",
  "kadr-scene",
  "kadr-timeline",
- "parking_lot",
  "png 0.17.16",
  "rfd",
  "serde",
@@ -2983,7 +2981,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
  "uuid",
 ]
 
