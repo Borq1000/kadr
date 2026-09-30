@@ -217,6 +217,11 @@ impl FfmpegSource {
     /// anything else an error carrying FFmpeg's own message.
     fn finish(&mut self, io: Option<std::io::Error>) -> Result<bool> {
         self.done = true;
+        if io.as_ref().is_some_and(|e| e.kind() != std::io::ErrorKind::UnexpectedEof) {
+            // The pipe failed while FFmpeg may still be running, blocked on
+            // a write nobody reads: waiting for it would never return.
+            let _ = self.child.kill();
+        }
         let status = self.child.wait()?;
         let tail = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
         let stderr = truncate(String::from_utf8_lossy(&tail).trim().to_string());
