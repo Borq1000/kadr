@@ -7,7 +7,7 @@ mod pcm;
 mod probe;
 pub(crate) mod progress;
 
-use crate::{ExportPlan, MediaBackend, MediaError, Progress, RgbaFrame, Result, StreamRequest, VideoStream};
+use crate::{ExportPlan, MediaBackend, MediaError, Progress, RgbaFrame, Result, SourceRequest, SourceStream, StreamRequest, VideoStream};
 use kadr_core::{CancelToken, MediaInfo, Time};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -121,6 +121,12 @@ impl MediaBackend for FfmpegCli {
     }
     fn open_stream(&self, req: &StreamRequest) -> Result<Box<dyn VideoStream>> {
         Ok(Box::new(frames::FfmpegStream::open(self, req)?))
+    }
+    fn open_source(&self, _req: &SourceRequest) -> Result<Box<dyn SourceStream>> {
+        Err(MediaError::Unsupported("source decoding: M3 task 2".into()))
+    }
+    fn decode_still(&self, _path: &Path, _width: u32, _height: u32, _out: &mut [u8]) -> Result<()> {
+        Err(MediaError::Unsupported("still decoding: M3 task 2".into()))
     }
     fn thumbnails(&self, path: &Path, times: &[Time], height: u32, cancel: &CancelToken) -> Result<Vec<RgbaFrame>> {
         let mut out = Vec::with_capacity(times.len());

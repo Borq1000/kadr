@@ -6,7 +6,7 @@ pub mod export;
 pub mod ffmpeg;
 pub mod stats;
 
-use kadr_core::{CancelToken, FrameRate, MediaInfo, Time};
+use kadr_core::{CancelToken, ColorInfo, FrameRate, MediaInfo, Time};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -87,6 +87,34 @@ pub struct StreamRequest {
     pub px_scale: f64,
 }
 
+/// A decode of a source's own frames (render spec §4.2, §9): no
+/// composition, no letterbox — the resolver's input.
+#[derive(Clone, Debug)]
+pub struct SourceRequest {
+    pub path: PathBuf,
+    /// Constant rate the stream is normalised to (the source's own rate).
+    pub rate: FrameRate,
+    /// Frame `n` read from the stream is source frame `start_frame + n`;
+    /// source frame `k` is the one shown at `rate.frame_to_time(k)`.
+    pub start_frame: i64,
+    /// Exact output size, upright (rotation metadata applied) with the
+    /// sample aspect ratio absorbed.
+    pub width: u32,
+    pub height: u32,
+    /// The source's colour: YUV → R'G'B' uses exactly this matrix and range.
+    pub color: ColorInfo,
+    /// Hardware decoding (slower on the CLI path, see the M3 plan).
+    pub hwaccel: bool,
+}
+
+/// Sequential source frames as RGBA8 (full-range non-linear R'G'B'; alpha
+/// straight, or 255 for opaque sources).
+pub trait SourceStream: Send {
+    /// Reads the next frame into `buf` (`width × height × 4` bytes);
+    /// `Ok(false)` at the end of the stream.
+    fn read_into(&mut self, buf: &mut [u8]) -> Result<bool>;
+}
+
 pub type Progress<'a> = &'a (dyn Fn(f32) + Sync);
 
 pub trait MediaBackend: Send + Sync {
@@ -95,6 +123,11 @@ pub trait MediaBackend: Send + Sync {
     /// Exact frame at source time `at`, scaled to fit `max_w × max_h`.
     fn decode_frame(&self, path: &Path, at: Time, max_w: u32, max_h: u32) -> Result<RgbaFrame>;
     fn open_stream(&self, req: &StreamRequest) -> Result<Box<dyn VideoStream>>;
+    /// Source frames from `req.start_frame` on (see [`SourceRequest`]).
+    fn open_source(&self, req: &SourceRequest) -> Result<Box<dyn SourceStream>>;
+    /// A still image scaled to exactly `width × height`, RGBA8 straight
+    /// alpha, into `out` (`width × height × 4` bytes).
+    fn decode_still(&self, path: &Path, width: u32, height: u32, out: &mut [u8]) -> Result<()>;
     /// Fast, keyframe-accurate thumbnails at the given source times.
     fn thumbnails(&self, path: &Path, times: &[Time], height: u32, cancel: &CancelToken) -> Result<Vec<RgbaFrame>>;
     /// Decodes the audio to interleaved s16le PCM at `rate`/`channels` into `out`.
