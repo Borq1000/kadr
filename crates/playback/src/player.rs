@@ -290,6 +290,10 @@ impl PreviewPlayer {
         let generation = self.bump(false);
         let _ = self.tx.send(Cmd::Show { generation, t, asked: Instant::now() });
         // The watch re-checks the show in flight against the newer request.
+        // Notified under its lock: between its check of the generation and
+        // its wait, a notify without the lock would be lost (the stuck show
+        // would then hold this request back until the next one).
+        let _st = self.watch.state.lock();
         self.watch.cv.notify_all();
         generation
     }
