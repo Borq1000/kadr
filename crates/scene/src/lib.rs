@@ -80,7 +80,10 @@
 //! Effects (point operations, formulas in the effects spec «Примитивы цвета»)
 //! apply to that sample in `effects` order, on unpremultiplied colour:
 //! `rgb / a` → the effect chain (clamped to [0, 1] once, at its end) →
-//! `× a`; a sample with `a = 0` stays as it is (the chain is skipped). This
+//! `× a`; a sample with `a = 0` stays as it is (the chain is skipped), and
+//! so does every sample when the chain holds only neutral adjusts
+//! ([`ColorAdjust::is_neutral`]: no-ops, the clamp included — which matters
+//! for premultiplied texels brighter than their alpha). This
 //! happens before opacity and coverage. For `c ≥ 0` exposure equals
 //! `c · 2^(ev/2.4)`; a negative intermediate value (only possible between
 //! chained adjusts) uses that same form, so the whole `ColorAdjust` is
@@ -90,17 +93,33 @@
 //! `placement.size` has a non-positive side, or its transform has no
 //! inverse.
 //!
+//! ## Value domain
+//!
+//! The evaluator emits finite values, with every `opacity` and transition
+//! `progress` in [0, 1]. A renderer still sanitises both defensively: a
+//! non-finite value counts as 0, anything else is clamped to [0, 1] (so a
+//! NaN opacity draws nothing rather than punching a hole).
+//!
 //! ## Layer edge coverage
 //!
-//! `coverage = clamp(0.5 + dist, 0, 1)`, where `dist` is the signed distance,
-//! in **output** pixels and positive inside, from the output pixel centre to
-//! the crop rectangle mapped into output space (`to_canvas`, then canvas →
-//! output; always a rectangle, possibly rotated). `dist` is the minimum over the
-//! rectangle's four edges of the signed distance to that edge's line
-//! (positive on the inner side). Colour and alpha are multiplied by
-//! coverage. An axis-aligned layer whose edges lie on output pixel
-//! boundaries therefore has coverage exactly 1 inside and 0 outside
-//! (consistent with `cull`'s "covers the canvas").
+//! The crop rectangle is mapped into output space (`to_canvas`, then canvas →
+//! output; always a rectangle, possibly rotated). For the output pixel
+//! centre, `dL`, `dR`, `dT`, `dB` are the signed distances, in **output**
+//! pixels and positive on the inner side, to the lines of the rectangle's
+//! four edges (`dL`, `dR`: the pair of opposite edges from the crop's `x0`
+//! and `x1`; `dT`, `dB`: from `y0` and `y1`). Per pair of opposite edges
+//!
+//! - `cx = clamp(min(1, 0.5 + dL) + min(1, 0.5 + dR) − 1, 0, 1)`,
+//! - `cy = clamp(min(1, 0.5 + dT) + min(1, 0.5 + dB) − 1, 0, 1)`,
+//!
+//! and `coverage = cx · cy`: the overlap of a one-pixel box around the centre
+//! with the band between the two edges, per axis of the rectangle. Colour and
+//! alpha are multiplied by coverage. An axis-aligned layer whose edges lie on
+//! output pixel boundaries therefore has coverage exactly 1 inside and 0
+//! outside (consistent with `cull`'s "covers the canvas"), and a layer
+//! thinner than a pixel gets the fraction of its width (a 0.25 px line
+//! through pixel centres: 0.25), so a layer shrinking to nothing fades out
+//! instead of lingering as a half-bright line.
 //! Coverage uses the layer's `crop` as given — **not** intersected with the
 //! decoded frame: a crop reaching past the content keeps coverage 1 there and
 //! shows the clamped edge texels (only sampling is limited to the frame).

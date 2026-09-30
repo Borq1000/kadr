@@ -15,7 +15,7 @@
 //! - Every store that lands within 1e-3 LSB of a rounding tie is recorded per
 //!   output pixel (`render_reference_with_ties`): an f32 and an f64 implementation may
 //!   legitimately round such a value differently, and the flip then passes through
-//!   the later `s + d·(1 − s.a)` blends, so parity allows one extra LSB per tie.
+//!   the later `s + d·(1 − s.a)` blends, so parity allows one extra LSB at such a pixel.
 //! - Missing / mismatching inputs: `Media` without a `Cpu` input is drawn as
 //!   `Rgba::MISSING`; a `Transition` without matching inputs gets no inputs.
 
@@ -89,6 +89,11 @@ pub fn render_reference_with_ties(scene: &FrameScene, inputs: &RenderInputs) -> 
     (buf.into_iter().flatten().collect(), g.ties.into_inner())
 }
 
+/// "Non-finite opacity or progress counts as 0; both are clamped to [0, 1]."
+fn unit(v: f32) -> f64 {
+    if v.is_finite() { (v as f64).clamp(0.0, 1.0) } else { 0.0 }
+}
+
 fn premul(c: Rgba) -> Px {
     let a = c.a as f64;
     [c.r as f64 * a, c.g as f64 * a, c.b as f64 * a, a]
@@ -140,8 +145,8 @@ fn draw_layers(g: &Geo, layers: &[Layer], inputs: &[LayerInput], buf: &mut [[u8;
                             continue;
                         }
                         let n = j * g.ow + i;
-                        let mixed = mix(g, &t.op, t.progress as f64, load4(from[n]), load4(to[n]), g.canvas_pos(i, j));
-                        let s = mixed.map(|v| v * layer.opacity as f64);
+                        let mixed = mix(g, &t.op, unit(t.progress), load4(from[n]), load4(to[n]), g.canvas_pos(i, j));
+                        let s = mixed.map(|v| v * unit(layer.opacity));
                         buf[n] = g.store4(n, blend(layer.blend, s, load4(buf[n])));
                     }
                 }
@@ -207,7 +212,7 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
                 continue;
             }
             let centre = (i as f64 + 0.5, j as f64 + 0.5);
-            let coverage = (0.5 + signed_distance(&corners, centroid, centre)).clamp(0.0, 1.0);
+            let coverage = coverage(&corners, centroid, centre);
 
             let (cx, cy) = g.canvas_pos(i, j);
             let (lx, ly) = inv.apply(cx, cy);
@@ -216,32 +221,30 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
                 Source::Texels(f) => bilinear(f, layer, lx, ly),
             };
             sample = apply_effects(&layer.effects, sample);
-            let s = sample.map(|v| v * layer.opacity as f64 * coverage);
+            let s = sample.map(|v| v * unit(layer.opacity) * coverage);
             let n = j * g.ow + i;
             buf[n] = g.store4(n, blend(layer.blend, s, load4(buf[n])));
         }
     }
 }
 
-/// Minimum over the four edges of the signed distance from `pt` to the edge's
-/// line, positive on the side of the rectangle's centre.
-fn signed_distance(corners: &[(f64, f64); 4], centroid: (f64, f64), pt: (f64, f64)) -> f64 {
-    let mut dist = f64::INFINITY;
-    for e in 0..4 {
+/// Edge coverage: `cx · cy`, each `clamp(min(1, 0.5 + d) + min(1, 0.5 + d') − 1, 0, 1)` over one pair of
+/// opposite edges, `d` the signed distance from `pt` to the edge's line, positive on the side of the
+/// rectangle's centre. `corners` go round the rectangle, so edges 0, 2 and 1, 3 are the opposite pairs.
+fn coverage(corners: &[(f64, f64); 4], centroid: (f64, f64), pt: (f64, f64)) -> f64 {
+    let d: [f64; 4] = std::array::from_fn(|e| {
         let (p, q) = (corners[e], corners[(e + 1) % 4]);
         let (dx, dy) = (q.0 - p.0, q.1 - p.1);
         let len = dx.hypot(dy);
         if len == 0.0 {
-            continue;
+            return f64::INFINITY;
         }
         let n = (-dy / len, dx / len);
-        let mut d = n.0 * (pt.0 - p.0) + n.1 * (pt.1 - p.1);
-        if n.0 * (centroid.0 - p.0) + n.1 * (centroid.1 - p.1) < 0.0 {
-            d = -d;
-        }
-        dist = dist.min(d);
-    }
-    dist
+        let d = n.0 * (pt.0 - p.0) + n.1 * (pt.1 - p.1);
+        if n.0 * (centroid.0 - p.0) + n.1 * (centroid.1 - p.1) < 0.0 { -d } else { d }
+    });
+    let axis = |a: f64, b: f64| ((0.5 + a).min(1.0) + (0.5 + b).min(1.0) - 1.0).clamp(0.0, 1.0);
+    axis(d[0], d[2]) * axis(d[1], d[3])
 }
 
 /// The premultiplied texel `(x, y)` of `f`, honouring the frame's alpha mode.
@@ -283,7 +286,8 @@ fn bilinear(f: &CpuFrame, layer: &Layer, lx: f64, ly: f64) -> Px {
 
 /// Effects on unpremultiplied colour: `rgb / a` → chain → clamp once → `× a`.
 fn apply_effects(effects: &[Effect], s: Px) -> Px {
-    if effects.is_empty() {
+    // "Neutral adjusts are no-ops: a chain with nothing else is skipped, clamp included."
+    if effects.iter().all(|e| matches!(e, Effect::ColorAdjust(a) if a.is_neutral())) {
         return s;
     }
     let a = s[3];

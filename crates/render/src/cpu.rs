@@ -202,6 +202,12 @@ fn pixel(row: &mut [u8], i: usize) -> &mut [u8; 4] {
     (&mut row[i * 4..i * 4 + 4]).try_into().unwrap()
 }
 
+/// Opacity or progress as the contract sanitises it: clamped to [0, 1], a
+/// non-finite value counts as 0.
+fn unit(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+}
+
 /// A straight scene colour, premultiplied.
 fn premul(c: Rgba) -> [f32; 4] {
     [c.r * c.a, c.g * c.a, c.b * c.a, c.a]
@@ -324,7 +330,8 @@ struct Plan {
     /// Output pixel → texel (frames only).
     tex: Affine2,
     /// Signed distance to each crop edge's line in output pixels, positive
-    /// inside: `a·x + b·y + c` at the output point `(x, y)`.
+    /// inside: `a·x + b·y + c` at the output point `(x, y)`. Edges `x0`, `x1`,
+    /// `y0`, `y1`: the opposite pairs are `0, 1` and `2, 3`.
     edges: [[f64; 3]; 4],
     opacity: f32,
     blend: BlendMode,
@@ -344,7 +351,8 @@ impl Plan {
         let (crop, size) = (layer.crop, layer.placement.size);
         // Opacity 0 leaves every pixel as it is; an empty crop, a non-positive size and a singular
         // transform draw nothing by the contract.
-        if g.is_empty() || layer.opacity == 0.0 || crop.is_empty() || !(size.x > 0.0 && size.y > 0.0) {
+        let opacity = unit(layer.opacity);
+        if g.is_empty() || opacity == 0.0 || crop.is_empty() || !(size.x > 0.0 && size.y > 0.0) {
             return None;
         }
         // Whether the layer has an inverse is the placement's (the contract's) call, not that of the
@@ -372,8 +380,18 @@ impl Plan {
         if rows.0 >= rows.1 || cols.0 >= cols.1 {
             return None;
         }
-        Some(Plan { inv, tex: inv, edges, opacity: layer.opacity, blend: layer.blend, fx: ColorFx::of(&layer.effects), rows, cols })
+        Some(Plan { inv, tex: inv, edges, opacity, blend: layer.blend, fx: ColorFx::of(&layer.effects), rows, cols })
     }
+}
+
+/// Coverage along one axis of the crop rectangle from the distances to its two
+/// opposite edges (positive inside): the overlap of a one-pixel-wide box
+/// around the centre with the band between them, `clamp(min(1, ½ + d₀) +
+/// min(1, ½ + d₁) − 1, 0, 1)`. It is exactly 1 when both distances are ≥ ½
+/// and 0 when either is ≤ −½.
+#[inline(always)]
+fn axis_coverage(d0: f64, d1: f64) -> f64 {
+    ((0.5 + d0).min(1.0) + (0.5 + d1).min(1.0) - 1.0).clamp(0.0, 1.0)
 }
 
 /// The pixel centres `x` of a row where every edge function `a·x + b` (row
@@ -397,7 +415,10 @@ fn centres_above(e: &[(f64, f64); 4], level: f64, cols: (usize, usize)) -> (f64,
 /// For one row: the columns `outer` that may have coverage > 0 (one extra
 /// pixel each side) and within them `inner`, whose pixels certainly have
 /// coverage 1 (one pixel less each side), so the distances are evaluated
-/// only near the edges.
+/// only near the edges. Coverage > 0 needs every distance > −½ (an axis
+/// term is 0 once either of its distances is ≤ −½), and coverage is exactly
+/// 1 when every distance is ≥ ½ (both axis terms are `1 + 1 − 1`), so the
+/// two spans are the regions above those levels.
 #[inline(always)]
 fn row_spans(e: &[(f64, f64); 4], cols: (usize, usize)) -> ((usize, usize), (usize, usize)) {
     let (lo, hi) = centres_above(e, -0.5, cols);
@@ -495,9 +516,8 @@ fn draw_sampled<S: Sampler>(data: &mut [u8], stride: usize, plan: &Plan, s: &S) 
         let (ub, vb) = (t.c * y + t.tx, t.d * y + t.ty);
         for i in (outer.0..inner.0).chain(inner.1..outer.1) {
             let x = i as f64 + 0.5;
-            let dist = e[0].0 * x + e[0].1;
-            let dist = dist.min(e[1].0 * x + e[1].1).min(e[2].0 * x + e[2].1).min(e[3].0 * x + e[3].1);
-            let cov = (0.5 + dist).clamp(0.0, 1.0) as f32;
+            let d = e.map(|(a, b)| a * x + b);
+            let cov = (axis_coverage(d[0], d[1]) * axis_coverage(d[2], d[3])) as f32;
             // Coverage 0 composites s = 0, which leaves the stored pixel as it is.
             if cov > 0.0 {
                 shade(plan, s.sample(t.a * x + ub, t.b * x + vb), cov, pixel(row, i));
@@ -545,7 +565,7 @@ fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &C
 
     if frame.color.alpha == AlphaMode::Opaque
         && plan.fx.is_none()
-        && layer.opacity == 1.0
+        && plan.opacity == 1.0
         && layer.blend == BlendMode::Normal
         && let Some(d) = grid_aligned(&plan.tex, crop, tw / sx, th / sy, tw, th)
     {
@@ -616,7 +636,7 @@ enum Mix {
 
 impl Mix {
     fn new(t: &TransitionLayer, g: &Grid) -> Mix {
-        let p = t.progress;
+        let p = unit(t.progress);
         match t.op {
             TransitionOp::Dissolve => Mix::Dissolve(p),
             TransitionOp::DipToColor(c) => Mix::Dip { colour: premul(c), p },
@@ -666,7 +686,8 @@ impl CpuRenderer {
     /// only: margins are neither drawn nor read), mixed and composited.
     #[allow(clippy::too_many_arguments)]
     fn draw_transition(&self, data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, t: &TransitionLayer, from: &[LayerInput], to: &[LayerInput]) -> Drawn {
-        if g.is_empty() || layer.opacity == 0.0 {
+        let opacity = unit(layer.opacity);
+        if g.is_empty() || opacity == 0.0 {
             return Drawn::Nothing;
         }
         let bs = g.w * 4;
@@ -679,7 +700,7 @@ impl CpuRenderer {
         }
         let (a, b) = (&bufs[0][..], &bufs[1][..]);
         let mix = Mix::new(t, g);
-        let (opacity, blend) = (layer.opacity, layer.blend);
+        let blend = layer.blend;
         par_rows(data, stride, (g.y0, g.y1), |j, row| {
             let (fr, tr) = (&a[j * bs..(j + 1) * bs], &b[j * bs..(j + 1) * bs]);
             let y = j as f64 + 0.5;
@@ -1083,6 +1104,60 @@ mod tests {
         let out = render(&scene((1000, 1000), (10, 10), Rgba::BLACK, vec![solid(WHITE, p)]), vec![LayerInput::None]);
         assert_eq!(px(&out, 10, 3, 0), [255, 255, 255, 255]);
         assert_eq!(px(&out, 10, 3, 1), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_layer_thinner_than_a_pixel_covers_its_width_fraction() {
+        // A white line 0.25 px wide and 4 tall, on and off the pixel centre: pixel 3 is covered by a quarter either way.
+        for x in [3.5, 3.2] {
+            let p = Placement { size: Vec2::new(0.25, 4.0), anchor: Vec2::new(0.5, 0.0), position: Vec2::new(x, 0.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+            let out = render(&scene((8, 4), (8, 4), Rgba::BLACK, vec![solid(WHITE, p)]), vec![LayerInput::None]);
+            let row: Vec<u8> = (0..8).map(|i| px(&out, 8, i, 2)[0]).collect();
+            assert_eq!(row, [0, 0, 0, 64, 0, 0, 0, 0], "centre at {x}");
+        }
+    }
+
+    #[test]
+    fn a_layer_scaled_down_to_nothing_fades_out_monotonically() {
+        let mut previous: Option<Vec<u8>> = None;
+        for n in 0..=40 {
+            let k = 1.0 - n as f32 / 40.0;
+            let p = Placement { size: Vec2::new(4.0, 4.0), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(4.3, 4.1), scale: Vec2::new(k, k), rotation: 0.4 };
+            let out = render(&scene((8, 8), (8, 8), Rgba::BLACK, vec![solid(WHITE, p)]), vec![LayerInput::None]);
+            if let Some(prev) = &previous {
+                assert!(out.iter().zip(prev).all(|(a, b)| a <= b), "scale {k}: some pixel got brighter");
+            }
+            if n == 39 {
+                // 0.1 × 0.1 px: 1 % of a pixel, not a half-bright dot.
+                assert!(out.iter().all(|&v| v <= 3 || v == 255), "scale {k}: {:?}", out.chunks(4).map(|p| p[0]).max());
+            }
+            previous = Some(out);
+        }
+        assert!(previous.unwrap().chunks(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn opacity_and_progress_are_sanitised() {
+        let c = SizeU::new(4, 4);
+        let base = |layers: Vec<Layer>, inputs: Vec<LayerInput>| render(&scene((4, 4), (4, 4), BLUE, layers), inputs);
+        let untouched = base(vec![], vec![]);
+        for o in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5] {
+            let mut red = solid(RED, Placement::fill(c));
+            red.opacity = o;
+            assert_eq!(base(vec![red], vec![LayerInput::None]), untouched, "solid, opacity {o}: nothing drawn, no hole");
+            let mut t = transition(TransitionOp::Dissolve, 0.5, c, vec![solid(RED, Placement::fill(c))], vec![]);
+            t.opacity = o;
+            assert_eq!(base(vec![t], vec![LayerInput::Transition { from: vec![LayerInput::None], to: vec![] }]), untouched, "transition, opacity {o}");
+        }
+        let mut red = solid(RED, Placement::fill(c));
+        red.opacity = 2.0;
+        assert_eq!(px(&base(vec![red], vec![LayerInput::None]), 4, 1, 1), [255, 0, 0, 255], "clamped to 1");
+        for (p, want) in [(f32::NAN, [255, 0, 0, 255]), (-1.0, [255, 0, 0, 255]), (7.0, [0, 255, 0, 255])] {
+            let green = Rgba { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+            let t = transition(TransitionOp::Dissolve, p, c, vec![solid(RED, Placement::fill(c))], vec![solid(green, Placement::fill(c))]);
+            let out = base(vec![t], vec![LayerInput::Transition { from: vec![LayerInput::None], to: vec![LayerInput::None] }]);
+            assert_eq!(px(&out, 4, 1, 1), want, "progress {p}");
+        }
     }
 
     #[test]

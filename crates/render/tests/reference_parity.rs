@@ -391,8 +391,14 @@ impl Gen {
         }
     }
 
+    /// Out of the contract's domain now and then: the renderer sanitises it.
+    fn out_of_range(&mut self) -> f32 {
+        [f32::NAN, f32::INFINITY, -0.3, 1.7][self.rng.int(0, 3) as usize]
+    }
+
     fn opacity(&mut self) -> f32 {
-        match self.rng.int(0, 9) {
+        match self.rng.int(0, 10) {
+            10 => self.out_of_range(),
             0..=3 => 1.0,
             4 => 0.0,
             _ => self.rng.f() as f32,
@@ -538,7 +544,8 @@ impl Gen {
                 TransitionOp::Wipe { angle, softness }
             }
         };
-        let progress = match self.rng.int(0, 9) {
+        let progress = match self.rng.int(0, 10) {
+            10 => self.out_of_range(),
             0 => 0.0,
             1 => 1.0,
             2 => 0.5,
@@ -591,9 +598,9 @@ fn env_num(name: &str) -> Option<u64> {
 const BASE_SEED: u64 = 0x4B41_4452_5245_4E44;
 
 /// Renders random scenes with `CpuRenderer` and with the reference; every byte must agree
-/// within 1 LSB (one more per rounding tie the reference passed through at that pixel: an f32
-/// and an f64 renderer may split a value that is exactly `k + 0.5` either way, and the flip
-/// carries through the later blends — e.g. `s.rgb + d·(1 − s.a)` with a flipped `s.a`).
+/// within 1 LSB, or 2 at a pixel where the reference passed through a rounding tie (an f32 and
+/// an f64 renderer may split a value that is exactly `k + 0.5` either way, and the flip carries
+/// through the later blends — e.g. `s.rgb + d·(1 − s.a)` with a flipped `s.a`).
 /// `PARITY_SCENES=n` changes the count, `PARITY_ONLY=i` runs just scene `i`.
 #[test]
 fn cpu_renderer_matches_the_reference_on_random_scenes() {
@@ -616,8 +623,8 @@ fn cpu_renderer_matches_the_reference_on_random_scenes() {
         drawn += stats.layers_drawn as u64;
         rendered += 1;
 
-        // 1 LSB, plus 1 per rounding tie the reference passed through at that pixel.
-        let allowed = |at: usize| 1 + ties[at / 4].min(7);
+        // 1 LSB, plus 1 at a pixel where the reference passed through a rounding tie.
+        let allowed = |at: usize| 1 + ties[at / 4].min(1);
         let mut bad_bytes = 0;
         let mut first_bad = None;
         for (at, (e, a)) in expected.iter().zip(&actual).enumerate() {
