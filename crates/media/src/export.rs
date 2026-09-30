@@ -189,6 +189,59 @@ fn atempo_chain(speed: f64) -> String {
     parts.join(",")
 }
 
+/// The audio half of the export graph: one chain per clip (`-ss`/`-t`/`-i`
+/// argument groups returned as inputs, numbered from `first_input`), mixed
+/// into `[aout]` and padded/trimmed to `total`. The last line has no
+/// trailing `;`. Shared by the legacy export and the frame encoder.
+pub(crate) fn audio_graph(audio: &[ExportAudio], first_input: usize, total: Time, sample_rate: u32) -> (Vec<String>, String) {
+    let mut inputs: Vec<String> = vec![];
+    let mut graph = String::new();
+    let sr = sample_rate;
+    let total_s = total.as_secs_f64();
+    let mut alabels = vec![];
+    for (i, a) in audio.iter().enumerate() {
+        let n_in = first_input + i;
+        let speed = if a.speed > 0.0 { a.speed } else { 1.0 };
+        let src_dur = Time::from_secs_f64(a.duration.as_secs_f64() * speed) + Time::from_millis(500);
+        inputs.extend(["-ss".into(), a.source_start.max(Time::ZERO).to_ffmpeg_arg(), "-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
+        inputs.push(a.path.to_string_lossy().into_owned());
+        let d = a.duration.as_secs_f64();
+        let mut chain = format!("[{n_in}:a:0]asetpts=PTS-STARTPTS");
+        if (speed - 1.0).abs() > 1e-6 {
+            let _ = write!(chain, ",{}", atempo_chain(speed));
+        }
+        let _ = write!(chain, ",aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur={d:.6},atrim=duration={d:.6}");
+        if a.gain_db != 0.0 {
+            let _ = write!(chain, ",volume={:.3}dB", a.gain_db);
+        }
+        if a.pan != 0.0 {
+            let p = a.pan.clamp(-1.0, 1.0);
+            let _ = write!(chain, ",pan=stereo|c0={:.4}*c0|c1={:.4}*c1", (1.0 - p).min(1.0), (1.0 + p).min(1.0));
+        }
+        if a.fade_in > Time::ZERO {
+            let _ = write!(chain, ",afade=t=in:st=0:d={:.4}", a.fade_in.as_secs_f64());
+        }
+        if a.fade_out > Time::ZERO {
+            let fo = a.fade_out.as_secs_f64().min(d);
+            let _ = write!(chain, ",afade=t=out:st={:.4}:d={fo:.4}", d - fo);
+        }
+        let delay = a.timeline_start.to_samples(sr).max(0);
+        let _ = writeln!(graph, "{chain},adelay=delays={delay}S:all=1[a{i}];");
+        alabels.push(format!("[a{i}]"));
+    }
+    if alabels.is_empty() {
+        let _ = writeln!(graph, "anullsrc=r={sr}:cl=stereo,atrim=duration={total_s:.6}[aout]");
+    } else {
+        let _ = writeln!(
+            graph,
+            "{}amix=inputs={}:normalize=0:dropout_transition=0,apad=whole_dur={total_s:.6},atrim=duration={total_s:.6}[aout]",
+            alabels.concat(),
+            alabels.len()
+        );
+    }
+    (inputs, graph)
+}
+
 /// Builds the FFmpeg input arguments and filter graph script.
 pub fn build_graph(plan: &ExportPlan) -> (Vec<String>, String) {
     let st = &plan.settings;
@@ -287,53 +340,13 @@ pub fn build_graph(plan: &ExportPlan) -> (Vec<String>, String) {
         flush(&mut run, &mut graph, "[vout]");
     }
 
-    let sr = st.sample_rate;
-    let total_s = plan.total.as_secs_f64();
-    let mut alabels = vec![];
-    for (i, a) in plan.audio.iter().enumerate() {
-        let speed = if a.speed > 0.0 { a.speed } else { 1.0 };
-        let src_dur = Time::from_secs_f64(a.duration.as_secs_f64() * speed) + Time::from_millis(500);
-        inputs.extend(["-ss".into(), a.source_start.max(Time::ZERO).to_ffmpeg_arg(), "-t".into(), src_dur.to_ffmpeg_arg(), "-i".into()]);
-        inputs.push(a.path.to_string_lossy().into_owned());
-        let d = a.duration.as_secs_f64();
-        let mut chain = format!("[{n_in}:a:0]asetpts=PTS-STARTPTS");
-        if (speed - 1.0).abs() > 1e-6 {
-            let _ = write!(chain, ",{}", atempo_chain(speed));
-        }
-        let _ = write!(chain, ",aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur={d:.6},atrim=duration={d:.6}");
-        if a.gain_db != 0.0 {
-            let _ = write!(chain, ",volume={:.3}dB", a.gain_db);
-        }
-        if a.pan != 0.0 {
-            let p = a.pan.clamp(-1.0, 1.0);
-            let _ = write!(chain, ",pan=stereo|c0={:.4}*c0|c1={:.4}*c1", (1.0 - p).min(1.0), (1.0 + p).min(1.0));
-        }
-        if a.fade_in > Time::ZERO {
-            let _ = write!(chain, ",afade=t=in:st=0:d={:.4}", a.fade_in.as_secs_f64());
-        }
-        if a.fade_out > Time::ZERO {
-            let fo = a.fade_out.as_secs_f64().min(d);
-            let _ = write!(chain, ",afade=t=out:st={:.4}:d={fo:.4}", d - fo);
-        }
-        let delay = a.timeline_start.to_samples(sr).max(0);
-        let _ = writeln!(graph, "{chain},adelay=delays={delay}S:all=1[a{i}];");
-        alabels.push(format!("[a{i}]"));
-        n_in += 1;
-    }
-    if alabels.is_empty() {
-        let _ = writeln!(graph, "anullsrc=r={sr}:cl=stereo,atrim=duration={total_s:.6}[aout]");
-    } else {
-        let _ = writeln!(
-            graph,
-            "{}amix=inputs={}:normalize=0:dropout_transition=0,apad=whole_dur={total_s:.6},atrim=duration={total_s:.6}[aout]",
-            alabels.concat(),
-            alabels.len()
-        );
-    }
+    let (audio_inputs, audio) = audio_graph(&plan.audio, n_in, plan.total, st.sample_rate);
+    inputs.extend(audio_inputs);
+    graph.push_str(&audio);
     (inputs, graph)
 }
 
-fn container_for(path: &Path) -> &'static str {
+pub(crate) fn container_for(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("mov") => "mov",
         Some("mkv") => "matroska",
@@ -341,19 +354,24 @@ fn container_for(path: &Path) -> &'static str {
     }
 }
 
-pub(crate) fn run(ff: &FfmpegCli, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()> {
-    if plan.total <= Time::ZERO {
-        return Err(MediaError::Unsupported("sequence is empty".into()));
-    }
-    let (inputs, graph) = build_graph(plan);
+/// Windows limits a command line to 32 767 chars; the inputs are what grows.
+pub(crate) fn check_command_len(inputs: &[String]) -> Result<()> {
     let cmd_len: usize = inputs.iter().map(|s| s.len() + 3).sum();
     if cmd_len > 30_000 {
-        // Windows limits a command line to 32 767 chars.
         return Err(MediaError::Unsupported(format!(
             "timeline has too many segments for a single export pass ({} inputs)",
             inputs.len() / 6
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn run(ff: &FfmpegCli, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()> {
+    if plan.total <= Time::ZERO {
+        return Err(MediaError::Unsupported("sequence is empty".into()));
+    }
+    let (inputs, graph) = build_graph(plan);
+    check_command_len(&inputs)?;
     // Unique per export: several exports may run concurrently.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -388,5 +406,94 @@ pub(crate) fn run(ff: &FfmpegCli, plan: &ExportPlan, progress: Progress, cancel:
             let _ = std::fs::remove_file(&part);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_plan(with_audio: bool) -> ExportPlan {
+        let look = VideoLook { scale: 0.5, x: 40.0, rotation_deg: 15.0, opacity: 0.8, ..VideoLook::default() };
+        let seg = |secs: i64, path: &str, look: VideoLook, t: Option<ExportTransition>| ExportVideo {
+            duration: Time::from_secs(secs),
+            source: Some(ExportVideoSource { path: path.into(), source_start: Time::from_secs(1), speed: 1.0, look }),
+            transition_in: t,
+        };
+        let audio = if with_audio {
+            vec![
+                ExportAudio {
+                    path: "a.wav".into(),
+                    source_start: Time::from_secs(2),
+                    timeline_start: Time::from_millis(500),
+                    duration: Time::from_secs(3),
+                    speed: 0.25,
+                    gain_db: -6.0,
+                    pan: 0.5,
+                    fade_in: Time::from_millis(200),
+                    fade_out: Time::from_millis(300),
+                },
+                ExportAudio {
+                    path: "b.wav".into(),
+                    source_start: Time::ZERO,
+                    timeline_start: Time::from_secs(3),
+                    duration: Time::from_secs(2),
+                    speed: 1.0,
+                    gain_db: 0.0,
+                    pan: 0.0,
+                    fade_in: Time::ZERO,
+                    fade_out: Time::ZERO,
+                },
+            ]
+        } else {
+            vec![]
+        };
+        ExportPlan {
+            output: "out.mp4".into(),
+            total: Time::from_secs(6),
+            video: vec![
+                seg(2, "v1.mp4", VideoLook::default(), None),
+                seg(2, "v2.mp4", look, Some(ExportTransition { kind: ExportTransitionKind::Dissolve, duration: Time::from_millis(500) })),
+                ExportVideo { duration: Time::from_secs(2), source: None, transition_in: None },
+            ],
+            audio,
+            settings: ExportSettings { width: 640, height: 360, ..ExportSettings::default() },
+        }
+    }
+
+    /// Frozen output of the pre-refactor `build_graph` (audio half factored
+    /// out into `audio_graph`): the legacy export must stay byte-identical.
+    #[test]
+    fn build_graph_is_unchanged_with_audio() {
+        let (inputs, graph) = build_graph(&sample_plan(true));
+        let expected_inputs: Vec<&str> = vec!["-ss", "1.000000", "-t", "3.266667", "-i", "v1.mp4", "-ss", "0.766667", "-t", "3.233333", "-i", "v2.mp4", "-ss", "2.000000", "-t", "1.250000", "-i", "a.wav", "-ss", "0.000000", "-t", "2.500000", "-i", "b.wav"];
+        assert_eq!(inputs, expected_inputs);
+        assert_eq!(graph, r#"[0:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,pad=640:360:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=68,setpts=PTS-STARTPTS[v0];
+[1:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,scale=trunc(iw*0.5000/2)*2:trunc(ih*0.5000/2)*2,format=rgba,rotate=0.26180:ow=rotw(0.26180):oh=roth(0.26180):c=none,colorchannelmixer=aa=0.8000,pad=w=iw+720:h=ih+360:x=(ow-iw)/2+40:y=(oh-ih)/2+0:color=black@0,crop=640:360:(iw-640)/2:(ih-360)/2,premultiply=inplace=1,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=67,setpts=PTS-STARTPTS[v1];
+color=c=black:s=640x360:r=30/1,format=yuv420p,trim=end_frame=60,setpts=PTS-STARTPTS[v2];
+[v0]null[c1];
+[c1][v1]xfade=transition=fade:duration=0.500000:offset=1.766667[x1];
+[x1][v2]concat=n=2:v=1:a=0,fps=30/1[vout];
+[2:a:0]asetpts=PTS-STARTPTS,atempo=0.5,atempo=0.500000,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur=3.000000,atrim=duration=3.000000,volume=-6.000dB,pan=stereo|c0=0.5000*c0|c1=1.0000*c1,afade=t=in:st=0:d=0.2000,afade=t=out:st=2.7000:d=0.3000,adelay=delays=24000S:all=1[a0];
+[3:a:0]asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur=2.000000,atrim=duration=2.000000,adelay=delays=144000S:all=1[a1];
+[a0][a1]amix=inputs=2:normalize=0:dropout_transition=0,apad=whole_dur=6.000000,atrim=duration=6.000000[aout]
+"#);
+    }
+
+    /// Frozen output of the pre-refactor `build_graph` (audio half factored
+    /// out into `audio_graph`): the legacy export must stay byte-identical.
+    #[test]
+    fn build_graph_is_unchanged_without_audio() {
+        let (inputs, graph) = build_graph(&sample_plan(false));
+        let expected_inputs: Vec<&str> = vec!["-ss", "1.000000", "-t", "3.266667", "-i", "v1.mp4", "-ss", "0.766667", "-t", "3.233333", "-i", "v2.mp4"];
+        assert_eq!(inputs, expected_inputs);
+        assert_eq!(graph, r#"[0:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,pad=640:360:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=68,setpts=PTS-STARTPTS[v0];
+[1:v:0]setpts=(PTS-STARTPTS)/1.000000,fps=30/1,scale=640:360:force_original_aspect_ratio=decrease,setsar=1,scale=trunc(iw*0.5000/2)*2:trunc(ih*0.5000/2)*2,format=rgba,rotate=0.26180:ow=rotw(0.26180):oh=roth(0.26180):c=none,colorchannelmixer=aa=0.8000,pad=w=iw+720:h=ih+360:x=(ow-iw)/2+40:y=(oh-ih)/2+0:color=black@0,crop=640:360:(iw-640)/2:(ih-360)/2,premultiply=inplace=1,format=yuv420p,                     tpad=stop_mode=clone:stop_duration=2,trim=end_frame=67,setpts=PTS-STARTPTS[v1];
+color=c=black:s=640x360:r=30/1,format=yuv420p,trim=end_frame=60,setpts=PTS-STARTPTS[v2];
+[v0]null[c1];
+[c1][v1]xfade=transition=fade:duration=0.500000:offset=1.766667[x1];
+[x1][v2]concat=n=2:v=1:a=0,fps=30/1[vout];
+anullsrc=r=48000:cl=stereo,atrim=duration=6.000000[aout]
+"#);
     }
 }

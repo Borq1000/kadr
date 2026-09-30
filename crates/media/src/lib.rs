@@ -2,6 +2,7 @@
 //! current implementation drives the FFmpeg CLI ([`ffmpeg::FfmpegCli`]), and
 //! an in-process libav backend can replace it without touching callers.
 
+pub mod encode;
 pub mod export;
 pub mod ffmpeg;
 pub mod stats;
@@ -10,6 +11,7 @@ use kadr_core::{CancelToken, ColorInfo, FrameRate, MediaInfo, Time};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub use encode::{EncodeJob, FrameEncoder};
 pub use export::{ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo};
 
 #[derive(Debug, Error)]
@@ -145,4 +147,7 @@ pub trait MediaBackend: Send + Sync {
         cancel: &CancelToken,
     ) -> Result<()>;
     fn export(&self, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()>;
+    /// Starts encoding rendered RGBA frames plus the job's audio into
+    /// `job.output` (see [`EncodeJob`]).
+    fn start_encode(&self, job: &EncodeJob) -> Result<Box<dyn FrameEncoder>>;
 }

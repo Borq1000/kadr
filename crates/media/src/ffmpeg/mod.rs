@@ -8,7 +8,7 @@ mod probe;
 pub(crate) mod progress;
 mod source;
 
-use crate::{ExportPlan, MediaBackend, MediaError, Progress, RgbaFrame, Result, SourceRequest, SourceStream, StreamRequest, VideoStream};
+use crate::{EncodeJob, ExportPlan, FrameEncoder, MediaBackend, MediaError, Progress, RgbaFrame, Result, SourceRequest, SourceStream, StreamRequest, VideoStream};
 use kadr_core::{CancelToken, MediaInfo, Time};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -157,5 +157,8 @@ impl MediaBackend for FfmpegCli {
     }
     fn export(&self, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()> {
         crate::export::run(self, plan, progress, cancel)
+    }
+    fn start_encode(&self, job: &EncodeJob) -> Result<Box<dyn FrameEncoder>> {
+        crate::encode::start(self, job)
     }
 }
