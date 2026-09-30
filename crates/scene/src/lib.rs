@@ -38,7 +38,8 @@
 //!   out.h / canvas.h)` and a centring offset
 //!   `o = ((out.w − k·canvas.w) / 2, (out.h − k·canvas.h) / 2)`;
 //!   `output = k · canvas + o`. When the output has the canvas's aspect (the
-//!   normal case) `o = (0, 0)`. Output pixels whose centre lies outside the
+//!   normal case) `o = (0, 0)`. A pixel centre exactly on the canvas
+//!   rectangle's boundary counts as inside. Output pixels whose centre lies outside the
 //!   canvas rectangle `[o.x, o.x + k·canvas.w] × [o.y, o.y + k·canvas.h]` are
 //!   margins: opaque black `(0, 0, 0, 1)`, nothing is drawn there.
 //! - Canvas → local: `placement.to_canvas().inverse()` (a layer whose
@@ -76,8 +77,15 @@
 //! Effects (point operations, formulas in the effects spec «Примитивы цвета»)
 //! apply to that sample in `effects` order, on unpremultiplied colour:
 //! `rgb / a` → the effect chain (clamped to [0, 1] once, at its end) →
-//! `× a`; a sample with `a = 0` stays transparent. This happens before
-//! opacity and coverage.
+//! `× a`; a sample with `a = 0` stays as it is (the chain is skipped). This
+//! happens before opacity and coverage. For `c ≥ 0` exposure equals
+//! `c · 2^(ev/2.4)`; a negative intermediate value (only possible between
+//! chained adjusts) uses that same form, so the whole `ColorAdjust` is
+//! affine in `c` and may be applied as one 3×4 matrix.
+//!
+//! A layer draws nothing when its crop is empty (`RectF::is_empty`), its
+//! `placement.size` has a non-positive side, or its transform has no
+//! inverse.
 //!
 //! ## Layer edge coverage
 //!
@@ -90,6 +98,9 @@
 //! coverage. An axis-aligned layer whose edges lie on output pixel
 //! boundaries therefore has coverage exactly 1 inside and 0 outside
 //! (consistent with `cull`'s "covers the canvas").
+//! Coverage uses the layer's `crop` as given — **not** intersected with the
+//! decoded frame: a crop reaching past the content keeps coverage 1 there and
+//! shows the clamped edge texels (only sampling is limited to the frame).
 //!
 //! ## Compositing
 //!
@@ -112,7 +123,9 @@
 //! value, which is composited pixel for pixel (no resampling, coverage 1)
 //! as a layer with `s = mixed · opacity` and the transition layer's `blend`;
 //! the evaluator emits full-canvas placement and crop, opacity 1, Normal
-//! and no effects for transition layers. With `p = progress`,
+//! and no effects for transition layers. A transition layer's own `placement`,
+//! `crop` and `effects` are ignored (its opacity and blend apply), and the
+//! mixed value goes straight into the composite without being stored first. With `p = progress`,
 //! `lerp(a, b, t) = a + (b − a)·t` per premultiplied component, alpha
 //! included:
 //!
