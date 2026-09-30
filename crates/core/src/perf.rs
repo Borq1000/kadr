@@ -125,7 +125,7 @@ impl PerfRing {
             decode: Stats::of(frames.iter().map(FramePerf::decode_total).collect()),
             composite: Stats::of(shown().map(|f| f.composite).collect()),
             present: Stats::of(shown().map(|f| f.present).collect()),
-            seek: Stats::of(frames.iter().filter_map(|f| f.seek_latency).collect()),
+            seek: Stats::of(shown().filter_map(|f| f.seek_latency).collect()),
             frame_allocs_per_frame: per(frames.iter().map(|f| f.frame_allocs as f64).sum()),
             frame_copies_per_frame: per(frames.iter().map(|f| f.frame_copies as f64).sum()),
             bytes_copied_per_frame: per(frames.iter().map(|f| f.bytes_copied as f64).sum()),
@@ -185,5 +185,14 @@ mod tests {
         assert!((s.frame_allocs_per_frame - 2.0 / 3.0).abs() < 1e-9);
         assert!((s.frame_copies_per_frame - 2.0 / 3.0).abs() < 1e-9);
         assert!((s.bytes_copied_per_frame - 100.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn seek_stats_exclude_dropped_frames() {
+        let ring = PerfRing::new(10);
+        ring.push(FramePerf { total: ms(20), seek_latency: Some(ms(20)), ..Default::default() });
+        ring.push(FramePerf { dropped: true, seek_latency: Some(ms(500)), ..Default::default() });
+        let s = ring.summary();
+        assert_eq!((s.seek.count, s.seek.max), (1, ms(20)));
     }
 }

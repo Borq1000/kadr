@@ -90,9 +90,11 @@ impl ColorInfo {
 
     /// From ffprobe's `pix_fmt`, `color_primaries`, `color_transfer`,
     /// `color_space` and `color_range`; each unknown or missing field falls
-    /// back to [`ColorInfo::guess_video`]. An RGB-family `pix_fmt` without a
-    /// known `color_space` is `Matrix::Rgb` and `Range::Full` (FFmpeg treats
-    /// RGB as full range). Alpha comes from the pixel format.
+    /// back to [`ColorInfo::guess_video`]. Without a known `color_space`, an
+    /// RGB-family `pix_fmt` is `Matrix::Rgb`; otherwise BT.2020 primaries
+    /// imply `Matrix::Bt2020Ncl` (not the size guess). `Matrix::Rgb` is always
+    /// `Range::Full` (FFmpeg treats RGB as full range), even tagged `tv`.
+    /// Alpha comes from the pixel format.
     pub fn from_ffprobe(
         width: u32,
         height: u32,
@@ -110,7 +112,12 @@ impl ColorInfo {
             Some("gbr") => Some(Matrix::Rgb),
             _ => None,
         };
-        let untagged_rgb = tagged_matrix.is_none() && is_rgb_pixel_format(pix_fmt);
+        let matrix = match tagged_matrix {
+            Some(m) => m,
+            None if is_rgb_pixel_format(pix_fmt) => Matrix::Rgb,
+            None if primaries == Some("bt2020") => Matrix::Bt2020Ncl,
+            None => g.matrix,
+        };
         ColorInfo {
             primaries: match primaries {
                 Some("bt709") => Primaries::Bt709,
@@ -128,13 +135,9 @@ impl ColorInfo {
                 Some("arib-std-b67") => Transfer::Hlg,
                 _ => g.transfer,
             },
-            matrix: match tagged_matrix {
-                Some(m) => m,
-                None if untagged_rgb => Matrix::Rgb,
-                None => g.matrix,
-            },
+            matrix,
             range: match range {
-                _ if untagged_rgb => Range::Full,
+                _ if matrix == Matrix::Rgb => Range::Full,
                 Some("pc") => Range::Full,
                 Some("tv") => Range::Limited,
                 _ => g.range,
@@ -143,10 +146,12 @@ impl ColorInfo {
         }
     }
 
-    /// Whether the SDR pipeline processes this correctly today.
+    /// Whether the SDR pipeline processes this correctly today: Rec.709/601
+    /// primaries, Rec.709 or sRGB transfer, and an RGB, Rec.709 or Rec.601 matrix.
     pub fn is_supported_sdr(&self) -> bool {
         matches!(self.primaries, Primaries::Bt709 | Primaries::Bt601_625 | Primaries::Bt601_525)
             && matches!(self.transfer, Transfer::Bt709 | Transfer::Srgb)
+            && matches!(self.matrix, Matrix::Rgb | Matrix::Bt709 | Matrix::Bt601)
     }
 }
 
@@ -235,6 +240,37 @@ mod tests {
         let tagged_yuv = ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("bt709"), Some("bt709"), Some("bt709"), Some("tv"));
         assert_eq!((tagged_yuv.matrix, tagged_yuv.range, tagged_yuv.alpha), (Matrix::Bt709, Range::Limited, AlphaMode::Opaque));
         assert_eq!(ColorInfo::guess_video_format(1920, 1080, "yuv420p"), ColorInfo::guess_video(1920, 1080), "untagged YUV unaffected");
+    }
+
+    #[test]
+    fn bt2020_primaries_imply_the_bt2020_matrix() {
+        let c = ColorInfo::from_ffprobe(1920, 1080, "yuv420p10le", Some("bt2020"), Some("bt709"), None, None);
+        assert_eq!((c.primaries, c.matrix), (Primaries::Bt2020, Matrix::Bt2020Ncl));
+        assert!(!c.is_supported_sdr());
+        // An unknown tag counts as untagged.
+        assert_eq!(ColorInfo::from_ffprobe(720, 480, "yuv420p", Some("bt2020"), None, Some("reserved"), None).matrix, Matrix::Bt2020Ncl);
+        // A tagged matrix wins; untagged RGB wins over the primaries.
+        assert_eq!(ColorInfo::from_ffprobe(1920, 1080, "yuv420p", Some("bt2020"), None, Some("bt709"), None).matrix, Matrix::Bt709);
+        assert_eq!(ColorInfo::from_ffprobe(1920, 1080, "gbrp10le", Some("bt2020"), None, None, None).matrix, Matrix::Rgb);
+    }
+
+    #[test]
+    fn rgb_is_always_full_range() {
+        let c = ColorInfo::from_ffprobe(1920, 1080, "yuv444p", None, None, Some("gbr"), Some("tv"));
+        assert_eq!((c.matrix, c.range), (Matrix::Rgb, Range::Full));
+        let c = ColorInfo::from_ffprobe(1920, 1080, "rgb24", None, None, None, Some("tv"));
+        assert_eq!((c.matrix, c.range), (Matrix::Rgb, Range::Full));
+    }
+
+    #[test]
+    fn sdr_support_needs_a_supported_matrix() {
+        let mut c = ColorInfo::WORKING_SDR;
+        for m in [Matrix::Rgb, Matrix::Bt709, Matrix::Bt601] {
+            c.matrix = m;
+            assert!(c.is_supported_sdr(), "{m:?}");
+        }
+        c.matrix = Matrix::Bt2020Ncl;
+        assert!(!c.is_supported_sdr());
     }
 
     #[test]
