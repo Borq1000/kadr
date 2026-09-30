@@ -320,6 +320,11 @@ fn export_retries_a_transient_failure_that_preview_reports() {
     assert_eq!(which(&inputs.layers[0]), (1, 10), "export is not short-circuited by the failure memory");
 
     // Two failed reads in a row at another frame: two retries, then the frame.
+    // A fresh resolver: the first one's session keeps reading ahead past
+    // frame 10 and could take the injected failures on frames other than
+    // 900 (correctly without a backoff for 900), which made this flaky.
+    drop(r);
+    let r = resolver(&fake, ResolverConfig::default());
     fake.fail_reads("a.mp4", 2);
     let t0 = Instant::now();
     let s = scene(vec![media_layer(1, a, &m, FrameRate::FPS_25.frame_to_time(900), CANVAS)]);
