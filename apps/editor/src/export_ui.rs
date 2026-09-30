@@ -1,16 +1,13 @@
-//! Export: builds a backend-agnostic plan from the same composition the
-//! preview uses, runs it as a high-priority background job.
+//! Export: the project's scenes rendered by the CPU renderer and encoded,
+//! as a high-priority background job.
 
 use crate::app::{with_app, App};
-use crate::preview::look_of;
 use crate::ExportState;
 use kadr_core::{Time, TimeRange};
 use kadr_i18n::{duration, t, tf};
 use kadr_jobs::{JobError, JobSpec, JobState, Priority};
-use kadr_media::export::ExportVideoSource;
-use kadr_project::TransitionKind;
-use kadr_media::{EncodeJob, ExportAudio, ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo};
-use kadr_timeline::composition::{audio_segments, transitions_into, video_segments};
+use kadr_media::{EncodeJob, ExportAudio, ExportSettings};
+use kadr_timeline::composition::audio_segments;
 use kadr_playback::{ExportError, ExportRequest, ExportStats, FfmpegDecoders, MissingPolicy};
 use kadr_project::Project;
 use kadr_project_scenes::ProjectScenes;
@@ -75,47 +72,6 @@ impl App {
         size_for(self.project.sequence(), resolution)
     }
 
-    pub fn build_export_plan(&self, output: PathBuf, preset: i32, resolution: i32) -> ExportPlan {
-        let seq = self.project.sequence();
-        let dur = seq.duration();
-        let range = TimeRange::new(Time::ZERO, dur);
-        let (w, h) = self.export_size(resolution);
-        let px_scale = w as f64 / seq.width.max(1) as f64;
-        let segs = video_segments(seq, range);
-        let transitions = transitions_into(seq, &segs);
-        let video = segs
-            .into_iter()
-            .zip(transitions)
-            .map(|(s, tr)| ExportVideo {
-                transition_in: tr.map(|t| ExportTransition {
-                    kind: match t.kind {
-                        TransitionKind::CrossDissolve => ExportTransitionKind::Dissolve,
-                        TransitionKind::DipToBlack => ExportTransitionKind::DipToBlack,
-                        TransitionKind::Wipe => ExportTransitionKind::Wipe,
-                    },
-                    duration: t.duration,
-                }),
-                duration: s.range.duration(),
-                source: s.source.and_then(|v| {
-                    let a = self.project.asset(v.asset)?;
-                    let mut look = look_of(&v.transform, &v.color, false);
-                    look.x *= px_scale;
-                    look.y *= px_scale;
-                    Some(ExportVideoSource { path: a.path.clone(), source_start: v.source_start, speed: v.speed, look })
-                }),
-            })
-            .collect();
-        let audio = export_audio(&self.project, range);
-        let settings = export_settings(seq, w, h, preset);
-        ExportPlan {
-            output,
-            total: dur,
-            video,
-            audio,
-            settings,
-        }
-    }
-
     /// Rough output size so the user isn't surprised by a 20 GB file.
     fn estimate_label(&self, preset: i32, resolution: i32) -> String {
         let seq = self.project.sequence();
@@ -149,13 +105,9 @@ impl App {
                 return self.toast_error(tf("err.export.no_folder", &[("path", &dir.display().to_string())]));
             }
         }
-        let cpu = crate::preview::RendererKind::from_env(std::env::var("KADR_RENDERER").ok().as_deref()) == crate::preview::RendererKind::Cpu;
-        let legacy_plan = (!cpu).then(|| self.build_export_plan(path.clone(), preset, resolution));
-        let cpu_job = cpu.then(|| {
-            let job = encode_job(&self.project, path.clone(), self.export_size(resolution), preset);
-            (Arc::new(ProjectScenes::new(&self.project, false)), job)
-        });
-        tracing::info!(output = %path.display(), renderer = if cpu { "cpu" } else { "legacy" }, "export requested");
+        let job = encode_job(&self.project, path.clone(), self.export_size(resolution), preset);
+        let scenes = Arc::new(ProjectScenes::new(&self.project, false));
+        tracing::info!(output = %path.display(), "export requested");
         self.export.preset = preset;
         self.export.resolution = resolution;
         self.export.done = false;
@@ -165,22 +117,15 @@ impl App {
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         self.export.job = Some(self.jobs.submit(JobSpec::new(tf("jobs.title.export", &[("name", &name)]), "export").priority(Priority::High), move |ctx| {
             let prog = |p: f32| ctx.progress(p);
-            if let Some((scenes, job)) = &cpu_job {
-                let decoders = Arc::new(FfmpegDecoders::new(media.clone()));
-                let req = ExportRequest::new(scenes.clone(), job.clone()).with_missing(MissingPolicy::Fail);
-                return match kadr_playback::export::export(req, decoders, &*media, &prog, &ctx.cancel) {
-                    Ok(stats) => {
-                        log_stats(&stats);
-                        Ok(())
-                    }
-                    Err(e) => Err(job_error(e)),
-                };
+            let decoders = Arc::new(FfmpegDecoders::new(media.clone()));
+            let req = ExportRequest::new(scenes.clone(), job.clone()).with_missing(MissingPolicy::Fail);
+            match kadr_playback::export::export(req, decoders, &*media, &prog, &ctx.cancel) {
+                Ok(stats) => {
+                    log_stats(&stats);
+                    Ok(())
+                }
+                Err(e) => Err(job_error(e)),
             }
-            let plan = legacy_plan.as_ref().expect("legacy plan");
-            media.export(plan, &prog, &ctx.cancel).map_err(|e| match e {
-                kadr_media::MediaError::Cancelled => JobError::Cancelled,
-                e => JobError::Fatal(e.to_string()),
-            })
         }));
         self.refresh_export();
     }
@@ -298,8 +243,8 @@ fn export_settings(seq: &kadr_project::Sequence, w: u32, h: u32, preset: i32) ->
     ExportSettings { width: w, height: h, rate: seq.frame_rate, sample_rate: seq.sample_rate, crf, preset: preset_name.into(), ..Default::default() }
 }
 
-/// The encoder job of the new pipeline: same size, rate, audio and quality
-/// settings as the legacy plan; `frames` as the legacy exporter rounds it.
+/// The encoder job: the export size, the sequence rate, its audio and the
+/// preset's quality settings; `frames` is the duration rounded to a frame.
 pub(crate) fn encode_job(project: &Project, output: PathBuf, size: (u32, u32), preset: i32) -> EncodeJob {
     let seq = project.sequence();
     let total = seq.duration();
@@ -384,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_job_matches_the_legacy_plan_numbers() {
+    fn encode_job_carries_the_export_numbers() {
         let p = project();
         let job = encode_job(&p, "out.mp4".into(), size_for(p.sequence(), 0), 1);
         assert_eq!((job.width, job.height), (1280, 720), "even size");

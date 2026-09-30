@@ -173,8 +173,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         }
     }
     let cache = Cache::new(dirs.cache());
-    let renderer = crate::preview::RendererKind::from_env(std::env::var("KADR_RENDERER").ok().as_deref());
-    let mut preview = PreviewController::new(media.clone(), clock, renderer);
+    let mut preview = PreviewController::new(media.clone(), clock);
     preview.quality = settings.preview_quality;
     let mut tl = TimelineUi::default();
     tl.snapping = settings.snapping;

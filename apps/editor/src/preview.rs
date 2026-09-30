@@ -1,75 +1,23 @@
-//! Preview controller with two backends, chosen by `KADR_RENDERER`
-//! (`legacy` | `cpu`, default `cpu`):
-//!
-//! - `cpu` (render foundation M4): the timeline as it really is — every
-//!   layer, transitions, crop, rotation, opacity, colour — through
-//!   `ProjectScenes` → `PreviewPlayer` → `CpuRenderer`, rendered straight
-//!   into the display buffer (see `preview_cpu`).
-//! - `legacy`: a decode thread driven by commands, kept until M6 to compare.
-//!   Paused: single frames on demand, coalesced (latest request wins).
-//!   Playing: streams the composition segment by segment (the top clip
-//!   only) and paces frames against the audio master clock. Frames go
-//!   through the same `look_filter` as the legacy export.
+//! Preview controller (render foundation M4): the timeline as it really is —
+//! every layer, transitions, crop, rotation, opacity, colour — through
+//! `ProjectScenes` → `PreviewPlayer` → `CpuRenderer`, rendered straight into
+//! the display buffer (see `preview_cpu`).
 
 use crate::app::{post, App};
 use crate::preview_cpu::{CpuPreview, PendingPlay, PlayerFrame, PREROLL_FALLBACK};
 use crate::scene_source::ProjectScenes;
-use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
 use kadr_audio::{AudioClock, MixSource};
-use kadr_core::perf::{FramePerf, LayerTiming, PerfRing, PERF_RING_FRAMES};
-use kadr_core::{FrameRate, Time, TimeRange};
-use kadr_media::export::VideoLook;
-use kadr_media::{MediaBackend, RgbaFrame, StreamRequest};
+use kadr_core::perf::{PerfRing, PERF_RING_FRAMES};
+use kadr_core::{Time, TimeRange};
+use kadr_media::MediaBackend;
 use kadr_playback::{FfmpegDecoders, Resolver, ResolverConfig};
-use kadr_project::{ColorAdjust, Project, Transform};
+use kadr_project::Project;
 use kadr_scene::{OutputSpec, RenderQuality, SizeU};
-use kadr_timeline::composition::{audio_segments, video_segments, VideoSource};
+use kadr_timeline::composition::audio_segments;
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-#[derive(Clone, Debug)]
-pub struct Seg {
-    pub range: TimeRange,
-    pub src: Option<(PathBuf, Time, f64, VideoLook)>,
-}
-
-enum Cmd {
-    Show { generation: u64, t: Time, seg: Seg, w: u32, h: u32, rate: FrameRate, px_scale: f64 },
-    Play { generation: u64, from: Time, segs: Vec<Seg>, w: u32, h: u32, rate: FrameRate, px_scale: f64 },
-    Stop,
-    Quit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RendererKind {
-    Legacy,
-    Cpu,
-}
-
-impl RendererKind {
-    /// `KADR_RENDERER`: `legacy` or `cpu`; unset or anything else → `cpu`.
-    pub fn from_env(v: Option<&str>) -> Self {
-        match v.map(|s| s.trim().to_ascii_lowercase()) {
-            Some(s) if s == "legacy" => RendererKind::Legacy,
-            Some(s) if s != "cpu" && !s.is_empty() => {
-                tracing::warn!(value = %s, "unknown KADR_RENDERER; using cpu");
-                RendererKind::Cpu
-            }
-            _ => RendererKind::Cpu,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            RendererKind::Legacy => "legacy",
-            RendererKind::Cpu => "cpu",
-        }
-    }
-}
 
 /// Frames shown on the UI thread in the last second, and how long they
 /// took from the player to the screen (DEV overlay).
@@ -104,15 +52,10 @@ impl DisplayMeter {
 }
 
 pub struct PreviewController {
-    tx: Sender<Cmd>,
-    generation: Arc<AtomicU64>,
     pub quality: i32,
-    /// Last 600 preview frames (MCP `get_perf`, DEV overlay), either backend.
+    /// Last 600 preview frames (MCP `get_perf`, DEV overlay).
     pub perf: Arc<PerfRing>,
-    /// Legacy: generation and start time of the pending paused-frame request.
-    pub seek_started: Option<(u64, Instant)>,
-    pub kind: RendererKind,
-    /// The `cpu` backend (`None` for legacy or without FFmpeg).
+    /// The CPU player (`None` without FFmpeg).
     pub cpu: Option<CpuPreview>,
     media: Option<Arc<dyn MediaBackend>>,
     /// MCP `get_frame`'s own resolver (export mode), created on first use.
@@ -120,65 +63,16 @@ pub struct PreviewController {
     pub meter: DisplayMeter,
 }
 
-pub fn look_of(t: &Transform, c: &ColorAdjust, bypass: bool) -> VideoLook {
-    if bypass {
-        return VideoLook::default();
-    }
-    VideoLook {
-        scale: t.scale,
-        x: t.x,
-        y: t.y,
-        rotation_deg: t.rotation_deg,
-        opacity: t.opacity,
-        crop: [t.crop_left, t.crop_right, t.crop_top, t.crop_bottom],
-        exposure: c.exposure,
-        contrast: c.contrast,
-        saturation: c.saturation,
-    }
-}
-
-fn to_seg(project: &Project, range: TimeRange, src: Option<&VideoSource>, bypass: bool) -> Seg {
-    Seg {
-        range,
-        src: src.and_then(|s| {
-            let a = project.asset(s.asset)?;
-            Some((a.path.clone(), s.source_start, s.speed, look_of(&s.transform, &s.color, bypass)))
-        }),
-    }
-}
-
 impl PreviewController {
-    pub fn new(media: Option<Arc<dyn MediaBackend>>, clock: AudioClock, kind: RendererKind) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let generation = Arc::new(AtomicU64::new(0));
+    pub fn new(media: Option<Arc<dyn MediaBackend>>, clock: AudioClock) -> Self {
         let perf = Arc::new(PerfRing::new(PERF_RING_FRAMES));
-        tracing::info!(renderer = kind.name(), "preview renderer (KADR_RENDERER=legacy|cpu)");
-        let mut cpu = None;
-        if let Some(m) = media.clone() {
-            match kind {
-                RendererKind::Legacy => {
-                    let g = generation.clone();
-                    let p = perf.clone();
-                    std::thread::Builder::new().name("kadr-preview".into()).spawn(move || worker(m, rx, clock, g, p)).expect("preview thread");
-                }
-                RendererKind::Cpu => cpu = Some(CpuPreview::new(m, clock, perf.clone())),
-            }
-        }
-        PreviewController { tx, generation, quality: 1, perf, seek_started: None, kind, cpu, media, mcp_resolver: None, meter: DisplayMeter::default() }
-    }
-
-    fn next_gen(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    pub fn current_gen(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        let cpu = media.clone().map(|m| CpuPreview::new(m, clock, perf.clone()));
+        PreviewController { quality: 1, perf, cpu, media, mcp_resolver: None, meter: DisplayMeter::default() }
     }
 
     /// Stops the preview threads: the player (joined) and every decoder
     /// session of both resolvers (joined, their processes killed).
     pub fn shutdown(&mut self) {
-        let _ = self.tx.send(Cmd::Quit);
         if let Some(cpu) = self.cpu.take() {
             let t0 = Instant::now();
             drop(cpu);
@@ -218,7 +112,7 @@ impl PreviewController {
         (w, h, s)
     }
 
-    /// The output the `cpu` preview renders at: the legacy size for the
+    /// The output the `cpu` preview renders at: the size for the
     /// quality; full quality renders `PreviewHigh`, ½ and ¼ `PreviewFast`.
     pub fn output(&self, project: &Project) -> OutputSpec {
         let (w, h, _) = self.size(project);
@@ -227,74 +121,10 @@ impl PreviewController {
 }
 
 impl App {
-    /// Requests the frame at the playhead (paused mode). With the `cpu`
-    /// backend while playing it only refreshes the player's snapshot, so a
-    /// live inspector drag shows up in the playing frames.
+    /// Requests the frame at the playhead (paused mode). While playing it
+    /// only refreshes the player's snapshot, so a live inspector drag shows
+    /// up in the playing frames.
     pub fn request_frame(&mut self) {
-        if self.preview.kind == RendererKind::Cpu {
-            return self.request_frame_cpu();
-        }
-        if self.playing || self.media.is_none() {
-            return;
-        }
-        let seq = self.project.sequence();
-        let t = self.playhead.min((seq.duration() - seq.frame_rate.frame_duration()).max(Time::ZERO));
-        let v = kadr_timeline::composition::video_at(seq, t);
-        let bypass = self.ui().get_bypass();
-        let seg = to_seg(&self.project, TimeRange::new(t, t + seq.frame_rate.frame_duration()), v.as_ref(), bypass);
-        let ui = self.ui();
-        let clip_name = v.as_ref().and_then(|v| seq.clip(v.clip)).map(|c| c.name.clone()).unwrap_or_default();
-        ui.set_preview_clip(clip_name.into());
-        ui.set_preview_offline(false);
-        let offline = v.as_ref().and_then(|v| self.project.asset(v.asset)).is_some_and(|a| !a.exists());
-        let empty = if seq.duration() == Time::ZERO {
-            1
-        } else if offline {
-            3
-        } else if seg.src.is_none() {
-            2
-        } else {
-            0
-        };
-        ui.set_preview_empty(empty);
-        if empty != 0 {
-            ui.set_preview_has_frame(false);
-            ui.set_preview_loading(false);
-            return;
-        }
-        let (w, h, px) = self.preview.size(&self.project);
-        let generation = self.preview.next_gen();
-        self.preview.seek_started = Some((generation, Instant::now()));
-        self.ui().set_preview_loading(true);
-        let rate = seq.frame_rate;
-        let _ = self.preview.tx.send(Cmd::Show { generation, t, seg, w, h, rate, px_scale: px });
-    }
-
-    /// The snapshot the preview shows (taken now if the project changed).
-    pub fn preview_scenes(&mut self) -> Arc<ProjectScenes> {
-        let bypass = self.ui().get_bypass();
-        let out = self.preview.output(&self.project);
-        let mcp = self.preview.mcp_resolver.clone();
-        match &mut self.preview.cpu {
-            Some(cpu) => {
-                cpu.set_output(out);
-                if cpu.offline_media_returned() {
-                    cpu.dirty = true;
-                }
-                match &cpu.scenes {
-                    Some(s) if !cpu.dirty && s.bypass() == bypass => s.clone(),
-                    _ => {
-                        let s = Arc::new(ProjectScenes::new(&self.project, bypass));
-                        cpu.set_scenes(s.clone(), mcp.as_deref());
-                        s
-                    }
-                }
-            }
-            None => Arc::new(ProjectScenes::new(&self.project, bypass)),
-        }
-    }
-
-    fn request_frame_cpu(&mut self) {
         if self.preview.cpu.is_none() {
             return;
         }
@@ -322,6 +152,30 @@ impl App {
         ui.set_preview_loading(true);
         if let Some(cpu) = &self.preview.cpu {
             cpu.player().show(t);
+        }
+    }
+
+    /// The snapshot the preview shows (taken now if the project changed).
+    pub fn preview_scenes(&mut self) -> Arc<ProjectScenes> {
+        let bypass = self.ui().get_bypass();
+        let out = self.preview.output(&self.project);
+        let mcp = self.preview.mcp_resolver.clone();
+        match &mut self.preview.cpu {
+            Some(cpu) => {
+                cpu.set_output(out);
+                if cpu.offline_media_returned() {
+                    cpu.dirty = true;
+                }
+                match &cpu.scenes {
+                    Some(s) if !cpu.dirty && s.bypass() == bypass => s.clone(),
+                    _ => {
+                        let s = Arc::new(ProjectScenes::new(&self.project, bypass));
+                        cpu.set_scenes(s.clone(), mcp.as_deref());
+                        s
+                    }
+                }
+            }
+            None => Arc::new(ProjectScenes::new(&self.project, bypass)),
         }
     }
 
@@ -355,35 +209,6 @@ impl App {
         self.audio.play(p.from, p.sources);
     }
 
-    pub fn on_preview_frame(&mut self, generation: u64, frame: RgbaFrame, show_loading_done: bool, mut perf: FramePerf) {
-        if generation != self.preview.current_gen() {
-            // Decoded for a request nobody wants any more: wasted work.
-            perf.dropped = true;
-            perf.total = perf.decode_total();
-            self.preview.perf.push(perf);
-            return;
-        }
-        let ui = self.ui();
-        let shown = Instant::now();
-        let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&frame.data, frame.width, frame.height);
-        // clone_from_slice allocates a new frame buffer and copies into it, on the UI thread.
-        perf.frame_allocs += 1;
-        perf.frame_copies += 1;
-        perf.bytes_copied += frame.data.len() as u64;
-        ui.set_preview_frame(slint::Image::from_rgba8(buf));
-        ui.set_preview_has_frame(true);
-        perf.present = shown.elapsed();
-        self.preview.meter.note(Instant::now(), perf.present);
-        if show_loading_done {
-            ui.set_preview_loading(false);
-            if let Some((_, asked)) = self.preview.seek_started.take_if(|(g, _)| *g == generation) {
-                perf.seek_latency = Some(asked.elapsed());
-            }
-        }
-        perf.total = perf.decode_total() + perf.present;
-        self.preview.perf.push(perf);
-    }
-
     pub fn start_playback(&mut self) {
         let seq = &self.project.sequence().clone();
         let dur = seq.duration();
@@ -395,7 +220,6 @@ impl App {
         }
         let from = self.playhead;
         let range = TimeRange::new(from, dur);
-        let bypass = self.ui().get_bypass();
         let sources: Vec<MixSource> = audio_segments(seq, range)
             .into_iter()
             .filter_map(|a| {
@@ -421,27 +245,18 @@ impl App {
         if missing_audio > 0 {
             self.toast_warn(kadr_i18n::tn("toast.audio_not_ready", missing_audio as i64, &[]));
         }
-        if self.preview.kind == RendererKind::Cpu {
-            if self.preview.cpu.is_none() {
-                return;
-            }
-            self.preview_scenes();
-            self.audio.stop();
-            let cpu = self.preview.cpu.as_mut().expect("checked");
-            // Pre-roll: the player renders the first frame, then the audio starts.
-            let generation = cpu.player().play(from);
-            cpu.pending = Some(PendingPlay { generation, from, sources });
-            // Through `post`: if the app is busy when the timer fires (a modal
-            // dialog pumping events), it retries instead of never starting the audio.
-            slint::Timer::single_shot(PREROLL_FALLBACK, move || post(move |app| app.start_pending_audio(generation)));
-        } else {
-            let segs: Vec<Seg> = video_segments(seq, range).iter().map(|s| to_seg(&self.project, s.range, s.source.as_ref(), bypass)).collect();
-            let (w, h, px) = self.preview.size(&self.project);
-            let rate = seq.frame_rate;
-            self.audio.play(from, sources);
-            let generation = self.preview.next_gen();
-            let _ = self.preview.tx.send(Cmd::Play { generation, from, segs, w, h, rate, px_scale: px });
+        if self.preview.cpu.is_none() {
+            return;
         }
+        self.preview_scenes();
+        self.audio.stop();
+        let cpu = self.preview.cpu.as_mut().expect("checked");
+        // Pre-roll: the player renders the first frame, then the audio starts.
+        let generation = cpu.player().play(from);
+        cpu.pending = Some(PendingPlay { generation, from, sources });
+        // Through `post`: if the app is busy when the timer fires (a modal
+        // dialog pumping events), it retries instead of never starting the audio.
+        slint::Timer::single_shot(PREROLL_FALLBACK, move || post(move |app| app.start_pending_audio(generation)));
         self.playing = true;
         let ui = self.ui();
         ui.set_playing(true);
@@ -460,9 +275,6 @@ impl App {
         if let Some(cpu) = self.preview.cpu.as_mut() {
             cpu.pending = None;
             cpu.player().stop();
-        } else {
-            let _ = self.preview.tx.send(Cmd::Stop);
-            self.preview.next_gen();
         }
         let ui = self.ui();
         ui.set_playing(false);
@@ -528,8 +340,8 @@ impl App {
                 let ui = self.ui();
                 ui.set_bypass(!ui.get_bypass());
                 self.preview.invalidate();
-                // The cpu player takes the new snapshot while playing; legacy restarts.
-                if self.playing && self.preview.kind == RendererKind::Legacy { self.restart_playback() } else { self.request_frame() }
+                // The player takes the new snapshot while playing.
+                self.request_frame();
             }
             "fullscreen" => {
                 self.fullscreen = !self.fullscreen;
@@ -580,174 +392,15 @@ impl App {
         let snapshot = self.preview.perf.snapshot();
         let summary = self.preview.perf.summary();
         let now = Instant::now();
-        let rows = crate::perf_view::dev_rows(&summary, &snapshot, self.preview.meter.fps(now), self.preview.meter.latency_p50(), self.preview.kind.name());
+        let rows = crate::perf_view::dev_rows(&summary, &snapshot, self.preview.meter.fps(now), self.preview.meter.latency_p50(), "cpu");
         let rows: Vec<crate::DevRow> = rows.into_iter().map(|(label, value)| crate::DevRow { label: label.into(), value: value.into() }).collect();
         ui.set_dev_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
     }
 }
 
-fn worker(media: Arc<dyn MediaBackend>, rx: Receiver<Cmd>, clock: AudioClock, current: Arc<AtomicU64>, perf: Arc<PerfRing>) {
-    let mut pending: Option<Cmd> = None;
-    loop {
-        let cmd = match pending.take() {
-            Some(c) => c,
-            None => match rx.recv() {
-                Ok(c) => c,
-                Err(_) => return,
-            },
-        };
-        // Coalesce: keep only the newest queued command.
-        let cmd = rx.try_iter().last().unwrap_or(cmd);
-        match cmd {
-            Cmd::Quit => return,
-            Cmd::Stop => {}
-            Cmd::Show { generation, t, seg, w, h, rate, px_scale } => {
-                let allocs = kadr_media::stats::frame_allocs_on_this_thread();
-                let started = Instant::now();
-                let frame = decode_one(&*media, t, &seg, w, h, rate, px_scale);
-                let pf = FramePerf {
-                    decode: vec![LayerTiming { layer: 0, time: started.elapsed() }],
-                    frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32,
-                    ..Default::default()
-                };
-                if let Some(f) = frame {
-                    post(move |app| app.on_preview_frame(generation, f, true, pf));
-                } else {
-                    post(move |app| {
-                        if generation == app.preview.current_gen() {
-                            app.ui().set_preview_loading(false);
-                        }
-                    });
-                }
-            }
-            Cmd::Play { generation, from, segs, w, h, rate, px_scale } => {
-                pending = play(&*media, &rx, &clock, &current, &perf, generation, from, &segs, w, h, rate, px_scale);
-            }
-        }
-    }
-}
-
-fn decode_one(media: &dyn MediaBackend, t: Time, seg: &Seg, w: u32, h: u32, rate: FrameRate, px: f64) -> Option<RgbaFrame> {
-    let (path, src_start, speed, look) = seg.src.clone()?;
-    let src_t = src_start + Time::from_secs_f64((t - seg.range.start).as_secs_f64() * speed);
-    let req = StreamRequest { path, start: src_t, width: w, height: h, rate, speed, look, px_scale: px };
-    let mut s = media.open_stream(&req).map_err(|e| tracing::warn!(error = %e, "preview decode failed")).ok()?;
-    s.next_frame().ok().flatten()
-}
-
-/// Streams segments from `from`. Returns a command that interrupted playback.
-#[allow(clippy::too_many_arguments)]
-fn play(
-    media: &dyn MediaBackend,
-    rx: &Receiver<Cmd>,
-    clock: &AudioClock,
-    current: &AtomicU64,
-    perf: &PerfRing,
-    generation: u64,
-    from: Time,
-    segs: &[Seg],
-    w: u32,
-    h: u32,
-    rate: FrameRate,
-    px: f64,
-) -> Option<Cmd> {
-    let fd = rate.frame_duration();
-    let now = || clock.now();
-    for seg in segs {
-        let start = seg.range.start.max(from);
-        if start >= seg.range.end {
-            continue;
-        }
-        match &seg.src {
-            None => {
-                let allocs = kadr_media::stats::frame_allocs_on_this_thread();
-                let black = RgbaFrame::black(w, h);
-                let pf = FramePerf { frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32, ..Default::default() };
-                post(move |app| app.on_preview_frame(generation, black, true, pf));
-                // Wait out the gap.
-                loop {
-                    if let Ok(c) = rx.try_recv() {
-                        return Some(c);
-                    }
-                    if current.load(Ordering::Acquire) != generation {
-                        return None;
-                    }
-                    if now().is_some_and(|t| t >= seg.range.end) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-            Some((path, src_start, speed, look)) => {
-                let src_t = *src_start + Time::from_secs_f64((start - seg.range.start).as_secs_f64() * speed);
-                let req = StreamRequest { path: path.clone(), start: src_t, width: w, height: h, rate, speed: *speed, look: look.clone(), px_scale: px };
-                let mut stream = match media.open_stream(&req) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "preview stream failed");
-                        continue;
-                    }
-                };
-                let mut i: i64 = 0;
-                loop {
-                    let ts = start + Time(fd.flicks() * i);
-                    if ts >= seg.range.end {
-                        break;
-                    }
-                    if let Ok(c) = rx.try_recv() {
-                        return Some(c);
-                    }
-                    if current.load(Ordering::Acquire) != generation {
-                        return None;
-                    }
-                    let allocs = kadr_media::stats::frame_allocs_on_this_thread();
-                    let started = Instant::now();
-                    let frame = match stream.next_frame() {
-                        Ok(Some(f)) => f,
-                        _ => break,
-                    };
-                    let mut pf = FramePerf {
-                        decode: vec![LayerTiming { layer: 0, time: started.elapsed() }],
-                        frame_allocs: (kadr_media::stats::frame_allocs_on_this_thread() - allocs) as u32,
-                        ..Default::default()
-                    };
-                    i += 1;
-                    // Pace against the audio clock.
-                    loop {
-                        match now() {
-                            Some(t) if t + Time::from_millis(4) >= ts => break,
-                            None => return None,
-                            _ => std::thread::sleep(Duration::from_millis(2)),
-                        }
-                    }
-                    let late = now().is_some_and(|t| t > ts + Time(fd.flicks() * 2));
-                    if late {
-                        pf.dropped = true;
-                        pf.total = pf.decode_total();
-                        perf.push(pf);
-                    } else {
-                        post(move |app| app.on_preview_frame(generation, frame, false, pf));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn renderer_switch_defaults_to_cpu() {
-        assert_eq!(RendererKind::from_env(None), RendererKind::Cpu);
-        assert_eq!(RendererKind::from_env(Some("legacy")), RendererKind::Legacy);
-        assert_eq!(RendererKind::from_env(Some(" LEGACY ")), RendererKind::Legacy);
-        assert_eq!(RendererKind::from_env(Some("cpu")), RendererKind::Cpu);
-        assert_eq!(RendererKind::from_env(Some("gpu")), RendererKind::Cpu, "unknown values fall back to cpu");
-        assert_eq!(RendererKind::from_env(Some("")), RendererKind::Cpu);
-    }
 
     #[test]
     fn display_meter_counts_the_last_second_and_takes_the_median_latency() {

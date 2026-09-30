@@ -50,8 +50,8 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
                 app.preview.perf.summary()
             };
             let mut v = crate::perf_view::summary_json(&summary);
-            // Numbers of the two backends differ in meaning (see docs/mcp.md): say which.
-            v["renderer"] = app.preview.kind.name().into();
+            // Kept for clients that read it: there is one renderer now (docs/mcp.md).
+            v["renderer"] = "cpu".into();
             Reply::Now(Ok(v))
         }
         "get_frame" => match ms(&p, "at_ms") {

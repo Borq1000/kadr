@@ -2920,7 +2920,6 @@ dependencies = [
 name = "kadr-editor"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
  "kadr-ai",
  "kadr-analysis",
  "kadr-audio",
