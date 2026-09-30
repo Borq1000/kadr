@@ -8,7 +8,6 @@ use kadr_cache::AssetCache;
 use kadr_core::{AssetId, FrameRate, Time};
 use kadr_i18n::tf;
 use kadr_jobs::{JobError, JobSpec, Priority};
-use kadr_media::export::VideoLook;
 use kadr_media::{MediaBackend, StreamRequest};
 use kadr_project::{AnalysisData, AnalysisResult, ShotSummary};
 use std::path::PathBuf;
@@ -36,8 +35,6 @@ fn analyze(media: &dyn MediaBackend, path: PathBuf, duration: Time, ctx: &kadr_j
         height: ANALYSIS_H,
         rate: FrameRate::new(ANALYSIS_FPS, 1),
         speed: 1.0,
-        look: VideoLook::default(),
-        px_scale: 1.0,
     };
     let mut stream = media.open_stream(&req).map_err(|e| JobError::Retryable(e.to_string()))?;
     let expected = (duration.as_secs_f64() * ANALYSIS_FPS as f64).max(1.0);

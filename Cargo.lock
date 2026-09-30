@@ -2868,7 +2868,6 @@ name = "kadr-analysis"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
- "serde",
 ]
 
 [[package]]
@@ -2887,7 +2886,10 @@ version = "0.1.0"
 dependencies = [
  "kadr-core",
  "kadr-media",
+ "kadr-playback",
  "kadr-project",
+ "kadr-project-scenes",
+ "kadr-render",
  "kadr-scene",
  "kadr-timeline",
  "serde_json",
@@ -2917,7 +2919,6 @@ dependencies = [
 name = "kadr-editor"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
  "kadr-ai",
  "kadr-analysis",
  "kadr-audio",
@@ -2927,9 +2928,12 @@ dependencies = [
  "kadr-jobs",
  "kadr-mcp-bridge",
  "kadr-media",
+ "kadr-playback",
  "kadr-project",
+ "kadr-project-scenes",
+ "kadr-render",
+ "kadr-scene",
  "kadr-timeline",
- "parking_lot",
  "png 0.17.16",
  "rfd",
  "serde",
@@ -2977,7 +2981,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
  "uuid",
 ]
 
@@ -2995,6 +2998,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-playback"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "kadr-core",
+ "kadr-media",
+ "kadr-render",
+ "kadr-scene",
+ "parking_lot",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "kadr-project"
 version = "0.1.0"
 dependencies = [
@@ -3004,6 +3021,29 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "kadr-project-scenes"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-media",
+ "kadr-playback",
+ "kadr-project",
+ "kadr-scene",
+ "kadr-timeline",
+ "tempfile",
+]
+
+[[package]]
+name = "kadr-render"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-scene",
+ "png 0.17.16",
+ "rayon",
 ]
 
 [[package]]

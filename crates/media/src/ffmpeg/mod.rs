@@ -6,8 +6,9 @@ mod frames;
 mod pcm;
 mod probe;
 pub(crate) mod progress;
+mod source;
 
-use crate::{ExportPlan, MediaBackend, MediaError, Progress, RgbaFrame, Result, StreamRequest, VideoStream};
+use crate::{EncodeJob, FrameEncoder, MediaBackend, MediaError, Progress, RgbaFrame, Result, SourceRequest, SourceStream, StreamRequest, VideoStream};
 use kadr_core::{CancelToken, MediaInfo, Time};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -122,6 +123,12 @@ impl MediaBackend for FfmpegCli {
     fn open_stream(&self, req: &StreamRequest) -> Result<Box<dyn VideoStream>> {
         Ok(Box::new(frames::FfmpegStream::open(self, req)?))
     }
+    fn open_source(&self, req: &SourceRequest) -> Result<Box<dyn SourceStream>> {
+        Ok(Box::new(source::FfmpegSource::open(self, req)?))
+    }
+    fn decode_still(&self, path: &Path, width: u32, height: u32, out: &mut [u8]) -> Result<()> {
+        source::decode_still(self, path, width, height, out)
+    }
     fn thumbnails(&self, path: &Path, times: &[Time], height: u32, cancel: &CancelToken) -> Result<Vec<RgbaFrame>> {
         let mut out = Vec::with_capacity(times.len());
         for &t in times {
@@ -148,7 +155,7 @@ impl MediaBackend for FfmpegCli {
     ) -> Result<()> {
         pcm::extract_pcm(self, path, out, rate, channels, duration, progress, cancel)
     }
-    fn export(&self, plan: &ExportPlan, progress: Progress, cancel: &CancelToken) -> Result<()> {
-        crate::export::run(self, plan, progress, cancel)
+    fn start_encode(&self, job: &EncodeJob) -> Result<Box<dyn FrameEncoder>> {
+        crate::encode::start(self, job)
     }
 }

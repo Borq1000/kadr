@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 blake3 = "1"
 cpal = "0.18"
 tempfile = "3"
+rayon = "1.12"
 
 [profile.dev]
 opt-level = 1

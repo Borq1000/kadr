@@ -107,12 +107,13 @@ impl App {
             self.submit_video_analysis(id, media.clone(), cache.clone(), asset.path.clone(), asset.duration(), &asset.name);
         }
         if asset.kind() != MediaKind::Audio {
+            let still = asset.kind() == MediaKind::Image;
             let (m, c, path, dur) = (media.clone(), cache.clone(), asset.path.clone(), asset.duration());
             self.jobs.submit(JobSpec::new(tf("jobs.title.thumb", &[("name", &asset.name)]), "thumbnails").priority(Priority::High).retries(1), move |ctx| {
                 let frame = match c.read("thumb.rgba", THUMB_VERSION).and_then(|b| decode_thumb(&b)) {
                     Some(f) => f,
                     None => {
-                        let at = if dur > Time::from_secs(4) { Time::from_secs_f64((dur.as_secs_f64() * 0.1).min(3.0)) } else { Time::ZERO };
+                        let at = thumb_time(still, dur);
                         let f = m
                             .thumbnails(&path, &[at], THUMB_H, &ctx.cancel)
                             .map_err(|e| JobError::Retryable(e.to_string()))?
@@ -248,4 +249,24 @@ fn decode_thumb(b: &[u8]) -> Option<kadr_media::RgbaFrame> {
     let h = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?);
     let data = b.get(8..8 + (w * h * 4) as usize)?.to_vec();
     Some(kadr_media::RgbaFrame { width: w, height: h, data })
+}
+
+/// Where the library thumbnail is taken: a tenth into a longer video (at
+/// most 3 s), else the first frame. A still has only that one frame:
+/// seeking into its nominal duration finds nothing (the job failed).
+fn thumb_time(still: bool, dur: Time) -> Time {
+    if !still && dur > Time::from_secs(4) { Time::from_secs_f64((dur.as_secs_f64() * 0.1).min(3.0)) } else { Time::ZERO }
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+
+    #[test]
+    fn stills_are_thumbnailed_at_their_only_frame() {
+        assert_eq!(thumb_time(true, Time::from_secs(5)), Time::ZERO);
+        assert_eq!(thumb_time(false, Time::from_secs(5)), Time::from_millis(500));
+        assert_eq!(thumb_time(false, Time::from_secs(60)), Time::from_secs(3));
+        assert_eq!(thumb_time(false, Time::from_secs(2)), Time::ZERO);
+    }
 }

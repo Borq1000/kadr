@@ -153,6 +153,7 @@ impl App {
             self.inspector_snapshot = Some((id, self.project.sequence().tracks[ti].clips[ci].clone()));
         }
         apply(&mut self.project.sequence_mut().tracks[ti].clips[ci], prop, v as f64);
+        self.preview.invalidate();
         self.refresh_inspector();
         if matches!(prop, "gain" | "fade-in" | "fade-out") {
             self.refresh_timeline();
@@ -178,6 +179,8 @@ impl App {
             EditCommand::SetClipProperty { clip: id, prop: property_for(prop, &c) }
         };
         if !self.execute(cmd) {
+            // The live drag's changes were rolled back above.
+            self.preview.invalidate();
             self.refresh_inspector();
             self.request_frame();
         }

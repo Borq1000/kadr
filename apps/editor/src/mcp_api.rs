@@ -44,10 +44,14 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
             }
         }
         "get_perf" => {
-            let v = crate::perf_view::summary_json(&app.preview.perf.summary());
-            if p.get("reset").and_then(Value::as_bool) == Some(true) {
-                app.preview.perf.clear();
-            }
+            let summary = if p.get("reset").and_then(Value::as_bool) == Some(true) {
+                app.preview.perf.take_summary()
+            } else {
+                app.preview.perf.summary()
+            };
+            let mut v = crate::perf_view::summary_json(&summary);
+            // Kept for clients that read it: there is one renderer now (docs/mcp.md).
+            v["renderer"] = "cpu".into();
             Reply::Now(Ok(v))
         }
         "get_frame" => match ms(&p, "at_ms") {
@@ -159,6 +163,7 @@ const UI_MENU_ALLOWED: &[&str] = &[
     "add-audio-track",
     "toggle-ai",
     "toggle-jobs",
+    "toggle-dev",
     "zoom-fit",
     "snap",
     "ripple",
@@ -451,26 +456,43 @@ impl App {
         }))
     }
 
-    /// The preview frame at `t` as PNG (at most `max_w` wide, and `max_h`
-    /// tall when given), decoded off the UI thread.
-    pub fn mcp_frame(&self, t: kadr_core::Time, max_w: u32, max_h: Option<u32>) -> Reply {
-        let Some(media) = self.media.clone() else { return Reply::Now(Err(BridgeError::new("io", "no FFmpeg"))) };
-        let src = match mcp_state::frame_source(&self.project, t) {
-            Ok(s) => s,
-            Err(e) => return Reply::Now(Err(e)),
-        };
-        let (w, h) = mcp_state::frame_size(src.size, max_w, max_h);
+    /// The frame at `t` as the preview shows it — every layer, transitions,
+    /// colour, the bypass state — as PNG (at most `max_w` wide, and `max_h`
+    /// tall when given, canvas aspect). Rendered through the new pipeline
+    /// with its own resolver in export mode (waits for every frame, never
+    /// superseded) off the UI thread.
+    pub fn mcp_frame(&mut self, t: kadr_core::Time, max_w: u32, max_h: Option<u32>) -> Reply {
+        if let Err(e) = mcp_state::frame_check(&self.project, t) {
+            return Reply::Now(Err(e));
+        }
+        let Some(resolver) = self.preview.mcp_resolver() else { return Reply::Now(Err(BridgeError::new("io", "no FFmpeg"))) };
+        let scenes = self.preview_scenes();
+        let canvas = kadr_playback::SceneSource::canvas(&*scenes);
+        let (w, h) = mcp_state::frame_size(Some((canvas.w, canvas.h)), max_w, max_h);
         Reply::Later(Box::new(move || {
-            let f = media.decode_frame(&src.path, src.source, w, h).map_err(|e| BridgeError::new("io", e.to_string()))?;
+            use kadr_playback::SceneSource;
+            use kadr_render::Renderer;
+            let out = kadr_scene::OutputSpec::new(kadr_scene::SizeU::new(w, h), kadr_scene::RenderQuality::Export);
+            let scene = scenes.scene_at(t, &out);
+            let mut perf = kadr_core::perf::FramePerf::default();
+            let inputs = resolver.prepare(&scene, &*scenes, kadr_playback::Mode::Export, &mut perf);
+            let mut px = vec![0u8; w as usize * h as usize * 4];
+            let frame = kadr_render::PreparedFrame { scene: &scene, inputs: &inputs };
+            let mut target = kadr_render::RenderTarget::Cpu(kadr_render::CpuTarget::packed(w, h, &mut px));
+            kadr_render::CpuRenderer::new().render(&frame, &mut target).map_err(|e| BridgeError::new("io", e.to_string()))?;
+            // The background is opaque black, so premultiplied = straight here.
             let mut png = Vec::new();
             {
-                let mut enc = png::Encoder::new(&mut png, f.width, f.height);
+                let mut enc = png::Encoder::new(&mut png, w, h);
                 enc.set_color(png::ColorType::Rgba);
                 enc.set_depth(png::BitDepth::Eight);
-                enc.write_header().and_then(|mut w| w.write_image_data(&f.data)).map_err(|e| BridgeError::new("io", e.to_string()))?;
+                enc.write_header().and_then(|mut wr| wr.write_image_data(&px)).map_err(|e| BridgeError::new("io", e.to_string()))?;
             }
             use base64_lite::encode;
-            Ok(json!({"mime": "image/png", "data": encode(&png), "width": f.width, "height": f.height}))
+            Ok(json!({
+                "mime": "image/png", "data": encode(&png), "width": w, "height": h,
+                "layers": scene.layers.len(), "offline": scenes.any_offline(&scene), "bypass": scenes.bypass(),
+            }))
         }))
     }
 }

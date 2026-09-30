@@ -20,8 +20,12 @@
 //!   channel, premultiplied. A value `v` is stored as
 //!   `floor(clamp(v, 0, 1) · 255 + 0.5)` (nearest, half up); it is read back
 //!   as `stored / 255`. Arithmetic in between is f32 or better. Fusing steps
-//!   (keeping an intermediate in float instead of storing it) is allowed:
-//!   the ±1 LSB tolerance covers it.
+//!   (keeping an intermediate in float instead of storing it) is allowed
+//!   only **within one layer** — sample → effects → opacity and coverage →
+//!   composite — and the ±1 LSB tolerance covers that. Between layers
+//!   nothing is fused: the output buffer is stored (rounded) after every
+//!   top-level layer, and each transition buffer (`from`, `to`) is stored
+//!   after its last layer, before the two are mixed.
 //! - Straight-alpha sources (images, alpha video) are premultiplied per
 //!   texel **before** filtering.
 //!
@@ -34,11 +38,15 @@
 //!   out.h / canvas.h)` and a centring offset
 //!   `o = ((out.w − k·canvas.w) / 2, (out.h − k·canvas.h) / 2)`;
 //!   `output = k · canvas + o`. When the output has the canvas's aspect (the
-//!   normal case) `o = (0, 0)`. Output pixels whose centre lies outside the
+//!   normal case) `o = (0, 0)`. A pixel centre exactly on the canvas
+//!   rectangle's boundary counts as inside. Output pixels whose centre lies outside the
 //!   canvas rectangle `[o.x, o.x + k·canvas.w] × [o.y, o.y + k·canvas.h]` are
 //!   margins: opaque black `(0, 0, 0, 1)`, nothing is drawn there.
 //! - Canvas → local: `placement.to_canvas().inverse()` (a layer whose
-//!   transform has no inverse draws nothing).
+//!   transform has no inverse — [`Affine2::inverse`], `|det| < 1e-12` —
+//!   draws nothing; decided on the placement alone, never on it composed
+//!   with the output map, whose `k²` would move the cut-off with the output
+//!   size).
 //! - Local → texel: the local content rectangle `[0, size.x] × [0, size.y]`
 //!   maps onto the whole decoded frame `[0, tw] × [0, th]` (`tw × th` texels):
 //!   `texel = (local.x · tw / size.x, local.y · th / size.y)` with
@@ -52,33 +60,69 @@
 //! One bilinear sample per output pixel, no mipmaps or area filtering. For
 //! the texel point `(u, v)`: clamp `u` to `[kx0 + 0.5, kx1 − 0.5]` and `v` to
 //! `[ky0 + 0.5, ky1 − 0.5]`, where the crop in whole texels is
-//! `kx0 = floor(cx0 + 0.5)`, `kx1 = max(floor(cx1 + 0.5), kx0 + 1)` (same for
-//! y) and `(cx0, cy0, cx1, cy1)` is the crop rectangle in texels. Then with
+//! `kx0 = min(floor(cx0 + 0.5), tw − 1)`,
+//! `kx1 = min(max(floor(cx1 + 0.5), kx0 + 1), tw)` (same for y with `th`)
+//! and `(cx0, cy0, cx1, cy1)` is the crop rectangle in texels **intersected
+//! with the decoded frame** `[0, tw] × [0, th]` (so `0 ≤ kx0 < kx1 ≤ tw`:
+//! at least one texel, never one outside the frame). Then with
 //! `i = floor(u − 0.5)`, `f = (u − 0.5) − i`, `j = floor(v − 0.5)`,
 //! `g = (v − 0.5) − j` the sample is the bilinear mix of texels `(i, j)`, `(i+1, j)`, `(i, j+1)`,
 //! `(i+1, j+1)` with weights `(1−f)(1−g)`, `f(1−g)`, `(1−f)g`, `fg`; an index
-//! outside `[kx0, kx1 − 1]` (or `[ky0, ky1 − 1]`) is clamped into it. So
+//! outside `[kx0, kx1 − 1]` (or `[ky0, ky1 − 1]`) is clamped into it, which
+//! also caps it at `tw − 1` (or `th − 1`). So
 //! nothing outside the crop is ever read (no bleeding). A
 //! [`LayerContent::Solid`] layer has no texels: its sample is its
-//! premultiplied colour.
+//! premultiplied colour. A [`LayerContent::Media`] layer whose frame is
+//! missing (offline media, a failed decode) is drawn exactly like a `Solid`
+//! layer of [`Rgba::MISSING`] with the same placement, crop, opacity, blend
+//! and effects; the scene itself never changes because of it.
 //!
 //! Effects (point operations, formulas in the effects spec «Примитивы цвета»)
 //! apply to that sample in `effects` order, on unpremultiplied colour:
 //! `rgb / a` → the effect chain (clamped to [0, 1] once, at its end) →
-//! `× a`; a sample with `a = 0` stays transparent. This happens before
-//! opacity and coverage.
+//! `× a`; a sample with `a = 0` stays as it is (the chain is skipped), and
+//! so does every sample when the chain holds only neutral adjusts
+//! ([`ColorAdjust::is_neutral`]: no-ops, the clamp included — which matters
+//! for premultiplied texels brighter than their alpha). This
+//! happens before opacity and coverage. For `c ≥ 0` exposure equals
+//! `c · 2^(ev/2.4)`; a negative intermediate value (only possible between
+//! chained adjusts) uses that same form, so the whole `ColorAdjust` is
+//! affine in `c` and may be applied as one 3×4 matrix.
+//!
+//! A layer draws nothing when its crop is empty (`RectF::is_empty`), its
+//! `placement.size` has a non-positive side, or its transform has no
+//! inverse.
+//!
+//! ## Value domain
+//!
+//! The evaluator emits finite values, with every `opacity` and transition
+//! `progress` in [0, 1]. A renderer still sanitises both defensively: a
+//! non-finite value counts as 0, anything else is clamped to [0, 1] (so a
+//! NaN opacity draws nothing rather than punching a hole).
 //!
 //! ## Layer edge coverage
 //!
-//! `coverage = clamp(0.5 + dist, 0, 1)`, where `dist` is the signed distance,
-//! in **output** pixels and positive inside, from the output pixel centre to
-//! the crop rectangle mapped into output space (`to_canvas`, then canvas →
-//! output; always a rectangle, possibly rotated). `dist` is the minimum over the
-//! rectangle's four edges of the signed distance to that edge's line
-//! (positive on the inner side). Colour and alpha are multiplied by
-//! coverage. An axis-aligned layer whose edges lie on output pixel
-//! boundaries therefore has coverage exactly 1 inside and 0 outside
-//! (consistent with `cull`'s "covers the canvas").
+//! The crop rectangle is mapped into output space (`to_canvas`, then canvas →
+//! output; always a rectangle, possibly rotated). For the output pixel
+//! centre, `dL`, `dR`, `dT`, `dB` are the signed distances, in **output**
+//! pixels and positive on the inner side, to the lines of the rectangle's
+//! four edges (`dL`, `dR`: the pair of opposite edges from the crop's `x0`
+//! and `x1`; `dT`, `dB`: from `y0` and `y1`). Per pair of opposite edges
+//!
+//! - `cx = clamp(min(1, 0.5 + dL) + min(1, 0.5 + dR) − 1, 0, 1)`,
+//! - `cy = clamp(min(1, 0.5 + dT) + min(1, 0.5 + dB) − 1, 0, 1)`,
+//!
+//! and `coverage = cx · cy`: the overlap of a one-pixel box around the centre
+//! with the band between the two edges, per axis of the rectangle. Colour and
+//! alpha are multiplied by coverage. An axis-aligned layer whose edges lie on
+//! output pixel boundaries therefore has coverage exactly 1 inside and 0
+//! outside (consistent with `cull`'s "covers the canvas"), and a layer
+//! thinner than a pixel gets the fraction of its width (a 0.25 px line
+//! through pixel centres: 0.25), so a layer shrinking to nothing fades out
+//! instead of lingering as a half-bright line.
+//! Coverage uses the layer's `crop` as given — **not** intersected with the
+//! decoded frame: a crop reaching past the content keeps coverage 1 there and
+//! shows the clamped edge texels (only sampling is limited to the frame).
 //!
 //! ## Compositing
 //!
@@ -101,7 +145,9 @@
 //! value, which is composited pixel for pixel (no resampling, coverage 1)
 //! as a layer with `s = mixed · opacity` and the transition layer's `blend`;
 //! the evaluator emits full-canvas placement and crop, opacity 1, Normal
-//! and no effects for transition layers. With `p = progress`,
+//! and no effects for transition layers. A transition layer's own `placement`,
+//! `crop` and `effects` are ignored (its opacity and blend apply), and the
+//! mixed value goes straight into the composite without being stored first. With `p = progress`,
 //! `lerp(a, b, t) = a + (b − a)·t` per premultiplied component, alpha
 //! included:
 //!

@@ -14,6 +14,10 @@ kadr-core = { path = "../../crates/core" }
 kadr-project = { path = "../../crates/project" }
 kadr-timeline = { path = "../../crates/timeline" }
 kadr-media = { path = "../../crates/media" }
+kadr-scene = { path = "../../crates/scene" }
+kadr-render = { path = "../../crates/render" }
+kadr-playback = { path = "../../crates/playback" }
+kadr-project-scenes = { path = "../../crates/project-scenes" }
 kadr-audio = { path = "../../crates/audio" }
 kadr-analysis = { path = "../../crates/analysis" }
 kadr-jobs = { path = "../../crates/jobs" }
@@ -28,8 +32,6 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
-crossbeam-channel.workspace = true
-parking_lot.workspace = true
 rfd = "0.17"
 
 [dev-dependencies]

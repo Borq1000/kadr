@@ -272,7 +272,25 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
     ui.invoke_focus_editor();
     let r = ui.run();
     with_app(|app| app.shutdown());
+    drop(rc);
+    drop_app();
     r
+}
+
+/// Drops the App now, on the UI thread, while every thread it owns still runs.
+///
+/// Left in [`APP`], the App would be dropped by the main thread's
+/// thread-local destructors, which on Windows run inside `ExitProcess`
+/// (`DLL_PROCESS_DETACH`), after the OS has already terminated every other
+/// thread. The AI assistant's tokio runtime then waits forever for its dead
+/// worker threads to report their exit: the process logs "Kadr exiting" and
+/// never ends, and a process that has begun exiting may refuse to be
+/// terminated from outside too.
+fn drop_app() {
+    let t0 = Instant::now();
+    let app = APP.with(|a| a.borrow_mut().take());
+    drop(app);
+    tracing::debug!(ms = t0.elapsed().as_millis() as u64, "app dropped");
 }
 
 pub fn lang_index() -> i32 {
@@ -315,6 +333,12 @@ fn start_timers() {
     let t = slint::Timer::default();
     t.start(slint::TimerMode::Repeated, Duration::from_millis(150), || {
         with_app(|app| app.tick_status());
+    });
+    std::mem::forget(t);
+    // DEV overlay numbers (2 Hz, only while it is open).
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, Duration::from_millis(500), || {
+        with_app(|app| app.tick_dev_overlay());
     });
     std::mem::forget(t);
     // Autosave check.
@@ -492,6 +516,9 @@ impl App {
         if self.playhead > dur {
             self.playhead = dur;
         }
+        self.preview.invalidate();
+        // The first clip placed sets the sequence format (size, aspect).
+        self.update_preview_info();
         if self.playing {
             self.restart_playback();
         }
@@ -533,6 +560,7 @@ impl App {
         self.refresh_status();
         self.refresh_ai();
         self.update_preview_info();
+        self.preview.invalidate();
         self.request_frame();
     }
 

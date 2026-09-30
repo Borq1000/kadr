@@ -366,7 +366,7 @@ impl App {
             InsertMode::Insert => tf("cmd.insert_named", &[("name", &group.name)]),
             InsertMode::Overwrite => tf("cmd.overwrite_named", &[("name", &group.name)]),
         };
-        if self.execute(EditCommand::Batch { label, commands: cmds }) && kadr_timeline::composition::video_at(self.project.sequence(), self.playhead).is_none() {
+        if self.execute(EditCommand::Batch { label, commands: cmds }) && !kadr_timeline::scene::has_video_at(&self.project, self.project.sequence(), self.playhead) {
             self.set_playhead(at);
         }
         self.refresh_library();

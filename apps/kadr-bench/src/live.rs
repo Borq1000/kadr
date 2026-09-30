@@ -69,40 +69,115 @@ pub fn tool_result(v: &Value) -> Result<Value, String> {
 }
 
 /// Numeric leaves of `v` → rows `scenario = prefix`, `metric = dotted path`.
-pub fn flatten(prefix: &str, v: &Value, r: &mut Report) {
-    fn walk(scenario: &str, path: &str, v: &Value, r: &mut Report) {
+pub fn flatten(prefix: &str, case: &str, v: &Value, r: &mut Report) {
+    fn walk(scenario: &str, case: &str, path: &str, v: &Value, r: &mut Report) {
         match v {
             Value::Object(m) => {
                 for (k, x) in m {
                     let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-                    walk(scenario, &p, x, r);
+                    walk(scenario, case, &p, x, r);
                 }
             }
-            Value::Number(n) => r.push(scenario, "live", path, n.as_f64().unwrap_or(0.0), ""),
+            Value::Number(n) => r.push(scenario, case, path, n.as_f64().unwrap_or(0.0), ""),
             _ => {}
         }
     }
-    walk(prefix, "", v, r)
+    walk(prefix, case, "", v, r)
 }
 
-pub fn run(clip: &Path, seconds: u64) -> Result<Report, String> {
+/// What the live run plays: one clip, or the three-layer project (`layers == 3`), at `quality`
+/// (0 = Full, 1 = ½, 2 = ¼; the editor's `preview_quality`).
+pub struct Options {
+    pub layers: u32,
+    pub quality: i32,
+}
+
+impl Options {
+    pub fn case(&self) -> String {
+        let q = match self.quality {
+            0 => "full",
+            1 => "half",
+            _ => "quarter",
+        };
+        format!("{} layer{} {q}", self.layers, if self.layers == 1 { "" } else { "s" })
+    }
+}
+
+/// `full` / `half` / `quarter` → the editor's preview quality index.
+pub fn parse_quality(s: &str) -> Option<i32> {
+    match s {
+        "full" => Some(0),
+        "half" => Some(1),
+        "quarter" => Some(2),
+        _ => None,
+    }
+}
+
+pub fn run(clip: &Path, seconds: u64, opts: &Options) -> Result<Report, String> {
     let clip = clip.canonicalize().map_err(|e| format!("{}: {e}", clip.display()))?;
     let data = std::env::temp_dir().join(format!("kadr-bench-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
     std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    let result = drive(&clip, &data, seconds);
+    let result = drive(&clip, &data, seconds, opts);
     let _ = std::fs::remove_dir_all(&data);
     result
 }
 
-fn drive(clip: &Path, data: &Path, seconds: u64) -> Result<Report, String> {
+/// The three-layer live project: `clip` on V1 (60 s), the 4K bench clip as a rotated picture-in-picture
+/// on V2 (three 20 s segments end to end) and the alpha logo on V3.
+fn three_layer_file(clip: &Path, data: &Path) -> Result<std::path::PathBuf, String> {
+    use kadr_core::{FrameRate, Time, TimeRange};
+    use kadr_project::{Clip, Project, Track, TrackKind};
+    let ff = kadr_media::ffmpeg::FfmpegCli::locate().map_err(|e| e.to_string())?;
+    let dir = crate::media::bench_dir();
+    let uhd = crate::export_bench::probe(&ff, &dir.join("h264_2160p30.mp4"))?;
+    let logo = crate::export_bench::probe(&ff, &crate::export_bench::ensure_logo(&dir)?)?;
+    let hd = crate::export_bench::probe(&ff, clip)?;
+    let mut p = Project::new("live3");
+    let seq = p.sequence_mut();
+    seq.width = 1920;
+    seq.height = 1080;
+    seq.frame_rate = FrameRate::FPS_30;
+    let total = Time::from_secs(60);
+    seq.tracks[0].clips.push(Clip::new(hd.id, "base", TimeRange::new(Time::ZERO, total), Time::ZERO));
+    seq.tracks.insert(1, Track::new(TrackKind::Video, "V2"));
+    for i in 0..3 {
+        let at = Time::from_secs(i * 20);
+        let mut pip = Clip::new(uhd.id, format!("pip{i}"), TimeRange::new(Time::ZERO, Time::from_secs(20)), at);
+        pip.transform.scale = 0.3;
+        pip.transform.rotation_deg = 5.0;
+        pip.transform.x = 560.0;
+        pip.transform.y = -290.0;
+        seq.tracks[1].clips.push(pip);
+    }
+    seq.tracks.insert(2, Track::new(TrackKind::Video, "V3"));
+    let mut mark = Clip::new(logo.id, "logo", TimeRange::new(Time::ZERO, total), Time::ZERO);
+    mark.transform.scale = 0.5;
+    mark.transform.x = -700.0;
+    mark.transform.y = 380.0;
+    seq.tracks[2].clips.push(mark);
+    p.assets.extend([hd, uhd, logo]);
+    let path = data.join("live3.kadr");
+    kadr_project::io::save(&mut p, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn drive(clip: &Path, data: &Path, seconds: u64, opts: &Options) -> Result<Report, String> {
+    // The isolated data dir carries the preview quality (the editor reads settings.json at start).
+    std::fs::write(data.join("settings.json"), format!("{{\"preview_quality\": {}}}", opts.quality)).map_err(|e| e.to_string())?;
+    let case = opts.case();
+    let project3 = if opts.layers == 3 { Some(three_layer_file(clip, data)?) } else { None };
     let mut m = Mcp::start(data)?;
     m.rpc("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "kadr-bench", "version": "1"}}))?;
-    m.call("import_media", json!({"paths": [clip]}))?;
-    m.call("wait_idle", json!({"timeout_ms": 120_000}))?;
-    let state = m.call("get_state", json!({}))?;
-    let asset = state["project"]["assets"][0]["id"].as_str().ok_or("import produced no asset")?.to_string();
-    m.call("place_media", json!({"id": asset, "at_ms": 0}))?;
+    if let Some(p) = &project3 {
+        m.call("project", json!({"action": "open", "path": p}))?;
+    } else {
+        m.call("import_media", json!({"paths": [clip]}))?;
+        m.call("wait_idle", json!({"timeout_ms": 120_000}))?;
+        let state = m.call("get_state", json!({}))?;
+        let asset = state["project"]["assets"][0]["id"].as_str().ok_or("import produced no asset")?.to_string();
+        m.call("place_media", json!({"id": asset, "at_ms": 0}))?;
+    }
     m.call("wait_idle", json!({"timeout_ms": 120_000}))?;
     let duration_ms = m.call("get_state", json!({}))?["timeline"]["duration_ms"].as_i64().ok_or("empty timeline")?;
 
@@ -111,13 +186,13 @@ fn drive(clip: &Path, data: &Path, seconds: u64) -> Result<Report, String> {
     m.call("playback", json!({"action": "play"}))?;
     std::thread::sleep(Duration::from_secs(seconds));
     m.call("playback", json!({"action": "pause"}))?;
-    flatten("playback", &m.call("get_perf", json!({"reset": true}))?, &mut r);
+    flatten("playback", &case, &m.call("get_perf", json!({"reset": true}))?, &mut r);
 
     for t in crate::baseline::seek_times((duration_ms / 1000) as u32, 10) {
         m.call("set_playhead", json!({"at_ms": t.as_millis()}))?;
         m.call("wait_idle", json!({"timeout_ms": 30_000}))?;
     }
-    flatten("seek", &m.call("get_perf", json!({"reset": true}))?, &mut r);
+    flatten("seek", &case, &m.call("get_perf", json!({"reset": true}))?, &mut r);
     Ok(r)
 }
 
@@ -139,8 +214,15 @@ mod tests {
     #[test]
     fn nested_numbers_become_rows() {
         let mut r = Report::new("t");
-        flatten("playback", &json!({"frames": 10, "total_ms": {"p50": 12.5}, "note": "x"}), &mut r);
+        flatten("playback", "live", &json!({"frames": 10, "total_ms": {"p50": 12.5}, "note": "x"}), &mut r);
         let got: Vec<(String, f64)> = r.rows.iter().map(|x| (format!("{}:{}", x.scenario, x.metric), x.value)).collect();
         assert_eq!(got, vec![("playback:frames".to_string(), 10.0), ("playback:total_ms.p50".to_string(), 12.5)]);
+    }
+
+    #[test]
+    fn options_name_their_case_and_quality_words_parse() {
+        assert_eq!(Options { layers: 1, quality: 1 }.case(), "1 layer half");
+        assert_eq!(Options { layers: 3, quality: 0 }.case(), "3 layers full");
+        assert_eq!([parse_quality("full"), parse_quality("half"), parse_quality("quarter"), parse_quality("x")], [Some(0), Some(1), Some(2), None]);
     }
 }

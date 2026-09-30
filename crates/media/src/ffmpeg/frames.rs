@@ -31,6 +31,13 @@ pub(super) fn decode_frame(ff: &FfmpegCli, path: &Path, at: Time, max_w: u32, ma
 }
 
 pub(crate) fn parse_pam(buf: &[u8]) -> Option<RgbaFrame> {
+    let (width, height, px) = pam_payload(buf)?;
+    crate::stats::note_frame_alloc();
+    Some(RgbaFrame { width, height, data: px.to_vec() })
+}
+
+/// Size and RGBA pixels of a PAM image (`DEPTH 4`), borrowed from `buf`.
+pub(crate) fn pam_payload(buf: &[u8]) -> Option<(u32, u32, &[u8])> {
     const END: &[u8] = b"ENDHDR\n";
     let hdr_end = buf.windows(END.len()).position(|w| w == END)? + END.len();
     let header = std::str::from_utf8(&buf[..hdr_end]).ok()?;
@@ -44,12 +51,11 @@ pub(crate) fn parse_pam(buf: &[u8]) -> Option<RgbaFrame> {
             _ => {}
         }
     }
-    let len = (w * h * 4) as usize;
+    let len = w as usize * h as usize * 4;
     if depth != 4 || buf.len() < hdr_end + len {
         return None;
     }
-    crate::stats::note_frame_alloc();
-    Some(RgbaFrame { width: w, height: h, data: buf[hdr_end..hdr_end + len].to_vec() })
+    Some((w, h, &buf[hdr_end..hdr_end + len]))
 }
 
 /// Long-running decoder process streaming raw RGBA frames through a pipe.

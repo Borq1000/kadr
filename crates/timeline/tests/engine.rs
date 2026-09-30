@@ -464,3 +464,38 @@ fn link_selection_joins_unlinked_clips_and_moves_them_together() {
     let (p2, _) = setup();
     assert!(commands::link_selection(p2.sequence(), &[p2.sequence().tracks[2].clips[0].id]).is_none());
 }
+
+fn transition_at(p: &Project) -> Vec<Time> {
+    p.sequence().transitions.iter().map(|t| t.at).collect()
+}
+
+#[test]
+fn add_transition_snaps_a_ms_rounded_time_to_the_cut_at_29_97() {
+    use kadr_scene::{LayerContent, OutputSpec, RenderQuality, SizeU};
+    let (mut p, mut e) = setup();
+    let fr = FrameRate::FPS_29_97;
+    p.sequence_mut().frame_rate = fr;
+    let cut = fr.frame_to_time(301); // 10.0434 s, not a whole millisecond
+    e.execute(&mut p, EditCommand::Split { at: cut, clips: None }).unwrap();
+    assert_eq!(p.sequence().tracks[0].clips[0].timeline_out, cut);
+    let track = p.sequence().tracks[0].id;
+    let rounded = Time::from_millis(cut.as_millis());
+    assert_ne!(rounded, cut);
+    let tr = Transition { id: kadr_core::TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: rounded, duration: ms(1_000) };
+    e.execute(&mut p, EditCommand::AddTransition(tr)).unwrap();
+    assert_eq!(transition_at(&p), vec![cut], "snapped exactly to the cut");
+    let scene = kadr_timeline::scene::evaluate(&p, p.sequence(), cut, &OutputSpec::new(SizeU::new(960, 540), RenderQuality::Export));
+    assert!(matches!(scene.layers[0].content, LayerContent::Transition(_)), "the evaluator produces a transition layer");
+}
+
+#[test]
+fn add_transition_far_from_any_cut_keeps_its_time() {
+    let (mut p, mut e) = setup();
+    e.execute(&mut p, EditCommand::Split { at: s(10), clips: None }).unwrap();
+    let track = p.sequence().tracks[0].id;
+    for at in [ms(10_100), s(30)] {
+        let tr = Transition { id: kadr_core::TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at, duration: ms(500) };
+        e.execute(&mut p, EditCommand::AddTransition(tr)).unwrap();
+    }
+    assert_eq!(transition_at(&p), vec![ms(10_100), s(30)]);
+}

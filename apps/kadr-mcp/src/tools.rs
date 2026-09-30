@@ -25,7 +25,7 @@ const EDIT_DESCRIPTION: &str = "Apply an undoable batch of timeline edit ops (un
 - \"change_speed\": clip_id, speed (number, 1.0 = normal)
 - \"set_audio_gain\": clip_id, gain_db (number)
 - \"add_marker\": at_ms, name
-- \"add_transition\": at_ms, kind (\"cross_dissolve\"|\"dip_to_black\"|\"wipe\"), duration_ms
+- \"add_transition\": at_ms, kind (\"cross_dissolve\"|\"dip_to_black\"|\"wipe\"), duration_ms (at_ms snaps to the cut within half a frame of it, if exactly one; else stays as given)
 - \"select_camera\": start_ms, end_ms, angle (multicam angle label, e.g. \"CAM2\")
 - \"add_caption\": start_ms, end_ms, text (not supported yet: rejected)
 - \"unlink\": clips (array of clip ids; their linked partners are unlinked too)
@@ -48,7 +48,7 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "get_frame",
-            "Render a preview frame at a given timeline position.",
+            "Render the frame at a timeline position exactly as the preview shows it (all layers, transitions, crop/rotation/opacity/colour, bypass). A gap or audio-only time is a black frame (`layers: 0`); an empty timeline or a time past the end is an error.",
             json!({
                 "at_ms": {"type": "integer", "description": "Timeline position in milliseconds."},
                 "max_w": {"type": "integer", "description": "Max width in pixels (default 960); the frame keeps its aspect and is never upscaled."},
@@ -58,8 +58,8 @@ pub fn kadr_tools() -> Vec<Value> {
         ),
         tool(
             "get_perf",
-            "Preview performance over the last frames (up to 600): percentiles (ms) of frame time, decode, composite and present; dropped frames (late or superseded); seek latency from a playhead change to the frame shown; frame-sized allocations and copies per frame. `reset: true` clears the window after reading, so the next read measures only what happens afterwards.",
-            json!({"reset": {"type": "boolean", "description": "Clear the window after reading."}}),
+            "Preview performance over the last frames (up to 600): percentiles (ms) of frame time, decode, composite and present; dropped frames (late or superseded) in the window, plus `total_frames`/`total_dropped`/`dropped_pct` since the last reset; seek latency from a playhead change to the frame shown; frame-sized allocations and copies per frame; `renderer` (always `cpu`). Present is the hand-off of the finished buffer to the UI thread (no copy) and a copy means the display still held a ring buffer. `reset: true` reads and clears the window and the totals at once, so the next read measures only what happens afterwards.",
+            json!({"reset": {"type": "boolean", "description": "Clear the window and the totals after reading."}}),
             &[],
         ),
         tool(

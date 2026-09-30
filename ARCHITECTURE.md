@@ -10,7 +10,7 @@
 | GUI | **Slint 1.18** (winit + femtovg/OpenGL, fallback software renderer) | нативный, декларативный `.slint`, HiDPI, `ContextMenuArea`, `FocusScope`, `SharedPixelBuffer` для кадров из фоновых потоков, GPL/Royalty-free/commercial лицензии | egui: immediate-mode, сложно получить «коммерческий» вид и сложные layouts; iced: хорош, но нет готовых контекстных меню/popup-инфраструктуры и медленнее эволюция виджетов. Объективных препятствий для Slint не найдено. |
 | Media | **FFmpeg 8 CLI** (`ffmpeg`/`ffprobe`) за трейтом `MediaBackend` | работает уже сейчас без dev-библиотек и линковки, изоляция процесса (краш декодера ≠ краш редактора), GPL-сборка не линкуется в бинарь | `ffmpeg-next 9` (libav bindings) — план для V0.2+ для низколатентного seek/decode в preview; GStreamer — избыточен для NLE-ядра |
 | Audio out | **cpal 0.18** (WASAPI) | стандарт де-факто, low-level, без лишних слоёв | rodio (надстройка, но микширование нам нужно своё) |
-| GPU | **wgpu 30** — *отложено до V0.2* | в V0.1 compositing = выбор верхнего клипа + scale; GPU «ради GPU» не используем | — |
+| GPU | **wgpu 30** — *отложено* | композицию делает `CpuRenderer` (многопоточный, байт-в-байт детерминированный); GPU-рендерер встанет за тем же контрактом `kadr-render` | — |
 | HTTP | reqwest 0.13 + `native-tls` (SChannel) | без cmake/nasm (`aws-lc-rs`), системные сертификаты Windows | rustls + ring |
 | Credentials | keyring 4 → Windows Credential Manager | ключи не хранятся в проекте/конфиге | DPAPI вручную |
 | Async | Tokio **только** в AI-слое (сетевые запросы) | медиа-работа — CPU/процессы, ей достаточно потоков | — |
@@ -31,9 +31,9 @@
              │ kadr-timeline      │  │ kadr-jobs       │ │ kadr-ai  │  │ kadr-media     │
              │ EditEngine, Command│  │ queue/priority/ │ │ EditCmd  │  │ MediaBackend   │
              │ Undo/Redo, snapping│  │ progress/cancel │ │ validate │  │ └ FfmpegCli    │
-             │ composition plan   │  │ retry           │ │ intents  │  │ probe/thumbs/  │
-             └────────┬───────────┘  └─────────────────┘ │ providers│  │ frames/pcm/    │
-                      │                                  │ cost/    │  │ export         │
+             │ scene evaluator    │  │ retry           │ │ intents  │  │ probe/thumbs/  │
+             └────────┬───────────┘  └─────────────────┘ │ providers│  │ source decode/ │
+                      │                                  │ cost/    │  │ pcm/ encoder   │
              ┌────────▼───────────┐  ┌─────────────────┐ │ privacy  │  └────────────────┘
              │ kadr-project       │  │ kadr-analysis   │ └──────────┘
              │ model + .kadr I/O  │  │ peaks, silence  │  ┌─────────────────┐
@@ -47,7 +47,8 @@
 Правила зависимостей:
 - `core` ни от чего не зависит; `project` → `core`; `timeline` → `project`.
 - `ai` → `timeline`/`project` (исполняет команды через EditEngine), **не** зависит от Slint.
-- `timeline` не знает об AI-провайдерах; `media` не знает о проекте (работает с путями/таймкодами), кроме модуля `export`, получающего готовый composition plan.
+- `timeline` не знает об AI-провайдерах и рендерерах: он только вычисляет `FrameScene` (`timeline::scene::evaluate`). `media` не знает о проекте (работает с путями/таймкодами): декодирует, масштабирует и кодирует кадры, композицию не делает.
+- `scene` (контракт) ← `render`, `playback`, `timeline`; рендерер не видит таймлайн, таймлайн не видит рендерер; `playback` с `render` знают друг друга только через `FrameScene`.
 - Только `apps/editor` зависит от Slint.
 
 ## 3. Crate boundaries
@@ -56,8 +57,12 @@
 |---|---|
 | `kadr-core` | `Time` (i64 flicks), `FrameRate` (рациональный), конвертации кадр↔время с округлением, timecode (включая drop-frame отображение), `Id`-типы |
 | `kadr-project` | Project, MediaAsset, Bin, Sequence, Track, Clip, Transition, Effect, Keyframe, Marker, Transcript, AnalysisResult, AIAction, EditorPreferenceEvent, MulticamGroup (ракурсы + смещения синхронизации), StoredDecision (решения Jev с вердиктом человека); сериализация `.kadr` c `format_version`; атомарная запись; autosave/recovery |
-| `kadr-timeline` | EditEngine: команды (Split/Trim/Move/Delete/Insert/ChangeProperty/AddTransition/SwitchAngle/SetAngleRange/Batch), мультикам-клипы (время группы ↔ таймлайн ↔ источник ракурса), undo/redo, ripple, snapping, linked A/V, composition plan (что видно/слышно в каждый момент) |
-| `kadr-media` | `MediaBackend` trait; `FfmpegCli` backend: probe, thumbnails, decode кадра, потоковый decode, извлечение PCM, export/encode/mux с прогрессом |
+| `kadr-timeline` | EditEngine: команды (Split/Trim/Move/Delete/Insert/ChangeProperty/AddTransition/SwitchAngle/SetAngleRange/Batch), мультикам-клипы (время группы ↔ таймлайн ↔ источник ракурса), undo/redo, ripple, snapping, linked A/V; вычислитель сцены `scene::evaluate` (что видно в момент t → `FrameScene`) и `composition::audio_segments` (что слышно) |
+| `kadr-media` | `MediaBackend` trait; `FfmpegCli` backend: probe, thumbnails, decode кадра, декодирование исходников (`open_source`, `decode_still`), масштабирующий поток для анализа, извлечение PCM, `FrameEncoder` (RGBA-кадры + аудио-граф → libx264/aac mp4 с прогрессом). FFmpeg только демультиплексирует, декодирует, масштабирует и кодирует — не компонует |
+| `kadr-scene` | контракт рендера: `FrameScene` (слои снизу вверх, размещения в пикселях холста, ссылки на media, а не пиксели), `OutputSpec`, `RenderQuality`, операции переходов |
+| `kadr-render` | `CpuRenderer`: `FrameScene` + готовые кадры источников → RGBA буфер (цвет, crop, поворот, прозрачность, blend, transitions), фиксированная математика — одинаковый результат при любом числе потоков |
+| `kadr-playback` | разрешение сцены в кадры: `Resolver` (декодеры, кэш кадров, пул буферов), `PreviewPlayer` (живой preview, часы аудио), `export` (кадр за кадром → энкодер, A/V sync) |
+| `kadr-project-scenes` | `ProjectScenes`: снимок проекта как `SceneSource` для playback (оценка сцены в момент `t`, пути media, offline-детектор) |
 | `kadr-audio` | воспроизведение: cpal-поток + микшер клипов из PCM-кэша, мастер-часы воспроизведения |
 | `kadr-analysis` | детерминированный анализ: пики waveform, RMS/loudness, детекция тишины; изображение — резкость/экспозиция/тряска/чёрный кадр по уменьшенным кадрам, границы планов (`VideoOverview`, `ShotSummary`); синхронизация ракурсов по огибающей звука (корреляция Пирсона, мин. перекрытие — половина короткого клипа) или по таймкоду |
 | `kadr-jobs` | фоновые задачи: priority queue, worker pool, progress, cancellation token, retry с backoff, error state |
@@ -68,7 +73,7 @@
 | `kadr-mcp-bridge` | HTTP/1.1 сервер на `127.0.0.1:0` внутри процесса редактора: JSON-RPC диспетчер Kadr-инструментов (`get_state`, `import_media`, `edit`, …) на UI-потоке через `post(...)`; bearer-токен, файл обнаружения `mcp.json` |
 | `apps/kadr-mcp` | Отдельный бинарник — stdio MCP-сервер (JSON-RPC 2.0, протокол `2025-06-18`) для Claude: агрегирует `ui_*` (проксирует в embedded MCP-сервер Slint 1.18) и Kadr-инструменты (проксирует в `kadr-mcp-bridge`); обнаруживает/запускает headless-инстанс Kadr |
 
-Сознательно **не** создаём отдельные `render`, `transcription`, `platform`: пока у них нет содержимого. Jev живёт модулем `kadr_ai::jev` — ему нужны те же CostGuard, PrivacyPolicy и ledger, что и чату.
+Сознательно **не** создаём отдельные `transcription`, `platform`: пока у них нет содержимого. Jev живёт модулем `kadr_ai::jev` — ему нужны те же CostGuard, PrivacyPolicy и ledger, что и чату.
 
 ## 4. Модель времени
 
@@ -106,24 +111,30 @@ Import → probe (ffprobe JSON) → MediaAsset
                audio proxy (ffmpeg → s16le 48 kHz stereo .pcm в кэше)
                → waveform peaks (из PCM) → silence analysis
                (V0.2: video proxy H.264 540p all-intra для быстрого seek)
-Preview:  seek/scrub → decode одиночного кадра (ffmpeg -ss … -frames:v 1 rawvideo rgba), latest-wins
-          play       → потоковый decode сегмента композиции (rawvideo pipe), синхронизация по аудио-часам
-Export:   composition plan → filter_complex (trim/setpts/scale/pad/concat + atrim/adelay/volume/amix)
-          → libx264/aac mp4, прогресс через -progress pipe:1
+Preview:  seek/scrub/play → PreviewPlayer (kadr-playback): FrameScene в момент t → Resolver (декодированные кадры источников) → CpuRenderer → буфер кольца → Slint Image; синхронизация по аудио-часам
+Export:   те же FrameScene по кадрам → Resolver → CpuRenderer → FrameEncoder (kadr-media: RGBA-кадры + аудио-граф atrim/adelay/volume/amix → libx264/aac mp4), прогресс и отмена через kadr-jobs
 ```
 
 ## 8. Rendering pipeline
 
-1. **Media Decode** (`kadr-media`) — выдаёт RGBA кадры/PCM.
-2. **Timeline Composition** (`kadr-timeline::composition`) — чистая функция: sequence → список сегментов «в [t0,t1) виден клип C, источник s0» + активные аудио-клипы. Используется и preview, и export (одна логика ⇒ WYSIWYG).
-3. **Preview Rendering** (`apps/editor`) — кадр → `SharedPixelBuffer` → Slint `Image`. V0.2: wgpu compositing нескольких слоёв/transform/transitions с Slint wgpu-interop.
-4. **Final Export** (`kadr-media::export`) — независим от preview, может выполняться параллельно монтажу.
+Одна цепочка для preview, экспорта и MCP `get_frame`:
+
+```
+Timeline ──evaluate(t, OutputSpec)──► FrameScene ──► kadr-playback Resolver ──► CpuRenderer ──► preview / FrameEncoder
+ (kadr-timeline::scene)              (kadr-scene)     (кадры источников:          (kadr-render)
+                                                       FFmpeg-декодеры, кэш)
+```
+
+1. **Scene evaluation** (`kadr-timeline::scene`) — чистая функция: проект, последовательность, время → `FrameScene`: видеодорожки снизу вверх, каждая — слой (клип или переход) с размещением в пикселях холста, crop, прозрачностью, blend и цветокоррекцией; невидимое отбрасывается (`cull`), чтобы не декодировалось. `has_video_at` — тот же вопрос «есть ли видео под playhead» для UI. Аудио-часть — `timeline::composition::audio_segments`.
+2. **Resolve** (`kadr-playback`) — `Resolver` превращает ссылки на media в декодированные кадры (FFmpeg `open_source`, стабильная нормализация частоты и цвета, кэш, пул буферов, read-ahead); `ProjectScenes` (`kadr-project-scenes`) — снимок проекта для него.
+3. **Render** (`kadr-render`) — `CpuRenderer` компонует слои в RGBA; качество `PreviewFast`/`PreviewHigh`/`Export` выбирает `OutputSpec`. Preview и экспорт дают один и тот же кадр при одном `OutputSpec`.
+4. **Output** — preview: кадр сразу в буфер дисплея (`apps/editor::preview_cpu`); экспорт: `kadr_playback::export` подаёт кадры в `FrameEncoder` (`kadr-media`), независимо от preview, параллельно монтажу.
 
 ## 9. Threading model
 
 - **UI thread** (Slint event loop): только модель UI и лёгкие вычисления; тяжёлое — никогда.
 - **Job workers** (`kadr-jobs`, N = cores-1, priority queue): probe, thumbnails, PCM, анализ, export. Результаты → UI через `slint::invoke_from_event_loop`.
-- **Preview decode thread**: одиночные кадры (канал с coalescing «последний запрос побеждает») и потоковое воспроизведение.
+- **Preview player** (`kadr-playback`): свой поток рендера кадров (latest-wins при scrub, по аудио-часам при воспроизведении), декодеры — процессы FFmpeg с read-ahead; рендер — пул потоков `CpuRenderer`.
 - **Audio**: cpal callback (real-time, без аллокаций и блокировок — lock-free ring buffer) + feeder-поток, читающий PCM-кэш и микширующий треки.
 - **Tokio runtime** (1–2 потока) — только AI HTTP.
 - **Autosave** — таймер UI сериализует проект в память, запись на диск в фоне.

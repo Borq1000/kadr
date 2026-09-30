@@ -23,11 +23,21 @@ pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) ->
     scene
 }
 
+/// Whether any video is visible at `t` (the evaluator's answer, so it agrees
+/// with preview and export: muted tracks, disabled clips and gaps show none).
+pub fn has_video_at(project: &Project, seq: &Sequence, t: Time) -> bool {
+    let size = SizeU::new(seq.width.max(1), seq.height.max(1));
+    !evaluate(project, seq, t, &OutputSpec::new(size, RenderQuality::PreviewFast)).layers.is_empty()
+}
+
 /// Below this a layer cannot change an 8-bit pixel.
 const MIN_OPACITY: f32 = 0.5 / 255.0;
 
 /// Drops layers that cannot affect the frame (render spec §7.3), so nothing
-/// invisible is ever decoded or drawn.
+/// invisible is ever decoded or drawn. A full-frame transition between two
+/// opaque full-frame pictures occludes like an opaque video does; its own
+/// placement, crop and effects are ignored by the contract, so only its
+/// opacity and blend matter.
 pub fn cull(scene: &mut FrameScene) {
     let canvas = RectF::new(0.0, 0.0, scene.canvas.w as f32, scene.canvas.h as f32);
     scene.layers.retain(|l| is_visible(l, &canvas));
@@ -51,7 +61,16 @@ fn covers_opaquely(l: &Layer, canvas: &RectF) -> bool {
     let opaque_content = match &l.content {
         LayerContent::Media { media, .. } => media.kind == SourceKind::Video && media.color.alpha == AlphaMode::Opaque,
         LayerContent::Solid(c) => c.a >= 1.0,
-        LayerContent::Transition(_) => false,
+        // The mixed buffer is opaque when both inputs are (the contract's
+        // Dissolve and Wipe interpolate alpha; DipToColor's `C(x)` has alpha
+        // `c.a · x.a`, so it needs an opaque dip colour).
+        LayerContent::Transition(t) => {
+            let opaque_op = match t.op {
+                TransitionOp::Dissolve | TransitionOp::Wipe { .. } => true,
+                TransitionOp::DipToColor(c) => c.a >= 1.0,
+            };
+            opaque_op && t.from.iter().any(|f| covers_opaquely(f, canvas)) && t.to.iter().any(|f| covers_opaquely(f, canvas))
+        }
     };
     opaque_content
         && l.opacity >= 1.0
@@ -369,6 +388,34 @@ mod tests {
     }
 
     #[test]
+    fn has_video_at_follows_gaps_mute_and_disabled_clips() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 3_000);
+        place(&mut p, 0, &hd(), 0, 5_000, 3_000);
+        let at = |p: &Project, ms: i64| has_video_at(p, p.sequence(), Time::from_millis(ms));
+        assert!(at(&p, 1_000) && !at(&p, 4_000) && at(&p, 6_000) && !at(&p, 9_000));
+        p.sequence_mut().tracks[0].clips[1].enabled = false;
+        assert!(!at(&p, 6_000), "a disabled clip is a gap");
+        p.sequence_mut().tracks[0].muted = true;
+        assert!(!at(&p, 1_000), "a muted only track shows nothing");
+    }
+
+    #[test]
+    fn muted_or_disabled_upper_clips_let_the_track_below_show() {
+        let mut p = Project::new("t");
+        let v2 = add_video_track(&mut p);
+        let lower = place(&mut p, 0, &hd(), 0, 0, 10_000);
+        let upper = place(&mut p, v2, &hd(), 30_000, 2_000, 3_000);
+        let ids = |p: &Project| scene_at(p, 3_000).layers.iter().map(|l| l.id).collect::<Vec<_>>();
+        assert_eq!(ids(&p), vec![LayerId::from(upper)], "the opaque upper clip hides the lower");
+        p.sequence_mut().tracks[v2].clips[0].enabled = false;
+        assert_eq!(ids(&p), vec![LayerId::from(lower)]);
+        p.sequence_mut().tracks[v2].clips[0].enabled = true;
+        p.sequence_mut().tracks[v2].muted = true;
+        assert_eq!(ids(&p), vec![LayerId::from(lower)]);
+    }
+
+    #[test]
     fn dissolve_window_is_centred_on_the_cut_with_exact_progress() {
         let mut p = Project::new("t");
         let a = place(&mut p, 0, &hd(), 0, 0, 2_000);
@@ -581,14 +628,84 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transitions_are_kept_and_do_not_occlude() {
+    /// V1 holds a clip; V2 holds two clips with a transition of `kind` at 2 s.
+    /// `edit_in` changes the incoming (second) V2 clip's transform.
+    fn under_a_transition(kind: TransitionKind, incoming: MediaAsset, edit_in: impl FnOnce(&mut kadr_project::Clip)) -> (Project, ClipId, TransitionId) {
         let mut p = Project::new("t");
         let v2 = add_video_track(&mut p);
         let below = place(&mut p, 0, &hd(), 0, 0, 4_000);
         place(&mut p, v2, &hd(), 0, 0, 2_000);
-        place(&mut p, v2, &hd(), 0, 2_000, 2_000);
-        let tid = add_transition(&mut p, v2, 2_000, 1_000, TransitionKind::DipToBlack);
-        assert_eq!(ids(&scene_at(&p, 2_000)), vec![LayerId::from(below), LayerId::from(tid)]);
+        place(&mut p, v2, &incoming, 0, 2_000, 2_000);
+        edit_in(&mut p.sequence_mut().tracks[v2].clips[1]);
+        let tid = add_transition(&mut p, v2, 2_000, 1_000, kind);
+        (p, below, tid)
+    }
+
+    #[test]
+    fn a_full_frame_transition_between_opaque_clips_hides_the_tracks_below() {
+        for kind in [TransitionKind::CrossDissolve, TransitionKind::DipToBlack, TransitionKind::Wipe] {
+            let (p, _, tid) = under_a_transition(kind, hd(), |_| {});
+            for ms in [1_600, 2_000, 2_400] {
+                assert_eq!(ids(&scene_at(&p, ms)), vec![LayerId::from(tid)], "{kind:?} at {ms} ms: V1 is not decoded");
+            }
+        }
+    }
+
+    #[test]
+    fn a_transition_with_a_picture_in_picture_or_alpha_side_keeps_the_tracks_below() {
+        type Edit = fn(&mut kadr_project::Clip);
+        let cases: [(&str, MediaAsset, Edit); 3] = [
+            ("scaled-down incoming clip", hd(), |c| c.transform.scale = 0.5),
+            ("translucent incoming clip", hd(), |c| c.transform.opacity = 0.5),
+            ("PNG with alpha", asset(MediaKind::Image, 1920, 1080, 0, (1, 1)), |_| {}),
+        ];
+        for (what, incoming, edit) in cases {
+            for kind in [TransitionKind::CrossDissolve, TransitionKind::DipToBlack, TransitionKind::Wipe] {
+                let (p, below, tid) = under_a_transition(kind, incoming.clone(), edit);
+                assert_eq!(ids(&scene_at(&p, 2_000)), vec![LayerId::from(below), LayerId::from(tid)], "{what}, {kind:?}");
+            }
+        }
+    }
+
+    /// A transition layer over one full-frame clip on each side, built by hand.
+    fn hand_transition(op: TransitionOp, opacity: f32, blend: BlendMode, nested: bool) -> (FrameScene, LayerId, LayerId) {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 4_000);
+        let canvas = SizeU::new(1920, 1080);
+        let mut scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(canvas, RenderQuality::Export));
+        let base = clip_layer(&p, &p.sequence().tracks[0].clips[0], Time::ZERO, canvas).unwrap();
+        let base_id = base.id;
+        let (from, to) = (base.clone(), base.clone());
+        let (from, to) = if nested {
+            let inner = |l: Layer| Layer { content: LayerContent::Transition(Box::new(TransitionLayer { op: TransitionOp::Dissolve, progress: 0.5, from: vec![l.clone()], to: vec![l] })), ..base.clone() };
+            (inner(from), inner(to))
+        } else {
+            (from, to)
+        };
+        let id = LayerId::from(TransitionId::new());
+        let placement = Placement::fill(canvas);
+        scene.layers.push(base);
+        scene.layers.push(Layer { id, content: LayerContent::Transition(Box::new(TransitionLayer { op, progress: 0.5, from: vec![from], to: vec![to] })), crop: placement.full_crop(), placement, opacity, blend, effects: vec![] });
+        (scene, base_id, id)
+    }
+
+    #[test]
+    fn a_transition_occludes_only_at_full_opacity_and_normal_blend() {
+        for (opacity, blend, hides) in [(1.0, BlendMode::Normal, true), (0.9, BlendMode::Normal, false), (1.0, BlendMode::Multiply, false)] {
+            let (mut scene, base, id) = hand_transition(TransitionOp::Dissolve, opacity, blend, false);
+            cull(&mut scene);
+            let want = if hides { vec![id] } else { vec![base, id] };
+            assert_eq!(ids(&scene), want, "opacity {opacity}, {blend:?}");
+        }
+    }
+
+    #[test]
+    fn dip_to_a_translucent_colour_does_not_occlude_and_nested_transitions_do() {
+        let (mut scene, base, id) = hand_transition(TransitionOp::DipToColor(Rgba { a: 0.5, ..Rgba::BLACK }), 1.0, BlendMode::Normal, false);
+        cull(&mut scene);
+        assert_eq!(ids(&scene), vec![base, id], "C(x) has alpha 0.5 at the midpoint");
+        let (mut scene, _, id) = hand_transition(TransitionOp::Dissolve, 1.0, BlendMode::Normal, true);
+        cull(&mut scene);
+        assert_eq!(ids(&scene), vec![id], "each side is itself an opaque full-frame transition");
     }
 }

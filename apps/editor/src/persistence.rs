@@ -102,6 +102,7 @@ impl App {
                 ui.set_jobs_open(!ui.get_jobs_open());
                 self.refresh_jobs();
             }
+            "toggle-dev" => self.toggle_dev_overlay(),
             "zoom-fit" => self.zoom_fit(),
             "snap" | "ripple" => self.tl_tool(m),
             "safe" | "fullscreen" => self.transport(m),

@@ -2,13 +2,13 @@ import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
 import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
-import { Preview, AngleView } from "preview.slint";
+import { Preview, AngleView, DevRow } from "preview.slint";
 import { Timeline, TrackView, ClipView, ClipMark, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, McAngleRow, AngleView, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { ShotRow, ClipMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -63,6 +63,9 @@ export component AppWindow inherits Window {
     in property <bool> preview-loading;
     in property <float> scrub-fraction;
     in property <bool> preview-compact;
+    in property <bool> preview-offline;
+    in property <bool> dev-overlay;
+    in property <[DevRow]> dev-rows;
     in property <[AngleView]> angles;
     in property <int> active-angle;
     callback angle-clicked(int);
@@ -321,6 +324,7 @@ export component AppWindow inherits Window {
                                 { id: "safe", label: Tr.t("menu.view.safe"), shortcut: "'", enabled: true, checked: root.safe-areas },
                                 { id: "fullscreen", label: Tr.t("menu.view.fullscreen"), shortcut: "F", enabled: true },
                                 { id: "reset-layout", label: Tr.t("menu.view.reset_layout"), enabled: true },
+                                { id: "toggle-dev", label: Tr.t("menu.view.dev_overlay"), shortcut: "Ctrl+Shift+D", enabled: true, checked: root.dev-overlay },
                                 { separator: true },
                                 { id: "lang-ru", label: "Русский", enabled: true, checked: root.language == 0 },
                                 { id: "lang-en", label: "English", enabled: true, checked: root.language == 1 },
@@ -412,6 +416,9 @@ export component AppWindow inherits Window {
                     loading: root.preview-loading;
                     scrub-fraction: root.scrub-fraction;
                     compact: root.preview-compact;
+                    offline: root.preview-offline;
+                    dev-overlay: root.dev-overlay;
+                    dev-rows: root.dev-rows;
                     angles: root.angles;
                     active-angle: root.active-angle;
                     angle-clicked(i) => { root.angle-clicked(i); root.focus-editor(); }

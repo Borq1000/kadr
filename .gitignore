@@ -3,3 +3,6 @@
 testdata/
 mds/api-keys.md
 desktop.ini
+
+# Personal Claude Code overrides
+.claude/settings.local.json

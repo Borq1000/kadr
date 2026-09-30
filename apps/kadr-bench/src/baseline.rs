@@ -1,15 +1,15 @@
-//! M0 baseline of the legacy pipeline: seek latency, sequential decode
-//! throughput and allocations, frame buffer cost, legacy export speed.
+//! M0 baseline: seek latency and sequential decode throughput through the
+//! scaling stream (`open_stream`), allocations and frame buffer cost. The
+//! M0 legacy export row is gone with the legacy export; its numbers stay in
+//! `docs/perf/2026-09-30-m0-baseline.md`.
 
 use crate::media::{self, TestClip};
 use crate::report::Report;
 use crate::alloc;
 use kadr_core::perf::Stats;
-use kadr_core::{CancelToken, FrameRate, Time};
-use kadr_media::export::{ExportVideoSource, VideoLook};
+use kadr_core::{FrameRate, Time};
 use kadr_media::ffmpeg::FfmpegCli;
-use kadr_media::{ExportPlan, ExportSettings, ExportTransition, ExportTransitionKind, ExportVideo, MediaBackend, StreamRequest};
-use std::path::Path;
+use kadr_media::{MediaBackend, StreamRequest};
 use std::time::Instant;
 
 pub fn run(quick: bool) -> Result<Report, String> {
@@ -33,13 +33,11 @@ pub fn run(quick: bool) -> Result<Report, String> {
         r.push("frame_buffer", &case, "alloc_and_first_touch", alloc_ms, "ms");
         r.push("frame_buffer", &case, "copy", copy_ms, "ms");
     }
-    let clip1080 = clips.iter().find(|c| c.name == "h264_1080p30").ok_or("no 1080p clip")?;
-    r.push("export_legacy", "1080p30 20 s, 10 cuts, 2 dissolves, Balanced", "fps", legacy_export(&ff, clip1080, &dir)?, "fps");
     Ok(r)
 }
 
 fn request(clip: &TestClip, start: Time, w: u32, h: u32) -> StreamRequest {
-    StreamRequest { path: clip.path.clone(), start, width: w, height: h, rate: FrameRate::FPS_30, speed: 1.0, look: VideoLook::default(), px_scale: 1.0 }
+    StreamRequest { path: clip.path.clone(), start, width: w, height: h, rate: FrameRate::FPS_30, speed: 1.0 }
 }
 
 /// Deterministic pseudo-random times in [0, secs − 2 s).
@@ -105,31 +103,6 @@ fn frame_memory(w: u32, h: u32, reps: usize) -> (f64, f64) {
         std::hint::black_box(&mut dst);
     }
     (alloc_ms, started.elapsed().as_secs_f64() * 1000.0 / reps as f64)
-}
-
-/// Legacy FFmpeg-graph export of a 20 s, 10-segment, 2-dissolve 1080p30 timeline.
-fn legacy_export(ff: &FfmpegCli, clip: &TestClip, dir: &Path) -> Result<f64, String> {
-    let output = dir.join("export-legacy.mp4");
-    let dissolve = ExportTransition { kind: ExportTransitionKind::Dissolve, duration: Time::from_millis(500) };
-    let video = (0..10)
-        .map(|i| ExportVideo {
-            duration: Time::from_secs(2),
-            source: Some(ExportVideoSource { path: clip.path.clone(), source_start: Time::from_secs(i * 5), speed: 1.0, look: VideoLook::default() }),
-            transition_in: (i == 3 || i == 7).then(|| dissolve.clone()),
-        })
-        .collect();
-    let plan = ExportPlan {
-        output: output.clone(),
-        total: Time::from_secs(20),
-        video,
-        audio: vec![],
-        settings: ExportSettings { width: 1920, height: 1080, rate: FrameRate::FPS_30, crf: 21, preset: "fast".into(), ..Default::default() },
-    };
-    let started = Instant::now();
-    ff.export(&plan, &|_| {}, &CancelToken::new()).map_err(|e| e.to_string())?;
-    let secs = started.elapsed().as_secs_f64();
-    let _ = std::fs::remove_file(&output);
-    Ok(600.0 / secs)
 }
 
 #[cfg(test)]
