@@ -40,7 +40,8 @@ fn edit_description_documents_every_op() {
     let d = tool("edit")["description"].as_str().unwrap().to_string() + prop("edit", "ops")["description"].as_str().unwrap_or("");
     for op in [
         "split_clip", "delete_range", "delete_clip", "trim_clip", "move_clip", "set_transform", "change_speed", "set_audio_gain", "add_marker",
-        "add_transition", "select_camera", "add_caption", "unlink", "link", "delete_part",
+        "add_transition", "select_camera", "add_caption", "unlink", "link", "delete_part", "set_keyframe", "remove_keyframe", "set_keyframe_ease",
+        "move_keyframes", "clear_animation", "set_video_fade",
     ] {
         assert!(d.contains(&format!("\"{op}\"")), "edit docs lack op {op}");
     }

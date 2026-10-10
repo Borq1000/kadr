@@ -72,6 +72,11 @@ pub fn timeline_json(seq: &Sequence, selection: &[ClipId], playhead: Time) -> Va
                 "id": c.id.to_string(), "name": c.name, "asset": c.asset.to_string(),
                 "start_ms": ms(c.timeline_in), "end_ms": ms(c.timeline_out),
                 "source_in_ms": ms(c.source_in), "enabled": c.enabled,
+                "video_fade": {"fade_in_ms": ms(c.video_fade.fade_in), "fade_out_ms": ms(c.video_fade.fade_out)},
+                "animation": c.animation.params().into_iter().map(|p| (p.key().to_string(), json!(c.animation.track(p).iter().map(|k| {
+                    let tl = c.timeline_time_of(k.at.0);
+                    json!({"at_ms": ms(tl), "source_ms": ms(k.at.0), "value": k.value, "ease": k.ease.key().unwrap_or("unknown"), "visible": tl >= c.timeline_in && tl < c.timeline_out})
+                }).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
                 "link": c.link.map(|l| l.to_string()),
                 "multicam": c.multicam.as_ref().map(|m| json!({"group": m.group.to_string(), "angle": m.angle})),
             })).collect::<Vec<_>>(),
@@ -103,6 +108,23 @@ mod tests {
         assert!(clip["link"].is_string());
         assert_eq!(j["selection"][0], id.to_string());
         assert_eq!(j["tracks"][0]["kind"], "video");
+    }
+
+    #[test]
+    fn clips_report_fades_and_animation_in_both_time_domains() {
+        let mut p = Project::new("t");
+        let mut c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(Time::from_secs(10), Time::from_secs(20)), Time::ZERO);
+        c.video_fade.fade_in = Time::from_millis(500);
+        c.animation.set_key(kadr_project::AnimParam::Opacity, kadr_project::SourceTime(Time::from_secs(12)), 0.5, None);
+        c.animation.set_key(kadr_project::AnimParam::Opacity, kadr_project::SourceTime(Time::from_secs(25)), 1.0, None);
+        p.sequence_mut().tracks[0].clips.push(c);
+        let v = timeline_json(p.sequence(), &[], Time::ZERO);
+        let cj = &v["tracks"][0]["clips"][0];
+        assert_eq!(cj["video_fade"], serde_json::json!({"fade_in_ms": 500, "fade_out_ms": 0}));
+        let k = &cj["animation"]["opacity"];
+        assert_eq!((k[0]["at_ms"].as_i64(), k[0]["source_ms"].as_i64(), k[0]["visible"].as_bool()), (Some(2_000), Some(12_000), Some(true)));
+        assert_eq!(k[0]["ease"], "ease_in_out");
+        assert_eq!(k[1]["visible"], false, "source 25 s is past the clip's out point");
     }
 
     #[test]

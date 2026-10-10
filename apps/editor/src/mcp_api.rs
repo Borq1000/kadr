@@ -112,6 +112,9 @@ pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> R
 
 /// One `edit` op; `edit_commands` prefixes errors with its index.
 fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditCommand>, BridgeError> {
+    if let Some(r) = crate::mcp_anim::anim_op(project, seq, op) {
+        return r;
+    }
     match op.get("type").and_then(Value::as_str) {
         Some("unlink") => {
             let ids = commands::with_links(seq, &clip_ids(project, op)?);
@@ -592,6 +595,20 @@ mod tests {
         let e = edit_commands(&p, &[], &serde_json::json!([{"type": "split_clip", "at_ms": 1}, {"type": "unlink", "clips": ["nope"]}])).unwrap_err();
         assert_eq!(e.code, "not_found");
         assert!(e.message.starts_with("op #1: "), "{}", e.message);
+    }
+
+    #[test]
+    fn edit_routes_keyframe_ops_and_prefixes_their_errors_with_the_op_index() {
+        let (p, v, _) = project_with_pair();
+        let ops = serde_json::json!([
+            {"type": "set_keyframe", "clip_id": v.to_string(), "param": "x", "at_ms": 1000, "value": 10.0},
+            {"type": "set_video_fade", "clip_id": v.to_string(), "fade_out_ms": 500},
+        ]);
+        assert_eq!(edit_commands(&p, &[], &ops).unwrap().len(), 2);
+        let ops = serde_json::json!([{"type": "split_clip", "at_ms": 1}, {"type": "set_keyframe", "clip_id": v.to_string(), "param": "x", "at_ms": 99_000, "value": 1.0}]);
+        let e = edit_commands(&p, &[], &ops).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        assert!(e.message.starts_with("op #1: ") && e.message.contains("outside the clip"), "{}", e.message);
     }
 
     #[test]

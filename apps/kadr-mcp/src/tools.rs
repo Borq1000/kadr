@@ -31,6 +31,13 @@ const EDIT_DESCRIPTION: &str = "Apply an undoable batch of timeline edit ops (un
 - \"unlink\": clips (array of clip ids; their linked partners are unlinked too)
 - \"link\": clips (array of at least two clip ids)
 - \"delete_part\": clips (array of clip ids), part (\"video\"|\"audio\"): deletes only that half of linked clips
+- \"set_keyframe\": clip_id, param, value, at_ms | source_ms, ease? (video clips only; params: x y scale rotation opacity crop_left crop_right crop_top crop_bottom exposure contrast saturation temperature; ease: ease_in_out (default for new animation) linear ease_in ease_out hold; at_ms is timeline time inside the clip, snapped to a frame; source_ms addresses source time, e.g. hidden keyframes)
+- \"remove_keyframe\": clip_id, param, at_ms | source_ms (finds the keyframe within half a frame)
+- \"set_keyframe_ease\": clip_id, param, at_ms | source_ms, ease
+- \"move_keyframes\": clip_id, from_ms | from_source_ms, to_ms (inside the clip; moving onto the same moment or onto another keyframe of the property is rejected), param? (all properties at that moment when omitted)
+- \"clear_animation\": clip_id, params? (default: every animated property; static properties are never touched, a clip or list without animation is rejected), keep_ms? (static values = the picture at that time; default: property defaults)
+- \"set_video_fade\": clip_id, fade_in_ms?, fade_out_ms? (picture fades from the clip's edges on a video clip, not an audio one; fade_in + fade_out <= clip length)
+Millisecond arguments are integers within +-10000000000. Keyframe and fade ops see the project as it was before the call, so a keyframe created by one op cannot be addressed by a later op of the same call. `get_state` shows each clip's `video_fade` and `animation` (per property: at_ms, source_ms, value, ease, visible).
 Unknown fields are rejected.";
 
 /// One JSON Schema tool entry per Kadr tool.
