@@ -1,4 +1,6 @@
-//! M1: cost of `evaluate` for a realistic 3-layer scene with a transition.
+//! `kadr-bench scene`: cost of one `evaluate` (the scene evaluator), two
+//! rows — M1's realistic 3-layer scene with a transition, and the keyframes
+//! row: 10 clips × 13 animated params (keyframes spec §8, target ≤ 100 µs).
 
 use crate::report::Report;
 use kadr_core::perf::Stats;
@@ -67,13 +69,14 @@ fn animated_project() -> Project {
     p
 }
 
-/// Mean cost of one `evaluate` over batches of 100 calls sweeping 60 s of frames.
+/// Mean cost of one `evaluate` over batches of 100 calls sweeping the scenes' 60 s of frames.
 fn sample(p: &Project) -> Stats {
     let seq = p.sequence();
     let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
     let fr = FrameRate::FPS_30;
     let mut samples = vec![];
-    // Batches of 100 evaluations sweep 60 s around the transition; each sample is the mean per call.
+    // 200 batches of 100 evaluations cycle through frames 0..1800 (both scenes are
+    // 60 s long; the M1 one has its transition at 29..31 s); each sample is the mean per call.
     for batch in 0..200 {
         let started = Instant::now();
         for i in 0..100 {
@@ -123,9 +126,10 @@ mod tests {
     fn animated_bench_scene_keeps_ten_layers_at_every_sample() {
         let p = animated_project();
         let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
-        for s in [0, 10, 30, 45, 59] {
-            let scene = evaluate(&p, p.sequence(), Time::from_secs(s), &out);
-            assert_eq!(scene.layers.len(), 10, "t = {s} s");
+        // Every frame the bench samples.
+        for f in 0..1800 {
+            let scene = evaluate(&p, p.sequence(), FrameRate::FPS_30.frame_to_time(f), &out);
+            assert_eq!(scene.layers.len(), 10, "frame {f}");
         }
         let clips: Vec<_> = p.sequence().tracks.iter().flat_map(|t| &t.clips).collect();
         assert_eq!(clips.len(), 10);
