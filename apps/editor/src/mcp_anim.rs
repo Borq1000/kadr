@@ -71,11 +71,15 @@ fn half(seq: &Sequence) -> Time {
     Time(seq.frame_rate.frame_duration().flicks() / 2)
 }
 
+fn outside(c: &Clip, ms: i64) -> BridgeError {
+    bad(format!("{ms} ms is outside the clip ({}..{} ms); use source_ms for hidden keyframes", c.timeline_in.as_millis(), c.timeline_out.as_millis()))
+}
+
 /// A timeline position inside the clip, frame-snapped.
 fn at_timeline(seq: &Sequence, c: &Clip, ms: i64) -> Result<Time, BridgeError> {
     let t = seq.frame_rate.snap(Time::from_millis(ms));
     if t < c.timeline_in || t >= c.timeline_out {
-        return Err(bad(format!("{ms} ms is outside the clip ({}..{} ms); use source_ms for hidden keyframes", c.timeline_in.as_millis(), c.timeline_out.as_millis())));
+        return Err(outside(c, ms));
     }
     Ok(t)
 }
@@ -102,25 +106,77 @@ fn new_time(seq: &Sequence, c: &Clip, op: &Value, at: &str, src: &str) -> Result
     })
 }
 
-/// An existing keyframe moment of `p` (or of any param when `p` is None),
-/// found within half a frame so a client echoing millisecond-rounded times
-/// (29.97 fps frames are not whole milliseconds) still hits it.
-fn existing(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<SourceTime, BridgeError> {
+/// The keyframe moment of `p` (of any param when `p` is None) nearest to the
+/// given time and strictly within half a frame of it, if any. A client
+/// echoing millisecond-rounded times (29.97 fps frames are not whole
+/// milliseconds) or addressing an off-frame key still hits it. With `at_ms`
+/// only keys inside the clip count (hidden ones are `source_ms` business).
+fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<Option<SourceTime>, BridgeError> {
     let h = half(seq);
-    let found = match when(op, at, src)? {
+    Ok(match when(op, at, src)? {
         When::Timeline(ms) => {
-            at_timeline(seq, c, ms)?; // must lie in the visible clip
-            // Looked up around the time as given: keyframes need not sit on frames.
+            // The raw time, not the snapped one: a visible key in the clip's last half frame
+            // is still reachable by its echoed ms.
             let t = Time::from_millis(ms);
+            if t < c.timeline_in - h || t >= c.timeline_out + h {
+                return Err(outside(c, ms));
+            }
             let params = p.map_or_else(|| c.animation.params(), |p| vec![p]);
-            params.into_iter().filter_map(|q| c.key_near(q, t, h)).min_by_key(|a| (c.timeline_time_of(a.0) - t).abs())
+            params
+                .into_iter()
+                .flat_map(|q| c.animation.track(q).iter().map(|k| k.at))
+                .map(|a| (a, c.timeline_time_of(a.0)))
+                .filter(|(_, tl)| *tl >= c.timeline_in && *tl < c.timeline_out && (*tl - t).abs() < h)
+                .min_by_key(|(_, tl)| (*tl - t).abs())
+                .map(|(a, _)| a)
         }
         When::Source(ms) => {
             let s = Time::from_millis(ms);
             c.animation.times().into_iter().filter(|a| p.is_none_or(|q| c.animation.params_at(*a).contains(&q))).filter(|a| (a.0 - s).abs() < h).min_by_key(|a| (a.0 - s).abs())
         }
+    })
+}
+
+/// Like `find`, but a missing keyframe is an error.
+fn existing(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<SourceTime, BridgeError> {
+    find(seq, c, p, op, at, src)?.ok_or_else(|| {
+        bad("no keyframe there (looked within half a frame of the given time; keyframes made by an earlier op of the same call are not visible yet)")
+    })
+}
+
+/// The accepted `value` range of a property (same limits as `set_transform`
+/// for the transform params; fractions of the frame for crops).
+fn value_range(p: AnimParam) -> (f64, f64) {
+    match p {
+        AnimParam::X | AnimParam::Y => (-20_000.0, 20_000.0),
+        AnimParam::Scale => (0.01, 16.0),
+        AnimParam::Rotation => (-3600.0, 3600.0),
+        AnimParam::Opacity | AnimParam::CropLeft | AnimParam::CropRight | AnimParam::CropTop | AnimParam::CropBottom => (0.0, 1.0),
+        AnimParam::Exposure => (-2.0, 2.0),
+        AnimParam::Contrast | AnimParam::Saturation => (0.0, 2.0),
+        AnimParam::Temperature => (-1.0, 1.0),
+    }
+}
+
+fn set_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
+    let p = param(op)?;
+    let value = op.get("value").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("value missing or not a number"))?;
+    let (lo, hi) = value_range(p);
+    if !(lo..=hi).contains(&value) {
+        return Err(bad(format!("{} out of range {lo}..{hi} (got {value})", p.key())));
+    }
+    let ease = ease(op)?;
+    // A key within half a frame is updated, not shadowed by a near-duplicate.
+    let at = match find(seq, c, Some(p), op, "at_ms", "source_ms")? {
+        Some(at) => {
+            if c.animation.track(p).iter().any(|k| k.at == at && k.value == value && ease.as_ref().is_none_or(|e| *e == k.ease)) {
+                return Err(bad("no change: that keyframe already has this value and ease"));
+            }
+            at
+        }
+        None => new_time(seq, c, op, "at_ms", "source_ms")?,
     };
-    found.ok_or_else(|| bad("no keyframe there (looked within half a frame of the given time)"))
+    Ok(EditCommand::SetKeyframe { clip: id, param: p, at, value, ease })
 }
 
 fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
@@ -175,12 +231,17 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
             return Err(bad(format!("unknown field `{extra}` for {ty}")));
         }
         let (id, c) = clip(seq, op)?;
-        Ok(vec![match ty {
-            "set_keyframe" => {
-                let p = param(op)?;
-                let value = op.get("value").and_then(Value::as_f64).ok_or_else(|| bad("value missing or not a number"))?;
-                EditCommand::SetKeyframe { clip: id, param: p, at: new_time(seq, c, op, "at_ms", "source_ms")?, value, ease: ease(op)? }
+        if let Some((ti, _)) = seq.locate_clip(id) {
+            let t = &seq.tracks[ti];
+            if t.locked {
+                return Err(bad(format!("track {} is locked", t.name)));
             }
+            if ty != "set_video_fade" && t.kind != TrackKind::Video {
+                return Err(bad("keyframes can only be set on clips of video tracks"));
+            }
+        }
+        Ok(vec![match ty {
+            "set_keyframe" => set_keyframe(seq, id, c, op)?,
             "remove_keyframe" => {
                 let p = param(op)?;
                 let at = existing(seq, c, Some(p), op, "at_ms", "source_ms")?;
@@ -189,10 +250,14 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
             "set_keyframe_ease" => {
                 let p = param(op)?;
                 let ease = ease(op)?.ok_or_else(|| bad("ease missing"))?;
-                EditCommand::SetKeyframeEase { clip: id, param: p, at: existing(seq, c, Some(p), op, "at_ms", "source_ms")?, ease }
+                let at = existing(seq, c, Some(p), op, "at_ms", "source_ms")?;
+                if c.animation.track(p).iter().any(|k| k.at == at && k.ease == ease) {
+                    return Err(bad("no change: that keyframe already has this ease"));
+                }
+                EditCommand::SetKeyframeEase { clip: id, param: p, at, ease }
             }
             "move_keyframes" => {
-                let p = op.get("param").map(|_| param(op)).transpose()?;
+                let p = op.get("param").filter(|v| !v.is_null()).map(|_| param(op)).transpose()?;
                 let from = existing(seq, c, p, op, "from_ms", "from_source_ms")?;
                 let to_ms = ms_arg(op, "to_ms")?.ok_or_else(|| bad("to_ms missing"))?;
                 let to = SourceTime(c.source_time_at(at_timeline(seq, c, to_ms)?));
@@ -200,6 +265,9 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                     return Err(bad("no change: the keyframes are already at that moment"));
                 }
                 let params = p.map_or_else(|| c.animation.params_at(from), |p| vec![p]);
+                if let Some(q) = params.iter().find(|q| c.animation.track(**q).iter().any(|k| k.at == to)) {
+                    return Err(bad(format!("{} already has a keyframe at {to_ms} ms; move or remove it first", q.key())));
+                }
                 EditCommand::MoveKeyframes { clip: id, moves: params.into_iter().map(|q| (q, from, to)).collect() }
             }
             "clear_animation" => clear_animation(seq, id, c, op)?,
@@ -214,6 +282,7 @@ mod tests {
     use super::*;
     use kadr_core::{AssetId, FrameRate, TimeRange};
     use kadr_project::{AnimParam, Clip, Project};
+    use kadr_project::SourceTime;
     use kadr_timeline::EditEngine;
     use serde_json::json;
 
@@ -235,17 +304,154 @@ mod tests {
         Ok(())
     }
 
+    fn project_at(fps: FrameRate) -> (Project, String) {
+        let (mut p, id) = project();
+        p.sequence_mut().frame_rate = fps;
+        (p, id)
+    }
+
     #[test]
     fn at_ms_is_converted_to_exact_source_time_and_found_again_after_ms_rounding() {
+        // Frames at these rates are not whole milliseconds; at_ms 6040 lands on a frame
+        // whose time is NOT a whole number of ms, so the echo from get_state is inexact.
+        for fps in [FrameRate::FPS_29_97, FrameRate::FPS_23_976, FrameRate::FPS_59_94] {
+            let (mut p, id) = project_at(fps);
+            run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "scale", "at_ms": 6_040, "value": 2.0})).unwrap();
+            let c = &p.sequence().tracks[0].clips[0];
+            let k_at = c.animation.track(AnimParam::Scale)[0].at;
+            assert_eq!(k_at.0, c.source_time_at(fps.snap(Time::from_millis(6_040))), "frame-snapped, exact");
+            let tl = c.timeline_time_of(k_at.0);
+            let echoed = tl.as_millis();
+            assert_ne!(Time::from_millis(echoed), tl, "{fps}: the echo must be a rounded value");
+            run(&mut p, json!({"type": "set_keyframe_ease", "clip_id": id, "param": "scale", "at_ms": echoed, "ease": "hold"})).unwrap();
+            assert_eq!(p.sequence().tracks[0].clips[0].animation.track(AnimParam::Scale)[0].ease, kadr_project::Ease::Hold, "{fps}");
+            // set_keyframe with the echoed time updates the key instead of adding a neighbour.
+            run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "scale", "at_ms": echoed, "value": 3.0})).unwrap();
+            let t = p.sequence().tracks[0].clips[0].animation.track(AnimParam::Scale).to_vec();
+            assert_eq!((t.len(), t[0].value, t[0].at), (1, 3.0, k_at), "{fps}");
+            run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": "scale", "at_ms": echoed})).unwrap();
+            assert!(p.sequence().tracks[0].clips[0].animation.is_empty(), "{fps}");
+        }
+    }
+
+    #[test]
+    fn set_keyframe_with_the_echoed_source_ms_updates_the_key() {
         let (mut p, id) = project();
-        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "scale", "at_ms": 6_000, "value": 2.0})).unwrap();
-        let c = &p.sequence().tracks[0].clips[0];
-        let k = &c.animation.track(AnimParam::Scale)[0];
-        assert_eq!(k.at.0, c.source_time_at(FrameRate::FPS_29_97.snap(Time::from_millis(6_000))), "frame-snapped, exact");
-        // 29.97 fps frames are not whole milliseconds; a client echoing at_ms still hits the keyframe.
-        let echoed = c.timeline_time_of(k.at.0).as_millis();
-        run(&mut p, json!({"type": "set_keyframe_ease", "clip_id": id, "param": "scale", "at_ms": echoed, "ease": "hold"})).unwrap();
-        assert_eq!(p.sequence().tracks[0].clips[0].animation.track(AnimParam::Scale)[0].ease, kadr_project::Ease::Hold);
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_040, "value": 1.0})).unwrap();
+        let at = p.sequence().tracks[0].clips[0].animation.track(AnimParam::X)[0].at;
+        let echoed = at.0.as_millis();
+        assert_ne!(Time::from_millis(echoed), at.0, "the source echo is rounded too");
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "source_ms": echoed, "value": 5.0})).unwrap();
+        let t = p.sequence().tracks[0].clips[0].animation.track(AnimParam::X).to_vec();
+        assert_eq!((t.len(), t[0].value, t[0].at), (1, 5.0, at));
+        // Far from any key it adds one.
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "source_ms": echoed + 500, "value": 6.0})).unwrap();
+        assert_eq!(p.sequence().tracks[0].clips[0].animation.track(AnimParam::X).len(), 2);
+    }
+
+    #[test]
+    fn off_frame_keys_of_a_speed_changed_clip_are_updated_by_their_at_ms_echo() {
+        let (mut p, id) = project();
+        {
+            // Source 10..20 s shown over timeline 5..10 s: 2x speed.
+            let c = &mut p.sequence_mut().tracks[0].clips[0];
+            c.timeline_out = Time::from_secs(10);
+        }
+        // source 12 000 ms is timeline 6 000 ms exactly, which is not a frame boundary at 29.97.
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "y", "source_ms": 12_000, "value": 1.0})).unwrap();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "y", "at_ms": 6_000, "value": 2.0})).unwrap();
+        let t = p.sequence().tracks[0].clips[0].animation.track(AnimParam::Y).to_vec();
+        assert_eq!((t.len(), t[0].value, t[0].at.0), (1, 2.0, Time::from_secs(12)), "updated, not a near-duplicate");
+        run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": "y", "at_ms": 6_000})).unwrap();
+        assert!(p.sequence().tracks[0].clips[0].animation.is_empty());
+    }
+
+    #[test]
+    fn a_visible_key_in_the_clips_last_half_frame_is_reachable_by_its_echo() {
+        let (mut p, id) = project();
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        let tl = c.timeline_out - Time::from_flicks(100_000);
+        let s = SourceTime(c.source_time_at(tl));
+        c.animation.set_key(AnimParam::X, s, 1.0, None);
+        let echoed = tl.as_millis();
+        assert!(Time::from_millis(echoed) < c.timeline_out);
+        run(&mut p, json!({"type": "set_keyframe_ease", "clip_id": id, "param": "x", "at_ms": echoed, "ease": "hold"})).unwrap();
+        assert_eq!(p.sequence().tracks[0].clips[0].animation.track(AnimParam::X)[0].ease, kadr_project::Ease::Hold);
+    }
+
+    #[test]
+    fn set_keyframe_value_must_be_in_the_params_range() {
+        let (mut p, id) = project();
+        for (param, ok, bad_v) in [
+            ("x", 20_000.0, 20_000.5), ("y", -20_000.0, -20_001.0), ("scale", 16.0, 0.0), ("rotation", -3600.0, 3600.5), ("opacity", 1.0, 1.5),
+            ("crop_left", 1.0, -0.1), ("crop_right", 0.0, 2.0), ("crop_top", 0.5, 1.1), ("crop_bottom", 0.5, -1.0), ("exposure", -2.0, 2.5),
+            ("contrast", 2.0, 3.0), ("saturation", 0.0, -0.5), ("temperature", -1.0, 1.5),
+        ] {
+            run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": param, "at_ms": 6_000, "value": ok})).unwrap();
+            let e = run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": param, "at_ms": 7_000, "value": bad_v})).unwrap_err();
+            assert!(e.message.contains(&format!("{param} out of range")), "{}", e.message);
+        }
+        assert_eq!(p.sequence().tracks[0].clips[0].animation.times().len(), 1, "rejected values created nothing");
+    }
+
+    #[test]
+    fn keyframe_ops_say_why_a_track_does_not_take_them() {
+        let (mut p, id) = project();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000, "value": 1.0})).unwrap();
+        let a = Clip::new(AssetId::new(), "a", TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let aid = a.id.to_string();
+        p.sequence_mut().tracks.iter_mut().find(|t| t.kind == kadr_project::TrackKind::Audio).unwrap().clips.push(a);
+        let e = run(&mut p, json!({"type": "set_keyframe", "clip_id": aid, "param": "x", "at_ms": 1_000, "value": 1.0})).unwrap_err();
+        assert!(e.message.contains("video track"), "{}", e.message);
+        p.sequence_mut().tracks[0].locked = true;
+        for op in [
+            json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 7_000, "value": 1.0}),
+            json!({"type": "remove_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000}),
+            json!({"type": "set_keyframe_ease", "clip_id": id, "param": "x", "at_ms": 6_000, "ease": "hold"}),
+            json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 7_000}),
+            json!({"type": "clear_animation", "clip_id": id}),
+            json!({"type": "set_video_fade", "clip_id": id, "fade_in_ms": 500}),
+        ] {
+            let e = run(&mut p, op.clone()).unwrap_err();
+            assert!(e.message.contains("locked"), "{op}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn move_keyframes_onto_an_existing_key_is_explained() {
+        let (mut p, id) = project();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000, "value": 1.0})).unwrap();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 8_000, "value": 2.0})).unwrap();
+        let e = run(&mut p, json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 8_000, "param": null})).unwrap_err();
+        assert!(e.message.contains("already") && e.message.contains("x"), "{}", e.message);
+        // "param": null means all params at that moment, like an absent param.
+        run(&mut p, json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 9_000, "param": null})).unwrap();
+    }
+
+    #[test]
+    fn repeating_a_keyframe_or_an_ease_is_no_change() {
+        let (mut p, id) = project();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_040, "value": 1.0})).unwrap();
+        let echoed = {
+            let c = &p.sequence().tracks[0].clips[0];
+            c.timeline_time_of(c.animation.track(AnimParam::X)[0].at.0).as_millis()
+        };
+        for op in [
+            json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": echoed, "value": 1.0}),
+            json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": echoed, "value": 1.0, "ease": "ease_in_out"}),
+            json!({"type": "set_keyframe_ease", "clip_id": id, "param": "x", "at_ms": echoed, "ease": "ease_in_out"}),
+        ] {
+            let e = run(&mut p, op.clone()).unwrap_err();
+            assert!(e.message.contains("no change"), "{op}: {}", e.message);
+        }
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": echoed, "value": 1.0, "ease": "linear"})).unwrap();
+    }
+
+    #[test]
+    fn a_missing_keyframe_hints_at_same_call_ops() {
+        let (mut p, id) = project();
+        let e = run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000})).unwrap_err();
+        assert!(e.message.contains("same call"), "{}", e.message);
     }
 
     #[test]
@@ -296,9 +502,12 @@ mod tests {
     #[test]
     fn clear_animation_keep_ms_freezes_the_picture_at_that_time() {
         let (mut p, id) = project();
-        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000, "value": 0.0})).unwrap();
-        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 8_000, "value": 100.0, "ease": "linear"})).unwrap();
-        run(&mut p, json!({"type": "clear_animation", "clip_id": id, "keep_ms": 8_000})).unwrap();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_040, "value": 0.0})).unwrap();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 8_040, "value": 100.0, "ease": "linear"})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        let echoed = c.timeline_time_of(c.animation.track(AnimParam::X)[1].at.0).as_millis();
+        assert_ne!(Time::from_millis(echoed), c.timeline_time_of(c.animation.track(AnimParam::X)[1].at.0), "an inexact echo");
+        run(&mut p, json!({"type": "clear_animation", "clip_id": id, "keep_ms": echoed})).unwrap();
         assert!((p.sequence().tracks[0].clips[0].transform.x - 100.0).abs() < 1e-9);
     }
 

@@ -45,7 +45,7 @@ fn edit_description_documents_every_op() {
     ] {
         assert!(d.contains(&format!("\"{op}\"")), "edit docs lack op {op}");
     }
-    for field in ["at_ms", "clip_id", "start_ms", "end_ms", "edge", "to_ms", "speed", "gain_db", "rotation_deg", "cross_dissolve", "angle", "part"] {
+    for field in ["at_ms", "clip_id", "start_ms", "end_ms", "edge", "to_ms", "speed", "gain_db", "rotation_deg", "cross_dissolve", "angle", "part", "source_ms", "from_source_ms", "param", "params", "keep_ms", "fade_in_ms", "fade_out_ms"] {
         assert!(d.contains(field), "edit docs lack field {field}");
     }
 }
