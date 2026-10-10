@@ -318,7 +318,7 @@ impl EditCommand {
                     ClipProperty::Name(v) => c.name = v.clone(),
                     ClipProperty::Link(v) => c.link = *v,
                     ClipProperty::VideoFade(f) => {
-                        if f.fade_in < Time::ZERO || f.fade_out < Time::ZERO || f.fade_in + f.fade_out > c.duration() {
+                        if f.fade_in < Time::ZERO || f.fade_out < Time::ZERO || f.fade_in > c.duration() - f.fade_out {
                             return Err(EditError::InvalidRange);
                         }
                         c.video_fade = *f;
@@ -523,18 +523,22 @@ impl EditCommand {
                 if moves.is_empty() {
                     return Err(EditError::NoOp);
                 }
-                // Remove every moving keyframe first, so keyframes can swap past each other.
+                // Work on a copy and assign only on success: a failed move must not
+                // leave half the keys moved, also inside a `Batch` (which swallows `NoOp`).
+                // Every moving keyframe is removed first, so keyframes can swap past each other.
+                let mut anim = c.animation.clone();
                 let mut taken = vec![];
                 for (p, from, to) in moves {
-                    let k = c.animation.remove_key(*p, *from).ok_or(EditError::NoOp)?;
+                    let k = anim.remove_key(*p, *from).ok_or(EditError::NoOp)?;
                     taken.push((*p, *to, k));
                 }
                 for (p, to, k) in taken {
-                    if c.animation.track(p).iter().any(|x| x.at == to) {
-                        return Err(EditError::KeyframeCollision); // the engine restores the snapshot
+                    if anim.track(p).iter().any(|x| x.at == to) {
+                        return Err(EditError::KeyframeCollision);
                     }
-                    c.animation.set_key(p, to, k.value, Some(k.ease));
+                    anim.set_key(p, to, k.value, Some(k.ease));
                 }
+                c.animation = anim;
                 Ok(())
             }
             EditCommand::SetKeyframeEase { clip, param, at, ease } => {

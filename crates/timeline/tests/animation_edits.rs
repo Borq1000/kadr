@@ -83,10 +83,33 @@ fn set_and_remove_keyframe_are_one_undo_step_each() {
 #[test]
 fn removing_the_last_keyframe_keeps_the_picture_at_the_playhead() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: Some(2.0) }).unwrap();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: Some(1.5) }).unwrap();
     let c = p.sequence().clip(id).unwrap();
     assert!(!c.animation.is_animated(AnimParam::Scale));
-    assert_eq!(c.transform.scale, 2.0);
+    assert_eq!(c.transform.scale, 1.5, "the caller's value at the playhead wins");
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: None }).unwrap();
+    assert_eq!(p.sequence().clip(id).unwrap().transform.scale, 2.0, "without keep, the removed value");
+}
+
+#[test]
+fn a_failed_move_inside_a_batch_loses_no_keyframe() {
+    let (mut p, mut e, id) = setup();
+    let batch = EditCommand::Batch {
+        label: "b".into(),
+        commands: vec![
+            EditCommand::MoveKeyframes {
+                clip: id,
+                moves: vec![
+                    (AnimParam::Scale, SourceTime(s(105)), SourceTime(s(106))),
+                    (AnimParam::Scale, SourceTime(s(101)), SourceTime(s(102))), // no such keyframe
+                ],
+            },
+            EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None },
+        ],
+    };
+    e.execute(&mut p, batch).unwrap();
+    assert_eq!(scale_track(&p, id), vec![(105_000, 2.0), (108_000, 3.0)], "the first move was not half-applied");
 }
 
 #[test]
