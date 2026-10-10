@@ -377,11 +377,14 @@ export component KeyNav inherits HorizontalLayout {
     // every inspector refresh — ~10 times a second during playback.
     for b[i] in [{ a: "prev", tip: Tr.t("inspector.key.prev") }, { a: "toggle", tip: Tr.t("inspector.key.toggle") }, { a: "next", tip: Tr.t("inspector.key.next") }]: Rectangle {
         property <bool> on: i == 0 ? root.k.prev : i == 2 ? root.k.next : root.k.enabled;
-        Text {
-            text: i == 0 ? "◀" : i == 2 ? "▶" : root.k.state == 2 ? "◆" : "◇";
-            font-size: i == 1 ? 13px : 9px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        // Paths, not text glyphs: Windows renders ◀ ▶ as colour emoji.
+        // Arrows are filled; the diamond is filled with a keyframe here (◆)
+        // and an outline otherwise (◇). Centred (no x/y).
+        Icon {
+            icon: i == 0 ? Icons.key-prev : i == 2 ? Icons.key-next : Icons.key;
+            filled: i != 1 || root.k.state == 2;
+            width: i == 1 ? 12px : 11px;
+            height: self.width;
             color: !parent.on ? Theme.text-faint : (i == 1 && root.k.state > 0) ? Theme.accent : (bta.has-hover ? Theme.text : Theme.text-dim);
         }
         bta := TouchArea {
