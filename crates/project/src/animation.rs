@@ -254,6 +254,10 @@ impl Animation {
     /// ease when one is given). A new keyframe inside a segment inherits
     /// that segment's ease; elsewhere it gets `ease` or the default.
     pub fn set_key(&mut self, p: AnimParam, at: SourceTime, value: f64, ease: Option<Ease>) {
+        if !self.tracks.contains_key(&p) {
+            // The user's edit supersedes an unreadable stored track of this param.
+            self.unknown.remove(p.key());
+        }
         let keys = self.tracks.entry(p).or_default();
         match keys.binary_search_by_key(&at, |k| k.at) {
             Ok(i) => {
@@ -272,11 +276,13 @@ impl Animation {
 
 impl Serialize for Animation {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = s.serialize_map(Some(self.tracks.len() + self.unknown.len()))?;
+        // Never write an unknown entry under the key of a stored known track.
+        let unknown: Vec<_> = self.unknown.iter().filter(|(k, _)| AnimParam::from_key(k).is_none_or(|p| !self.tracks.contains_key(&p))).collect();
+        let mut m = s.serialize_map(Some(self.tracks.len() + unknown.len()))?;
         for (p, keys) in &self.tracks {
             m.serialize_entry(p.key(), keys)?;
         }
-        for (k, v) in &self.unknown {
+        for (k, v) in unknown {
             m.serialize_entry(k, v)?;
         }
         m.end()
@@ -382,6 +388,20 @@ mod tests {
         let a: Animation = serde_json::from_value(bad.clone()).unwrap();
         assert!(a.is_empty(), "nothing executable");
         assert_eq!(serde_json::to_value(&a).unwrap(), bad, "and nothing lost");
+    }
+
+    /// A user keyframe supersedes an unreadable stored track of the same param.
+    #[test]
+    fn a_user_key_supersedes_an_unreadable_track_of_the_same_param() {
+        let mut a: Animation = serde_json::from_str(r#"{"scale":"not an array"}"#).unwrap();
+        a.set_key(AnimParam::Scale, st(0), 2.0, None);
+        let text = serde_json::to_string(&a).unwrap();
+        assert_eq!(text.matches("\"scale\"").count(), 1, "no duplicate key: {text}");
+        let again: Animation = serde_json::from_str(&text).unwrap();
+        assert!(again.is_animated(AnimParam::Scale));
+        let t: Vec<(i64, f64)> = again.track(AnimParam::Scale).iter().map(|k| (k.at.0.flicks(), k.value)).collect();
+        assert_eq!(t, vec![(0, 2.0)]);
+        assert_eq!(again.unknown_len(), 0);
     }
 
     #[test]
