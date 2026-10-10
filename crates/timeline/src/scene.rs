@@ -85,7 +85,7 @@ fn track_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas
         return Some(layer);
     }
     let clip = track.clip_at(t).filter(|c| c.enabled)?;
-    clip_layer(project, clip, t, canvas)
+    clip_layer(project, clip, t, canvas, seq.frame_rate.frame_duration())
 }
 
 /// The window of a transition over the cut at `at` whose (clamped)
@@ -124,8 +124,9 @@ fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, c
         // the same picture as export's `xfade=wipeleft`.
         TransitionKind::Wipe => TransitionOp::Wipe { angle: std::f32::consts::PI, softness: 0.0 },
     };
-    let from = clip_layer(project, outgoing, t, canvas)?;
-    let to = clip_layer(project, incoming, t, canvas)?;
+    let frame = seq.frame_rate.frame_duration();
+    let from = clip_layer(project, outgoing, t, canvas, frame)?;
+    let to = clip_layer(project, incoming, t, canvas, frame)?;
     let placement = Placement::fill(canvas);
     Some(Layer {
         id: LayerId::from(tr.id),
@@ -138,9 +139,66 @@ fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, c
     })
 }
 
+/// A clip's visual state at timeline time `t` (keyframes spec §3):
+/// animated values resolved in source time, normalised at this boundary
+/// (§3.4), and the clip-bound fade factor (§3.3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipState {
+    pub transform: Transform,
+    pub color: ClipColor,
+    pub fade: f64,
+}
+
+pub fn clip_state_at(clip: &Clip, t: Time, frame: Time) -> ClipState {
+    let mut transform = clip.transform.clone();
+    let mut color = clip.color.clone();
+    if !clip.animation.is_empty() {
+        let s = kadr_project::SourceTime(clip.source_time_at(t));
+        for p in clip.animation.params() {
+            if let Some(v) = clip.animation.value_at(p, s) {
+                p.write(&mut transform, &mut color, v);
+            }
+        }
+    }
+    normalise(&mut transform, &mut color);
+    ClipState { transform, color, fade: fade_at(clip, t, frame) }
+}
+
+/// Non-finite → default; opacity and crop in `[0, 1]`; contrast and
+/// saturation ≥ 0; exposure and temperature in the inspector's ranges.
+/// Rotation is left as is (0 → 720° is two turns). Scale ≤ 0 and empty
+/// crops are dropped by `clip_layer`, not here.
+fn normalise(t: &mut Transform, c: &mut ClipColor) {
+    for p in kadr_project::AnimParam::ALL {
+        let v = p.read(t, c);
+        let v = if v.is_finite() { v } else { p.default_value() };
+        use kadr_project::AnimParam as P;
+        let v = match p {
+            P::Opacity | P::CropLeft | P::CropRight | P::CropTop | P::CropBottom => v.clamp(0.0, 1.0),
+            P::Contrast | P::Saturation => v.max(0.0),
+            P::Exposure => v.clamp(-2.0, 2.0),
+            P::Temperature => v.clamp(-1.0, 1.0),
+            _ => v,
+        };
+        p.write(t, c, v);
+    }
+}
+
+/// Clip-bound fade factor (spec §3.3). `t` is clamped into the clip's own
+/// frames, so a transition asking for the clip beyond its edge gets the
+/// edge's value; zero-length fades are 1 without dividing.
+pub fn fade_at(clip: &Clip, t: Time, frame: Time) -> f64 {
+    let last = (clip.timeline_out - frame).max(clip.timeline_in);
+    let tt = t.max(clip.timeline_in).min(last);
+    let part = |num: Time, len: Time| if len <= Time::ZERO { 1.0 } else { (num.flicks() as f64 / len.flicks() as f64).clamp(0.0, 1.0) };
+    part(tt - clip.timeline_in, clip.video_fade.fade_in) * part(last - tt, clip.video_fade.fade_out)
+}
+
 /// One clip at timeline time `t` (which may lie outside the clip, for
 /// transition handles: the source time is extrapolated, then clamped).
-pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU) -> Option<Layer> {
+/// `frame` is the sequence's frame duration (the fade-out ends one frame
+/// before the clip's out-point).
+pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU, frame: Time) -> Option<Layer> {
     let asset = project.asset(clip.asset)?;
     let kind = match asset.info.kind {
         MediaKind::Video => SourceKind::Video,
@@ -156,10 +214,14 @@ pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU) -> Opt
         SourceKind::Image => Time::ZERO,
         SourceKind::Video => clip.source_time_at(t).max(Time::ZERO).min(asset.info.duration),
     };
-    let placement = placement_of(&clip.transform, fit_contain(display_size, canvas), canvas);
-    let crop = crop_of(&clip.transform, placement.size)?;
+    let st = clip_state_at(clip, t, frame);
+    if st.transform.scale <= 0.0 {
+        return None;
+    }
+    let placement = placement_of(&st.transform, fit_contain(display_size, canvas), canvas);
+    let crop = crop_of(&st.transform, placement.size)?;
     let mut effects = vec![];
-    let color = color_of(&clip.color);
+    let color = color_of(&st.color);
     if !color.is_neutral() {
         effects.push(Effect::ColorAdjust(color));
     }
@@ -171,7 +233,7 @@ pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU) -> Opt
         },
         placement,
         crop,
-        opacity: clip.transform.opacity.clamp(0.0, 1.0) as f32,
+        opacity: (st.transform.opacity * st.fade) as f32,
         blend: BlendMode::Normal,
         effects,
     })
@@ -673,7 +735,7 @@ mod tests {
         place(&mut p, 0, &hd(), 0, 0, 4_000);
         let canvas = SizeU::new(1920, 1080);
         let mut scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(canvas, RenderQuality::Export));
-        let base = clip_layer(&p, &p.sequence().tracks[0].clips[0], Time::ZERO, canvas).unwrap();
+        let base = clip_layer(&p, &p.sequence().tracks[0].clips[0], Time::ZERO, canvas, p.sequence().frame_rate.frame_duration()).unwrap();
         let base_id = base.id;
         let (from, to) = (base.clone(), base.clone());
         let (from, to) = if nested {
@@ -707,5 +769,157 @@ mod tests {
         let (mut scene, _, id) = hand_transition(TransitionOp::Dissolve, 1.0, BlendMode::Normal, true);
         cull(&mut scene);
         assert_eq!(ids(&scene), vec![id], "each side is itself an opaque full-frame transition");
+    }
+
+    use kadr_project::{AnimParam, Ease, EdgeFades, SourceTime};
+
+    fn st(ms: i64) -> SourceTime {
+        SourceTime(Time::from_millis(ms))
+    }
+    const F30: Time = Time(705_600_000 / 30);
+
+    fn animated_clip() -> Clip {
+        // Source 10..20 s at timeline 0..10 s; opacity 0 → 1 over source 10..12 s (linear).
+        let mut c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(Time::from_secs(10), Time::from_secs(20)), Time::ZERO);
+        c.animation.set_key(AnimParam::Opacity, st(10_000), 0.0, Some(Ease::Linear));
+        c.animation.set_key(AnimParam::Opacity, st(12_000), 1.0, None);
+        c
+    }
+
+    #[test]
+    fn animated_opacity_is_evaluated_in_source_time() {
+        let c = animated_clip();
+        assert_eq!(clip_state_at(&c, Time::from_secs(1), F30).transform.opacity, 0.5);
+        let mut trimmed = c.clone();
+        crate::ops::trim_start(&mut trimmed, Time::from_secs(1));
+        assert_eq!(clip_state_at(&trimmed, Time::from_secs(1), F30).transform.opacity, 0.5, "same content frame, same value");
+        let mut fast = c.clone();
+        fast.timeline_out = Time::from_secs(5); // 2×
+        assert_eq!(clip_state_at(&fast, Time::from_millis(500), F30).transform.opacity, 0.5, "timeline 0.5 s = source 11 s");
+    }
+
+    #[test]
+    fn hidden_keyframes_still_shape_the_visible_part() {
+        let mut c = animated_clip();
+        crate::ops::trim_start(&mut c, Time::from_secs(1)); // source 11 s now at the clip start
+        assert_eq!(clip_state_at(&c, c.timeline_in, F30).transform.opacity, 0.5);
+    }
+
+    #[test]
+    fn fade_contract_first_and_last_frames_transparent_zero_is_one() {
+        let mut c = animated_clip();
+        c.animation = Default::default();
+        c.video_fade = EdgeFades { fade_in: Time::from_secs(1), fade_out: Time::from_secs(1) };
+        assert_eq!(fade_at(&c, Time::ZERO, F30), 0.0, "first frame of the fade-in");
+        assert_eq!(fade_at(&c, Time::from_secs(1), F30), 1.0, "frame F_in / d");
+        assert_eq!(fade_at(&c, c.timeline_out - F30, F30), 0.0, "last frame of the fade-out");
+        c.video_fade = EdgeFades::default();
+        assert_eq!(fade_at(&c, Time::ZERO, F30), 1.0);
+    }
+
+    /// Review focus 3: transition overhang, one-frame clips.
+    #[test]
+    fn fade_outside_the_clip_or_on_a_one_frame_clip_is_finite() {
+        let mut c = animated_clip();
+        c.video_fade = EdgeFades { fade_in: Time::from_secs(1), fade_out: Time::from_secs(1) };
+        for t in [Time::from_secs(-3), Time::from_secs(30)] {
+            let f = fade_at(&c, t, F30);
+            assert!((0.0..=1.0).contains(&f), "{f} at {t:?}");
+        }
+        c.timeline_out = F30;
+        assert!(fade_at(&c, Time::ZERO, F30).is_finite());
+    }
+
+    #[test]
+    fn final_opacity_is_resolved_times_fade_and_zero_is_culled() {
+        let mut p = Project::new("t");
+        let id = place(&mut p, 0, &hd(), 0, 0, 10_000);
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.transform.opacity = 0.8;
+        c.video_fade = EdgeFades { fade_in: Time::from_secs(2), fade_out: Time::ZERO };
+        let l = &scene_at(&p, 1_000).layers[0];
+        assert_eq!(l.id, LayerId::from(id));
+        assert!((l.opacity - 0.4).abs() < 1e-6, "{}", l.opacity);
+        assert!(scene_at(&p, 0).layers.is_empty(), "fade 0 → the layer is not decoded");
+    }
+
+    #[test]
+    fn invariants_empty_crop_negative_scale_and_two_turns() {
+        let mut p = Project::new("t");
+        place(&mut p, 0, &hd(), 0, 0, 10_000);
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.transform.crop_left = 0.6;
+        c.transform.crop_right = 0.5;
+        assert!(scene_at(&p, 1_000).layers.is_empty(), "no visible area");
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.transform = Transform::default();
+        c.transform.scale = -1.0;
+        assert!(scene_at(&p, 1_000).layers.is_empty(), "scale ≤ 0");
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.transform.scale = 0.5; // not full-frame, so it is not an occluder question
+        c.animation.set_key(AnimParam::Rotation, st(0), 0.0, Some(Ease::Linear));
+        c.animation.set_key(AnimParam::Rotation, st(10_000), 720.0, None);
+        let rot = scene_at(&p, 5_000).layers[0].placement.rotation;
+        assert!((rot - 360f32.to_radians()).abs() < 1e-4, "{rot}: no modulo 360");
+    }
+
+    /// Review focus 2: a non-finite value evaluates to the default.
+    #[test]
+    fn non_finite_values_become_defaults() {
+        let mut c = animated_clip();
+        c.animation = Default::default();
+        c.transform.scale = f64::NAN;
+        c.color.saturation = f64::INFINITY;
+        let s = clip_state_at(&c, Time::ZERO, F30);
+        assert_eq!((s.transform.scale, s.color.saturation), (1.0, 1.0));
+    }
+
+    /// Spec §4 / review focus 5: split never changes the picture — both
+    /// halves are the same function of the same source time. At speed 1 the
+    /// halves evaluate exactly as the original. At other speeds integer
+    /// flooring may move a half's source mapping by one flick, so there the
+    /// test pins that drift (≤ 1 flick) and that each half carries the
+    /// original's animation unchanged; values are not compared, since one
+    /// flick across a `Hold` boundary or a 1 ms key gap may change them.
+    #[test]
+    fn split_halves_match_the_original_on_every_frame() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let eases = [Ease::EaseInOut, Ease::Linear, Ease::EaseIn, Ease::EaseOut, Ease::Hold];
+        for case in 0..200 {
+            let dur_f = 30 + rnd(300) as i64; // frames
+            let speed_num = if case % 4 == 0 { 1 } else { 1 + rnd(7) as i64 };
+            let speed_den = if case % 4 == 0 { 1 } else { 1 + rnd(5) as i64 };
+            let sin = Time::from_millis(rnd(20_000) as i64);
+            let tl_dur = F30.mul_ratio(dur_f, 1);
+            let mut c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(sin, sin + tl_dur.mul_ratio(speed_num, speed_den)), Time::from_secs(5));
+            c.timeline_out = c.timeline_in + tl_dur;
+            for _ in 0..(1 + rnd(5)) {
+                let p = AnimParam::ALL[rnd(13) as usize];
+                let at = SourceTime(sin - Time::from_secs(2) + Time::from_millis(rnd((tl_dur.as_millis() * speed_num / speed_den + 4_000) as u64) as i64));
+                c.animation.set_key(p, at, rnd(1000) as f64 / 10.0, Some(eases[rnd(5) as usize].clone()));
+            }
+            let cut = c.timeline_in + F30.mul_ratio(1 + rnd(dur_f as u64 - 2) as i64, 1);
+            let (l, r) = crate::ops::split_clip(&c, cut, &mut crate::ops::LinkRemap::default());
+            if speed_num != speed_den {
+                assert_eq!(l.animation, c.animation, "case {case}: left half's animation");
+                assert_eq!(r.animation, c.animation, "case {case}: right half's animation");
+            }
+            for f in 0..dur_f {
+                let t = c.timeline_in + F30.mul_ratio(f, 1);
+                let half = if t < cut { &l } else { &r };
+                let ds = (half.source_time_at(t) - c.source_time_at(t)).abs();
+                assert!(ds <= Time(1), "case {case} frame {f}: source drift {ds:?}");
+                if speed_num == speed_den {
+                    let (a, b) = (clip_state_at(&c, t, F30), clip_state_at(half, t, F30));
+                    assert_eq!((&a.transform, &a.color), (&b.transform, &b.color), "case {case} frame {f}");
+                }
+            }
+        }
     }
 }
