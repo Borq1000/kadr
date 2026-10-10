@@ -242,8 +242,13 @@ component ClipRect inherits Rectangle {
     if root.cv.width > 24px: HorizontalLayout {
         y: 0;
         height: 16px;
-        padding-left: 6px;
-        padding-right: 6px;
+        // The name keeps clear of a fade handle that stays on screen (its
+        // fade is set, or the clip is selected), at the x Rust places and
+        // hit-tests it: radius 5 px + a 2 px gap. A zero fade's handle shown
+        // only on hover overlaps it for the moment instead, so names don't
+        // slide as the pointer crosses clips.
+        padding-left: root.cv.show-fade-in-handle && (root.cv.fade-in > 0 || root.cv.selected) ? max(6px, root.cv.fade-in-handle-x + 7px) : 6px;
+        padding-right: root.cv.show-fade-out-handle && (root.cv.fade-out > 0 || root.cv.selected) ? max(6px, root.cv.width - root.cv.fade-out-handle-x + 7px) : 6px;
         spacing: 4px;
         if root.cv.linked: Icon { y: 2px; icon: Icons.link; width: 11px; height: 11px; color: #ffffffb0; }
         Text {
@@ -311,7 +316,7 @@ component ClipRect inherits Rectangle {
         color: Theme.keyframe;
     }
     // Fade handles over the name bar, centred where Rust places (and
-    // hit-tests) them; 10 px circles.
+    // hit-tests) them; 10 px circles. The name above is padded past them.
     if root.cv.show-fade-in-handle: Rectangle {
         x: root.cv.fade-in-handle-x - 5px;
         y: root.cv.fade-handle-y - 5px;
