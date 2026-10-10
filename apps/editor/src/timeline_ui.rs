@@ -5,9 +5,9 @@
 use crate::anim_ui;
 use crate::app::App;
 use crate::util::{fmt_ruler, fmt_secs, rgb};
-use crate::{ClipMark, ClipView, MarkerView, TickView, TrackView, TransitionView};
+use crate::{ClipMark, ClipView, EaseItem, KeyMark, MarkerView, TickView, TrackView, TransitionView};
 use kadr_core::{ClipId, LinkId, MediaKind, Time, TimeRange, TrackId};
-use kadr_project::{Clip, EdgeFades, FadeEdge, Sequence, TrackKind, Transition, TransitionKind};
+use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, Sequence, SourceTime, TrackKind, Transition, TransitionKind};
 use kadr_timeline::snap::{snap, snap_move, snap_points};
 use kadr_timeline::{ClipProperty, EditCommand, InsertMode, TrackFlag, TrimEdge};
 use kadr_i18n::{t, tf};
@@ -25,6 +25,7 @@ pub enum Drag {
     Move { clips: Vec<ClipId>, anchor_t: f64, start_x: f64, start_y: f64, start_row: usize, delta: Time, track_delta: i32, started: bool, clicked: Option<ClipId> },
     Trim { clip: ClipId, edge: TrimEdge, to: Time },
     Fade(FadeDrag),
+    Keys(KeyDrag),
 }
 
 /// A fade-handle drag. The fade boundary follows the pointer's movement
@@ -45,10 +46,31 @@ pub struct FadeDrag {
     value: Time,
 }
 
+/// A keyframe-diamond drag: the keyframes of one exact moment `at`, all
+/// properties. Past `DRAG_THRESHOLD` they follow the pointer's movement on
+/// whole frames, live in the clip (`App::live_edit`, recomputed from the
+/// recorded clip each step); the release records one `MoveKeyframes`. A
+/// press released without a drag is a click: select the clip, playhead to
+/// the moment.
+#[derive(Clone, Copy)]
+pub struct KeyDrag {
+    clip: ClipId,
+    at: SourceTime,
+    start_x: f64,
+    started: bool,
+    /// The target (timeline time); `None` while it is the keyframe's own frame.
+    to: Option<Time>,
+}
+
 // Spec §6.2: a handle's grab zone is at least 10 px wide and starts where
 // the trim zone around the clip edge ends.
 const _: () = assert!(2.0 * anim_ui::FADE_R >= 10.0);
 const _: () = assert!(anim_ui::HANDLE_INSET - anim_ui::FADE_R >= TRIM_ZONE);
+// Diamonds are hit in a video clip's bottom strip (2 px margin + KEY_STRIP_H),
+// fade handles in its top one (HEADER_H): the strips never meet.
+const _: () = assert!(anim_ui::HEADER_H <= VIDEO_H - 2.0 - anim_ui::KEY_STRIP_H);
+// A diamond's grab zone (2 · CLUSTER_PX) is at least 10 px wide too.
+const _: () = assert!(2.0 * anim_ui::CLUSTER_PX >= 10.0);
 
 /// The fades a clip shows on the timeline: the picture's on a video track,
 /// the sound's on an audio track.
@@ -88,6 +110,8 @@ pub struct TimelineUi {
     pub renaming_track: Option<TrackId>,
     /// The clip under the pointer (shows its fade handles).
     pub hover_clip: Option<ClipId>,
+    /// The keyframe moment the keyframe menu acts on (its last right press).
+    pub menu_key: Option<(ClipId, SourceTime)>,
 }
 
 impl TimelineUi {
@@ -120,6 +144,7 @@ impl Default for TimelineUi {
             ghost: None,
             renaming_track: None,
             hover_clip: None,
+            menu_key: None,
         }
     }
 }
@@ -154,6 +179,8 @@ enum Hit {
     Clip { id: ClipId, edge: Option<TrimEdge> },
     /// `edge: None` — two overlapping handles; the drag direction picks.
     Fade { id: ClipId, edge: Option<FadeEdge> },
+    /// A keyframe diamond: one real moment (also inside a drawn cluster).
+    Key { id: ClipId, at: SourceTime },
     Empty,
 }
 
@@ -197,6 +224,20 @@ impl App {
                 None => {}
             }
         }
+        // Keyframe diamonds, in a video clip's bottom strip, of the clip under
+        // `x` only: the nearest real moment within CLUSTER_PX. Here they come
+        // before the trim edges (a keyframe on the clip's first frame stays
+        // reachable); above the strip the edges are whole. Not on a locked
+        // track or in blade mode, as the fade handles.
+        if rs[ri].kind == TrackKind::Video
+            && !track.locked
+            && !self.tl.blade
+            && y >= rs[ri].y + rs[ri].h - 2.0 - anim_ui::KEY_STRIP_H
+            && let Some(c) = track.clip_at(t).filter(|c| !c.animation.is_empty())
+            && let Some(at) = anim_ui::nearest_key(&self.key_positions(c), x, anim_ui::CLUSTER_PX)
+        {
+            return Hit::Key { id: c.id, at };
+        }
         let tol = Time::from_secs_f64(TRIM_ZONE / self.tl.pps);
         // Prefer edges (even slightly outside the clip) for precise trimming.
         for c in &track.clips {
@@ -213,6 +254,11 @@ impl App {
             Some(c) => Hit::Clip { id: c.id, edge: None },
             None => Hit::Empty,
         }
+    }
+
+    /// (moment, x in lane pixels) of the clip's visible keyframe moments.
+    fn key_positions(&self, c: &Clip) -> Vec<(SourceTime, f64)> {
+        anim_ui::visible_keys(c).into_iter().map(|(at, t)| (at, self.time_to_x(t))).collect()
     }
 
     fn snap_threshold(&self) -> Time {
@@ -258,24 +304,42 @@ impl App {
         self.tl.last_mouse_x = x;
         match kind {
             0 if button == 1 => {
-                // Right click: select what's under the cursor for the context menu.
-                if let Hit::Clip { id, .. } | Hit::Fade { id, .. } = self.hit(x, y) {
-                    if !self.tl.selection.contains(&id) {
-                        self.tl.selection = vec![id];
-                        self.refresh_timeline();
-                        self.refresh_inspector();
-                    }
+                // Right click: select what's under the cursor for the context
+                // menu; a diamond opens the keyframe menu for its moment.
+                // Runs before Slint shows the menu, which reads `menu-kind`.
+                let hit = self.hit(x, y);
+                self.tl.menu_key = match hit {
+                    Hit::Key { id, at } => Some((id, at)),
+                    _ => None,
+                };
+                if let Some((id, at)) = self.tl.menu_key {
+                    self.set_key_menu(id, at);
+                }
+                self.ui().set_tl_menu_kind(self.tl.menu_key.is_some() as i32);
+                if let Hit::Clip { id, .. } | Hit::Fade { id, .. } | Hit::Key { id, .. } = hit
+                    && !self.tl.selection.contains(&id)
+                {
+                    self.tl.selection = vec![id];
+                    self.refresh_timeline();
+                    self.refresh_inspector();
                 }
             }
             0 if button == 0 => self.pointer_down(x, y, shift, ctrl),
             1 => self.pointer_move(x, y),
             2 if button == 0 => self.pointer_up(),
-            3 => {
-                if let Hit::Clip { .. } | Hit::Fade { .. } = self.hit(x, y) {
+            3 => match self.hit(x, y) {
+                // A diamond's own moment, not the pointer's spot beside it.
+                Hit::Key { id, at } => {
+                    if let Some(t) = self.project.sequence().clip(id).map(|c| c.timeline_time_of(at.0)) {
+                        self.set_playhead(t);
+                    }
+                }
+                Hit::Clip { .. } | Hit::Fade { .. } => {
                     let t = self.x_to_time(x);
                     self.set_playhead(t);
                 }
-            }
+                Hit::Empty => {}
+            },
             // The pointer left the lanes.
             4 => self.set_hover_clip(None),
             // The grab was lost (focus gone mid-drag): no release will come,
@@ -299,13 +363,18 @@ impl App {
         seq.tracks[r.track].clip_at(self.x_to_time(x)).map(|c| c.id)
     }
 
-    fn show_fade_tip(&self, edge: FadeEdge, value: Time, x: f64, y: f64) {
-        let v = fmt_secs(value);
-        let text = if edge == FadeEdge::In { tf("tl.fade.in_tip", &[("t", &v)]) } else { tf("tl.fade.out_tip", &[("t", &v)]) };
+    /// A dragged handle's or diamond's value beside the pointer.
+    fn show_tip(&self, text: String, x: f64, y: f64) {
         let ui = self.ui();
         ui.set_tl_tip_text(text.into());
         ui.set_tl_tip_x(x as f32);
         ui.set_tl_tip_y(y as f32);
+    }
+
+    fn show_fade_tip(&self, edge: FadeEdge, value: Time, x: f64, y: f64) {
+        let v = fmt_secs(value);
+        let text = if edge == FadeEdge::In { tf("tl.fade.in_tip", &[("t", &v)]) } else { tf("tl.fade.out_tip", &[("t", &v)]) };
+        self.show_tip(text, x, y);
     }
 
     /// A press on a handle (`edge: None` — two overlapping ones, picked by
@@ -337,7 +406,7 @@ impl App {
         if !d.started && (x - d.start_x).abs() > DRAG_THRESHOLD {
             // Past the threshold: overlapping handles are told apart by the
             // direction, and the fade boundary follows the pointer from here.
-            let edge = *d.edge.get_or_insert(anim_ui::edge_for_move(x - d.start_x));
+            let edge = *d.edge.get_or_insert(anim_ui::edge_for_move(x - d.start_x, fi, fo));
             let fade = if edge == FadeEdge::In { fi } else { fo };
             d.grab = d.start_x - anim_ui::fade_edge_x(x0, x1, fade.as_secs_f64() * self.tl.pps, edge);
             d.started = true;
@@ -401,6 +470,165 @@ impl App {
         }
     }
 
+    /// A diamond-drag step: the moment's keyframes (every property) go live
+    /// to the target frame, computed from the recorded clip; history is
+    /// untouched. A target taken by another keyframe of one of those
+    /// properties keeps the last preview and says so; the release then gets
+    /// the engine's refusal (no partial move).
+    fn drag_keys(&mut self, mut d: KeyDrag, x: f64, y: f64) {
+        if !d.started && (x - d.start_x).abs() <= DRAG_THRESHOLD {
+            self.tl.drag = Some(Drag::Keys(d));
+            return;
+        }
+        d.started = true;
+        let seq = self.project.sequence();
+        let fr = seq.frame_rate;
+        let Some((ti, ci)) = seq.locate_clip(d.clip) else {
+            // The clip is gone (an undo or an AI edit removed it): the drag ends.
+            self.ui().set_tl_tip_text("".into());
+            return;
+        };
+        // The recorded clip: the armed snapshot during the preview, the clip
+        // itself before it (or after an undo / AI edit rolled it back).
+        let live = self.live_edit.recorded(d.clip);
+        let armed = live.is_some();
+        let rec = live.unwrap_or(&seq.tracks[ti].clips[ci]);
+        let params = rec.animation.params_at(d.at);
+        if params.is_empty() {
+            self.ui().set_tl_tip_text("".into()); // the moment is gone: the drag ends
+            return;
+        }
+        let from = rec.timeline_time_of(d.at.0);
+        let dt = Time::from_secs_f64((x - d.start_x) / self.tl.pps);
+        let to = anim_ui::key_drag_to(rec, from, dt, fr);
+        let moved = to != anim_ui::key_drag_to(rec, from, Time::ZERO, fr);
+        let prev = std::mem::replace(&mut d.to, moved.then_some(to));
+        // `None`: back on its own frame; `Some(None)`: the target is taken.
+        let preview = moved.then(|| {
+            let mut anim = rec.animation.clone();
+            let new_at = SourceTime(rec.source_time_at(to));
+            params.iter().all(|p| anim.move_key(*p, d.at, new_at).is_ok()).then_some(anim)
+        });
+        let tip = match preview {
+            Some(None) => t("err.edit.keyframe_collision"),
+            _ => tf("tl.key.tip", &[("t", &kadr_core::Timecode::from_time(to, fr).to_string())]),
+        };
+        self.tl.drag = Some(Drag::Keys(d));
+        self.show_tip(tip, x, y);
+        let changed = match preview {
+            None => self.live_edit.roll_back(self.project.sequence_mut()),
+            Some(None) => false,
+            Some(Some(_)) if armed && prev == d.to => false, // already shown
+            Some(Some(anim)) => {
+                self.live_edit.arm(self.project.sequence_mut(), d.clip);
+                self.project.sequence_mut().tracks[ti].clips[ci].animation = anim;
+                true
+            }
+        };
+        if changed {
+            self.preview.invalidate();
+            self.request_frame();
+            self.refresh_inspector();
+            self.refresh_timeline();
+        }
+    }
+
+    /// The release of a diamond press: a click selects the clip and puts
+    /// the playhead on the moment; a drag rolls its preview back and records
+    /// one `MoveKeyframes` — none when the keyframes end where they started.
+    fn commit_keys(&mut self, d: KeyDrag) {
+        self.ui().set_tl_tip_text("".into());
+        let rolled_back = self.live_edit.roll_back(self.project.sequence_mut());
+        let seq = self.project.sequence();
+        let frame = seq.frame_rate.frame_duration();
+        let Some(c) = seq.clip(d.clip) else {
+            if rolled_back {
+                self.show_rolled_back();
+            }
+            return;
+        };
+        if !d.started {
+            let t = c.timeline_time_of(d.at.0);
+            if let Some(sel) = narrowed_on_release(&self.tl.selection, d.clip) {
+                self.tl.selection = sel;
+                self.refresh_inspector();
+            }
+            self.set_playhead(t);
+            return;
+        }
+        // Measured against the recorded clip, which an edit during the drag
+        // (undo, AI) may have changed: still on frames inside its visible range.
+        let cmd = d.to.and_then(|to| {
+            let to = to.max(c.timeline_in).min((c.timeline_out - frame).max(c.timeline_in));
+            let new_at = SourceTime(c.source_time_at(to));
+            let moves: Vec<_> = c.animation.params_at(d.at).into_iter().map(|p| (p, d.at, new_at)).collect();
+            (new_at != d.at && !moves.is_empty()).then_some(EditCommand::MoveKeyframes { clip: d.clip, moves })
+        });
+        let recorded = cmd.is_some_and(|cmd| self.execute(cmd));
+        if !recorded && rolled_back {
+            self.show_rolled_back();
+        }
+    }
+
+    /// The keyframe menu's curves for the moment `at` of `clip`: the one
+    /// every property there shares is checked. A new list for every opening
+    /// (see `EaseItem` in timeline.slint).
+    fn set_key_menu(&self, clip: ClipId, at: SourceTime) {
+        let Some(c) = self.project.sequence().clip(clip) else { return };
+        let current = anim_ui::moment_ease(c, at);
+        let title = |e: &Ease| match e {
+            Ease::EaseInOut => t("anim.ease.ease_in_out"),
+            Ease::Linear => t("anim.ease.linear"),
+            Ease::EaseIn => t("anim.ease.ease_in"),
+            Ease::EaseOut => t("anim.ease.ease_out"),
+            Ease::Hold => t("anim.ease.hold"),
+            Ease::Unknown(_) => t("anim.ease.other"),
+        };
+        let item = |e: &Ease| {
+            let key = anim_ui::ease_key(e);
+            EaseItem { key: key.into(), title: title(e).into(), checked: key == current }
+        };
+        let mut items: Vec<EaseItem> = Ease::KNOWN.iter().map(item).collect();
+        // A curve from a newer Kadr that all of them share: shown, not editable.
+        if current == "other" {
+            items.push(item(&Ease::Unknown(Default::default())));
+        }
+        self.ui().set_tl_key_eases(ModelRc::new(VecModel::from(items)));
+    }
+
+    /// The keyframe menu (spec §6.2): `key-ease:<key>` sets the curve of the
+    /// moment's keyframes that differ (R14), `key-delete` removes all of
+    /// them — the picture at the playhead stays for a property losing its
+    /// last keyframe. One undo entry; nothing when nothing would change.
+    fn key_menu_action(&mut self, action: &str) {
+        let Some((clip, at)) = self.tl.menu_key else { return };
+        let seq = self.project.sequence();
+        let Some(c) = seq.clip(clip) else { return };
+        let (label, commands): (String, Vec<EditCommand>) = match action.strip_prefix("key-ease:") {
+            Some(key) => {
+                let Some(ease) = Ease::from_key(key) else { return };
+                let commands = anim_ui::ease_targets(c, at, &ease)
+                    .into_iter()
+                    .map(|param| EditCommand::SetKeyframeEase { clip, param, at, ease: ease.clone() })
+                    .collect();
+                (t("cmd.keyframe_ease"), commands)
+            }
+            None => {
+                let shown = anim_ui::shown_time(c, self.playhead, seq.frame_rate.frame_duration());
+                let commands: Vec<EditCommand> = c
+                    .animation
+                    .params_at(at)
+                    .into_iter()
+                    .map(|param| EditCommand::RemoveKeyframe { clip, param, at, keep: Some(c.anim_value(param, shown)) })
+                    .collect();
+                (t(if commands.len() > 1 { "cmd.remove_keyframes" } else { "cmd.remove_keyframe" }), commands)
+            }
+        };
+        if !commands.is_empty() {
+            self.execute(EditCommand::Batch { label, commands });
+        }
+    }
+
     fn pointer_down(&mut self, x: f64, y: f64, shift: bool, ctrl: bool) {
         // A press while a drag is still on: its release never reached us —
         // end it as released first, so its live state is recorded, not lost.
@@ -409,7 +637,7 @@ impl App {
         }
         let hit = match self.hit(x, y) {
             // Ctrl/Shift-click edits the selection, as anywhere on the clip.
-            Hit::Fade { id, .. } if ctrl || shift => Hit::Clip { id, edge: None },
+            Hit::Fade { id, .. } | Hit::Key { id, .. } if ctrl || shift => Hit::Clip { id, edge: None },
             hit => hit,
         };
         if self.tl.blade {
@@ -426,6 +654,12 @@ impl App {
                     self.tl.selection = vec![id];
                 }
                 self.start_fade_drag(id, edge, x, y);
+            }
+            Hit::Key { id, at } => {
+                if !self.tl.selection.contains(&id) {
+                    self.tl.selection = vec![id];
+                }
+                self.tl.drag = Some(Drag::Keys(KeyDrag { clip: id, at, start_x: x, started: false, to: None }));
             }
             Hit::Clip { id, edge: Some(edge) } => {
                 if !self.tl.selection.contains(&id) {
@@ -484,7 +718,7 @@ impl App {
                     0
                 } else {
                     match self.hit(x, y) {
-                        Hit::Clip { edge: Some(_), .. } | Hit::Fade { .. } => 1,
+                        Hit::Clip { edge: Some(_), .. } | Hit::Fade { .. } | Hit::Key { .. } => 1,
                         _ => 0,
                     }
                 };
@@ -499,6 +733,7 @@ impl App {
                 self.tl.drag = Some(Drag::Scrub);
             }
             Some(Drag::Fade(d)) => self.drag_fade(d, x, y),
+            Some(Drag::Keys(d)) => self.drag_keys(d, x, y),
             Some(Drag::Trim { clip, edge, .. }) => {
                 let ex: HashSet<ClipId> = std::iter::once(clip).chain(self.project.sequence().linked_clips(clip)).collect();
                 let to = self.snap_time(self.x_to_time(x), &ex);
@@ -567,6 +802,7 @@ impl App {
                 self.execute(EditCommand::TrimClip { clip, edge, to, ripple });
             }
             Some(Drag::Fade(d)) => self.commit_fade(d),
+            Some(Drag::Keys(d)) => self.commit_keys(d),
             _ => {}
         }
         self.refresh_timeline();
@@ -777,6 +1013,7 @@ impl App {
             "set-in" => self.set_in_out(true),
             "set-out" => self.set_in_out(false),
             "clear-in-out" => self.clear_in_out(),
+            a if a == "key-delete" || a.starts_with("key-ease:") => self.key_menu_action(a),
             _ => {}
         }
     }
@@ -876,6 +1113,18 @@ impl App {
             pts.into_iter().rev().find(|p| *p < self.playhead)
         };
         if let Some(t) = t {
+            self.set_playhead(t);
+        }
+    }
+
+    /// Alt+←/→: the previous / next visible keyframe moment of the
+    /// inspected clip (spec §6.2); hidden keyframes are skipped.
+    pub fn jump_keyframe(&mut self, forward: bool) {
+        let seq = self.project.sequence();
+        let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return };
+        let times: Vec<Time> = anim_ui::visible_keys(c).into_iter().map(|(_, t)| t).collect();
+        if let Some(t) = anim_ui::visible_neighbour(&times, self.playhead, anim_ui::half_frame(seq), forward) {
+            self.stop_playback();
             self.set_playhead(t);
         }
     }
@@ -995,11 +1244,11 @@ impl App {
         let sel: HashSet<ClipId> = self.tl.selection.iter().copied().collect();
 
         // Live drag offsets.
-        let (moving, move_delta, move_tracks): (HashSet<ClipId>, f64, i32) = match &self.tl.drag {
+        let (moving, move_delta, move_tracks): (HashSet<ClipId>, Time, i32) = match &self.tl.drag {
             Some(Drag::Move { clips, delta, track_delta, started: true, .. }) => {
-                (kadr_timeline::commands::with_links(&seq, clips).into_iter().collect(), delta.as_secs_f64(), *track_delta)
+                (kadr_timeline::commands::with_links(&seq, clips).into_iter().collect(), *delta, *track_delta)
             }
-            _ => (HashSet::new(), 0.0, 0),
+            _ => (HashSet::new(), Time::ZERO, 0),
         };
         let primary: HashSet<ClipId> = match &self.tl.drag {
             Some(Drag::Move { clips, .. }) => clips.iter().copied().collect(),
@@ -1035,13 +1284,13 @@ impl App {
             }
             let first = t.clips.partition_point(|c| c.timeline_out.as_secs_f64() < t0 - 1.0);
             for c in &t.clips[first..] {
-                let mut cin = c.timeline_in.as_secs_f64();
-                let mut cout = c.timeline_out.as_secs_f64();
+                // The range shown, in time: a move or trim drag previews its own.
+                let (mut tin, mut tout) = (c.timeline_in, c.timeline_out);
                 let mut row = r;
                 let moved = moving.contains(&c.id);
                 if moved {
-                    cin += move_delta;
-                    cout += move_delta;
+                    tin += move_delta;
+                    tout += move_delta;
                     if primary.contains(&c.id) && move_tracks != 0 {
                         // Show on the destination row of the same kind.
                         let same: Vec<&Row> = rs.iter().filter(|x| x.kind == r.kind).collect();
@@ -1051,14 +1300,15 @@ impl App {
                         row = same[np];
                     }
                 }
-                if let Some((group, edge, d)) = &trim {
-                    if group.contains(&c.id) {
-                        match edge {
-                            TrimEdge::Start => cin += d.as_secs_f64(),
-                            TrimEdge::End => cout += d.as_secs_f64(),
-                        }
+                if let Some((group, edge, d)) = &trim
+                    && group.contains(&c.id)
+                {
+                    match edge {
+                        TrimEdge::Start => tin += *d,
+                        TrimEdge::End => tout += *d,
                     }
                 }
+                let (cin, cout) = (tin.as_secs_f64(), tout.as_secs_f64());
                 if cin > t1 + 1.0 && !moved {
                     break;
                 }
@@ -1090,6 +1340,18 @@ impl App {
                 let fades = clip_fades(c, is_audio);
                 let (show_in, show_out) = self.tl.fade_handles(c.id, sel.contains(&c.id), t.locked, width, fades);
                 let (fi_px, fo_px) = (fades.0.as_secs_f64() * self.tl.pps, fades.1.as_secs_f64() * self.tl.pps);
+                // Keyframe diamonds: the visible moments (clusters merge on
+                // screen only); hidden ones show as ‹ ›. The same positions
+                // as `hit` without a drag; a move or trim drag previews them.
+                let (keys, hidden_left, hidden_right) = if is_audio || c.animation.is_empty() {
+                    (vec![], false, false)
+                } else {
+                    let shift = if moved { move_delta } else { Time::ZERO };
+                    let (shown, before, after) = anim_ui::split_keys(c, shift, tin, tout);
+                    let xs: Vec<f64> = shown.iter().map(|(_, kt)| (*kt - tin).as_secs_f64() * self.tl.pps).collect();
+                    let marks = anim_ui::key_marks(&xs).into_iter().map(|(x, cluster)| KeyMark { x: x as f32, cluster }).collect();
+                    (marks, before, after)
+                };
                 clips.push(ClipView {
                     id: c.id.to_string().into(),
                     x: x as f32,
@@ -1117,6 +1379,10 @@ impl App {
                     fade_handle_y: anim_ui::HANDLE_Y as f32,
                     offline: rt.is_some_and(|r| r.status == crate::app::AssetStatus::Missing),
                     marks: ModelRc::new(VecModel::from(marks)),
+                    keys: ModelRc::new(VecModel::from(keys)),
+                    key_y: (row.h - 4.0 - anim_ui::KEY_CY) as f32,
+                    hidden_left,
+                    hidden_right,
                 });
                 let _ = ri;
             }
@@ -1169,12 +1435,15 @@ impl App {
             .collect();
 
         crate::util::sync_rows(ui.get_tracks(), tracks, |m| ui.set_tracks(m));
-        // Each clip keeps its previous marks model (see `reuse_rows`).
-        let old_marks: std::collections::HashMap<slint::SharedString, ModelRc<ClipMark>> = slint::Model::iter(&ui.get_clips()).map(|c| (c.id, c.marks)).collect();
+        // Each clip keeps its previous marks and diamonds models (see `reuse_rows`).
+        type Nested = (ModelRc<ClipMark>, ModelRc<KeyMark>);
+        let old: std::collections::HashMap<slint::SharedString, Nested> = slint::Model::iter(&ui.get_clips()).map(|c| (c.id, (c.marks, c.keys))).collect();
         let clips: Vec<ClipView> = clips
             .into_iter()
             .map(|mut c| {
-                c.marks = crate::util::reuse_rows(old_marks.get(&c.id).cloned(), slint::Model::iter(&c.marks).collect());
+                let (marks, keys) = old.get(&c.id).cloned().unzip();
+                c.marks = crate::util::reuse_rows(marks, slint::Model::iter(&c.marks).collect());
+                c.keys = crate::util::reuse_rows(keys, slint::Model::iter(&c.keys).collect());
                 c
             })
             .collect();

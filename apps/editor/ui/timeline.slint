@@ -27,6 +27,23 @@ export struct ClipMark {
     kind: int, // 1 review, 2 discard
 }
 
+/// A keyframe diamond along the bottom of a video clip (x in the clip's
+/// coordinates). `cluster`: it stands for moments closer than 6 px — merged
+/// on screen only; a press always picks one real moment (Rust).
+export struct KeyMark {
+    x: length,
+    cluster: bool,
+}
+
+/// A curve in the keyframe menu. Rust sets a new list on every right press
+/// on a diamond: activating a checkable item overwrites its `checked`
+/// binding, so items are never reused from an earlier opening.
+export struct EaseItem {
+    key: string,
+    title: string,
+    checked: bool,
+}
+
 export struct ClipView {
     id: string,
     x: length,
@@ -58,6 +75,13 @@ export struct ClipView {
     fade-handle-y: length,
     offline: bool,
     marks: [ClipMark],
+    // Keyframe diamonds of the visible moments (video clips), centred at
+    // `key-y`, the spot Rust hit-tests; ‹ › when keyframes are hidden
+    // beyond the clip's start / end.
+    keys: [KeyMark],
+    key-y: length,
+    hidden-left: bool,
+    hidden-right: bool,
 }
 
 export struct TickView {
@@ -259,6 +283,42 @@ component ClipRect inherits Rectangle {
         border-width: root.cv.selected ? 2px : 1px;
         border-color: root.cv.selected ? Theme.selection : #00000055;
     }
+    // Keyframe diamonds (10 px squares turned 45°) and the chevrons of
+    // hidden keyframes, in the bottom strip where Rust hit-tests them.
+    for k in root.cv.keys: Rectangle {
+        x: k.x - 5px;
+        y: root.cv.key-y - 5px;
+        width: 10px;
+        height: 10px;
+        transform-rotation: 45deg;
+        background: k.cluster ? Theme.accent : Theme.keyframe;
+        border-width: 1px;
+        border-color: #00000099;
+    }
+    if root.cv.hidden-left: Text {
+        x: 1px;
+        y: root.cv.key-y - 8px;
+        width: 8px;
+        height: 16px;
+        text: "‹";
+        font-size: 13px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: Theme.keyframe;
+    }
+    if root.cv.hidden-right: Text {
+        x: parent.width - 9px;
+        y: root.cv.key-y - 8px;
+        width: 8px;
+        height: 16px;
+        text: "›";
+        font-size: 13px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: Theme.keyframe;
+    }
     // Fade handles over the name bar, centred where Rust places (and
     // hit-tests) them; 10 px circles.
     if root.cv.show-fade-in-handle: Rectangle {
@@ -317,6 +377,11 @@ export component Timeline inherits Rectangle {
     in property <string> tip-text;
     in property <length> tip-x;
     in property <length> tip-y;
+    // Which menu a right press in the lanes opens: 0 the clip menu, 1 the
+    // keyframe menu (a diamond). Rust sets it, and `key-eases`, in the
+    // `lane-pointer` call that precedes the menu's `show`.
+    in property <int> menu-kind;
+    in property <[EaseItem]> key-eases;
     out property <length> lanes-width: lanes.width;
     out property <length> lanes-height: lanes.height;
     out property <length> lanes-abs-x: lanes.absolute-position.x;
@@ -534,6 +599,29 @@ export component Timeline inherits Rectangle {
                         width: 1px;
                         background: Theme.snap;
                     }
+                    // The keyframe menu (spec §6.2) for the moment under a right
+                    // press. No size: it never takes a press itself, the lanes'
+                    // TouchArea opens it explicitly.
+                    key-menu := ContextMenuArea {
+                        x: 0;
+                        y: 0;
+                        width: 0;
+                        height: 0;
+                        Menu {
+                            Menu {
+                                title: Tr.t("anim.ease");
+                                for e in root.key-eases: MenuItem {
+                                    title: e.title;
+                                    // A curve from a newer Kadr: shown, not editable.
+                                    enabled: e.key != "other";
+                                    checkable: true;
+                                    checked: e.checked;
+                                    activated => { root.context-action("key-ease:" + e.key); }
+                                }
+                            }
+                            MenuItem { title: Tr.t("tl.key.delete"); activated => { root.context-action("key-delete"); } }
+                        }
+                    }
                     lane-menu := ContextMenuArea {
                         Menu {
                             MenuItem { title: Tr.t("tl.ctx.split"); activated => { root.context-action("split"); } }
@@ -567,8 +655,15 @@ export component Timeline inherits Rectangle {
                                 // The grab was lost (no release will come): Rust ends the drag
                                 // as released, so a live fade change is never left unrecorded.
                                 if (e.kind == PointerEventKind.cancel) { root.lane-pointer(5, self.mouse-x, self.mouse-y, 0, false, false, false); }
-                                // After tl-pointer selected the clip under the cursor.
-                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { lane-menu.show({ x: self.absolute-position.x - lane-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - lane-menu.absolute-position.y + self.mouse-y }); }
+                                // After tl-pointer selected the clip under the cursor and set
+                                // `menu-kind` (a diamond: the keyframe menu).
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                    if (root.menu-kind == 1) {
+                                        key-menu.show({ x: self.absolute-position.x - key-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - key-menu.absolute-position.y + self.mouse-y });
+                                    } else {
+                                        lane-menu.show({ x: self.absolute-position.x - lane-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - lane-menu.absolute-position.y + self.mouse-y });
+                                    }
+                                }
                             }
                             changed has-hover => { if (!self.has-hover) { root.lane-pointer(4, self.mouse-x, self.mouse-y, 0, false, false, false); } }
                             double-clicked => { root.lane-pointer(3, self.mouse-x, self.mouse-y, 0, false, false, false); }

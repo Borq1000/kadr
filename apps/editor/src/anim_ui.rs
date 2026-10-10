@@ -1,7 +1,7 @@
 //! Pure keyframe/fade UI logic shared by the inspector and the timeline.
 
-use kadr_core::Time;
-use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, Sequence};
+use kadr_core::{FrameRate, Time};
+use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, Sequence, SourceTime};
 
 /// Inspector property names of the animatable rows (Temperature has no row).
 pub const PROPS: [(&str, AnimParam); 12] = [
@@ -43,7 +43,6 @@ pub fn label_key(p: AnimParam) -> &'static str {
 }
 
 /// Tolerance of "at the playhead" (spec §5).
-#[expect(dead_code, reason = "first used by the timeline's keyframe navigation")]
 pub fn half_frame(seq: &Sequence) -> Time {
     Time(seq.frame_rate.frame_duration().flicks() / 2)
 }
@@ -184,8 +183,12 @@ pub fn pick_handle(x: f64, x0: f64, x1: f64, fi_px: f64, fo_px: f64, (show_in, s
 /// For `HandleHit::Both`: the handle a first movement by `dx` px drags —
 /// the one it shortens (left: the fade-in, right: the fade-out), so either
 /// fade can be shortened from a shared spot, which separates the handles.
-pub fn edge_for_move(dx: f64) -> FadeEdge {
-    if dx < 0.0 { FadeEdge::In } else { FadeEdge::Out }
+/// A zero fade cannot get shorter: then the movement lengthens the other
+/// one (a fade within `HANDLE_INSET` of filling the clip shares its spot
+/// with the other, zero fade's handle).
+pub fn edge_for_move(dx: f64, fade_in: Time, fade_out: Time) -> FadeEdge {
+    let (shortened, fade, other) = if dx < 0.0 { (FadeEdge::In, fade_in, FadeEdge::Out) } else { (FadeEdge::Out, fade_out, FadeEdge::In) };
+    if fade > Time::ZERO { shortened } else { other }
 }
 
 /// The fade a handle dragged to `x` sets: whole frames, in `[0, dur − other]`.
@@ -201,11 +204,119 @@ pub fn fade_drag_value(edge: FadeEdge, x: f64, x0: f64, x1: f64, pps: f64, frame
     snapped.min((dur - other).max(Time::ZERO))
 }
 
+// --------------------------------------------------------------- diamonds
+//
+// Timeline keyframe diamonds (spec §6.2), in lane pixels: one per exact
+// source moment with a keyframe of any property, along the bottom of a
+// video clip. Clusters exist only on screen; hit-testing, dragging and the
+// menu always work on one real moment.
+
+/// Diamonds closer than this merge into one drawn cluster.
+pub const CLUSTER_PX: f64 = 6.0;
+/// The strip where diamonds are hit: this high above the 2 px margin under
+/// a video clip (the fade handles' strip is at the top: `HEADER_H`).
+pub const KEY_STRIP_H: f64 = 14.0;
+/// A drawn diamond's centre above the bottom of the clip's rectangle: the
+/// middle of `KEY_STRIP_H`.
+pub const KEY_CY: f64 = KEY_STRIP_H / 2.0;
+
+/// Render-only clusters of sorted diamond positions: (x of the first
+/// member, `true` when it stands for more than one moment). Each distance
+/// is measured from the previous key, so a dense run draws as one diamond;
+/// the moments themselves are never merged.
+pub fn key_marks(xs: &[f64]) -> Vec<(f64, bool)> {
+    let mut out: Vec<(f64, bool)> = vec![];
+    let mut last = f64::NEG_INFINITY;
+    for &x in xs {
+        match out.last_mut() {
+            Some(m) if x - last < CLUSTER_PX => m.1 = true,
+            _ => out.push((x, false)),
+        }
+        last = x;
+    }
+    out
+}
+
+/// The real moment nearest to `x` among (moment, x) within `r` px — a
+/// press on a cluster picks one of its moments, never the group.
+pub fn nearest_key(xs: &[(SourceTime, f64)], x: f64, r: f64) -> Option<SourceTime> {
+    xs.iter()
+        .map(|(at, kx)| (*at, (kx - x).abs()))
+        .filter(|(_, d)| *d <= r)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(at, _)| at)
+}
+
+/// Alt+←/→: the previous / next of the sorted visible keyframe `times`
+/// at least `half` a frame away from the playhead (a keyframe at the
+/// playhead is the current one, not a neighbour).
+pub fn visible_neighbour(times: &[Time], playhead: Time, half: Time, forward: bool) -> Option<Time> {
+    if forward {
+        times.iter().copied().find(|t| *t >= playhead + half)
+    } else {
+        times.iter().rev().copied().find(|t| *t <= playhead - half)
+    }
+}
+
+/// The clip's keyframe moments as (source time, timeline time), shifted by
+/// `shift` and split by the shown range `[tin, tout)`: the visible ones in
+/// time order, and whether any are hidden before / after it (the ‹ ›
+/// chevrons). Without a drag the range is the clip's own and `shift` zero;
+/// a move or trim drag previews its own. A hidden moment never gets a diamond.
+pub fn split_keys(c: &Clip, shift: Time, tin: Time, tout: Time) -> (Vec<(SourceTime, Time)>, bool, bool) {
+    let (mut before, mut after) = (false, false);
+    let mut shown = vec![];
+    for at in c.animation.times() {
+        let t = c.timeline_time_of(at.0) + shift;
+        if t < tin {
+            before = true;
+        } else if t >= tout {
+            after = true;
+        } else {
+            shown.push((at, t));
+        }
+    }
+    (shown, before, after)
+}
+
+/// The clip's visible keyframe moments (on `[timeline_in, timeline_out)`).
+pub fn visible_keys(c: &Clip) -> Vec<(SourceTime, Time)> {
+    split_keys(c, Time::ZERO, c.timeline_in, c.timeline_out).0
+}
+
+/// Where a diamond shown at `from` lands when dragged by `dt`: on whole
+/// sequence frames, inside the clip's visible range `[timeline_in,
+/// timeline_out − frame]` (review focus 4). With `dt` zero it is the
+/// keyframe's own frame — the "not moved" position.
+pub fn key_drag_to(c: &Clip, from: Time, dt: Time, fr: FrameRate) -> Time {
+    let last = (c.timeline_out - fr.frame_duration()).max(c.timeline_in);
+    fr.snap(from + dt).max(c.timeline_in).min(last)
+}
+
+/// The UI name of the curve every property's keyframe at `at` shares;
+/// `""` when they differ or there is none (the menu marks nothing).
+pub fn moment_ease(c: &Clip, at: SourceTime) -> &'static str {
+    let mut keys = c.animation.params_at(at).into_iter().filter_map(|p| c.animation.track(p).iter().find(|k| k.at == at).map(|k| ease_key(&k.ease)));
+    match keys.next() {
+        Some(first) if keys.all(|k| k == first) => first,
+        _ => "",
+    }
+}
+
+/// The properties whose keyframe at `at` does not have curve `e` yet: the
+/// keyframe menu changes only those (none — no command at all).
+pub fn ease_targets(c: &Clip, at: SourceTime, e: &Ease) -> Vec<AnimParam> {
+    c.animation
+        .params_at(at)
+        .into_iter()
+        .filter(|p| c.animation.track(*p).iter().any(|k| k.at == at && k.ease != *e))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kadr_core::{AssetId, TimeRange};
-    use kadr_project::{Ease, SourceTime};
 
     const F: Time = Time(705_600_000 / 30);
 
@@ -364,13 +475,35 @@ mod tests {
         let spot = handle_x(x0, x1, px(fi), FadeEdge::In);
         assert_eq!(spot, handle_x(x0, x1, px(fo), FadeEdge::Out));
         assert_eq!(pick_handle(spot, x0, x1, px(fi), px(fo), (true, true)), Some(HandleHit::Both));
-        assert_eq!(edge_for_move(-4.0), FadeEdge::In);
-        assert_eq!(edge_for_move(4.0), FadeEdge::Out);
+        assert_eq!(edge_for_move(-4.0, fi, fo), FadeEdge::In);
+        assert_eq!(edge_for_move(4.0, fi, fo), FadeEdge::Out);
         // Each grabbed at the spot and moved 10 px its way gets 10 px (0.1 s) shorter.
         let grab_in = spot - fade_edge_x(x0, x1, px(fi), FadeEdge::In);
         assert_eq!(fade_drag_value(FadeEdge::In, spot - 10.0 - grab_in, x0, x1, pps, F, fo, dur), F.mul_ratio(33, 1));
         let grab_out = spot - fade_edge_x(x0, x1, px(fo), FadeEdge::Out);
         assert_eq!(fade_drag_value(FadeEdge::Out, spot + 10.0 - grab_out, x0, x1, pps, F, fi, dur), F.mul_ratio(21, 1));
+    }
+
+    /// A fade within `HANDLE_INSET` of filling the clip, the other one zero:
+    /// both handles clamp to one spot. A movement that would shorten the zero
+    /// fade takes the other edge, so the near-full fade can still be lengthened.
+    #[test]
+    fn a_near_full_fade_lengthens_from_the_shared_spot() {
+        use kadr_project::FadeEdge;
+        let (x0, x1, pps, dur) = (100.0, 300.0, 100.0, Time::from_secs(2));
+        let (fi, fo) = (Time::from_millis(1_950), Time::ZERO);
+        let px = |t: Time| t.as_secs_f64() * pps;
+        assert_eq!(pick_handle(288.0, x0, x1, px(fi), px(fo), (true, true)), Some(HandleHit::Both));
+        let edge = edge_for_move(298.0 - 288.0, fi, fo);
+        assert_eq!(edge, FadeEdge::In, "the zero fade-out cannot get shorter");
+        let grab = 288.0 - fade_edge_x(x0, x1, px(fi), edge);
+        let v = fade_drag_value(edge, 298.0 - grab, x0, x1, pps, F, fo, dur);
+        assert!(v > fi, "the fade-in got longer: {v:?}");
+        assert_eq!(v, dur, "up to the whole clip");
+        // Mirrored: a near-full fade-out and a move to the left.
+        assert_eq!(edge_for_move(-10.0, Time::ZERO, fi), FadeEdge::Out);
+        // Shortening a set fade keeps the old rule.
+        assert_eq!(edge_for_move(-10.0, fi, fo), FadeEdge::In);
     }
 
     /// R18 (spec §6.2 per fade): a handle whose own fade is set always
@@ -399,5 +532,94 @@ mod tests {
         assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0, out_only), Some(HandleHit::Edge(FadeEdge::Out)));
         assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 0.0, (false, false)), None);
         assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0, (true, false)), Some(HandleHit::Edge(FadeEdge::In)));
+    }
+
+    // ------------------------------------------------------------ diamonds
+
+    #[test]
+    fn marks_cluster_only_for_drawing() {
+        assert_eq!(key_marks(&[10.0, 13.0, 30.0, 35.9, 50.0]), vec![(10.0, true), (30.0, true), (50.0, false)]);
+        assert_eq!(key_marks(&[10.0, 17.0]), vec![(10.0, false), (17.0, false)], "6 px apart or more: separate");
+    }
+
+    /// A click on a cluster picks the nearest *real* moment, never the group.
+    #[test]
+    fn nearest_key_returns_a_real_time() {
+        let s = |ms| SourceTime(Time::from_millis(ms));
+        let xs = [(s(1_000), 10.0), (s(1_040), 13.0), (s(9_000), 90.0)];
+        assert_eq!(nearest_key(&xs, 12.0, 6.0), Some(s(1_040)));
+        assert_eq!(nearest_key(&xs, 10.4, 6.0), Some(s(1_000)));
+        assert_eq!(nearest_key(&xs, 50.0, 6.0), None);
+    }
+
+    #[test]
+    fn alt_arrows_step_between_visible_keyframes() {
+        let ts = [Time::from_secs(1), Time::from_secs(3), Time::from_secs(5)];
+        let half = Time::from_millis(16);
+        assert_eq!(visible_neighbour(&ts, Time::from_secs(3), half, true), Some(Time::from_secs(5)));
+        assert_eq!(visible_neighbour(&ts, Time::from_secs(3), half, false), Some(Time::from_secs(1)));
+        assert_eq!(visible_neighbour(&ts, Time::from_secs(5), half, true), None);
+    }
+
+    /// One moment per exact source time; a hidden one (outside
+    /// `[timeline_in, timeline_out)`) never gets a diamond, only a chevron.
+    #[test]
+    fn hidden_keys_get_a_chevron_never_a_diamond() {
+        let mut c = clip(); // timeline 10..20 s = source 0..10 s
+        for (src, p) in [(-5, AnimParam::X), (0, AnimParam::X), (4, AnimParam::X), (4, AnimParam::Opacity), (10, AnimParam::Opacity)] {
+            c.animation.set_key(p, SourceTime(Time::from_secs(src)), 1.0, None);
+        }
+        let s = |x| SourceTime(Time::from_secs(x));
+        assert_eq!(visible_keys(&c), vec![(s(0), Time::from_secs(10)), (s(4), Time::from_secs(14))], "−5 s and timeline_out are hidden");
+        let (_, before, after) = split_keys(&c, Time::ZERO, c.timeline_in, c.timeline_out);
+        assert!(before && after, "‹ and › instead");
+        // A trim drag previewing a longer clip shows the hidden moments.
+        let (shown, before, after) = split_keys(&c, Time::ZERO, Time::from_secs(4), Time::from_secs(21));
+        assert_eq!(shown.len(), 4);
+        assert!(!before && !after);
+        // A move drag shifts the moments with the clip.
+        let moved = split_keys(&c, Time::from_secs(1), Time::from_secs(11), Time::from_secs(21));
+        assert_eq!(moved, (vec![(s(0), Time::from_secs(11)), (s(4), Time::from_secs(15))], true, true));
+        let bare = clip();
+        assert_eq!(split_keys(&bare, Time::ZERO, bare.timeline_in, bare.timeline_out), (vec![], false, false));
+    }
+
+    /// Review focus 4: a dragged diamond lands on whole frames and never
+    /// leaves the visible clip range `[timeline_in, timeline_out − frame]`.
+    #[test]
+    fn a_dragged_diamond_stays_on_frames_inside_the_clip() {
+        use kadr_core::FrameRate;
+        let c = clip(); // timeline 10..20 s
+        let fr = FrameRate::FPS_30;
+        let from = Time::from_secs(14);
+        assert_eq!(key_drag_to(&c, from, Time::ZERO, fr), from);
+        assert_eq!(key_drag_to(&c, from, Time(F.flicks() * 5 / 2), fr), from + F.mul_ratio(3, 1), "2.5 frames → 3 frames (nearest)");
+        assert_eq!(key_drag_to(&c, from, Time::from_secs(-30), fr), Time::from_secs(10), "not before the clip");
+        assert_eq!(key_drag_to(&c, from, Time::from_secs(30), fr), Time::from_secs(20) - F, "not past its last frame");
+        // A keyframe between frames (e.g. after a speed change) snaps when moved.
+        let off = from + Time(F.flicks() / 4);
+        assert_eq!(key_drag_to(&c, off, F, fr), from + F);
+        assert_eq!(key_drag_to(&c, off, Time::ZERO, fr), from, "its own frame: no move");
+    }
+
+    /// R14: the keyframe menu marks the curve every property of the moment
+    /// shares, and setting a curve touches only the keyframes that differ.
+    #[test]
+    fn the_keyframe_menu_marks_a_shared_curve_and_sets_only_the_others() {
+        let mut c = clip();
+        let at = SourceTime(Time::from_secs(4));
+        assert_eq!(moment_ease(&c, at), "", "no keyframe there");
+        c.animation.set_key(AnimParam::X, at, 1.0, Some(Ease::Linear));
+        c.animation.set_key(AnimParam::Opacity, at, 1.0, Some(Ease::Linear));
+        c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(5)), 1.0, Some(Ease::Hold));
+        assert_eq!(moment_ease(&c, at), "linear", "another moment's curve does not count");
+        assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![], "nothing to change: no command");
+        c.animation.set_key(AnimParam::Y, at, 1.0, Some(Ease::Hold));
+        assert_eq!(moment_ease(&c, at), "", "mixed: nothing marked");
+        assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![AnimParam::Y]);
+        assert_eq!(ease_targets(&c, at, &Ease::Hold), vec![AnimParam::X, AnimParam::Opacity]);
+        let other = SourceTime(Time::from_secs(6));
+        c.animation.set_key(AnimParam::X, other, 1.0, Some(Ease::Unknown(Default::default())));
+        assert_eq!(moment_ease(&c, other), "other");
     }
 }

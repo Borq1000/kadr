@@ -45,8 +45,8 @@ fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
 }
 
 /// The recorded (pre-drag) state of the clip a drag changes live — an
-/// inspector slider or a timeline fade handle (one pointer, so one drag at a
-/// time). A drag ends with a commit, which rolls back and records one
+/// inspector slider, a timeline fade handle or keyframe diamond (one
+/// pointer, so one drag at a time). A drag ends with a commit, which rolls back and records one
 /// command; anything else that edits the project rolls back first, so live
 /// changes never outlive their drag and no stale state is ever restored.
 #[derive(Default)]
@@ -62,6 +62,12 @@ impl LiveEdit {
         if self.0.is_none() {
             self.0 = seq.clip(id).map(|c| (id, c.clone()));
         }
+    }
+
+    /// The recorded state of `id` while a live change of it is armed — a
+    /// drag that recomputes its preview from the start (timeline diamonds).
+    pub fn recorded(&self, id: ClipId) -> Option<&Clip> {
+        self.0.as_ref().filter(|(sid, _)| *sid == id).map(|(_, c)| c)
     }
 
     /// Restores the recorded state and disarms; `true` when a clip was restored.
@@ -463,6 +469,21 @@ mod tests {
         set_opacity(&mut seq, b, 0.4);
         assert!(live.roll_back(&mut seq));
         assert_eq!(opacity(&seq, b), 1.0);
+    }
+
+    /// A diamond drag recomputes its preview from the recorded clip, never
+    /// from the previous preview.
+    #[test]
+    fn the_recorded_state_is_there_only_while_armed_for_that_clip() {
+        let (mut seq, a, b) = seq_with_two_clips();
+        let mut live = LiveEdit::default();
+        assert!(live.recorded(a).is_none());
+        live.arm(&mut seq, a);
+        set_opacity(&mut seq, a, 0.3);
+        assert_eq!(live.recorded(a).map(|c| c.transform.opacity), Some(1.0));
+        assert!(live.recorded(b).is_none(), "another clip's drag");
+        live.roll_back(&mut seq);
+        assert!(live.recorded(a).is_none());
     }
 
     #[test]

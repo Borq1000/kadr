@@ -123,6 +123,21 @@ fn moving_keyframes_onto_another_is_rejected_whole() {
     assert_eq!(EditCommand::error_key(&EditError::KeyframeCollision), "err.edit.keyframe_collision");
 }
 
+/// Review focus 4, the timeline diamond drag's command: every property of
+/// the dragged moment moves, as one undo step.
+#[test]
+fn a_diamond_drag_moves_every_property_of_that_moment() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::X, at: SourceTime(s(105)), value: 9.0, ease: None }).unwrap();
+    let c = p.sequence().clip(id).unwrap();
+    let at = SourceTime(s(105));
+    let moves = c.animation.params_at(at).into_iter().map(|q| (q, at, SourceTime(s(107)))).collect();
+    e.execute(&mut p, EditCommand::MoveKeyframes { clip: id, moves }).unwrap();
+    assert_eq!(p.sequence().clip(id).unwrap().animation.times(), vec![SourceTime(s(107))]);
+    e.undo(&mut p);
+    assert_eq!(p.sequence().clip(id).unwrap().animation.times(), vec![SourceTime(s(105))], "one undo step");
+}
+
 #[test]
 fn ease_and_clear_animation() {
     let (mut p, mut e, id) = setup();

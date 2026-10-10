@@ -25,6 +25,7 @@ pub fn shortcut_rows() -> Vec<ShortcutRow> {
         r("← / →", "keys.frame"),
         r("Shift + ← / →", "keys.second"),
         r("↑ / ↓", "keys.edit_points"),
+        r("Alt + ← / →", "keys.keyframe"),
         r("Home / End", "keys.home_end"),
         g("keys.g.editing"),
         r("S · Ctrl+B", "keys.split"),
@@ -83,7 +84,15 @@ pub fn latin_key(text: &str) -> String {
 
 impl App {
     pub fn on_key(&mut self, text: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+        // Alt combinations are free but Alt+←/→ (keyframes spec §6.2). No
+        // Windows window menu: winit lets DefWindowProc see WM_SYSKEYUP (the
+        // Alt release that activates a menu bar) only when the window has a
+        // native menu, which Kadr's has not; arrows make no WM_SYSCHAR.
         if alt {
+            if is(text, Key::LeftArrow) || is(text, Key::RightArrow) {
+                self.jump_keyframe(is(text, Key::RightArrow));
+                return true;
+            }
             return false;
         }
         if ctrl {
