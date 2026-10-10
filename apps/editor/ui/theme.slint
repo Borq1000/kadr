@@ -98,8 +98,12 @@ export global Icons {
     out property <string> jobs: "M4 6 H20 M4 12 H14 M4 18 H10 M17 15 L19.5 17.5 L17 20";
     out property <string> save: "M5 4 H16 L20 8 V20 H5 Z M8 4 V9 H15 V4 M8 20 V14 H16 V20";
     // Keyframe navigation (KeyNav): paths, not ◀ ◆ ▶ text — Windows draws
-    // U+25C0 / U+25B6 with the colour emoji font.
-    out property <string> key-prev: "M16 5.5 L7 12 L16 18.5 Z";
-    out property <string> key-next: "M8 5.5 L17 12 L8 18.5 Z";
+    // U+25C0 / U+25B6 with the colour emoji font. Arrows 12 × 16 of 24
+    // (6 × 8 px in the 12 px box), mirror images wound the SAME way: the
+    // FemtoVG renderer fills a contour by its winding (one way antialiased on
+    // the edge, the other grown by half a pixel), so oppositely wound mirrors
+    // render at visibly different sizes this small.
+    out property <string> key-prev: "M18 4 L6 12 L18 20 Z";
+    out property <string> key-next: "M6 20 L18 12 L6 4 Z";
     out property <string> key: "M12 3.5 L20.5 12 L12 20.5 L3.5 12 Z";
 }
