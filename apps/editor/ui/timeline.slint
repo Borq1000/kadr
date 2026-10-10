@@ -45,8 +45,11 @@ export struct ClipView {
     has-wave: bool,
     wave-x: length,
     wave-width: length,
+    // Fade diagonals: the picture's on a video track, the sound's on an audio track.
     fade-in: length,
     fade-out: length,
+    // Fade handles (Rust decides: wide enough, unlocked, hovered, selected or faded).
+    show-fade-handles: bool,
     offline: bool,
     marks: [ClipMark],
 }
@@ -250,6 +253,28 @@ component ClipRect inherits Rectangle {
         border-width: root.cv.selected ? 2px : 1px;
         border-color: root.cv.selected ? Theme.selection : #00000055;
     }
+    // Fade handles over the name bar, on the fade boundary but at least 12 px
+    // (anim_ui::HANDLE_INSET) inside the clip; Rust hit-tests the same spots.
+    if root.cv.show-fade-handles: Rectangle {
+        x: clamp(root.cv.fade-in, 12px, parent.width - 12px) - 5px;
+        y: 3px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: #ffffff;
+        border-width: 1px;
+        border-color: #00000080;
+    }
+    if root.cv.show-fade-handles: Rectangle {
+        x: clamp(parent.width - root.cv.fade-out, 12px, parent.width - 12px) - 5px;
+        y: 3px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: #ffffff;
+        border-width: 1px;
+        border-color: #00000080;
+    }
 }
 
 export component Timeline inherits Rectangle {
@@ -282,6 +307,10 @@ export component Timeline inherits Rectangle {
     in property <bool> has-selection;
     in property <float> scroll-fraction;
     in property <float> view-fraction;
+    // Value of a dragged fade handle, shown beside the pointer (lane coordinates).
+    in property <string> tip-text;
+    in property <length> tip-x;
+    in property <length> tip-y;
     out property <length> lanes-width: lanes.width;
     out property <length> lanes-height: lanes.height;
     out property <length> lanes-abs-x: lanes.absolute-position.x;
@@ -290,7 +319,7 @@ export component Timeline inherits Rectangle {
     property <length> ruler-height: 26px;
     property <int> hover-marker: -1;
 
-    callback lane-pointer(int /*kind 0 down,1 move,2 up,3 dbl*/, length, length, int /*button 0 l,1 r,2 m*/, bool /*shift*/, bool /*ctrl*/, bool /*alt*/);
+    callback lane-pointer(int /*kind 0 down,1 move,2 up,3 dbl,4 left the lanes,5 grab lost*/, length, length, int /*button 0 l,1 r,2 m*/, bool /*shift*/, bool /*ctrl*/, bool /*alt*/);
     callback scroll(length, length, bool /*ctrl*/, bool /*shift*/);
     callback ruler(int, length);
     callback track-toggle(int, string);
@@ -526,10 +555,16 @@ export component Timeline inherits Rectangle {
                                         e.button == PointerEventButton.left ? 0 : e.button == PointerEventButton.right ? 1 : 2,
                                         e.modifiers.shift, e.modifiers.control, e.modifiers.alt);
                                 }
+                                // Hover and drag alike (`moved` fires only while pressed):
+                                // Rust tracks the clip under the pointer for its fade handles.
+                                if (e.kind == PointerEventKind.move) { root.lane-pointer(1, self.mouse-x, self.mouse-y, 0, false, false, false); }
+                                // The grab was lost (no release will come): Rust ends the drag
+                                // as released, so a live fade change is never left unrecorded.
+                                if (e.kind == PointerEventKind.cancel) { root.lane-pointer(5, self.mouse-x, self.mouse-y, 0, false, false, false); }
                                 // After tl-pointer selected the clip under the cursor.
                                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { lane-menu.show({ x: self.absolute-position.x - lane-menu.absolute-position.x + self.mouse-x, y: self.absolute-position.y - lane-menu.absolute-position.y + self.mouse-y }); }
                             }
-                            moved => { root.lane-pointer(1, self.mouse-x, self.mouse-y, 0, false, false, false); }
+                            changed has-hover => { if (!self.has-hover) { root.lane-pointer(4, self.mouse-x, self.mouse-y, 0, false, false, false); } }
                             double-clicked => { root.lane-pointer(3, self.mouse-x, self.mouse-y, 0, false, false, false); }
                             scroll-event(e) => {
                                 root.scroll(e.delta-x, e.delta-y, e.modifiers.control, e.modifiers.shift);
@@ -541,6 +576,13 @@ export component Timeline inherits Rectangle {
                         x: root.playhead-x;
                         width: 1px;
                         background: Theme.playhead;
+                    }
+                    // A dragged fade handle's value: above the pointer, below it on
+                    // the top track, always inside the lanes.
+                    if root.tip-text != "": Tooltip {
+                        text: root.tip-text;
+                        x: max(0px, min(root.tip-x + 12px, parent.width - self.width - 4px));
+                        y: clamp(root.tip-y >= 32px ? root.tip-y - 32px : root.tip-y + 20px, 0px, max(0px, parent.height - self.height));
                     }
                     if root.is-empty: VerticalLayout {
                         alignment: center;

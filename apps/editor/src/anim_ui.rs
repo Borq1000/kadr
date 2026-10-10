@@ -1,7 +1,7 @@
 //! Pure keyframe/fade UI logic shared by the inspector and the timeline.
 
 use kadr_core::Time;
-use kadr_project::{AnimParam, Clip, Ease, Keyframe, Sequence};
+use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, Sequence};
 
 /// Inspector property names of the animatable rows (Temperature has no row).
 pub const PROPS: [(&str, AnimParam); 12] = [
@@ -110,6 +110,62 @@ pub fn key_info(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> KeyIn
     }
 }
 
+// ---------------------------------------------------------- fade handles
+//
+// Timeline fade handles (spec §6.2), in lane pixels. A handle's grab zone
+// is `2 · FADE_R` wide and the clip's top strip high; it starts
+// `HANDLE_INSET − FADE_R` inside the clip, i.e. right where the trim zone
+// (`timeline_ui::TRIM_ZONE` around the edge) ends, so the two never overlap.
+
+/// Half the width of a handle's grab zone.
+pub const FADE_R: f64 = 6.0;
+/// Closest a handle's centre comes to the clip's edge.
+pub const HANDLE_INSET: f64 = 12.0;
+/// The clip's top strip (its 2 px margin + the 16 px name bar) where handles are hit.
+pub const HEADER_H: f64 = 18.0;
+/// Narrower clips show no handles (trimming and moving keep the room).
+pub const FADE_MIN_W: f64 = 40.0;
+
+/// Centre of a handle: on the fade boundary, kept `HANDLE_INSET` inside the clip.
+pub fn handle_x(x0: f64, x1: f64, fade_px: f64, edge: FadeEdge) -> f64 {
+    match edge {
+        FadeEdge::In => (x0 + fade_px).max(x0 + HANDLE_INSET).min(x1 - HANDLE_INSET),
+        FadeEdge::Out => (x1 - fade_px).min(x1 - HANDLE_INSET).max(x0 + HANDLE_INSET),
+    }
+}
+
+/// The fade boundary itself (a handle without its inset). A drag moves it
+/// by the pointer's movement, so grabbing a handle never makes the fade jump.
+pub fn fade_edge_x(x0: f64, x1: f64, fade_px: f64, edge: FadeEdge) -> f64 {
+    match edge {
+        FadeEdge::In => x0 + fade_px,
+        FadeEdge::Out => x1 - fade_px,
+    }
+}
+
+/// The handle at `x`: the nearest within `FADE_R`. Where both sit on one
+/// spot (a fade filling the clip) the longer fade wins — the other one
+/// cannot grow, so picking it would leave the handle stuck.
+pub fn pick_handle(x: f64, x0: f64, x1: f64, fi_px: f64, fo_px: f64) -> Option<FadeEdge> {
+    let d_in = (x - handle_x(x0, x1, fi_px, FadeEdge::In)).abs();
+    let d_out = (x - handle_x(x0, x1, fo_px, FadeEdge::Out)).abs();
+    let edge = if d_in < d_out || (d_in == d_out && fi_px >= fo_px) { FadeEdge::In } else { FadeEdge::Out };
+    (d_in.min(d_out) <= FADE_R).then_some(edge)
+}
+
+/// The fade a handle dragged to `x` sets: whole frames, in `[0, dur − other]`.
+#[allow(clippy::too_many_arguments)]
+pub fn fade_drag_value(edge: FadeEdge, x: f64, x0: f64, x1: f64, pps: f64, frame: Time, other: Time, dur: Time) -> Time {
+    let px = match edge {
+        FadeEdge::In => x - x0,
+        FadeEdge::Out => x1 - x,
+    };
+    let f = frame.flicks().max(1);
+    let raw = Time::from_secs_f64((px / pps).max(0.0));
+    let snapped = Time((raw.flicks() + f / 2) / f * f);
+    snapped.min((dur - other).max(Time::ZERO))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +250,60 @@ mod tests {
         assert!(key_here(&c, AnimParam::X, Time::from_secs(12) + F, F).is_none(), "a frame away is not here");
         assert!(key_here(&c, AnimParam::X, Time::from_secs(5), F).is_none(), "a hidden keyframe is never here");
         assert_eq!(key_here(&c, AnimParam::Y, Time::from_secs(14), F).map(|k| ease_key(&k.ease)), Some("other"));
+    }
+
+    #[test]
+    fn handles_stay_inside_the_clip_and_track_the_fade() {
+        use kadr_project::FadeEdge;
+        assert_eq!(handle_x(100.0, 300.0, 0.0, FadeEdge::In), 112.0, "zero fade: inset from the edge");
+        assert_eq!(handle_x(100.0, 300.0, 50.0, FadeEdge::In), 150.0);
+        assert_eq!(handle_x(100.0, 300.0, 0.0, FadeEdge::Out), 288.0);
+        assert_eq!(handle_x(100.0, 300.0, 80.0, FadeEdge::Out), 220.0);
+        assert_eq!(handle_x(100.0, 300.0, 500.0, FadeEdge::In), 288.0, "never past the other inset");
+    }
+
+    #[test]
+    fn fade_drag_snaps_to_frames_and_respects_the_other_fade() {
+        use kadr_project::FadeEdge;
+        let pps = 100.0; // px per second
+        let dur = Time::from_secs(4);
+        let v = fade_drag_value(FadeEdge::In, 100.0 + 51.0, 100.0, 500.0, pps, F, Time::ZERO, dur);
+        assert_eq!(v, F.mul_ratio(15, 1), "0.51 s → 15 frames at 30 fps");
+        let v = fade_drag_value(FadeEdge::Out, 500.0 - 390.0, 100.0, 500.0, pps, F, Time::from_secs(1), dur);
+        assert_eq!(v, Time::from_secs(3), "capped at duration − fade_in");
+        assert_eq!(fade_drag_value(FadeEdge::In, 50.0, 100.0, 500.0, pps, F, Time::ZERO, dur), Time::ZERO);
+    }
+
+    /// A drag moves the fade boundary by the pointer's movement: grabbing a
+    /// zero fade's handle (drawn at the inset) does not jump to the inset.
+    #[test]
+    fn grabbing_a_handle_off_its_boundary_does_not_jump() {
+        use kadr_project::FadeEdge;
+        let (x0, x1, pps) = (100.0, 500.0, 100.0);
+        let press = handle_x(x0, x1, 0.0, FadeEdge::In);
+        let grab = press - fade_edge_x(x0, x1, 0.0, FadeEdge::In);
+        let v = fade_drag_value(FadeEdge::In, press + 3.4 - grab, x0, x1, pps, F, Time::ZERO, Time::from_secs(4));
+        assert_eq!(v, F, "3.4 px = 0.034 s → 1 frame, not the 12 px inset");
+        let press = handle_x(x0, x1, 150.0, FadeEdge::Out);
+        let grab = press - fade_edge_x(x0, x1, 150.0, FadeEdge::Out);
+        assert_eq!(grab, 0.0, "a handle on its boundary is grabbed as it is");
+    }
+
+    /// The handle under the pointer: the nearest within `FADE_R`; where both
+    /// sit on one spot (a fade filling the clip) the one that can move.
+    #[test]
+    fn the_nearest_handle_is_picked_and_a_full_fade_stays_movable() {
+        use kadr_project::FadeEdge;
+        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 0.0), Some(FadeEdge::In));
+        assert_eq!(pick_handle(106.0, 100.0, 300.0, 0.0, 0.0), Some(FadeEdge::In), "the grab zone is 2·FADE_R wide");
+        assert_eq!(pick_handle(105.0, 100.0, 300.0, 0.0, 0.0), None, "the clip edge belongs to trimming");
+        assert_eq!(pick_handle(288.0, 100.0, 300.0, 0.0, 0.0), Some(FadeEdge::Out));
+        assert_eq!(pick_handle(200.0, 100.0, 300.0, 0.0, 0.0), None);
+        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0), Some(FadeEdge::Out), "fade-out fills the clip");
+        assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0), Some(FadeEdge::In), "fade-in fills the clip");
+        // The narrowest clip with handles: both zones apart, the middle moves the clip.
+        assert_eq!(pick_handle(118.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0), Some(FadeEdge::In));
+        assert_eq!(pick_handle(120.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0), None);
+        assert_eq!(pick_handle(122.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0), Some(FadeEdge::Out));
     }
 }

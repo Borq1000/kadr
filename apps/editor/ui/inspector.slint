@@ -262,18 +262,18 @@ export component Inspector inherits Rectangle {
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.fades"); }
                 if root.d.has-video-props: HorizontalLayout {
                     padding-right: Theme.key-nav;
-                    PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.vfade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-out, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("vfade-in", v); } committed(v) => { root.commit("vfade-in", v); } }
+                    PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.vfade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-out, 0.01); default-value: 0; unit: " " + Tr.t("unit.sec_symbol"); changed(v) => { root.live("vfade-in", v); } committed(v) => { root.commit("vfade-in", v); } }
                 }
                 if root.d.has-video-props: HorizontalLayout {
                     padding-right: Theme.key-nav;
-                    PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.vfade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-in, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("vfade-out", v); } committed(v) => { root.commit("vfade-out", v); } }
+                    PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.vfade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-in, 0.01); default-value: 0; unit: " " + Tr.t("unit.sec_symbol"); changed(v) => { root.live("vfade-out", v); } committed(v) => { root.commit("vfade-out", v); } }
                 }
 
                 if root.d.is-audio: SectionTitle { text: Tr.t("inspector.audio"); resettable: true; reset => { root.reset("audio"); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.gain"); value: root.d.gain; minimum: -40; maximum: 12; default-value: 0; decimals: 1; unit: " dB"; changed(v) => { root.live("gain", v); } committed(v) => { root.commit("gain", v); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.pan"); value: root.d.pan; minimum: -1; maximum: 1; default-value: 0; changed(v) => { root.live("pan", v); } committed(v) => { root.commit("pan", v); } }
-                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-out, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
-                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-in, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-out, 0.01); default-value: 0; unit: " " + Tr.t("unit.sec_symbol"); changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-in, 0.01); default-value: 0; unit: " " + Tr.t("unit.sec_symbol"); changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
 
                 if root.d.shots.length > 0: SectionTitle { text: Tr.t("inspector.shots"); }
                 if root.d.shots.length > 0 && !root.d.shots-graded: Text { text: Tr.t("inspector.shots.ungraded"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }

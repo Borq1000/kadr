@@ -122,7 +122,12 @@ impl App {
         } else if is(text, Key::Delete) || is(text, Key::Backspace) {
             self.delete_selection(shift || self.tl.ripple);
         } else if is(text, Key::Escape) {
-            // Esc closes the topmost overlay first, then clears the selection.
+            // Esc first cancels a timeline drag in progress (a fade handle's
+            // live value goes back), then closes the topmost overlay, then
+            // clears the selection.
+            if self.tl_cancel_drag() {
+                return true;
+            }
             let ui = self.ui();
             if ui.get_confirm_open() {
                 self.confirm_answer(false);

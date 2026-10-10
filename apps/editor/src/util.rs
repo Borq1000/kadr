@@ -70,6 +70,11 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
+/// A duration in seconds with two decimals, in the UI language ("0.50 s").
+pub fn fmt_secs(d: kadr_core::Time) -> String {
+    tf("unit.sec", &[("v", &format!("{:.2}", d.as_secs_f64()))])
+}
+
 /// Local timezone offset in minutes (east positive).
 fn local_offset_min() -> i64 {
     #[cfg(windows)]

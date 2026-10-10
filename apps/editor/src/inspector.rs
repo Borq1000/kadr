@@ -44,8 +44,9 @@ fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
     }
 }
 
-/// The recorded (pre-drag) state of the clip an inspector slider changes
-/// live. A drag ends with a commit, which rolls back and records one
+/// The recorded (pre-drag) state of the clip a drag changes live — an
+/// inspector slider or a timeline fade handle (one pointer, so one drag at a
+/// time). A drag ends with a commit, which rolls back and records one
 /// command; anything else that edits the project rolls back first, so live
 /// changes never outlive their drag and no stale state is ever restored.
 #[derive(Default)]
@@ -227,7 +228,7 @@ impl App {
         if self.project.sequence().tracks[ti].locked {
             return;
         }
-        self.inspector_snapshot.arm(self.project.sequence_mut(), id);
+        self.live_edit.arm(self.project.sequence_mut(), id);
         let frame = self.project.sequence().frame_rate.frame_duration();
         let playhead = self.playhead;
         let c = &mut self.project.sequence_mut().tracks[ti].clips[ci];
@@ -243,16 +244,20 @@ impl App {
         }
         self.preview.invalidate();
         self.refresh_inspector();
-        if matches!(prop, "gain" | "fade-in" | "fade-out") {
+        // The timeline draws the waveform (gain), fade diagonals and handles;
+        // sound-only changes leave the picture as it is.
+        let sound_only = matches!(prop, "gain" | "fade-in" | "fade-out");
+        if sound_only || matches!(prop, "vfade-in" | "vfade-out") {
             self.refresh_timeline();
-        } else {
+        }
+        if !sound_only {
             self.request_frame();
         }
     }
 
     pub fn inspector_commit(&mut self, prop: &str, v: f32) {
         // Restore the pre-drag state, then apply as one undoable command.
-        let rolled_back = self.inspector_snapshot.roll_back(self.project.sequence_mut());
+        let rolled_back = self.live_edit.roll_back(self.project.sequence_mut());
         let Some((id, (ti, ci))) = self.inspected().and_then(|id| Some((id, self.project.sequence().locate_clip(id)?))) else {
             if rolled_back {
                 self.show_rolled_back();
@@ -290,19 +295,21 @@ impl App {
         }
     }
 
-    /// The live drag's changes were rolled back: show the clip as it is.
-    fn show_rolled_back(&mut self) {
+    /// The live drag's changes were rolled back: show the clip as it is —
+    /// picture, inspector and timeline (fade diagonals, handles, waveform).
+    pub fn show_rolled_back(&mut self) {
         self.preview.invalidate();
         self.refresh_inspector();
+        self.refresh_timeline();
         self.request_frame();
     }
 
-    /// Any other edit (command, undo, redo) first ends an inspector drag
-    /// whose release never came: its live changes were never recorded, so
-    /// the edit and its undo must not see them, and no stale snapshot may
-    /// be restored over the edit later.
+    /// Any other edit (command, undo, redo) first ends a live drag (inspector
+    /// slider, timeline fade handle) whose release never came: its live
+    /// changes were never recorded, so the edit and its undo must not see
+    /// them, and no stale snapshot may be restored over the edit later.
     pub fn end_live_edit(&mut self) {
-        if self.inspector_snapshot.roll_back(self.project.sequence_mut()) {
+        if self.live_edit.roll_back(self.project.sequence_mut()) {
             self.show_rolled_back();
         }
     }

@@ -113,6 +113,10 @@ export component AppWindow inherits Window {
     in property <bool> has-selection;
     in property <float> scroll-fraction;
     in property <float> view-fraction: 1;
+    // A dragged fade handle's value beside the pointer ("" = hidden).
+    in property <string> tl-tip-text;
+    in property <length> tl-tip-x;
+    in property <length> tl-tip-y;
     out property <length> lanes-width: tl.lanes-width;
     out property <length> lanes-height: tl.lanes-height;
     out property <length> lanes-abs-x: tl.lanes-abs-x;
@@ -524,6 +528,9 @@ export component AppWindow inherits Window {
                 has-selection: root.has-selection;
                 scroll-fraction: root.scroll-fraction;
                 view-fraction: root.view-fraction;
+                tip-text: root.tl-tip-text;
+                tip-x: root.tl-tip-x;
+                tip-y: root.tl-tip-y;
                 lane-pointer(k, x, y, b, s, c, a) => { root.tl-pointer(k, x, y, b, s, c, a); }
                 scroll(dx, dy, c, s) => { root.tl-scroll(dx, dy, c, s); }
                 ruler(k, x) => { root.tl-ruler(k, x); }

@@ -94,8 +94,9 @@ pub struct App {
     pub preview: PreviewController,
     pub ai: AiUi,
     pub export: ExportUi,
-    /// Pre-drag state of the clip an inspector slider changes live.
-    pub inspector_snapshot: crate::inspector::LiveEdit,
+    /// Pre-drag state of the clip a drag changes live (an inspector slider,
+    /// a timeline fade handle); see `LiveEdit`.
+    pub live_edit: crate::inspector::LiveEdit,
     /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
     pub inspector_refreshed: Option<Instant>,
     pub library_drag: Option<LibDrag>,
@@ -202,7 +203,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         audio,
         ai: AiUi::new(Assistant::new(ai_settings)),
         export: ExportUi::default(),
-        inspector_snapshot: Default::default(),
+        live_edit: Default::default(),
         inspector_refreshed: None,
         library_drag: None,
         mc: Default::default(),
