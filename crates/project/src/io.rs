@@ -85,9 +85,66 @@ pub fn parse(bytes: &[u8], path: &Path) -> Result<Project, ProjectIoError> {
     serde_json::from_value(value).map_err(|source| ProjectIoError::Parse { path: path.to_path_buf(), source })
 }
 
-/// Upgrades older JSON layouts in place. Format 1 is the first release.
-fn migrate(value: serde_json::Value, _from: u32) -> serde_json::Value {
+/// Upgrades older JSON layouts in place. Format 1 is the first release;
+/// format 2 replaced the never-evaluated string-keyed `keyframes` with
+/// source-bound `animation` (keyframes spec section 2.2).
+fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
+    if from < 2 {
+        if let Some(seqs) = value.get_mut("sequences").and_then(|s| s.as_array_mut()) {
+            for clip in seqs
+                .iter_mut()
+                .flat_map(|s| s["tracks"].as_array_mut().into_iter().flatten())
+                .flat_map(|t| t["clips"].as_array_mut().into_iter().flatten())
+            {
+                migrate_clip_keyframes(clip);
+            }
+        }
+        // The upgraded document is a format-2 document in memory too.
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("format_version".into(), 2.into());
+        }
+    }
     value
+}
+
+fn migrate_clip_keyframes(clip: &mut serde_json::Value) {
+    use serde_json::{json, Map, Value};
+    let Some(Value::Array(old)) = clip.as_object_mut().and_then(|o| o.remove("keyframes")) else { return };
+    let num = |k: &str| clip.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let (sin, sout, tin, tout) = (num("source_in"), num("source_out"), num("timeline_in"), num("timeline_out"));
+    let mut anim: Map<String, Value> = Map::new();
+    for k in old {
+        let prop = k.get("property").and_then(Value::as_str).unwrap_or_default().to_string();
+        let param = match prop.as_str() {
+            "transform.x" => Some("x"),
+            "transform.y" => Some("y"),
+            "transform.scale" => Some("scale"),
+            "transform.rotation_deg" => Some("rotation"),
+            "transform.opacity" => Some("opacity"),
+            "transform.crop_left" => Some("crop_left"),
+            "transform.crop_right" => Some("crop_right"),
+            "transform.crop_top" => Some("crop_top"),
+            "transform.crop_bottom" => Some("crop_bottom"),
+            "color.exposure" => Some("exposure"),
+            "color.contrast" => Some("contrast"),
+            "color.saturation" => Some("saturation"),
+            "color.temperature" => Some("temperature"),
+            _ => None,
+        };
+        let entry = match param {
+            Some(p) => {
+                let rel = kadr_core::Time(k.get("time").and_then(Value::as_i64).unwrap_or(0));
+                let at = kadr_core::Time(sin) + rel.mul_ratio(sout - sin, (tout - tin).max(1));
+                let ease = k.get("interpolation").cloned().unwrap_or(json!("ease_in_out"));
+                (p.to_string(), json!({"at": at.flicks(), "value": k.get("value").cloned().unwrap_or(Value::Null), "ease": ease}))
+            }
+            None => (prop, k),
+        };
+        anim.entry(entry.0).or_insert_with(|| json!([])).as_array_mut().unwrap().push(entry.1);
+    }
+    if !anim.is_empty() {
+        clip["animation"] = Value::Object(anim);
+    }
 }
 
 /// If an absolute media path no longer exists but the path relative to the
@@ -159,5 +216,48 @@ mod tests {
         let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
         let err = parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err();
         assert!(matches!(err, ProjectIoError::TooNew { .. }));
+    }
+
+    /// Format 1 clip JSON with the old string-keyed keyframes, 2x speed:
+    /// source 10..30 s over timeline 0..10 s.
+    fn v1_project() -> serde_json::Value {
+        let p = crate::Project::new("old");
+        let mut v = serde_json::to_value(&p).unwrap();
+        v["format_version"] = serde_json::json!(1);
+        let f = |s: f64| (s * kadr_core::FLICKS_PER_SECOND as f64) as i64;
+        let clip = serde_json::json!({
+            "id": kadr_core::ClipId::new(), "asset": kadr_core::AssetId::new(), "name": "c",
+            "source_in": f(10.0), "source_out": f(30.0), "timeline_in": 0, "timeline_out": f(10.0),
+            "keyframes": [
+                {"property": "transform.scale", "time": f(1.0), "value": 1.2, "interpolation": "linear"},
+                {"property": "color.exposure", "time": 0, "value": 0.5, "interpolation": "hold"},
+                {"property": "audio.gain_db", "time": 0, "value": -6.0, "interpolation": "ease_in_out"}
+            ]
+        });
+        v["sequences"][0]["tracks"][0]["clips"] = serde_json::json!([clip]);
+        v
+    }
+
+    #[test]
+    fn format_1_keyframes_migrate_to_source_bound_animation() {
+        let bytes = serde_json::to_vec(&v1_project()).unwrap();
+        let p = parse(&bytes, Path::new("old.kadr")).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        let scale = c.animation.track(crate::AnimParam::Scale);
+        assert_eq!(scale.len(), 1);
+        assert_eq!(scale[0].at, crate::SourceTime(kadr_core::Time::from_secs(12)), "timeline 1 s at 2x = source 12 s");
+        assert_eq!((scale[0].value, &scale[0].ease), (1.2, &crate::Ease::Linear));
+        assert_eq!(c.animation.track(crate::AnimParam::Exposure)[0].ease, crate::Ease::Hold);
+        assert_eq!(c.animation.unknown_len(), 1, "audio.gain_db is not a V1 animation param: kept, not run");
+        let saved = serde_json::to_value(&p).unwrap();
+        assert!(saved["sequences"][0]["tracks"][0]["clips"][0].get("keyframes").is_none(), "old field never written");
+        assert_eq!(saved["format_version"], serde_json::json!(FORMAT_VERSION));
+    }
+
+    #[test]
+    fn a_format_2_file_is_too_new_for_a_format_1_reader() {
+        assert_eq!(FORMAT_VERSION, 2);
+        let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
+        assert!(matches!(parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err(), ProjectIoError::TooNew { .. }));
     }
 }
