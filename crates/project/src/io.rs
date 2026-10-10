@@ -133,8 +133,15 @@ fn migrate_clip_keyframes(clip: &mut serde_json::Value) {
         };
         let entry = match param {
             Some(p) => {
-                let rel = kadr_core::Time(k.get("time").and_then(Value::as_i64).unwrap_or(0));
-                let at = kadr_core::Time(sin) + rel.mul_ratio(sout - sin, (tout - tin).max(1));
+                let rel = k.get("time").and_then(Value::as_i64).unwrap_or(0);
+                // A garbage time must not overflow the load: it stays beyond
+                // MAX_KEY_FLICKS, so the track loads as unknown (kept, not run).
+                let at = if rel.unsigned_abs() > crate::MAX_KEY_FLICKS {
+                    kadr_core::Time(rel)
+                } else {
+                    let rel = kadr_core::Time(rel).mul_ratio(sout.saturating_sub(sin), tout.saturating_sub(tin).max(1));
+                    kadr_core::Time(sin.saturating_add(rel.flicks()))
+                };
                 let ease = k.get("interpolation").cloned().unwrap_or(json!("ease_in_out"));
                 (p.to_string(), json!({"at": at.flicks(), "value": k.get("value").cloned().unwrap_or(Value::Null), "ease": ease}))
             }
@@ -252,6 +259,18 @@ mod tests {
         let saved = serde_json::to_value(&p).unwrap();
         assert!(saved["sequences"][0]["tracks"][0]["clips"][0].get("keyframes").is_none(), "old field never written");
         assert_eq!(saved["format_version"], serde_json::json!(FORMAT_VERSION));
+    }
+
+    /// R25: a garbage old keyframe time neither panics the migration nor runs.
+    #[test]
+    fn a_format_1_keyframe_with_a_garbage_time_loads_as_unknown() {
+        let mut v = v1_project();
+        v["sequences"][0]["tracks"][0]["clips"][0]["keyframes"][0]["time"] = serde_json::json!(i64::MAX);
+        let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert!(!c.animation.is_animated(crate::AnimParam::Scale), "never run");
+        assert_eq!(c.animation.unknown_len(), 2, "kept with audio.gain_db");
+        assert!(c.animation.is_animated(crate::AnimParam::Exposure), "the rest migrates");
     }
 
     #[test]

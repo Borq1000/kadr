@@ -100,6 +100,36 @@ fn autosave_newer_than_project_is_offered_for_recovery() {
     assert!(io::recovery_candidate(&path).is_none());
 }
 
+/// R25 / Review Focus 2: garbage animation data never fails the project
+/// load, and nothing that survives can panic the time conversions.
+#[test]
+fn garbage_clip_animation_never_fails_the_load() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.kadr");
+    let p = sample_project(dir.path());
+    let with_animation = |anim: serde_json::Value| {
+        let mut v: serde_json::Value = serde_json::from_slice(&io::to_json(&p)).unwrap();
+        v["sequences"][0]["tracks"][0]["clips"][0]["animation"] = anim;
+        serde_json::to_vec(&v).unwrap()
+    };
+    for garbage in [json!(null), json!([]), json!("x")] {
+        let loaded = io::parse(&with_animation(garbage.clone()), &path).unwrap_or_else(|e| panic!("{garbage}: {e}"));
+        let clip = &loaded.sequences[0].tracks[0].clips[0];
+        assert!(clip.animation.is_stored_empty(), "{garbage}");
+        assert_eq!(clip.transform.scale, 1.25, "the rest of the clip loads");
+        assert_eq!(io::parse(&io::to_json(&loaded), &path).unwrap(), loaded, "{garbage}: round trip");
+    }
+
+    let extreme = json!({"scale": [{"at": i64::MAX, "value": 2.0}]});
+    let loaded = io::parse(&with_animation(extreme.clone()), &path).unwrap();
+    let clip = &loaded.sequences[0].tracks[0].clips[0];
+    assert!(clip.animation.is_empty(), "never executed");
+    assert_eq!(clip.anim_value(AnimParam::Scale, Time::from_secs(1)), 1.25, "the static value applies");
+    let saved: serde_json::Value = serde_json::from_slice(&io::to_json(&loaded)).unwrap();
+    assert_eq!(saved["sequences"][0]["tracks"][0]["clips"][0]["animation"], extreme, "kept verbatim");
+}
+
 #[test]
 fn old_project_json_still_loads() {
     // A project written before decisions / angle descriptions existed.

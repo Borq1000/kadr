@@ -376,14 +376,43 @@ impl Serialize for Animation {
     }
 }
 
+/// Largest |`at`| (flicks, ~147 days) of a track that runs. Far beyond any
+/// media, and small enough that the time conversions (`Clip::source_time_at`,
+/// `Clip::timeline_time_of`, `shift_all`) cannot overflow `i64`.
+pub const MAX_KEY_FLICKS: u64 = 1 << 53;
+
+impl Keyframe {
+    /// Whether a loaded key can run: a finite value (always true for JSON —
+    /// `serde_json` has no NaN / ±inf, a `null` value fails to parse — but
+    /// not for other deserializers) and a time within ±`MAX_KEY_FLICKS`.
+    fn runnable(&self) -> bool {
+        self.value.is_finite() && self.at.0.flicks().unsigned_abs() <= MAX_KEY_FLICKS
+    }
+}
+
 impl<'de> Deserialize<'de> for Animation {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = BTreeMap::<String, Value>::deserialize(d)?;
+        // Never fail the project load over animation data (Review Focus 2):
+        // anything but an object is dropped.
+        let raw = match Value::deserialize(d)? {
+            Value::Object(m) => m,
+            other => {
+                let kind = match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::String(_) => "a string",
+                    _ => "an array",
+                };
+                tracing::warn!("ignoring a clip animation that is {kind}, not an object");
+                return Ok(Animation::default());
+            }
+        };
         let mut a = Animation::default();
         for (k, v) in raw {
             let parsed = AnimParam::from_key(&k).and_then(|p| serde_json::from_value::<Vec<Keyframe>>(v.clone()).ok().map(|keys| (p, keys)));
             match parsed {
-                Some((p, mut keys)) if keys.iter().all(|k| k.value.is_finite()) && !keys.is_empty() => {
+                Some((p, mut keys)) if keys.iter().all(Keyframe::runnable) && !keys.is_empty() => {
                     // Stable sort keeps file order among equal times; keep the last of each.
                     keys.sort_by_key(|k| k.at);
                     let mut dedup: Vec<Keyframe> = Vec::with_capacity(keys.len());
@@ -396,7 +425,9 @@ impl<'de> Deserialize<'de> for Animation {
                     a.tracks.insert(p, dedup);
                 }
                 _ => {
-                    // Unknown key, unparsable or non-finite track: keep it, never run it.
+                    // Unknown key, a track that does not parse (not an array,
+                    // a `null` value…), is empty or has a key time beyond
+                    // ±MAX_KEY_FLICKS: keep it verbatim, never run it.
                     a.unknown.insert(k, v);
                 }
             }
@@ -475,6 +506,34 @@ mod tests {
         let a: Animation = serde_json::from_value(bad.clone()).unwrap();
         assert!(a.is_empty(), "nothing executable");
         assert_eq!(serde_json::to_value(&a).unwrap(), bad, "and nothing lost");
+    }
+
+    /// R25: an `animation` that is not an object never fails the load.
+    #[test]
+    fn a_non_object_animation_loads_empty() {
+        for v in [json!(null), json!([]), json!("x"), json!(5), json!(true), json!([{"at": 0, "value": 1.0}])] {
+            let a: Animation = serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"));
+            assert!(a.is_stored_empty(), "{v}");
+        }
+    }
+
+    /// R25: a key time beyond ±2^53 flicks would overflow the time
+    /// conversions (`Clip::timeline_time_of`); such a track is kept verbatim
+    /// and never run.
+    #[test]
+    fn a_track_with_an_extreme_time_is_kept_as_unknown() {
+        let bad = json!({
+            "scale": [{"at": i64::MAX, "value": 1.0}],
+            "x": [{"at": 0, "value": 1.0}, {"at": i64::MIN, "value": 2.0}],
+            "y": [{"at": (1_i64 << 53) + 1, "value": 1.0}]
+        });
+        let a: Animation = serde_json::from_value(bad.clone()).unwrap();
+        assert!(a.is_empty(), "nothing executable");
+        assert_eq!(a.unknown_len(), 3);
+        assert_eq!(serde_json::to_value(&a).unwrap(), bad, "and nothing lost");
+        let edge = json!({"y": [{"at": 1_i64 << 53, "value": 1.0}, {"at": -(1_i64 << 53), "value": 2.0}]});
+        let a: Animation = serde_json::from_value(edge).unwrap();
+        assert_eq!(a.track(AnimParam::Y).len(), 2, "±2^53 itself still runs");
     }
 
     /// A user keyframe supersedes an unreadable stored track of the same param.
