@@ -101,7 +101,8 @@ fn window(at: Time, d: Time) -> TimeRange {
 /// valid one. Like export, its length is clamped to both neighbours —
 /// `min(duration, outgoing, incoming)` — and under two frames there is no
 /// transition. Among valid transitions whose clamped window contains `t`,
-/// the earlier cut wins.
+/// the earlier cut wins. A side whose clip draws nothing at `t` is empty;
+/// with both sides empty there is no layer.
 fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
     let min_len = seq.frame_rate.frame_to_time(2);
     let (tr, outgoing, incoming, w) = seq
@@ -124,13 +125,20 @@ fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, c
         // the same picture as export's `xfade=wipeleft`.
         TransitionKind::Wipe => TransitionOp::Wipe { angle: std::f32::consts::PI, softness: 0.0 },
     };
+    // A side that draws nothing at `t` (scale ≤ 0, empty crop, no picture) is an empty,
+    // transparent side, and the other side still mixes against it (keyframes
+    // spec §3.5: cull only what provably contributes nothing). An empty side
+    // never makes the transition an occluder (`covers_opaquely`).
     let frame = seq.frame_rate.frame_duration();
-    let from = clip_layer(project, outgoing, t, canvas, frame)?;
-    let to = clip_layer(project, incoming, t, canvas, frame)?;
+    let from = clip_layer(project, outgoing, t, canvas, frame);
+    let to = clip_layer(project, incoming, t, canvas, frame);
+    if from.is_none() && to.is_none() {
+        return None;
+    }
     let placement = Placement::fill(canvas);
     Some(Layer {
         id: LayerId::from(tr.id),
-        content: LayerContent::Transition(Box::new(TransitionLayer { op, progress, from: vec![from], to: vec![to] })),
+        content: LayerContent::Transition(Box::new(TransitionLayer { op, progress, from: from.into_iter().collect(), to: to.into_iter().collect() })),
         crop: placement.full_crop(),
         placement,
         opacity: 1.0,
@@ -727,6 +735,54 @@ mod tests {
                 assert_eq!(ids(&scene_at(&p, 2_000)), vec![LayerId::from(below), LayerId::from(tid)], "{what}, {kind:?}");
             }
         }
+    }
+
+    /// Spec §3.5: a side the evaluator proves invisible is an empty
+    /// (transparent) side; the other side still dissolves. Here the incoming
+    /// clip zooms in from nothing: scale 0 at its first source frame, so in
+    /// the pre-cut half (source time before that key) it has no area.
+    #[test]
+    fn a_culled_side_is_empty_and_the_transition_is_kept() {
+        let mut p = Project::new("t");
+        let a = place(&mut p, 0, &hd(), 0, 0, 2_000);
+        let b = place(&mut p, 0, &hd(), 10_000, 2_000, 2_000);
+        let incoming = &mut p.sequence_mut().tracks[0].clips[1];
+        incoming.animation.set_key(kadr_project::AnimParam::Scale, kadr_project::SourceTime(Time::from_secs(10)), 0.0, Some(kadr_project::Ease::Linear));
+        incoming.animation.set_key(kadr_project::AnimParam::Scale, kadr_project::SourceTime(Time::from_secs(11)), 1.0, None);
+        let tid = add_transition(&mut p, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        for ms in [1_500, 1_750, 2_000] {
+            let s = scene_at(&p, ms);
+            assert_eq!(ids(&s), vec![LayerId::from(tid)], "t = {ms} ms: the outgoing clip still dissolves out");
+            let tr = transition(&s.layers[0]);
+            assert_eq!(ids_of(&tr.from), vec![LayerId::from(a)], "t = {ms} ms");
+            assert!(tr.to.is_empty(), "t = {ms} ms: scale 0 → an empty side, not the whole transition");
+        }
+        let tr = transition(&scene_at(&p, 2_250).layers[0]).clone();
+        assert_eq!((ids_of(&tr.from), ids_of(&tr.to)), (vec![LayerId::from(a)], vec![LayerId::from(b)]), "zoomed in a quarter of the way");
+    }
+
+    #[test]
+    fn a_transition_with_both_sides_culled_adds_nothing() {
+        let (mut p, below, _) = under_a_transition(TransitionKind::CrossDissolve, hd(), |c| c.transform.scale = 0.0);
+        let v2 = p.sequence().tracks.iter().position(|t| t.name == "V2").unwrap();
+        p.sequence_mut().tracks[v2].clips[0].transform.crop_left = 1.0; // the outgoing clip: empty crop
+        for ms in [1_600, 2_000, 2_400] {
+            assert_eq!(ids(&scene_at(&p, ms)), vec![LayerId::from(below)], "t = {ms} ms: only V1");
+        }
+    }
+
+    #[test]
+    fn a_transition_with_an_empty_side_never_occludes() {
+        for kind in [TransitionKind::CrossDissolve, TransitionKind::DipToBlack, TransitionKind::Wipe] {
+            let (p, below, tid) = under_a_transition(kind, hd(), |c| c.transform.scale = 0.0);
+            for ms in [1_600, 2_000, 2_400] {
+                assert_eq!(ids(&scene_at(&p, ms)), vec![LayerId::from(below), LayerId::from(tid)], "{kind:?} at {ms} ms");
+            }
+        }
+    }
+
+    fn ids_of(layers: &[Layer]) -> Vec<LayerId> {
+        layers.iter().map(|l| l.id).collect()
     }
 
     /// A transition layer over one full-frame clip on each side, built by hand.
