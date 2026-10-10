@@ -3,7 +3,7 @@
 use crate::report::Report;
 use kadr_core::perf::Stats;
 use kadr_core::{FrameRate, MediaInfo, MediaKind, Time, TimeRange, TransitionId, VideoInfo};
-use kadr_project::{Clip, MediaAsset, Project, Track, TrackKind, Transition, TransitionKind};
+use kadr_project::{AnimParam, Clip, MediaAsset, Project, SourceTime, Track, TrackKind, Transition, TransitionKind};
 use kadr_scene::{OutputSpec, RenderQuality, SizeU};
 use kadr_timeline::scene::evaluate;
 use std::time::Instant;
@@ -45,8 +45,30 @@ fn project() -> Project {
     p
 }
 
-pub fn run() -> Result<Report, String> {
-    let p = project();
+/// 10 full-length clips on 10 video tracks, each with all 13 parameters animated (3 keyframes each).
+fn animated_project() -> Project {
+    let mut p = Project::new("bench-anim");
+    let a = asset(MediaKind::Video, 1920, 1080);
+    p.assets.push(a.clone());
+    for i in 1..10 {
+        p.sequence_mut().tracks.insert(i, Track::new(TrackKind::Video, format!("V{}", i + 1)));
+    }
+    for i in 0..10 {
+        let mut c = Clip::new(a.id, "c", TimeRange::new(Time::ZERO, Time::from_secs(60)), Time::ZERO);
+        for param in AnimParam::ALL {
+            // Scale starts at 0.3 (not its default 1.0): a full-frame opaque layer would cull the nine below it.
+            let base = if param == AnimParam::Scale { 0.3 } else { param.default_value() };
+            for (k, s) in [0i64, 30, 60].iter().enumerate() {
+                c.animation.set_key(param, SourceTime(Time::from_secs(*s)), base + k as f64 * 0.1, None);
+            }
+        }
+        p.sequence_mut().tracks[i].clips.push(c);
+    }
+    p
+}
+
+/// Mean cost of one `evaluate` over batches of 100 calls sweeping 60 s of frames.
+fn sample(p: &Project) -> Stats {
     let seq = p.sequence();
     let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
     let fr = FrameRate::FPS_30;
@@ -56,15 +78,23 @@ pub fn run() -> Result<Report, String> {
         let started = Instant::now();
         for i in 0..100 {
             let t = fr.frame_to_time(((batch * 100 + i) % 1800) as i64);
-            std::hint::black_box(evaluate(&p, seq, t, &out));
+            std::hint::black_box(evaluate(p, seq, t, &out));
         }
         samples.push(started.elapsed() / 100);
     }
-    let s = Stats::of(samples);
+    Stats::of(samples)
+}
+
+pub fn run() -> Result<Report, String> {
     let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
     let mut r = Report::new("m1-scene");
+    let s = sample(&project());
     for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
         r.push("scene", "3 layers + transition", metric, us(v), "µs");
+    }
+    let s = sample(&animated_project());
+    for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
+        r.push("scene", "10 clips × 13 animated params", metric, us(v), "µs");
     }
     Ok(r)
 }
@@ -86,5 +116,19 @@ mod tests {
         let cut = at(30);
         assert_eq!(cut.layers.len(), 3);
         assert!(matches!(cut.layers[0].content, LayerContent::Transition(_)));
+    }
+
+    /// The animated row must really evaluate 10 live layers with animation, not cull them away.
+    #[test]
+    fn animated_bench_scene_keeps_ten_layers_at_every_sample() {
+        let p = animated_project();
+        let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
+        for s in [0, 10, 30, 45, 59] {
+            let scene = evaluate(&p, p.sequence(), Time::from_secs(s), &out);
+            assert_eq!(scene.layers.len(), 10, "t = {s} s");
+        }
+        let clips: Vec<_> = p.sequence().tracks.iter().flat_map(|t| &t.clips).collect();
+        assert_eq!(clips.len(), 10);
+        assert!(clips.iter().all(|c| c.animation.params().len() == 13));
     }
 }

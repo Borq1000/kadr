@@ -92,7 +92,7 @@ Sequence { id, name, frame_rate, width, height, sample_rate, tracks[], markers[]
 Track { id, kind: Video|Audio, name, muted, solo, locked, height, clips[] (отсортированы) }
 Clip  { id, asset, source_in, source_out, timeline_in, (timeline_out = in + dur/speed),
         link_group, speed, transform, color, audio: {gain_db, pan, fade_in, fade_out},
-        effects[], keyframes }
+        effects[], animation, video_fade }
 Transition { id, kind, duration, from_clip, to_clip }
 ```
 Исходные media никогда не модифицируются; clip только ссылается на `asset` и диапазон источника.
@@ -126,6 +126,7 @@ Timeline ──evaluate(t, OutputSpec)──► FrameScene ──► kadr-playba
 ```
 
 1. **Scene evaluation** (`kadr-timeline::scene`) — чистая функция: проект, последовательность, время → `FrameScene`: видеодорожки снизу вверх, каждая — слой (клип или переход) с размещением в пикселях холста, crop, прозрачностью, blend и цветокоррекцией; невидимое отбрасывается (`cull`), чтобы не декодировалось. `has_video_at` — тот же вопрос «есть ли видео под playhead» для UI. Аудио-часть — `timeline::composition::audio_segments`.
+   **Ключевые кадры и фейды клипа.** Анимация (`Clip::animation`, 13 параметров `AnimParam`: X, Y, масштаб, поворот, прозрачность, четыре обрезки, четыре цветовых) привязана к времени *источника* (`SourceTime`), поэтому trim, move, speed, slip и split её не переписывают; `clip_state_at` переводит время сцены в источниковое (`Clip::source_time_at`), вычисляет сегмент (целочисленные flicks, `f64` только в прогрессе сегмента `u` кривой) и подставляет анимированное значение вместо статического (статическое или анимированное, не оба). Фейд клипа (`Clip::video_fade`) привязан к *клипу*: `fade_at` даёт множитель `[0, 1]` по времени от краёв клипа (первый кадр фейд-ина и последний кадр фейд-аута полностью прозрачны), и итоговая прозрачность слоя равна `resolved_opacity × fade`. Значения нормализуются (clamp в допустимый диапазон, нефинитное → значение по умолчанию) на границе вычислителя, в `clip_state_at`, так что `kadr-scene`, `kadr-render` и `kadr-playback` получают обычный `FrameScene` с готовыми числами и не меняются.
 2. **Resolve** (`kadr-playback`) — `Resolver` превращает ссылки на media в декодированные кадры (FFmpeg `open_source`, стабильная нормализация частоты и цвета, кэш, пул буферов, read-ahead); `ProjectScenes` (`kadr-project-scenes`) — снимок проекта для него.
 3. **Render** (`kadr-render`) — `CpuRenderer` компонует слои в RGBA; качество `PreviewFast`/`PreviewHigh`/`Export` выбирает `OutputSpec`. Preview и экспорт дают один и тот же кадр при одном `OutputSpec`.
 4. **Output** — preview: кадр сразу в буфер дисплея (`apps/editor::preview_cpu`); экспорт: `kadr_playback::export` подаёт кадры в `FrameEncoder` (`kadr-media`), независимо от preview, параллельно монтажу.
