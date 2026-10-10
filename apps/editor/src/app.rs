@@ -95,6 +95,8 @@ pub struct App {
     pub ai: AiUi,
     pub export: ExportUi,
     pub inspector_snapshot: Option<(ClipId, Clip)>,
+    /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
+    pub inspector_refreshed: Option<Instant>,
     pub library_drag: Option<LibDrag>,
     pub mc: crate::multicam_ui::McState,
     pub waves: WaveCache,
@@ -200,6 +202,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         ai: AiUi::new(Assistant::new(ai_settings)),
         export: ExportUi::default(),
         inspector_snapshot: None,
+        inspector_refreshed: None,
         library_drag: None,
         mc: Default::default(),
         waves: WaveCache::default(),
@@ -420,6 +423,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_inspector_reset, |s| |app: &mut App| app.inspector_reset(&s));
     cb!(ui.on_inspector_marker, |i, a| |app: &mut App| app.marker_action(i as usize, &a));
     cb!(ui.on_inspector_sequence, |a| |app: &mut App| app.sequence_action(&a));
+    cb!(ui.on_inspector_key, |p, a| |app: &mut App| app.inspector_key(&p, &a));
 
     cb!(ui.on_ai_send, |t| |app: &mut App| app.ai_send(&t));
     cb!(ui.on_ai_plan_action, |i, a| |app: &mut App| app.ai_plan_action(i as usize, &a));

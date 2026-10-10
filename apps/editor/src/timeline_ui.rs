@@ -755,6 +755,20 @@ impl App {
         let dur = seq.duration();
         ui.set_duration_label(format!("/ {}", kadr_core::Timecode::from_time(dur, seq.frame_rate)).into());
         ui.set_scrub_fraction(if dur > Time::ZERO { (self.playhead.as_secs_f64() / dur.as_secs_f64()) as f32 } else { 0.0 });
+        // The inspector follows the playhead (keyframes spec §6.1): animated
+        // values and ◆ states ~10 Hz while playing, at once when paused or
+        // scrubbing; entering or leaving the clip (◆ enabled, hint) at once.
+        let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return };
+        let outside = crate::anim_ui::edit_time(c, self.playhead, seq.frame_rate.frame_duration()).is_none();
+        let crossed = ui.get_inspector().outside != outside;
+        if c.animation.is_empty() && !crossed {
+            return;
+        }
+        let due = crossed || !self.playing || self.inspector_refreshed.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
+        if due {
+            self.inspector_refreshed = Some(std::time::Instant::now());
+            self.refresh_inspector();
+        }
     }
 
     pub fn refresh_timeline(&mut self) {

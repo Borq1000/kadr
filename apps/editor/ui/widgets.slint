@@ -242,12 +242,26 @@ export component PropSlider inherits Rectangle {
     in property <int> decimals: 2;
     in property <bool> enabled: true;
     in property <float> display-scale: 1; // e.g. 100 to show 0..1 as percent
+    // Has keyframes: accent label and a dot in the margin left of it (the
+    // label keeps its full width).
+    in property <bool> animated;
     callback changed(float);
     callback committed(float);
+    // Right press on the slider or the value (window coordinates): the
+    // TouchAreas take it, so a surrounding ContextMenuArea never sees it.
+    callback menu-requested(length, length);
     property <bool> editing;
     height: 26px;
     property <float> t: (root.value - root.minimum) / (root.maximum - root.minimum);
     property <float> shown: root.value * root.display-scale;
+    if root.animated: Rectangle {
+        x: -9px;
+        y: (root.height - self.height) / 2;
+        width: 5px;
+        height: 5px;
+        border-radius: 2.5px;
+        background: Theme.accent;
+    }
     HorizontalLayout {
         spacing: 8px;
         Text {
@@ -255,7 +269,7 @@ export component PropSlider inherits Rectangle {
             text: root.label;
             vertical-alignment: center;
             font-size: Theme.font-sm;
-            color: root.enabled ? (root.value != root.default-value ? Theme.text : Theme.text-dim) : Theme.text-faint;
+            color: root.animated ? Theme.accent : root.enabled ? (root.value != root.default-value ? Theme.text : Theme.text-dim) : Theme.text-faint;
             overflow: elide;
         }
         track := Rectangle {
@@ -291,6 +305,7 @@ export component PropSlider inherits Rectangle {
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.changed(self.v); }
                     if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) { root.committed(self.v); }
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.menu-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y); }
                 }
                 moved => { if (self.pressed) { root.changed(self.v); } }
                 double-clicked => { root.changed(root.default-value); root.committed(root.default-value); }
@@ -312,6 +327,9 @@ export component PropSlider inherits Rectangle {
                     enabled: root.enabled;
                     mouse-cursor: text;
                     double-clicked => { root.editing = true; }
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.menu-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y); }
+                    }
                 }
             }
             if root.editing: le := LineEdit {
@@ -330,6 +348,47 @@ export component PropSlider inherits Rectangle {
                     reject
                 }
             }
+        }
+    }
+}
+
+// Keyframes of one property at the playhead. `state`: 0 not animated,
+// 1 animated without a keyframe here, 2 keyframe here. `ease`: curve of the
+// keyframe here ("" without one, "other" for a curve from a newer Kadr).
+export struct KeyState { state: int, prev: bool, next: bool, enabled: bool, ease: string }
+
+// ◀ ◆ ▶ next to an animatable property (keyframes spec §6.1).
+export component KeyNav inherits HorizontalLayout {
+    in property <KeyState> k;
+    callback nav(string); // "prev" | "toggle" | "next"
+    // Right press on an active button (window coordinates), see PropSlider.
+    callback menu-requested(length, length);
+    spacing: 0;
+    padding-left: 2px;
+    width: Theme.key-nav;
+    for b[i] in [{ g: "◀", a: "prev", tip: Tr.t("inspector.key.prev") }, { g: root.k.state == 2 ? "◆" : "◇", a: "toggle", tip: Tr.t("inspector.key.toggle") }, { g: "▶", a: "next", tip: Tr.t("inspector.key.next") }]: Rectangle {
+        property <bool> on: i == 0 ? root.k.prev : i == 2 ? root.k.next : root.k.enabled;
+        Text {
+            text: b.g;
+            font-size: i == 1 ? 13px : 9px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: !parent.on ? Theme.text-faint : (i == 1 && root.k.state > 0) ? Theme.accent : (bta.has-hover ? Theme.text : Theme.text-dim);
+        }
+        bta := TouchArea {
+            enabled: parent.on;
+            mouse-cursor: parent.on ? pointer : default;
+            clicked => { root.nav(b.a); }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.menu-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y); }
+            }
+        }
+        // Above and right-aligned: rows below are drawn later and the panel
+        // edge is to the right.
+        if bta.has-hover: Tooltip {
+            text: b.tip;
+            x: parent.width - self.width;
+            y: -self.height - 4px;
         }
     }
 }

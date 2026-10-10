@@ -1,6 +1,6 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip } from "widgets.slint";
+import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip, KeyState } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
 import { Preview, AngleView, DevRow } from "preview.slint";
 import { Timeline, TrackView, ClipView, ClipMark, TickView, MarkerView, TransitionView } from "timeline.slint";
@@ -8,7 +8,7 @@ import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { ShotRow, ClipMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -201,6 +201,7 @@ export component AppWindow inherits Window {
     callback inspector-reset(string);
     callback inspector-marker(int, string);
     callback inspector-sequence(string);
+    callback inspector-key(string, string);
     callback ai-send(string);
     callback ai-plan-action(int, string);
     callback ai-plan-toggle(int, int);
@@ -444,6 +445,7 @@ export component AppWindow inherits Window {
                     marker-action(i, a) => { root.inspector-marker(i, a); }
                     sequence-action(a) => { root.inspector-sequence(a); }
                     shot-clicked(i) => { root.inspector-shot(i); }
+                    key-action(p, a) => { root.inspector-key(p, a); root.focus-editor(); }
                 }
                 if root.ai-open: Splitter {
                     property <length> start;

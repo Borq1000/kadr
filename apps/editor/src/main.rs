@@ -4,6 +4,7 @@
 slint::include_modules!();
 
 mod ai_ui;
+mod anim_ui;
 mod app;
 mod app_settings;
 mod export_ui;

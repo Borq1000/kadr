@@ -1,6 +1,6 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon } from "widgets.slint";
+import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyNav, KeyState } from "widgets.slint";
 import { ScrollView, Switch } from "std-widgets.slint";
 
 export struct MarkerRow {
@@ -55,6 +55,15 @@ export struct InspectorData {
     // Jev shot grading of the inspected clip's media.
     shots: [ShotRow],
     shots-graded: bool,
+    // Keyframes at the playhead, indexed by `AnimParam::index()`.
+    keys: [KeyState],
+    // The playhead is off the inspected clip: animated values show its
+    // nearest edge and cannot be edited there.
+    outside: bool,
+    vfade-in: float,
+    vfade-out: float,
+    // Clip duration in seconds: fade-in + fade-out never exceed it.
+    fade-max: float,
 }
 
 component InfoRow inherits HorizontalLayout {
@@ -66,6 +75,74 @@ component InfoRow inherits HorizontalLayout {
     Text { text: root.value; font-size: Theme.font-sm; color: Theme.text; wrap: word-wrap; horizontal-stretch: 1; }
 }
 
+// An animatable property (keyframes spec §6.1): the slider, ◀ ◆ ▶ and a
+// right-click menu with the curve of the keyframe at the playhead and
+// "Reset property animation". Live/commit/key actions carry `prop`.
+component AnimRow inherits ContextMenuArea {
+    in property <string> prop;
+    in property <KeyState> k;
+    in property <bool> outside;
+    in property <string> label;
+    in property <float> value;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> default-value;
+    in property <float> display-scale: 1;
+    in property <int> decimals: 2;
+    in property <string> unit;
+    callback live(string, float);
+    callback commit(string, float);
+    callback key-action(string, string);
+    function menu-at(x: length, y: length) {
+        root.show({ x: x - root.absolute-position.x, y: y - root.absolute-position.y });
+    }
+    Menu {
+        Menu {
+            title: Tr.t("anim.ease");
+            for e in [
+                { key: "ease_in_out", title: Tr.t("anim.ease.ease_in_out") },
+                { key: "linear", title: Tr.t("anim.ease.linear") },
+                { key: "ease_in", title: Tr.t("anim.ease.ease_in") },
+                { key: "ease_out", title: Tr.t("anim.ease.ease_out") },
+                { key: "hold", title: Tr.t("anim.ease.hold") },
+            ]: MenuItem {
+                title: e.title;
+                enabled: root.k.state == 2;
+                checkable: true;
+                checked: root.k.ease == e.key;
+                activated => {
+                    if (root.k.ease != e.key) { root.key-action(root.prop, "ease:" + e.key); }
+                }
+            }
+            // A curve from a newer Kadr: shown, not editable until a known one is picked.
+            if root.k.ease == "other": MenuItem { title: Tr.t("anim.ease.other"); enabled: false; checkable: true; checked: true; }
+        }
+        MenuItem { title: Tr.t("anim.clear"); enabled: root.k.state > 0; activated => { root.key-action(root.prop, "clear"); } }
+    }
+    HorizontalLayout {
+        PropSlider {
+            label: root.label;
+            animated: root.k.state > 0;
+            enabled: !(root.outside && root.k.state > 0);
+            value: root.value;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            default-value: root.default-value;
+            display-scale: root.display-scale;
+            decimals: root.decimals;
+            unit: root.unit;
+            changed(v) => { root.live(root.prop, v); }
+            committed(v) => { root.commit(root.prop, v); }
+            menu-requested(x, y) => { root.menu-at(x, y); }
+        }
+        KeyNav {
+            k: root.k;
+            nav(a) => { root.key-action(root.prop, a); }
+            menu-requested(x, y) => { root.menu-at(x, y); }
+        }
+    }
+}
+
 export component Inspector inherits Rectangle {
     in property <InspectorData> d;
     callback live(string, float);
@@ -75,6 +152,7 @@ export component Inspector inherits Rectangle {
     callback marker-action(int, string);
     callback sequence-action(string);
     callback shot-clicked(int);
+    callback key-action(string /* prop */, string /* prev | toggle | next | clear | ease:<key> */);
     background: Theme.bg1;
 
     VerticalLayout {
@@ -150,21 +228,27 @@ export component Inspector inherits Rectangle {
                 }
 
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.transform"); resettable: true; reset => { root.reset("transform"); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.pos_x"); value: root.d.x; minimum: -1920; maximum: 1920; default-value: 0; decimals: 0; unit: " px"; changed(v) => { root.live("x", v); } committed(v) => { root.commit("x", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.pos_y"); value: root.d.y; minimum: -1080; maximum: 1080; default-value: 0; decimals: 0; unit: " px"; changed(v) => { root.live("y", v); } committed(v) => { root.commit("y", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.scale"); value: root.d.scale; minimum: 0.1; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("scale", v); } committed(v) => { root.commit("scale", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.rotation"); value: root.d.rotation; minimum: -180; maximum: 180; default-value: 0; decimals: 1; unit: "°"; changed(v) => { root.live("rotation", v); } committed(v) => { root.commit("rotation", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.opacity"); value: root.d.opacity; minimum: 0; maximum: 1; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("opacity", v); } committed(v) => { root.commit("opacity", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_l"); value: root.d.crop-l; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-l", v); } committed(v) => { root.commit("crop-l", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_r"); value: root.d.crop-r; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-r", v); } committed(v) => { root.commit("crop-r", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_t"); value: root.d.crop-t; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-t", v); } committed(v) => { root.commit("crop-t", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.crop_b"); value: root.d.crop-b; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("crop-b", v); } committed(v) => { root.commit("crop-b", v); } }
+                if root.d.has-video-props: AnimRow { prop: "x"; k: root.d.keys[0]; outside: root.d.outside; label: Tr.t("inspector.pos_x"); value: root.d.x; minimum: -1920; maximum: 1920; default-value: 0; decimals: 0; unit: " px"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "y"; k: root.d.keys[1]; outside: root.d.outside; label: Tr.t("inspector.pos_y"); value: root.d.y; minimum: -1080; maximum: 1080; default-value: 0; decimals: 0; unit: " px"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "scale"; k: root.d.keys[2]; outside: root.d.outside; label: Tr.t("inspector.scale"); value: root.d.scale; minimum: 0.1; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "rotation"; k: root.d.keys[3]; outside: root.d.outside; label: Tr.t("inspector.rotation"); value: root.d.rotation; minimum: -180; maximum: 180; default-value: 0; decimals: 1; unit: "°"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "opacity"; k: root.d.keys[4]; outside: root.d.outside; label: Tr.t("inspector.opacity"); value: root.d.opacity; minimum: 0; maximum: 1; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "crop-l"; k: root.d.keys[5]; outside: root.d.outside; label: Tr.t("inspector.crop_l"); value: root.d.crop-l; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "crop-r"; k: root.d.keys[6]; outside: root.d.outside; label: Tr.t("inspector.crop_r"); value: root.d.crop-r; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "crop-t"; k: root.d.keys[7]; outside: root.d.outside; label: Tr.t("inspector.crop_t"); value: root.d.crop-t; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "crop-b"; k: root.d.keys[8]; outside: root.d.outside; label: Tr.t("inspector.crop_b"); value: root.d.crop-b; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props && root.d.outside: Text { text: Tr.t("inspector.key.outside"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
 
                 SectionTitle { text: root.d.has-video-props ? Tr.t("inspector.video") : Tr.t("inspector.timing"); resettable: root.d.has-video-props; reset => { root.reset("color"); } }
-                PropSlider { label: Tr.t("inspector.speed"); value: root.d.speed; minimum: 0.25; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("speed", v); } committed(v) => { root.commit("speed", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.exposure"); value: root.d.exposure; minimum: -2; maximum: 2; default-value: 0; unit: " EV"; changed(v) => { root.live("exposure", v); } committed(v) => { root.commit("exposure", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.contrast"); value: root.d.contrast; minimum: 0.5; maximum: 2; default-value: 1; changed(v) => { root.live("contrast", v); } committed(v) => { root.commit("contrast", v); } }
-                if root.d.has-video-props: PropSlider { label: Tr.t("inspector.saturation"); value: root.d.saturation; minimum: 0; maximum: 2; default-value: 1; changed(v) => { root.live("saturation", v); } committed(v) => { root.commit("saturation", v); } }
+                // Video rows keep the ◀ ◆ ▶ column free so the values line up.
+                HorizontalLayout {
+                    padding-right: root.d.has-video-props ? Theme.key-nav : 0px;
+                    PropSlider { label: Tr.t("inspector.speed"); value: root.d.speed; minimum: 0.25; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("speed", v); } committed(v) => { root.commit("speed", v); } }
+                }
+                if root.d.has-video-props: AnimRow { prop: "exposure"; k: root.d.keys[9]; outside: root.d.outside; label: Tr.t("inspector.exposure"); value: root.d.exposure; minimum: -2; maximum: 2; default-value: 0; unit: " EV"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "contrast"; k: root.d.keys[10]; outside: root.d.outside; label: Tr.t("inspector.contrast"); value: root.d.contrast; minimum: 0.5; maximum: 2; default-value: 1; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+                if root.d.has-video-props: AnimRow { prop: "saturation"; k: root.d.keys[11]; outside: root.d.outside; label: Tr.t("inspector.saturation"); value: root.d.saturation; minimum: 0; maximum: 2; default-value: 1; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
+
                 if root.d.has-video-props: HorizontalLayout {
                     height: 26px;
                     Text { text: Tr.t("inspector.stabilization"); width: 92px; font-size: Theme.font-sm; color: Theme.text-faint; vertical-alignment: center; }
@@ -172,11 +256,22 @@ export component Inspector inherits Rectangle {
                     Switch { enabled: false; }
                 }
 
+                // Each fade is at most the clip minus the other fade (spec §6.1).
+                if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.fades"); }
+                if root.d.has-video-props: HorizontalLayout {
+                    padding-right: Theme.key-nav;
+                    PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.vfade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-out, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("vfade-in", v); } committed(v) => { root.commit("vfade-in", v); } }
+                }
+                if root.d.has-video-props: HorizontalLayout {
+                    padding-right: Theme.key-nav;
+                    PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.vfade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.vfade-in, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("vfade-out", v); } committed(v) => { root.commit("vfade-out", v); } }
+                }
+
                 if root.d.is-audio: SectionTitle { text: Tr.t("inspector.audio"); resettable: true; reset => { root.reset("audio"); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.gain"); value: root.d.gain; minimum: -40; maximum: 12; default-value: 0; decimals: 1; unit: " dB"; changed(v) => { root.live("gain", v); } committed(v) => { root.commit("gain", v); } }
                 if root.d.is-audio: PropSlider { label: Tr.t("inspector.pan"); value: root.d.pan; minimum: -1; maximum: 1; default-value: 0; changed(v) => { root.live("pan", v); } committed(v) => { root.commit("pan", v); } }
-                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
-                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: 5; default-value: 0; unit: " s"; changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_in"); value: root.d.fade-in; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-out, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("fade-in", v); } committed(v) => { root.commit("fade-in", v); } }
+                if root.d.is-audio: PropSlider { label: Tr.t("inspector.fade_out"); value: root.d.fade-out; minimum: 0; maximum: max(root.d.fade-max - root.d.fade-in, 0.01); default-value: 0; unit: " s"; changed(v) => { root.live("fade-out", v); } committed(v) => { root.commit("fade-out", v); } }
 
                 if root.d.shots.length > 0: SectionTitle { text: Tr.t("inspector.shots"); }
                 if root.d.shots.length > 0 && !root.d.shots-graded: Text { text: Tr.t("inspector.shots.ungraded"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
