@@ -93,8 +93,8 @@ fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
         if let Some(seqs) = value.get_mut("sequences").and_then(|s| s.as_array_mut()) {
             for clip in seqs
                 .iter_mut()
-                .flat_map(|s| s["tracks"].as_array_mut().into_iter().flatten())
-                .flat_map(|t| t["clips"].as_array_mut().into_iter().flatten())
+                .flat_map(|s| s.get_mut("tracks").and_then(serde_json::Value::as_array_mut).into_iter().flatten())
+                .flat_map(|t| t.get_mut("clips").and_then(serde_json::Value::as_array_mut).into_iter().flatten())
             {
                 migrate_clip_keyframes(clip);
             }
@@ -259,5 +259,17 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 2);
         let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
         assert!(matches!(parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err(), ProjectIoError::TooNew { .. }));
+    }
+
+    #[test]
+    fn malformed_pre_v2_structure_is_a_parse_error_not_a_panic() {
+        for json in [
+            r#"{"format_version":1,"sequences":[1]}"#,
+            r#"{"format_version":1,"sequences":[{"tracks":["x"]}]}"#,
+            r#"{"format_version":1,"sequences":[{"tracks":[{"clips":[7]}]}]}"#,
+        ] {
+            let r = parse(json.as_bytes(), Path::new("bad.kadr"));
+            assert!(matches!(r, Err(ProjectIoError::Parse { .. })), "{json}: {r:?}");
+        }
     }
 }
