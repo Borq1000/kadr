@@ -26,11 +26,13 @@ pub fn insert_sorted(track: &mut Track, clip: Clip) {
 pub fn trim_start(clip: &mut Clip, t: Time) {
     clip.source_in = clip.source_time_at(t);
     clip.timeline_in = t;
+    clip.clamp_fades(kadr_project::FadeEdge::In);
 }
 
 pub fn trim_end(clip: &mut Clip, t: Time) {
     clip.source_out = clip.source_time_at(t);
     clip.timeline_out = t;
+    clip.clamp_fades(kadr_project::FadeEdge::Out);
 }
 
 /// Splits at `t` (must be strictly inside). Left keeps the original id.
@@ -38,13 +40,16 @@ pub fn split_clip(clip: &Clip, t: Time, links: &mut LinkRemap) -> (Clip, Clip) {
     debug_assert!(clip.timeline_in < t && t < clip.timeline_out);
     let mut left = clip.clone();
     let mut right = clip.clone();
+    // Fades belong to the outer edges; zero the inner ones before trimming so
+    // the clamp sees the final values.
+    left.audio.fade_out = Time::ZERO;
+    left.video_fade.fade_out = Time::ZERO;
+    right.audio.fade_in = Time::ZERO;
+    right.video_fade.fade_in = Time::ZERO;
     trim_end(&mut left, t);
     trim_start(&mut right, t);
     right.id = ClipId::new();
     right.link = links.right_link(clip.link);
-    // Fades belong to the outer edges.
-    left.audio.fade_out = Time::ZERO;
-    right.audio.fade_in = Time::ZERO;
     (left, right)
 }
 

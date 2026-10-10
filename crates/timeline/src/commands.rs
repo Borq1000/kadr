@@ -307,6 +307,7 @@ impl EditCommand {
                             return Err(EditError::Overlap);
                         }
                         c.timeline_out = out;
+                        c.clamp_fades(kadr_project::FadeEdge::Out);
                     }
                 }
                 Ok(())
@@ -433,6 +434,9 @@ impl EditCommand {
                 let (asset, src) = crate::multicam::angle_source(group, *angle, c, ctx.assets)?;
                 let label = group.angles[*angle as usize].label.clone();
                 let c = &mut seq.tracks[ti].clips[ci];
+                // Keyframes are source-bound: follow the sync-offset difference.
+                let shift = src.start - c.source_in;
+                c.animation.shift_all(shift);
                 c.asset = asset;
                 c.source_in = src.start;
                 c.source_out = src.end;

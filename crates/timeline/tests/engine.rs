@@ -499,3 +499,14 @@ fn add_transition_far_from_any_cut_keeps_its_time() {
     }
     assert_eq!(transition_at(&p), vec![ms(10_100), s(30)]);
 }
+
+#[test]
+fn switch_angle_shifts_keyframes_by_the_sync_difference() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    let c = p.sequence_mut().tracks[0].clips.iter_mut().find(|c| c.id == clip).unwrap();
+    c.animation.set_key(AnimParam::Scale, SourceTime(s(12)), 2.0, None); // CAM1 source 12 s = group 12 s
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: None }).unwrap();
+    let c = p.sequence().clip(clip).unwrap();
+    assert_eq!(c.animation.times(), vec![SourceTime(s(10))], "group 12 s is CAM2 source 10 s");
+    assert_eq!(c.timeline_time_of(s(10)), s(2), "same place on the timeline");
+}
