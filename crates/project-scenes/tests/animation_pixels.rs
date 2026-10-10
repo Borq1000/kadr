@@ -48,7 +48,7 @@ fn animated_opacity_and_fade_reach_the_pixels() {
     assert!((half as i32 - 128).abs() <= 1, "halfway: {half}");
     assert_eq!(red_at(&p, ms(2_500)), 255, "opaque, before the fade-out");
     let mid_fade = red_at(&p, ms(3_500));
-    assert!((110..=130).contains(&mid_fade), "opacity 1 × fade (3.967 − 3.5) / 1 ≈ 0.47: {mid_fade}");
+    assert!((mid_fade as i32 - 119).abs() <= 1, "opacity 1 × fade (3.967 − 3.5) / 1 ≈ 0.467 of white: {mid_fade}");
     let last = Time::from_secs(4) - FrameRate::FPS_30.frame_duration();
     assert_eq!(red_at(&p, last), 0, "last frame of the fade-out is transparent");
 }

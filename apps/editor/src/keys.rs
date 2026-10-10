@@ -14,6 +14,21 @@ fn is(text: &str, k: Key) -> bool {
     text == s.as_str()
 }
 
+/// With Alt held: Alt+← / Alt+→ alone jump to the previous / next keyframe
+/// (`Some(forward)`). Not with Ctrl or Shift too — Ctrl+Alt is AltGr on
+/// many layouts, and those combinations stay free.
+fn keyframe_jump(text: &str, ctrl: bool, shift: bool) -> Option<bool> {
+    if ctrl || shift {
+        None
+    } else if is(text, Key::LeftArrow) {
+        Some(false)
+    } else if is(text, Key::RightArrow) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Shortcut reference shown in Settings → Keyboard (and on F1).
 pub fn shortcut_rows() -> Vec<ShortcutRow> {
     let g = |k: &str| ShortcutRow { keys: "".into(), action: t(k).into(), group: true };
@@ -89,8 +104,8 @@ impl App {
         // Alt release that activates a menu bar) only when the window has a
         // native menu, which Kadr's has not; arrows make no WM_SYSCHAR.
         if alt {
-            if is(text, Key::LeftArrow) || is(text, Key::RightArrow) {
-                self.jump_keyframe(is(text, Key::RightArrow));
+            if let Some(forward) = keyframe_jump(text, ctrl, shift) {
+                self.jump_keyframe(forward);
                 return true;
             }
             return false;
@@ -240,7 +255,18 @@ impl App {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::latin_key;
+    use super::{keyframe_jump, latin_key, Key};
+
+    #[test]
+    fn only_plain_alt_arrows_jump_keyframes() {
+        let (left, right): (slint::SharedString, slint::SharedString) = (Key::LeftArrow.into(), Key::RightArrow.into());
+        assert_eq!(keyframe_jump(&left, false, false), Some(false));
+        assert_eq!(keyframe_jump(&right, false, false), Some(true));
+        for (ctrl, shift) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(keyframe_jump(&right, ctrl, shift), None, "ctrl {ctrl} shift {shift}");
+        }
+        assert_eq!(keyframe_jump("a", false, false), None);
+    }
 
     #[test]
     fn shortcuts_work_on_the_russian_layout() {
