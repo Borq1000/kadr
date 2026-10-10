@@ -327,9 +327,7 @@ impl EditCommand {
                         if !(speed.is_finite() && (0.05..=20.0).contains(speed)) {
                             return Err(EditError::InvalidRange);
                         }
-                        let src = c.source_out - c.source_in;
-                        let dur = fr.snap(Time::from_secs_f64(src.as_secs_f64() / speed)).max(fr.frame_duration());
-                        let out = c.timeline_in + dur;
+                        let out = c.timeline_in + duration_at_speed(c.source_out - c.source_in, *speed, fr);
                         if next_in.is_some_and(|n| out > n) {
                             return Err(EditError::Overlap);
                         }
@@ -778,4 +776,10 @@ fn trim(seq: &mut Sequence, ctx: &EditContext, id: ClipId, edge: TrimEdge, to: T
         }
     }
     Ok(())
+}
+
+/// The length `ClipProperty::Speed` gives a clip showing `source` of its
+/// media at `speed`: whole sequence frames, at least one.
+pub fn duration_at_speed(source: Time, speed: f64, fr: kadr_core::FrameRate) -> Time {
+    fr.snap(Time::from_secs_f64(source.as_secs_f64() / speed)).max(fr.frame_duration())
 }

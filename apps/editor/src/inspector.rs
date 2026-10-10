@@ -5,11 +5,12 @@
 
 use crate::anim_ui;
 use crate::app::{App, Prompt};
-use crate::util::rgb;
+use crate::util::{fmt_secs, rgb};
 use crate::{InspectorData, KeyState, MarkerRow};
 use kadr_core::{ClipId, Time, Timecode};
 use kadr_i18n::{duration, t, tf, tn};
 use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, Sequence, SourceTime, TrackKind, Transform};
+use kadr_timeline::commands::duration_at_speed;
 use kadr_timeline::{ClipProperty, EditCommand};
 use slint::{Model, ModelRc, SharedString, VecModel};
 
@@ -98,6 +99,38 @@ fn property_for(prop: &str, c: &Clip) -> ClipProperty {
         "gain" | "pan" | "fade-in" | "fade-out" => ClipProperty::Audio(c.audio.clone()),
         "vfade-in" | "vfade-out" => ClipProperty::VideoFade(c.video_fade),
         _ => ClipProperty::Transform(c.transform.clone()),
+    }
+}
+
+/// What a fade slider's commit changes: the i18n key of the fade's name,
+/// the old and the new length; `None` for every other property.
+fn fade_change(prop: &str, before: &Clip, after: &Clip) -> Option<(&'static str, Time, Time)> {
+    Some(match prop {
+        "fade-in" => ("inspector.fade_in", before.audio.fade_in, after.audio.fade_in),
+        "fade-out" => ("inspector.fade_out", before.audio.fade_out, after.audio.fade_out),
+        "vfade-in" => ("inspector.fade_in", before.video_fade.fade_in, after.video_fade.fade_in),
+        "vfade-out" => ("inspector.fade_out", before.video_fade.fade_out, after.video_fade.fade_out),
+        _ => return None,
+    })
+}
+
+/// History label (with the property's `{name}`) of a keyframe action from
+/// `◆` or the row menu: each action says what it did.
+fn key_label(cmd: &EditCommand) -> &'static str {
+    match cmd {
+        EditCommand::RemoveKeyframe { .. } => "cmd.remove_keyframe_named",
+        EditCommand::ClearAnimation { .. } => "cmd.clear_animation_named",
+        EditCommand::SetKeyframeEase { .. } => "cmd.keyframe_ease_named",
+        _ => "cmd.keyframe_named",
+    }
+}
+
+/// History label of a section's "Reset" (sentence case, not the title).
+fn reset_label(section: &str) -> &'static str {
+    match section {
+        "transform" => "cmd.reset_transform",
+        "color" => "cmd.reset_color",
+        _ => "cmd.reset_audio",
     }
 }
 
@@ -283,14 +316,30 @@ impl App {
                 let set = EditCommand::SetKeyframe { clip: id, param: p, at, value: v as f64, ease: None };
                 EditCommand::Batch { label, commands: vec![set] }
             }
-            _ if prop == "speed" => EditCommand::SetClipProperty { clip: id, prop: ClipProperty::Speed(v as f64) },
+            _ if prop == "speed" => {
+                // The engine frame-snaps the new length: a speed that keeps it
+                // changes nothing, so no undo entry.
+                let speed = v as f64;
+                if speed > 0.0 && duration_at_speed(cur.source_out - cur.source_in, speed, seq.frame_rate) == cur.duration() {
+                    return self.show_rolled_back();
+                }
+                EditCommand::SetClipProperty { clip: id, prop: ClipProperty::Speed(speed) }
+            }
             _ => {
                 let mut c = cur.clone();
                 apply(&mut c, prop, v as f64, frame);
                 if c == *cur {
                     return self.show_rolled_back(); // nothing changed: no undo entry
                 }
-                EditCommand::SetClipProperty { clip: id, prop: property_for(prop, &c) }
+                let set = EditCommand::SetClipProperty { clip: id, prop: property_for(prop, &c) };
+                // A fade is labelled like the timeline handle's: «Появление: 0,5 с → 1 с».
+                match fade_change(prop, cur, &c) {
+                    Some((name, old, new)) => {
+                        let label = tf("cmd.fade_named", &[("name", &t(name)), ("from", &fmt_secs(old)), ("to", &fmt_secs(new))]);
+                        EditCommand::Batch { label, commands: vec![set] }
+                    }
+                    None => set,
+                }
             }
         };
         if !self.execute(cmd) {
@@ -354,7 +403,7 @@ impl App {
             }
             _ => return,
         };
-        let label = tf("cmd.keyframe_named", &[("name", &t(anim_ui::label_key(p)))]);
+        let label = tf(key_label(&cmd), &[("name", &t(anim_ui::label_key(p)))]);
         self.execute(EditCommand::Batch { label, commands: vec![cmd] });
     }
 
@@ -368,10 +417,10 @@ impl App {
             "color" => &AnimParam::ALL[9..],
             _ => &[],
         };
-        let (prop, unchanged, name) = match section {
-            "transform" => (ClipProperty::Transform(Transform::default()), c.transform == Transform::default(), "inspector.transform"),
-            "color" => (ClipProperty::Color(ColorAdjust::default()), c.color == ColorAdjust::default(), "inspector.video"),
-            _ => (ClipProperty::Audio(AudioProps::default()), c.audio == AudioProps::default(), "inspector.audio"),
+        let (prop, unchanged) = match section {
+            "transform" => (ClipProperty::Transform(Transform::default()), c.transform == Transform::default()),
+            "color" => (ClipProperty::Color(ColorAdjust::default()), c.color == ColorAdjust::default()),
+            _ => (ClipProperty::Audio(AudioProps::default()), c.audio == AudioProps::default()),
         };
         let animated: Vec<(AnimParam, f64)> = params.iter().filter(|p| c.animation.is_animated(**p)).map(|p| (*p, p.default_value())).collect();
         if unchanged && animated.is_empty() {
@@ -381,8 +430,7 @@ impl App {
         if !animated.is_empty() {
             commands.push(EditCommand::ClearAnimation { clip: id, statics: animated });
         }
-        let label = tf("cmd.reset_section", &[("name", &t(name))]);
-        if self.execute(EditCommand::Batch { label, commands }) {
+        if self.execute(EditCommand::Batch { label: t(reset_label(section)), commands }) {
             self.toast(t("toast.reset_done"));
         }
     }
@@ -491,6 +539,33 @@ mod tests {
         seq.tracks[0].clips.remove(0);
         assert!(!live.roll_back(&mut seq));
         assert!(!live.roll_back(&mut seq));
+    }
+
+    /// Each keyframe action names what it did in the history, and a section
+    /// reset has a sentence-case label, not its uppercase title.
+    #[test]
+    fn keyframe_actions_and_section_resets_have_their_own_labels() {
+        let (clip, param, at) = (ClipId::new(), AnimParam::Scale, SourceTime(Time::ZERO));
+        assert_eq!(key_label(&EditCommand::SetKeyframe { clip, param, at, value: 1.0, ease: None }), "cmd.keyframe_named");
+        assert_eq!(key_label(&EditCommand::RemoveKeyframe { clip, param, at, keep: None }), "cmd.remove_keyframe_named");
+        assert_eq!(key_label(&EditCommand::ClearAnimation { clip, statics: vec![] }), "cmd.clear_animation_named");
+        assert_eq!(key_label(&EditCommand::SetKeyframeEase { clip, param, at, ease: Ease::Linear }), "cmd.keyframe_ease_named");
+        assert_eq!(["transform", "color", "audio"].map(reset_label), ["cmd.reset_transform", "cmd.reset_color", "cmd.reset_audio"]);
+    }
+
+    /// A fade slider's commit is labelled with the fade's name and its old
+    /// and new length (whole frames, as applied), like the timeline handle.
+    #[test]
+    fn fade_slider_commits_know_the_old_and_new_length() {
+        let (seq, a, _) = seq_with_two_clips();
+        let frame = seq.frame_rate.frame_duration();
+        let before = seq.clip(a).unwrap().clone();
+        for (prop, name) in [("vfade-in", "inspector.fade_in"), ("vfade-out", "inspector.fade_out"), ("fade-in", "inspector.fade_in"), ("fade-out", "inspector.fade_out")] {
+            let mut after = before.clone();
+            apply(&mut after, prop, 0.51, frame);
+            assert_eq!(fade_change(prop, &before, &after), Some((name, Time::ZERO, frame.mul_ratio(15, 1))), "{prop}: 0.51 s → 15 frames");
+        }
+        assert_eq!(fade_change("opacity", &before, &before), None);
     }
 
     /// Rows a periodic refresh did not change keep their model: a new one

@@ -510,3 +510,14 @@ fn switch_angle_shifts_keyframes_by_the_sync_difference() {
     assert_eq!(c.animation.times(), vec![SourceTime(s(10))], "group 12 s is CAM2 source 10 s");
     assert_eq!(c.timeline_time_of(s(10)), s(2), "same place on the timeline");
 }
+
+/// The length a speed gives (shared by the engine and the inspector's
+/// no-change check): whole frames, at least one.
+#[test]
+fn duration_at_speed_is_whole_frames_and_at_least_one() {
+    use kadr_timeline::commands::duration_at_speed;
+    let fr = FrameRate::FPS_30;
+    assert_eq!(duration_at_speed(s(10), 2.0, fr), s(5));
+    assert_eq!(duration_at_speed(s(10), 1.00001, fr), s(10), "a hair faster keeps the length: no change");
+    assert_eq!(duration_at_speed(ms(10), 1.0, fr), fr.frame_duration());
+}
