@@ -15,10 +15,7 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 
 fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
     // Fade durations from a slider: seconds → whole frames (rounded).
-    let frames = |secs: f64| {
-        let f = frame.flicks().max(1);
-        Time((Time::from_secs_f64(secs.max(0.0)).flicks() + f / 2) / f * f)
-    };
+    let frames = |secs: f64| anim_ui::whole_frames(Time::from_secs_f64(secs.max(0.0)), frame);
     let t = &mut c.transform;
     match prop {
         "x" => t.x = v,

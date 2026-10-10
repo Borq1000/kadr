@@ -1099,7 +1099,7 @@ impl App {
         let seq = self.project.sequence();
         let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return };
         let times: Vec<Time> = anim_ui::visible_keys(c).into_iter().map(|(_, t)| t).collect();
-        if let Some(t) = anim_ui::visible_neighbour(&times, self.playhead, anim_ui::half_frame(seq), forward) {
+        if let Some(t) = anim_ui::visible_neighbour(&times, self.playhead, anim_ui::half_frame(seq.frame_rate.frame_duration()), forward) {
             self.stop_playback();
             self.set_playhead(t);
         }

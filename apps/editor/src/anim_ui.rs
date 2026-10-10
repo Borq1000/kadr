@@ -1,7 +1,7 @@
 //! Pure keyframe/fade UI logic shared by the inspector and the timeline.
 
 use kadr_core::{FrameRate, Time};
-use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, Sequence, SourceTime};
+use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, SourceTime};
 
 /// Inspector property names of the animatable rows (Temperature has no row).
 pub const PROPS: [(&str, AnimParam); 12] = [
@@ -42,9 +42,34 @@ pub fn label_key(p: AnimParam) -> &'static str {
     }
 }
 
-/// Tolerance of "at the playhead" (spec §5).
-pub fn half_frame(seq: &Sequence) -> Time {
-    Time(seq.frame_rate.frame_duration().flicks() / 2)
+/// Half a sequence `frame`: the tolerance of "at the playhead" (spec §5).
+pub fn half_frame(frame: Time) -> Time {
+    Time(frame.flicks() / 2)
+}
+
+/// `t` (≥ 0) in whole `frame`s, rounded to the nearest (half a frame up):
+/// fade lengths set in the inspector or by a timeline handle.
+pub fn whole_frames(t: Time, frame: Time) -> Time {
+    let f = frame.flicks().max(1);
+    Time((t.flicks() + f / 2) / f * f)
+}
+
+/// "The keyframe here" (spec §5): the keyframe moment of `p` (of any
+/// property when `None`) whose timeline time is nearest to `t` and strictly
+/// within half a `frame` of it — among the **visible** ones only. A key
+/// hidden past an edge of the clip never counts, even within half a frame
+/// of it (review focus 1): it is not on screen, and only MCP `source_ms`
+/// addresses it. The inspector and MCP `at_ms` share this rule.
+pub fn visible_key_near(c: &Clip, p: Option<AnimParam>, t: Time, frame: Time) -> Option<SourceTime> {
+    let half = half_frame(frame);
+    let params = p.map_or_else(|| c.animation.params(), |p| vec![p]);
+    params
+        .into_iter()
+        .flat_map(|q| c.animation.track(q).iter().map(|k| k.at))
+        .map(|at| (at, c.timeline_time_of(at.0)))
+        .filter(|(_, tl)| *tl >= c.timeline_in && *tl < c.timeline_out && (*tl - t).abs() < half)
+        .min_by_key(|(_, tl)| (*tl - t).abs())
+        .map(|(at, _)| at)
 }
 
 /// Where a keyframe may be set or changed: the playhead, only while it is
@@ -67,11 +92,11 @@ pub fn outside_hint(clip: &Clip, playhead: Time, frame: Time) -> bool {
     !clip.animation.is_empty() && edit_time(clip, playhead, frame).is_none()
 }
 
-/// The keyframe of `p` at the playhead (within half a frame, spec §5),
-/// only while the playhead is on the clip.
+/// The keyframe of `p` at the playhead (`visible_key_near`), only while
+/// the playhead is on the clip.
 pub fn key_here(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> Option<&Keyframe> {
     let t = edit_time(clip, playhead, frame)?;
-    let at = clip.key_near(p, t, Time(frame.flicks() / 2))?;
+    let at = visible_key_near(clip, Some(p), t, frame)?;
     clip.animation.track(p).iter().find(|k| k.at == at)
 }
 
@@ -94,7 +119,7 @@ pub fn key_info(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> KeyIn
     if !clip.animation.is_animated(p) {
         return KeyInfo { state: 0, prev: None, next: None };
     }
-    let half = Time(frame.flicks() / 2);
+    let half = half_frame(frame);
     let visible: Vec<Time> = clip
         .animation
         .track(p)
@@ -198,10 +223,7 @@ pub fn fade_drag_value(edge: FadeEdge, x: f64, x0: f64, x1: f64, pps: f64, frame
         FadeEdge::In => x - x0,
         FadeEdge::Out => x1 - x,
     };
-    let f = frame.flicks().max(1);
-    let raw = Time::from_secs_f64((px / pps).max(0.0));
-    let snapped = Time((raw.flicks() + f / 2) / f * f);
-    snapped.min((dur - other).max(Time::ZERO))
+    whole_frames(Time::from_secs_f64((px / pps).max(0.0)), frame).min((dur - other).max(Time::ZERO))
 }
 
 // --------------------------------------------------------------- diamonds
@@ -395,6 +417,51 @@ mod tests {
         assert!(key_here(&c, AnimParam::X, Time::from_secs(12) + F, F).is_none(), "a frame away is not here");
         assert!(key_here(&c, AnimParam::X, Time::from_secs(5), F).is_none(), "a hidden keyframe is never here");
         assert_eq!(key_here(&c, AnimParam::Y, Time::from_secs(14), F).map(|k| ease_key(&k.ease)), Some("other"));
+    }
+
+    /// Review focus 1: a key hidden less than half a frame past an edge of
+    /// the clip is never "the keyframe here" — not in the inspector (◆, the
+    /// slider would edit it) and not for MCP `at_ms`.
+    #[test]
+    fn a_hidden_key_within_half_a_frame_of_an_edge_is_not_here() {
+        let mut c = clip(); // timeline 10..20 s = source 0..10 s
+        let third = Time(F.flicks() / 3);
+        c.animation.set_key(AnimParam::X, SourceTime(Time::ZERO - third), 1.0, None); // just before timeline_in
+        c.animation.set_key(AnimParam::X, SourceTime(Time::from_secs(5)), 2.0, None);
+        c.animation.set_key(AnimParam::Y, SourceTime(Time::from_secs(10)), 1.0, None); // at timeline_out: hidden
+        let (tin, last) = (Time::from_secs(10), Time::from_secs(20) - third);
+        assert!(key_here(&c, AnimParam::X, tin, F).is_none());
+        assert_eq!(key_info(&c, AnimParam::X, tin, F).state, 1, "animated, no keyframe here");
+        assert!(key_here(&c, AnimParam::Y, last, F).is_none());
+        assert_eq!(visible_key_near(&c, None, tin, F), None);
+        assert_eq!(visible_key_near(&c, None, last, F), None);
+        assert_eq!(visible_key_near(&c, None, Time::from_secs(15) + third, F), Some(SourceTime(Time::from_secs(5))), "a visible one is");
+    }
+
+    /// The distance is timeline time (a 2× clip halves source distances),
+    /// strictly inside half a frame; `None` looks at every property.
+    #[test]
+    fn the_key_near_is_measured_on_the_timeline_strictly_within_half_a_frame() {
+        let mut c = clip();
+        c.source_out = Time::from_secs(20); // 2×: timeline 10..20 s = source 0..20 s
+        c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(4)), 1.0, None); // timeline 12 s
+        let half = half_frame(F);
+        assert_eq!(half, Time(F.flicks() / 2));
+        let at = |t: Time, p| visible_key_near(&c, p, t, F);
+        assert_eq!(at(Time::from_secs(12) + half - Time(1), Some(AnimParam::Scale)), Some(SourceTime(Time::from_secs(4))));
+        assert_eq!(at(Time::from_secs(12) - half + Time(1), None), Some(SourceTime(Time::from_secs(4))));
+        assert_eq!(at(Time::from_secs(12) + half, Some(AnimParam::Scale)), None, "exactly half a frame away is not near");
+        assert_eq!(at(Time::from_secs(12), Some(AnimParam::X)), None, "another property");
+    }
+
+    /// Fade lengths are whole frames, rounded to the nearest (ties up).
+    #[test]
+    fn whole_frames_rounds_to_the_nearest_frame() {
+        assert_eq!(whole_frames(Time::ZERO, F), Time::ZERO);
+        assert_eq!(whole_frames(Time(F.flicks() / 2 - 1), F), Time::ZERO);
+        assert_eq!(whole_frames(Time(F.flicks() / 2), F), F, "half a frame rounds up");
+        assert_eq!(whole_frames(Time::from_millis(510), F), F.mul_ratio(15, 1));
+        assert_eq!(whole_frames(Time::from_secs(1), Time::ZERO), Time::from_secs(1), "a zero frame never divides by zero");
     }
 
     #[test]

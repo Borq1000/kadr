@@ -6,6 +6,7 @@
 //! before the call, so a later op in the same batch does not see keyframes
 //! an earlier one created.
 
+use crate::anim_ui;
 use kadr_core::{ClipId, Time};
 use kadr_mcp_bridge::BridgeError;
 use kadr_project::{AnimParam, Clip, EdgeFades, Ease, Project, Sequence, SourceTime, TrackKind};
@@ -67,10 +68,6 @@ fn ease(op: &Value) -> Result<Option<Ease>, BridgeError> {
     }
 }
 
-fn half(seq: &Sequence) -> Time {
-    Time(seq.frame_rate.frame_duration().flicks() / 2)
-}
-
 fn outside(c: &Clip, ms: i64) -> BridgeError {
     bad(format!("{ms} ms is outside the clip ({}..{} ms); use source_ms for hidden keyframes", c.timeline_in.as_millis(), c.timeline_out.as_millis()))
 }
@@ -110,9 +107,11 @@ fn new_time(seq: &Sequence, c: &Clip, op: &Value, at: &str, src: &str) -> Result
 /// given time and strictly within half a frame of it, if any. A client
 /// echoing millisecond-rounded times (29.97 fps frames are not whole
 /// milliseconds) or addressing an off-frame key still hits it. With `at_ms`
-/// only keys inside the clip count (hidden ones are `source_ms` business).
+/// only keys inside the clip count — the inspector's "keyframe here" rule
+/// (`anim_ui::visible_key_near`); hidden ones are `source_ms` business.
 fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<Option<SourceTime>, BridgeError> {
-    let h = half(seq);
+    let frame = seq.frame_rate.frame_duration();
+    let h = anim_ui::half_frame(frame);
     Ok(match when(op, at, src)? {
         When::Timeline(ms) => {
             // The raw time, not the snapped one: a visible key in the clip's last half frame
@@ -121,14 +120,7 @@ fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, sr
             if t < c.timeline_in - h || t >= c.timeline_out + h {
                 return Err(outside(c, ms));
             }
-            let params = p.map_or_else(|| c.animation.params(), |p| vec![p]);
-            params
-                .into_iter()
-                .flat_map(|q| c.animation.track(q).iter().map(|k| k.at))
-                .map(|a| (a, c.timeline_time_of(a.0)))
-                .filter(|(_, tl)| *tl >= c.timeline_in && *tl < c.timeline_out && (*tl - t).abs() < h)
-                .min_by_key(|(_, tl)| (*tl - t).abs())
-                .map(|(a, _)| a)
+            anim_ui::visible_key_near(c, p, t, frame)
         }
         When::Source(ms) => {
             let s = Time::from_millis(ms);

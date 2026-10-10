@@ -250,17 +250,6 @@ impl Clip {
             .unwrap_or_else(|| p.read(&self.transform, &self.color))
     }
 
-    /// The keyframe of `p` shown within `tol` (exclusive) of timeline `t`, nearest first.
-    pub fn key_near(&self, p: crate::AnimParam, t: Time, tol: Time) -> Option<crate::SourceTime> {
-        self.animation
-            .track(p)
-            .iter()
-            .map(|k| (k.at, (self.timeline_time_of(k.at.0) - t).abs()))
-            .filter(|(_, d)| *d < tol)
-            .min_by_key(|(_, d)| *d)
-            .map(|(at, _)| at)
-    }
-
     /// Re-establishes `fade_in + fade_out ≤ duration` for picture and sound.
     pub fn clamp_fades(&mut self, first: crate::FadeEdge) {
         let d = self.duration();
@@ -412,16 +401,6 @@ mod animation_clip_tests {
         c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(10)), 1.0, Some(crate::Ease::Linear));
         c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(14)), 2.0, None);
         assert_eq!(c.anim_value(AnimParam::Scale, Time::from_secs(1)), 1.5, "timeline 1 s = source 12 s");
-    }
-
-    #[test]
-    fn key_near_uses_timeline_distance_strictly_inside_the_tolerance() {
-        let mut c = clip_2x();
-        c.animation.set_key(AnimParam::X, SourceTime(Time::from_secs(14)), 1.0, None); // timeline 2 s
-        let half = Time::from_millis(16);
-        assert_eq!(c.key_near(AnimParam::X, Time::from_millis(2_010), half), Some(SourceTime(Time::from_secs(14))));
-        assert_eq!(c.key_near(AnimParam::X, Time::from_millis(2_016), half), None);
-        assert_eq!(c.key_near(AnimParam::Y, Time::from_secs(2), half), None);
     }
 
     #[test]
