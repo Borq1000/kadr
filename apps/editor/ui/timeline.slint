@@ -35,15 +35,6 @@ export struct KeyMark {
     cluster: bool,
 }
 
-/// A curve in the keyframe menu. Rust sets a new list on every right press
-/// on a diamond: activating a checkable item overwrites its `checked`
-/// binding, so items are never reused from an earlier opening.
-export struct EaseItem {
-    key: string,
-    title: string,
-    checked: bool,
-}
-
 export struct ClipView {
     id: string,
     x: length,
@@ -378,10 +369,11 @@ export component Timeline inherits Rectangle {
     in property <length> tip-x;
     in property <length> tip-y;
     // Which menu a right press in the lanes opens: 0 the clip menu, 1 the
-    // keyframe menu (a diamond). Rust sets it, and `key-eases`, in the
-    // `lane-pointer` call that precedes the menu's `show`.
+    // keyframe menu (a diamond). Rust sets it, and `key-ease` (the curve
+    // every property of that moment shares, "" when they differ, "other" for
+    // one from a newer Kadr), in the `lane-pointer` call before the `show`.
     in property <int> menu-kind;
-    in property <[EaseItem]> key-eases;
+    in property <string> key-ease;
     out property <length> lanes-width: lanes.width;
     out property <length> lanes-height: lanes.height;
     out property <length> lanes-abs-x: lanes.absolute-position.x;
@@ -607,17 +599,26 @@ export component Timeline inherits Rectangle {
                         y: 0;
                         width: 0;
                         height: 0;
+                        // As the inspector's curve menu. Slint builds a ContextMenuArea's
+                        // items anew on every `show`, so a pick never leaves a stale ✓.
                         Menu {
                             Menu {
                                 title: Tr.t("anim.ease");
-                                for e in root.key-eases: MenuItem {
+                                for e in [
+                                    { key: "ease_in_out", title: Tr.t("anim.ease.ease_in_out") },
+                                    { key: "linear", title: Tr.t("anim.ease.linear") },
+                                    { key: "ease_in", title: Tr.t("anim.ease.ease_in") },
+                                    { key: "ease_out", title: Tr.t("anim.ease.ease_out") },
+                                    { key: "hold", title: Tr.t("anim.ease.hold") },
+                                ]: MenuItem {
                                     title: e.title;
-                                    // A curve from a newer Kadr: shown, not editable.
-                                    enabled: e.key != "other";
                                     checkable: true;
-                                    checked: e.checked;
+                                    checked: root.key-ease == e.key;
+                                    // Rust changes only the keyframes whose curve differs (none: no command).
                                     activated => { root.context-action("key-ease:" + e.key); }
                                 }
+                                // A curve from a newer Kadr that all of them share: shown, not editable.
+                                if root.key-ease == "other": MenuItem { title: Tr.t("anim.ease.other"); enabled: false; checkable: true; checked: true; }
                             }
                             MenuItem { title: Tr.t("tl.key.delete"); activated => { root.context-action("key-delete"); } }
                         }

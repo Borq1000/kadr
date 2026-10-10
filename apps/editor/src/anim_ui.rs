@@ -221,18 +221,17 @@ pub const KEY_STRIP_H: f64 = 14.0;
 pub const KEY_CY: f64 = KEY_STRIP_H / 2.0;
 
 /// Render-only clusters of sorted diamond positions: (x of the first
-/// member, `true` when it stands for more than one moment). Each distance
-/// is measured from the previous key, so a dense run draws as one diamond;
-/// the moments themselves are never merged.
+/// member, `true` when it stands for more than one moment). A cluster is
+/// anchored at its first member: a key less than `CLUSTER_PX` right of the
+/// anchor joins it, the next one starts a new mark — so a dense run shows a
+/// diamond every ≥ `CLUSTER_PX` (R21). The moments are never merged.
 pub fn key_marks(xs: &[f64]) -> Vec<(f64, bool)> {
     let mut out: Vec<(f64, bool)> = vec![];
-    let mut last = f64::NEG_INFINITY;
     for &x in xs {
         match out.last_mut() {
-            Some(m) if x - last < CLUSTER_PX => m.1 = true,
+            Some(m) if x - m.0 < CLUSTER_PX => m.1 = true,
             _ => out.push((x, false)),
         }
-        last = x;
     }
     out
 }
@@ -540,6 +539,15 @@ mod tests {
     fn marks_cluster_only_for_drawing() {
         assert_eq!(key_marks(&[10.0, 13.0, 30.0, 35.9, 50.0]), vec![(10.0, true), (30.0, true), (50.0, false)]);
         assert_eq!(key_marks(&[10.0, 17.0]), vec![(10.0, false), (17.0, false)], "6 px apart or more: separate");
+    }
+
+    /// R21: a cluster is anchored at its first member, so a dense run of
+    /// keyframes shows a diamond every ≥ CLUSTER_PX instead of one at its start.
+    #[test]
+    fn a_dense_run_shows_a_diamond_every_cluster_width() {
+        let run: Vec<f64> = (0..=10).map(|i| i as f64 * 2.0).collect(); // every 2 px over 20 px
+        assert_eq!(key_marks(&run), vec![(0.0, true), (6.0, true), (12.0, true), (18.0, true)]);
+        assert_eq!(key_marks(&[0.0, 2.0, 6.0]), vec![(0.0, true), (6.0, false)], "measured from the anchor, not the previous key");
     }
 
     /// A click on a cluster picks the nearest *real* moment, never the group.

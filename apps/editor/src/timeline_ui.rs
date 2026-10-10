@@ -5,7 +5,7 @@
 use crate::anim_ui;
 use crate::app::App;
 use crate::util::{fmt_ruler, fmt_secs, rgb};
-use crate::{ClipMark, ClipView, EaseItem, KeyMark, MarkerView, TickView, TrackView, TransitionView};
+use crate::{ClipMark, ClipView, KeyMark, MarkerView, TickView, TrackView, TransitionView};
 use kadr_core::{ClipId, LinkId, MediaKind, Time, TimeRange, TrackId};
 use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, Sequence, SourceTime, TrackKind, Transition, TransitionKind};
 use kadr_timeline::snap::{snap, snap_move, snap_points};
@@ -313,7 +313,9 @@ impl App {
                     _ => None,
                 };
                 if let Some((id, at)) = self.tl.menu_key {
-                    self.set_key_menu(id, at);
+                    // The curve the menu checks: shared by every property there.
+                    let ease = self.project.sequence().clip(id).map_or("", |c| anim_ui::moment_ease(c, at));
+                    self.ui().set_tl_key_ease(ease.into());
                 }
                 self.ui().set_tl_menu_kind(self.tl.menu_key.is_some() as i32);
                 if let Hit::Clip { id, .. } | Hit::Fade { id, .. } | Hit::Key { id, .. } = hit
@@ -568,32 +570,6 @@ impl App {
         if !recorded && rolled_back {
             self.show_rolled_back();
         }
-    }
-
-    /// The keyframe menu's curves for the moment `at` of `clip`: the one
-    /// every property there shares is checked. A new list for every opening
-    /// (see `EaseItem` in timeline.slint).
-    fn set_key_menu(&self, clip: ClipId, at: SourceTime) {
-        let Some(c) = self.project.sequence().clip(clip) else { return };
-        let current = anim_ui::moment_ease(c, at);
-        let title = |e: &Ease| match e {
-            Ease::EaseInOut => t("anim.ease.ease_in_out"),
-            Ease::Linear => t("anim.ease.linear"),
-            Ease::EaseIn => t("anim.ease.ease_in"),
-            Ease::EaseOut => t("anim.ease.ease_out"),
-            Ease::Hold => t("anim.ease.hold"),
-            Ease::Unknown(_) => t("anim.ease.other"),
-        };
-        let item = |e: &Ease| {
-            let key = anim_ui::ease_key(e);
-            EaseItem { key: key.into(), title: title(e).into(), checked: key == current }
-        };
-        let mut items: Vec<EaseItem> = Ease::KNOWN.iter().map(item).collect();
-        // A curve from a newer Kadr that all of them share: shown, not editable.
-        if current == "other" {
-            items.push(item(&Ease::Unknown(Default::default())));
-        }
-        self.ui().set_tl_key_eases(ModelRc::new(VecModel::from(items)));
     }
 
     /// The keyframe menu (spec §6.2): `key-ease:<key>` sets the curve of the

@@ -3,12 +3,12 @@ import { Tr } from "i18n.slint";
 import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip, KeyState } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
 import { Preview, AngleView, DevRow } from "preview.slint";
-import { Timeline, TrackView, ClipView, ClipMark, KeyMark, EaseItem, TickView, MarkerView, TransitionView } from "timeline.slint";
+import { Timeline, TrackView, ClipView, ClipMark, KeyMark, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, KeyMark, EaseItem, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -117,9 +117,9 @@ export component AppWindow inherits Window {
     in property <string> tl-tip-text;
     in property <length> tl-tip-x;
     in property <length> tl-tip-y;
-    // Right press in the lanes: 0 the clip menu, 1 the keyframe menu (and its curves).
+    // Right press in the lanes: 0 the clip menu, 1 the keyframe menu (and the curve it checks).
     in property <int> tl-menu-kind;
-    in property <[EaseItem]> tl-key-eases;
+    in property <string> tl-key-ease;
     out property <length> lanes-width: tl.lanes-width;
     out property <length> lanes-height: tl.lanes-height;
     out property <length> lanes-abs-x: tl.lanes-abs-x;
@@ -535,7 +535,7 @@ export component AppWindow inherits Window {
                 tip-x: root.tl-tip-x;
                 tip-y: root.tl-tip-y;
                 menu-kind: root.tl-menu-kind;
-                key-eases: root.tl-key-eases;
+                key-ease: root.tl-key-ease;
                 lane-pointer(k, x, y, b, s, c, a) => { root.tl-pointer(k, x, y, b, s, c, a); }
                 scroll(dx, dy, c, s) => { root.tl-scroll(dx, dy, c, s); }
                 ruler(k, x) => { root.tl-ruler(k, x); }
