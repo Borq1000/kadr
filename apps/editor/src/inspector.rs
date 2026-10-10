@@ -244,7 +244,7 @@ impl App {
             d.fade_in = c.audio.fade_in.as_secs_f64() as f32;
             d.fade_out = c.audio.fade_out.as_secs_f64() as f32;
             d.enabled = c.enabled;
-            let fx: Vec<SharedString> = c.effects.iter().map(|e| SharedString::from(e.kind.as_str())).collect();
+            let fx: Vec<SharedString> = c.effects.iter().map(|e| SharedString::from(e.recipe.as_str())).collect();
             d.effects = same_or_new(shown.effects, fx);
             if !is_audio {
                 let (rows, graded) = self.inspector_shots(c);

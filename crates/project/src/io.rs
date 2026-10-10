@@ -87,24 +87,61 @@ pub fn parse(bytes: &[u8], path: &Path) -> Result<Project, ProjectIoError> {
 
 /// Upgrades older JSON layouts in place. Format 1 is the first release;
 /// format 2 replaced the never-evaluated string-keyed `keyframes` with
-/// source-bound `animation` (keyframes spec section 2.2).
+/// source-bound `animation` (keyframes spec §2.2); format 3 replaced the
+/// never-evaluated `effects` with `AppliedEffect`s (effects spec §2).
+/// Transitions keep their `kind` in format 3: stage E3 converts a
+/// transition that has `kind` and no `recipe` by content, in this same
+/// function, without another format bump.
 fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
     if from < 2 {
-        if let Some(seqs) = value.get_mut("sequences").and_then(|s| s.as_array_mut()) {
-            for clip in seqs
-                .iter_mut()
-                .flat_map(|s| s.get_mut("tracks").and_then(serde_json::Value::as_array_mut).into_iter().flatten())
-                .flat_map(|t| t.get_mut("clips").and_then(serde_json::Value::as_array_mut).into_iter().flatten())
-            {
-                migrate_clip_keyframes(clip);
-            }
-        }
-        // The upgraded document is a format-2 document in memory too.
+        for_each_clip(&mut value, migrate_clip_keyframes);
+    }
+    if from < 3 {
+        for_each_clip(&mut value, migrate_clip_effects);
+        // The upgraded document is a format-3 document in memory too.
         if let Some(obj) = value.as_object_mut() {
-            obj.insert("format_version".into(), 2.into());
+            obj.insert("format_version".into(), 3.into());
         }
     }
     value
+}
+
+/// Every clip object of every sequence; malformed levels are skipped
+/// (the parse after the migration reports them).
+fn for_each_clip(value: &mut serde_json::Value, mut f: impl FnMut(&mut serde_json::Value)) {
+    use serde_json::Value;
+    let Some(seqs) = value.get_mut("sequences").and_then(Value::as_array_mut) else { return };
+    for clip in seqs
+        .iter_mut()
+        .flat_map(|s| s.get_mut("tracks").and_then(Value::as_array_mut).into_iter().flatten())
+        .flat_map(|t| t.get_mut("clips").and_then(Value::as_array_mut).into_iter().flatten())
+    {
+        f(clip);
+    }
+}
+
+/// Format 2 → 3: `effects: [{id, kind, enabled, params: {name: number}}]`
+/// becomes `AppliedEffect`s — `recipe = kind`, numbers become
+/// `{"number": v}`, version 1, full progress. An unknown `kind` is an
+/// unknown recipe (kept, not run); an entry that is not an object stays as
+/// it is and the lenient loader drops it.
+fn migrate_clip_effects(clip: &mut serde_json::Value) {
+    use serde_json::{json, Value};
+    let Some(list) = clip.get_mut("effects").and_then(Value::as_array_mut) else { return };
+    for e in list.iter_mut() {
+        let Some(o) = e.as_object_mut() else { continue };
+        if let Some(kind) = o.remove("kind") {
+            o.entry("recipe").or_insert(kind);
+        }
+        if let Some(params) = o.get_mut("params").and_then(Value::as_object_mut) {
+            for v in params.values_mut() {
+                if v.is_number() {
+                    *v = json!({ "number": v.clone() });
+                }
+            }
+        }
+        o.entry("version").or_insert(json!(1));
+    }
 }
 
 fn migrate_clip_keyframes(clip: &mut serde_json::Value) {
@@ -274,10 +311,63 @@ mod tests {
     }
 
     #[test]
-    fn a_format_2_file_is_too_new_for_a_format_1_reader() {
-        assert_eq!(FORMAT_VERSION, 2);
+    fn a_format_3_file_is_too_new_for_a_format_2_reader() {
+        assert_eq!(FORMAT_VERSION, 3);
         let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
         assert!(matches!(parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err(), ProjectIoError::TooNew { .. }));
+    }
+
+    /// Format 2 clip JSON with the old, never-evaluated effects list.
+    fn v2_project() -> serde_json::Value {
+        let p = crate::Project::new("old");
+        let mut v = serde_json::to_value(&p).unwrap();
+        v["format_version"] = serde_json::json!(2);
+        let f = |s: i64| s * kadr_core::FLICKS_PER_SECOND;
+        let clip = serde_json::json!({
+            "id": kadr_core::ClipId::new(), "asset": kadr_core::AssetId::new(), "name": "c",
+            "source_in": 0, "source_out": f(10), "timeline_in": 0, "timeline_out": f(10),
+            "effects": [
+                {"id": kadr_core::EffectId::new(), "kind": "blur", "enabled": false, "params": {"radius": 4.5}},
+                {"id": kadr_core::EffectId::new(), "kind": "smooth_zoom", "enabled": true, "params": {"strength": 1}}
+            ]
+        });
+        v["sequences"][0]["tracks"][0]["clips"] = serde_json::json!([clip]);
+        v
+    }
+
+    #[test]
+    fn format_2_effects_migrate_to_applied_effects() {
+        let p = parse(&serde_json::to_vec(&v2_project()).unwrap(), Path::new("old.kadr")).unwrap();
+        let fx = &p.sequence().tracks[0].clips[0].effects;
+        assert_eq!(fx.len(), 2);
+        assert_eq!((fx[0].recipe.as_str(), fx[0].enabled, fx[0].version, fx[0].progress), ("blur", false, 1, (0.0, 1.0)), "an unknown kind is an unknown recipe: kept");
+        assert_eq!(fx[0].params["radius"], crate::ParamValue::Number(4.5));
+        assert_eq!(fx[1].params["strength"], crate::ParamValue::Number(1.0));
+        let saved = serde_json::to_value(&p).unwrap();
+        assert!(saved["sequences"][0]["tracks"][0]["clips"][0]["effects"][0].get("kind").is_none(), "the old field is never written");
+        assert_eq!(saved["format_version"], serde_json::json!(3));
+    }
+
+    /// The E3 hook: format 3 keeps transitions as they are (E3 converts a
+    /// transition with `kind` and no `recipe` by content, no new format).
+    #[test]
+    fn transitions_keep_their_kind_in_format_3() {
+        let mut v = v2_project();
+        let track = v["sequences"][0]["tracks"][0]["id"].clone();
+        v["sequences"][0]["transitions"] = serde_json::json!([{"id": kadr_core::TransitionId::new(), "kind": "dip_to_black", "track": track, "at": 0, "duration": 100}]);
+        let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap();
+        assert_eq!(p.sequence().transitions[0].kind, crate::TransitionKind::DipToBlack);
+    }
+
+    /// R25: a garbage old effects list never panics the migration.
+    #[test]
+    fn malformed_format_2_effects_never_panic() {
+        for effects in [r#""x""#, "[7]", r#"[{"kind": 5}]"#, r#"[{"id": "nope", "kind": "a"}]"#, r#"[{"kind": "a", "params": [1]}]"#, "null"] {
+            let json = format!(r#"{{"format_version":2,"sequences":[{{"tracks":[{{"clips":[{{"effects":{effects}}}]}}]}}]}}"#);
+            let r = parse(json.as_bytes(), Path::new("bad.kadr"));
+            // The rest of this skeleton is not a project: a parse error, never a panic.
+            assert!(matches!(r, Err(ProjectIoError::Parse { .. })), "{effects}: {r:?}");
+        }
     }
 
     #[test]

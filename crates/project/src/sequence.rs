@@ -1,13 +1,9 @@
 //! Sequence / track / clip model. Everything here is plain data; the edit
 //! rules (ripple, overlap resolution, undo) live in `kadr-timeline`.
 
-use kadr_core::{
-    AssetId, ClipId, EffectId, FrameRate, LinkId, MarkerId, SequenceId, Time, TimeRange, TrackId,
-    TransitionId,
-};
-use crate::{Animation, EdgeFades};
+use kadr_core::{AssetId, ClipId, FrameRate, LinkId, MarkerId, SequenceId, Time, TimeRange, TrackId, TransitionId};
+use crate::{Animation, AppliedEffect, EdgeFades};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sequence {
@@ -164,8 +160,9 @@ pub struct Clip {
     pub color: ColorAdjust,
     #[serde(default)]
     pub audio: AudioProps,
-    #[serde(default)]
-    pub effects: Vec<Effect>,
+    /// Applied effects in order of application (effects spec §2).
+    #[serde(default, deserialize_with = "crate::effects::deserialize_effects")]
+    pub effects: Vec<AppliedEffect>,
     /// Source-bound keyframe tracks (keyframes spec §2).
     #[serde(default, skip_serializing_if = "Animation::is_stored_empty")]
     pub animation: Animation,
@@ -327,15 +324,6 @@ impl Default for AudioProps {
     fn default() -> Self {
         AudioProps { gain_db: 0.0, pan: 0.0, fade_in: Time::ZERO, fade_out: Time::ZERO }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Effect {
-    pub id: EffectId,
-    /// Registry key, e.g. "blur", "stabilize".
-    pub kind: String,
-    pub enabled: bool,
-    pub params: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
