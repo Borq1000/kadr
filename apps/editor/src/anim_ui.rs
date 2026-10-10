@@ -123,6 +123,9 @@ pub const FADE_R: f64 = 6.0;
 pub const HANDLE_INSET: f64 = 12.0;
 /// The clip's top strip (its 2 px margin + the 16 px name bar) where handles are hit.
 pub const HEADER_H: f64 = 18.0;
+/// Centre of a drawn handle below the top of the clip's rectangle (which
+/// starts 2 px into its row): the middle of the 16 px name bar.
+pub const HANDLE_Y: f64 = 8.0;
 /// Narrower clips show no handles (trimming and moving keep the room).
 pub const FADE_MIN_W: f64 = 40.0;
 
@@ -153,16 +156,36 @@ pub fn shown_handles(width: f64, active: bool, fi: Time, fo: Time) -> (bool, boo
     (active || fi > Time::ZERO, active || fo > Time::ZERO)
 }
 
+/// What a press on a clip's handles grabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleHit {
+    Edge(FadeEdge),
+    /// Two handles on (nearly) one spot — e.g. fades that fill the clip:
+    /// the first movement picks the one it shortens (`edge_for_move`).
+    Both,
+}
+
 /// The shown handle at `x`: the nearest within `FADE_R`; a hidden one is
-/// never picked. Where both sit on one spot (a fade filling the clip) the
-/// longer fade wins — the other one cannot grow, so picking it would leave
-/// the handle stuck.
-pub fn pick_handle(x: f64, x0: f64, x1: f64, fi_px: f64, fo_px: f64, (show_in, show_out): (bool, bool)) -> Option<FadeEdge> {
-    let dist = |shown: bool, fade_px, edge| if shown { (x - handle_x(x0, x1, fade_px, edge)).abs() } else { f64::INFINITY };
-    let d_in = dist(show_in, fi_px, FadeEdge::In);
-    let d_out = dist(show_out, fo_px, FadeEdge::Out);
-    let edge = if d_in < d_out || (d_in == d_out && fi_px >= fo_px) { FadeEdge::In } else { FadeEdge::Out };
-    (d_in.min(d_out) <= FADE_R).then_some(edge)
+/// never picked. Handles closer than `FADE_R` to each other overlap on
+/// screen, so a press near both is `Both`.
+pub fn pick_handle(x: f64, x0: f64, x1: f64, fi_px: f64, fo_px: f64, (show_in, show_out): (bool, bool)) -> Option<HandleHit> {
+    let (h_in, h_out) = (handle_x(x0, x1, fi_px, FadeEdge::In), handle_x(x0, x1, fo_px, FadeEdge::Out));
+    let near_in = show_in && (x - h_in).abs() <= FADE_R;
+    let near_out = show_out && (x - h_out).abs() <= FADE_R;
+    match (near_in, near_out) {
+        (true, true) if (h_out - h_in).abs() <= FADE_R => Some(HandleHit::Both),
+        (true, true) => Some(HandleHit::Edge(if (x - h_in).abs() <= (x - h_out).abs() { FadeEdge::In } else { FadeEdge::Out })),
+        (true, false) => Some(HandleHit::Edge(FadeEdge::In)),
+        (false, true) => Some(HandleHit::Edge(FadeEdge::Out)),
+        (false, false) => None,
+    }
+}
+
+/// For `HandleHit::Both`: the handle a first movement by `dx` px drags —
+/// the one it shortens (left: the fade-in, right: the fade-out), so either
+/// fade can be shortened from a shared spot, which separates the handles.
+pub fn edge_for_move(dx: f64) -> FadeEdge {
+    if dx < 0.0 { FadeEdge::In } else { FadeEdge::Out }
 }
 
 /// The fade a handle dragged to `x` sets: whole frames, in `[0, dur − other]`.
@@ -301,23 +324,53 @@ mod tests {
         assert_eq!(grab, 0.0, "a handle on its boundary is grabbed as it is");
     }
 
-    /// The handle under the pointer: the nearest within `FADE_R`; where both
-    /// sit on one spot (a fade filling the clip) the one that can move.
+    /// The handle under the pointer: the nearest within `FADE_R`; two
+    /// handles on (nearly) one spot are `Both` (the drag direction picks).
     #[test]
-    fn the_nearest_handle_is_picked_and_a_full_fade_stays_movable() {
+    fn the_nearest_handle_is_picked_and_overlapping_ones_wait_for_the_drag() {
         use kadr_project::FadeEdge;
         const BOTH: (bool, bool) = (true, true);
-        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 0.0, BOTH), Some(FadeEdge::In));
-        assert_eq!(pick_handle(106.0, 100.0, 300.0, 0.0, 0.0, BOTH), Some(FadeEdge::In), "the grab zone is 2·FADE_R wide");
+        let one = |e| Some(HandleHit::Edge(e));
+        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 0.0, BOTH), one(FadeEdge::In));
+        assert_eq!(pick_handle(106.0, 100.0, 300.0, 0.0, 0.0, BOTH), one(FadeEdge::In), "the grab zone is 2·FADE_R wide");
         assert_eq!(pick_handle(105.0, 100.0, 300.0, 0.0, 0.0, BOTH), None, "the clip edge belongs to trimming");
-        assert_eq!(pick_handle(288.0, 100.0, 300.0, 0.0, 0.0, BOTH), Some(FadeEdge::Out));
+        assert_eq!(pick_handle(288.0, 100.0, 300.0, 0.0, 0.0, BOTH), one(FadeEdge::Out));
         assert_eq!(pick_handle(200.0, 100.0, 300.0, 0.0, 0.0, BOTH), None);
-        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0, BOTH), Some(FadeEdge::Out), "fade-out fills the clip");
-        assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0, BOTH), Some(FadeEdge::In), "fade-in fills the clip");
+        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0, BOTH), Some(HandleHit::Both), "fade-out fills the clip");
+        assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0, BOTH), Some(HandleHit::Both), "fade-in fills the clip");
         // The narrowest clip with handles: both zones apart, the middle moves the clip.
-        assert_eq!(pick_handle(118.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0, BOTH), Some(FadeEdge::In));
+        assert_eq!(pick_handle(118.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0, BOTH), one(FadeEdge::In));
         assert_eq!(pick_handle(120.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0, BOTH), None);
-        assert_eq!(pick_handle(122.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0, BOTH), Some(FadeEdge::Out));
+        assert_eq!(pick_handle(122.0, 100.0, 100.0 + FADE_MIN_W, 0.0, 0.0, BOTH), one(FadeEdge::Out));
+        // Handles 4 px apart overlap: `Both` where the pointer is near both,
+        // the near one outside that.
+        assert_eq!(pick_handle(150.0, 100.0, 300.0, 48.0, 148.0, BOTH), Some(HandleHit::Both));
+        assert_eq!(pick_handle(143.0, 100.0, 300.0, 48.0, 148.0, BOTH), one(FadeEdge::In));
+        assert_eq!(pick_handle(157.0, 100.0, 300.0, 48.0, 148.0, BOTH), one(FadeEdge::Out));
+        // Handles further apart than FADE_R: the nearest, even between them.
+        assert_eq!(pick_handle(154.0, 100.0, 300.0, 50.0, 140.0, BOTH), one(FadeEdge::In));
+        assert_eq!(pick_handle(156.0, 100.0, 300.0, 50.0, 140.0, BOTH), one(FadeEdge::Out));
+    }
+
+    /// Meeting handles (fade_in + fade_out = duration): moving left
+    /// shortens the fade-in, moving right the fade-out — either fade can be
+    /// shortened from the spot, which separates the handles.
+    #[test]
+    fn meeting_handles_are_told_apart_by_the_first_movement() {
+        use kadr_project::FadeEdge;
+        let (x0, x1, pps, dur) = (100.0, 300.0, 100.0, Time::from_secs(2));
+        let (fi, fo) = (F.mul_ratio(36, 1), F.mul_ratio(24, 1)); // 1.2 s + 0.8 s
+        let px = |t: Time| t.as_secs_f64() * pps;
+        let spot = handle_x(x0, x1, px(fi), FadeEdge::In);
+        assert_eq!(spot, handle_x(x0, x1, px(fo), FadeEdge::Out));
+        assert_eq!(pick_handle(spot, x0, x1, px(fi), px(fo), (true, true)), Some(HandleHit::Both));
+        assert_eq!(edge_for_move(-4.0), FadeEdge::In);
+        assert_eq!(edge_for_move(4.0), FadeEdge::Out);
+        // Each grabbed at the spot and moved 10 px its way gets 10 px (0.1 s) shorter.
+        let grab_in = spot - fade_edge_x(x0, x1, px(fi), FadeEdge::In);
+        assert_eq!(fade_drag_value(FadeEdge::In, spot - 10.0 - grab_in, x0, x1, pps, F, fo, dur), F.mul_ratio(33, 1));
+        let grab_out = spot - fade_edge_x(x0, x1, px(fo), FadeEdge::Out);
+        assert_eq!(fade_drag_value(FadeEdge::Out, spot + 10.0 - grab_out, x0, x1, pps, F, fi, dur), F.mul_ratio(21, 1));
     }
 
     /// R18 (spec §6.2 per fade): a handle whose own fade is set always
@@ -341,10 +394,10 @@ mod tests {
         use kadr_project::FadeEdge;
         let out_only = (false, true);
         assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 50.0, out_only), None, "the zero fade-in's spot");
-        assert_eq!(pick_handle(250.0, 100.0, 300.0, 0.0, 50.0, out_only), Some(FadeEdge::Out));
-        // A fade-out filling the clip sits where the hidden fade-in would.
-        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0, out_only), Some(FadeEdge::Out));
+        assert_eq!(pick_handle(250.0, 100.0, 300.0, 0.0, 50.0, out_only), Some(HandleHit::Edge(FadeEdge::Out)));
+        // A fade-out filling the clip sits where the hidden fade-in would: no tie.
+        assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 200.0, out_only), Some(HandleHit::Edge(FadeEdge::Out)));
         assert_eq!(pick_handle(112.0, 100.0, 300.0, 0.0, 0.0, (false, false)), None);
-        assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0, (true, false)), Some(FadeEdge::In));
+        assert_eq!(pick_handle(288.0, 100.0, 300.0, 200.0, 0.0, (true, false)), Some(HandleHit::Edge(FadeEdge::In)));
     }
 }

@@ -49,9 +49,13 @@ export struct ClipView {
     fade-in: length,
     fade-out: length,
     // Fade handles (Rust decides): each with its own fade, both while the
-    // clip is hovered or selected; never on narrow or locked clips.
+    // clip is hovered or selected; never on narrow or locked clips. Centres
+    // in the clip's coordinates, the same spots Rust hit-tests.
     show-fade-in-handle: bool,
     show-fade-out-handle: bool,
+    fade-in-handle-x: length,
+    fade-out-handle-x: length,
+    fade-handle-y: length,
     offline: bool,
     marks: [ClipMark],
 }
@@ -255,11 +259,11 @@ component ClipRect inherits Rectangle {
         border-width: root.cv.selected ? 2px : 1px;
         border-color: root.cv.selected ? Theme.selection : #00000055;
     }
-    // Fade handles over the name bar, on the fade boundary but at least 12 px
-    // (anim_ui::HANDLE_INSET) inside the clip; Rust hit-tests the same spots.
+    // Fade handles over the name bar, centred where Rust places (and
+    // hit-tests) them; 10 px circles.
     if root.cv.show-fade-in-handle: Rectangle {
-        x: clamp(root.cv.fade-in, 12px, parent.width - 12px) - 5px;
-        y: 3px;
+        x: root.cv.fade-in-handle-x - 5px;
+        y: root.cv.fade-handle-y - 5px;
         width: 10px;
         height: 10px;
         border-radius: 5px;
@@ -268,8 +272,8 @@ component ClipRect inherits Rectangle {
         border-color: #00000080;
     }
     if root.cv.show-fade-out-handle: Rectangle {
-        x: clamp(parent.width - root.cv.fade-out, 12px, parent.width - 12px) - 5px;
-        y: 3px;
+        x: root.cv.fade-out-handle-x - 5px;
+        y: root.cv.fade-handle-y - 5px;
         width: 10px;
         height: 10px;
         border-radius: 5px;

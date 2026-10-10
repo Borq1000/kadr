@@ -122,10 +122,11 @@ impl App {
         } else if is(text, Key::Delete) || is(text, Key::Backspace) {
             self.delete_selection(shift || self.tl.ripple);
         } else if is(text, Key::Escape) {
-            // Esc first cancels a timeline drag in progress (a fade handle's
-            // live value goes back), then closes the topmost overlay, then
-            // clears the selection.
-            if self.tl_cancel_drag() {
+            // No drag is cancelled by Esc in V1 (spec §6.2): during a timeline
+            // drag Esc does nothing — the drag ends on release as usual and
+            // the selection stays. Otherwise Esc closes the topmost overlay
+            // first, then clears the selection.
+            if self.tl.drag.is_some() {
                 return true;
             }
             let ui = self.ui();

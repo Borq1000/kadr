@@ -7,7 +7,6 @@
   "unit.gb": "{v} GB",
   "unit.mb": "{v} MB",
   "unit.kb": "{v} KB",
-  "unit.sec": "{v} s",
   "unit.sec_symbol": "s",
   "time.just_now": "just now",
   "time.min_ago.one": "{n} minute ago",

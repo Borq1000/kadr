@@ -70,9 +70,17 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
-/// A duration in seconds with two decimals, in the UI language ("0.50 s").
+/// A duration in seconds in the UI language: "0.5 s", «0,5 с», "1 s".
 pub fn fmt_secs(d: kadr_core::Time) -> String {
-    tf("unit.sec", &[("v", &format!("{:.2}", d.as_secs_f64()))])
+    tf("dur.s", &[("s", &short_decimal(d.as_secs_f64(), kadr_i18n::lang()))])
+}
+
+/// `v` with at most two decimals and no trailing zeros, with `lang`'s
+/// decimal separator (as `kadr_i18n::duration`): 0.5 / 0,5, 1, 2.25.
+fn short_decimal(v: f64, lang: kadr_i18n::Lang) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if lang == kadr_i18n::Lang::Ru { s.replace('.', ",") } else { s.to_string() }
 }
 
 /// Local timezone offset in minutes (east positive).
@@ -272,6 +280,21 @@ pub fn civil(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seconds in labels: at most two decimals, no trailing zeros, the
+    /// language's decimal separator (R13) — «0,5 с → 1 с».
+    #[test]
+    fn seconds_are_short_and_use_the_language_separator() {
+        use kadr_i18n::Lang;
+        assert_eq!(short_decimal(0.5, Lang::Ru), "0,5");
+        assert_eq!(short_decimal(1.0, Lang::Ru), "1");
+        assert_eq!(short_decimal(0.5, Lang::En), "0.5");
+        assert_eq!(short_decimal(2.25, Lang::En), "2.25");
+        assert_eq!(short_decimal(10.0, Lang::En), "10");
+        assert_eq!(short_decimal(0.0, Lang::Ru), "0");
+        assert_eq!(short_decimal(1.0 / 30.0, Lang::En), "0.03", "one frame at 30 fps");
+        assert_eq!(short_decimal(0.999, Lang::En), "1");
+    }
 
     #[test]
     fn ruler_labels() {

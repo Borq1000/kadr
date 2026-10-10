@@ -33,10 +33,13 @@ pub enum Drag {
 #[derive(Clone, Copy)]
 pub struct FadeDrag {
     clip: ClipId,
-    edge: FadeEdge,
+    /// `None` while two overlapping handles wait for the first movement
+    /// (`anim_ui::edge_for_move`).
+    edge: Option<FadeEdge>,
     is_audio: bool,
     start_x: f64,
-    /// Pointer − fade boundary at the press, px: grabbing never makes the fade jump.
+    /// Press − fade boundary, px, taken when the drag starts: grabbing
+    /// never makes the fade jump.
     grab: f64,
     started: bool,
     value: Time,
@@ -149,7 +152,8 @@ pub fn rows(seq: &Sequence, scroll_y: f64) -> Vec<Row> {
 
 enum Hit {
     Clip { id: ClipId, edge: Option<TrimEdge> },
-    Fade { id: ClipId, edge: FadeEdge },
+    /// `edge: None` — two overlapping handles; the drag direction picks.
+    Fade { id: ClipId, edge: Option<FadeEdge> },
     Empty,
 }
 
@@ -187,8 +191,10 @@ impl App {
             let fades = clip_fades(c, track.kind == TrackKind::Audio);
             let shown = self.tl.fade_handles(c.id, self.tl.selection.contains(&c.id), track.locked, x1 - x0, fades);
             let px = |f: Time| f.as_secs_f64() * self.tl.pps;
-            if let Some(edge) = anim_ui::pick_handle(x, x0, x1, px(fades.0), px(fades.1), shown) {
-                return Hit::Fade { id: c.id, edge };
+            match anim_ui::pick_handle(x, x0, x1, px(fades.0), px(fades.1), shown) {
+                Some(anim_ui::HandleHit::Edge(edge)) => return Hit::Fade { id: c.id, edge: Some(edge) },
+                Some(anim_ui::HandleHit::Both) => return Hit::Fade { id: c.id, edge: None },
+                None => {}
             }
         }
         let tol = Time::from_secs_f64(TRIM_ZONE / self.tl.pps);
@@ -265,7 +271,7 @@ impl App {
             1 => self.pointer_move(x, y),
             2 if button == 0 => self.pointer_up(),
             3 => {
-                if let Hit::Clip { .. } = self.hit(x, y) {
+                if let Hit::Clip { .. } | Hit::Fade { .. } = self.hit(x, y) {
                     let t = self.x_to_time(x);
                     self.set_playhead(t);
                 }
@@ -302,23 +308,23 @@ impl App {
         ui.set_tl_tip_y(y as f32);
     }
 
-    fn start_fade_drag(&mut self, id: ClipId, edge: FadeEdge, x: f64, y: f64) {
+    /// A press on a handle (`edge: None` — two overlapping ones, picked by
+    /// the first movement). Nothing changes before the drag threshold.
+    fn start_fade_drag(&mut self, id: ClipId, edge: Option<FadeEdge>, x: f64, y: f64) {
         let seq = self.project.sequence();
         let Some((ti, ci)) = seq.locate_clip(id) else { return };
         let is_audio = seq.tracks[ti].kind == TrackKind::Audio;
-        let c = &seq.tracks[ti].clips[ci];
-        let (fi, fo) = clip_fades(c, is_audio);
-        let value = if edge == FadeEdge::In { fi } else { fo };
-        let (x0, x1) = (self.time_to_x(c.timeline_in), self.time_to_x(c.timeline_out));
-        let grab = x - anim_ui::fade_edge_x(x0, x1, value.as_secs_f64() * self.tl.pps, edge);
-        self.tl.drag = Some(Drag::Fade(FadeDrag { clip: id, edge, is_audio, start_x: x, grab, started: false, value }));
-        self.show_fade_tip(edge, value, x, y);
+        let (fi, fo) = clip_fades(&seq.tracks[ti].clips[ci], is_audio);
+        let value = if edge == Some(FadeEdge::In) { fi } else { fo };
+        self.tl.drag = Some(Drag::Fade(FadeDrag { clip: id, edge, is_audio, start_x: x, grab: 0.0, started: false, value }));
+        if let Some(edge) = edge {
+            self.show_fade_tip(edge, value, x, y);
+        }
     }
 
     /// A fade-handle drag step: the new value goes live into the clip
     /// (preview, inspector and timeline follow); history is untouched.
     fn drag_fade(&mut self, mut d: FadeDrag, x: f64, y: f64) {
-        d.started |= (x - d.start_x).abs() > DRAG_THRESHOLD;
         let seq = self.project.sequence();
         let Some((ti, ci)) = seq.locate_clip(d.clip) else {
             // The clip is gone (an undo or an AI edit removed it): the drag ends.
@@ -327,20 +333,32 @@ impl App {
         };
         let c = &seq.tracks[ti].clips[ci];
         let (fi, fo) = clip_fades(c, d.is_audio);
-        let (now, other) = if d.edge == FadeEdge::In { (fi, fo) } else { (fo, fi) };
+        let (x0, x1) = (self.time_to_x(c.timeline_in), self.time_to_x(c.timeline_out));
+        if !d.started && (x - d.start_x).abs() > DRAG_THRESHOLD {
+            // Past the threshold: overlapping handles are told apart by the
+            // direction, and the fade boundary follows the pointer from here.
+            let edge = *d.edge.get_or_insert(anim_ui::edge_for_move(x - d.start_x));
+            let fade = if edge == FadeEdge::In { fi } else { fo };
+            d.grab = d.start_x - anim_ui::fade_edge_x(x0, x1, fade.as_secs_f64() * self.tl.pps, edge);
+            d.started = true;
+        }
+        let Some(edge) = d.edge else {
+            self.tl.drag = Some(Drag::Fade(d)); // overlapping handles, not moved yet
+            return;
+        };
+        let (now, other) = if edge == FadeEdge::In { (fi, fo) } else { (fo, fi) };
         d.value = if d.started {
-            let (x0, x1) = (self.time_to_x(c.timeline_in), self.time_to_x(c.timeline_out));
-            anim_ui::fade_drag_value(d.edge, x - d.grab, x0, x1, self.tl.pps, seq.frame_rate.frame_duration(), other, c.duration())
+            anim_ui::fade_drag_value(edge, x - d.grab, x0, x1, self.tl.pps, seq.frame_rate.frame_duration(), other, c.duration())
         } else {
             now // within the threshold: the fade stays as it is
         };
         self.tl.drag = Some(Drag::Fade(d));
-        self.show_fade_tip(d.edge, d.value, x, y);
+        self.show_fade_tip(edge, d.value, x, y);
         if d.value == now {
             return;
         }
         self.live_edit.arm(self.project.sequence_mut(), d.clip);
-        *fade_slot(&mut self.project.sequence_mut().tracks[ti].clips[ci], d.is_audio, d.edge) = d.value;
+        *fade_slot(&mut self.project.sequence_mut().tracks[ti].clips[ci], d.is_audio, edge) = d.value;
         if !d.is_audio {
             self.preview.invalidate();
             self.request_frame();
@@ -355,7 +373,8 @@ impl App {
     fn commit_fade(&mut self, FadeDrag { clip, edge, is_audio, started, value, .. }: FadeDrag) {
         self.ui().set_tl_tip_text("".into());
         let rolled_back = self.live_edit.roll_back(self.project.sequence_mut());
-        let cmd = self.project.sequence().clip(clip).filter(|_| started).and_then(|c| {
+        let cmd = edge.filter(|_| started).and_then(|edge| {
+            let c = self.project.sequence().clip(clip)?;
             let (fi, fo) = clip_fades(c, is_audio);
             let (old, other) = if edge == FadeEdge::In { (fi, fo) } else { (fo, fi) };
             // Measured against the recorded clip, which an edit during the
@@ -382,29 +401,17 @@ impl App {
         }
     }
 
-    /// Esc during a timeline drag: it ends with no change — a fade's live
-    /// value is rolled back, a move or trim is dropped. `false` when no drag.
-    pub fn tl_cancel_drag(&mut self) -> bool {
-        let Some(drag) = self.tl.drag.take() else { return false };
-        self.tl.snap_line = None;
-        if let Drag::Fade(_) = drag {
-            self.ui().set_tl_tip_text("".into());
-            if self.live_edit.roll_back(self.project.sequence_mut()) {
-                self.show_rolled_back();
-                return true;
-            }
-        }
-        self.refresh_timeline();
-        true
-    }
-
     fn pointer_down(&mut self, x: f64, y: f64, shift: bool, ctrl: bool) {
         // A press while a drag is still on: its release never reached us —
         // end it as released first, so its live state is recorded, not lost.
         if self.tl.drag.is_some() {
             self.pointer_up();
         }
-        let hit = self.hit(x, y);
+        let hit = match self.hit(x, y) {
+            // Ctrl/Shift-click edits the selection, as anywhere on the clip.
+            Hit::Fade { id, .. } if ctrl || shift => Hit::Clip { id, edge: None },
+            hit => hit,
+        };
         if self.tl.blade {
             if let Hit::Clip { id, .. } = hit {
                 let t = self.snap_time(self.x_to_time(x), &HashSet::new());
@@ -1082,6 +1089,7 @@ impl App {
                 let marks: Vec<ClipMark> = if is_audio { vec![] } else { self.clip_marks(c, width) };
                 let fades = clip_fades(c, is_audio);
                 let (show_in, show_out) = self.tl.fade_handles(c.id, sel.contains(&c.id), t.locked, width, fades);
+                let (fi_px, fo_px) = (fades.0.as_secs_f64() * self.tl.pps, fades.1.as_secs_f64() * self.tl.pps);
                 clips.push(ClipView {
                     id: c.id.to_string().into(),
                     x: x as f32,
@@ -1100,10 +1108,13 @@ impl App {
                     wave: wave.unwrap_or_default(),
                     wave_x: wave_x as f32,
                     wave_width: wave_w as f32,
-                    fade_in: (fades.0.as_secs_f64() * self.tl.pps) as f32,
-                    fade_out: (fades.1.as_secs_f64() * self.tl.pps) as f32,
+                    fade_in: fi_px as f32,
+                    fade_out: fo_px as f32,
                     show_fade_in_handle: show_in,
                     show_fade_out_handle: show_out,
+                    fade_in_handle_x: anim_ui::handle_x(0.0, width, fi_px, FadeEdge::In) as f32,
+                    fade_out_handle_x: anim_ui::handle_x(0.0, width, fo_px, FadeEdge::Out) as f32,
+                    fade_handle_y: anim_ui::HANDLE_Y as f32,
                     offline: rt.is_some_and(|r| r.status == crate::app::AssetStatus::Missing),
                     marks: ModelRc::new(VecModel::from(marks)),
                 });
