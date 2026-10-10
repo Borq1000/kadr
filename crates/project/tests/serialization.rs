@@ -33,12 +33,8 @@ fn sample_project(media_dir: &std::path::Path) -> Project {
     let mut clip = Clip::new(aid, "cam1", TimeRange::new(Time::from_secs(5), Time::from_secs(20)), Time::ZERO);
     clip.transform.scale = 1.25;
     clip.audio.gain_db = -3.0;
-    clip.keyframes.push(Keyframe {
-        property: "transform.opacity".into(),
-        time: Time::from_millis(500),
-        value: 0.5,
-        interpolation: Interpolation::EaseInOut,
-    });
+    clip.animation.set_key(AnimParam::Opacity, SourceTime(Time::from_millis(5_500)), 0.5, Some(Ease::EaseInOut));
+    clip.video_fade = EdgeFades { fade_in: Time::from_millis(500), fade_out: Time::ZERO };
     seq.tracks[0].clips.push(clip);
     seq.markers.push(Marker::new(Time::from_secs(3), "Song 2"));
     p.analysis.push(AnalysisResult {

@@ -5,6 +5,7 @@ use kadr_core::{
     AssetId, ClipId, EffectId, FrameRate, LinkId, MarkerId, SequenceId, Time, TimeRange, TrackId,
     TransitionId,
 };
+use crate::{Animation, EdgeFades};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -165,8 +166,12 @@ pub struct Clip {
     pub audio: AudioProps,
     #[serde(default)]
     pub effects: Vec<Effect>,
+    /// Source-bound keyframe tracks (keyframes spec §2).
+    #[serde(default, skip_serializing_if = "Animation::is_stored_empty")]
+    pub animation: Animation,
+    /// Clip-bound fades of the picture (audio uses `audio.fade_*`).
     #[serde(default)]
-    pub keyframes: Vec<Keyframe>,
+    pub video_fade: EdgeFades,
     /// Set when this clip is an angle of a multicam group; switching camera
     /// swaps `asset`/source range using the group's sync offsets.
     #[serde(default)]
@@ -196,7 +201,8 @@ impl Clip {
             color: ColorAdjust::default(),
             audio: AudioProps::default(),
             effects: vec![],
-            keyframes: vec![],
+            animation: Animation::default(),
+            video_fade: EdgeFades::default(),
             multicam: None,
         }
     }
@@ -314,24 +320,6 @@ pub struct Effect {
     pub kind: String,
     pub enabled: bool,
     pub params: BTreeMap<String, f64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Interpolation {
-    Linear,
-    Hold,
-    EaseInOut,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Keyframe {
-    /// Property path, e.g. "transform.scale", "audio.gain_db".
-    pub property: String,
-    /// Relative to the clip's timeline_in.
-    pub time: Time,
-    pub value: f64,
-    pub interpolation: Interpolation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
