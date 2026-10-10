@@ -6,8 +6,8 @@
 use crate::ops::{self, LinkRemap};
 use kadr_core::{AssetId, ClipId, MarkerId, MediaKind, Time, TimeRange, TrackId, TransitionId};
 use kadr_project::{
-    AudioProps, Clip, ColorAdjust, MediaAsset, Marker, Sequence, Track, TrackKind, Transform,
-    Transition,
+    AnimError, AnimParam, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, Sequence,
+    SourceTime, Track, TrackKind, Transform, Transition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -33,6 +33,8 @@ pub enum EditError {
     TrackNotEmpty,
     #[error("a sequence needs at least one video and one audio track")]
     LastTrack,
+    #[error("a keyframe already exists at that time")]
+    KeyframeCollision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,8 @@ pub enum ClipProperty {
     /// Playback speed factor (2.0 = twice as fast). Changes the clip's
     /// timeline length; fails if the new length would overlap the next clip.
     Speed(f64),
+    /// Video fade-in / fade-out durations (each >= 0, sum <= clip duration).
+    VideoFade(EdgeFades),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,6 +105,17 @@ pub enum EditCommand {
     /// Shows `angle` over `range` on the topmost video track that has a
     /// multicam clip at `range.start`, cutting at both edges (AI camera picks).
     SetAngleRange { range: TimeRange, angle: u32 },
+    /// Inserts or updates a keyframe (`ease: None` -> keep / inherit, spec §3.1).
+    SetKeyframe { clip: ClipId, param: AnimParam, at: SourceTime, value: f64, ease: Option<Ease> },
+    /// Removes a keyframe; if it was the property's last, the static value
+    /// becomes `keep` (the value at the playhead) or the removed value.
+    RemoveKeyframe { clip: ClipId, param: AnimParam, at: SourceTime, keep: Option<f64> },
+    /// Moves keyframes (all or nothing); a move onto another keyframe of the
+    /// same property is rejected.
+    MoveKeyframes { clip: ClipId, moves: Vec<(AnimParam, SourceTime, SourceTime)> },
+    SetKeyframeEase { clip: ClipId, param: AnimParam, at: SourceTime, ease: Ease },
+    /// Drops the tracks of the listed properties and sets their static values.
+    ClearAnimation { clip: ClipId, statics: Vec<(AnimParam, f64)> },
     /// Applied atomically; one undo step (e.g. an AI edit).
     Batch { label: String, commands: Vec<EditCommand> },
 }
@@ -152,6 +167,11 @@ impl EditCommand {
             EditCommand::SwitchAngle { at: Some(_), .. } => "cmd.cut_to_angle",
             EditCommand::SwitchAngle { .. } => "cmd.switch_angle",
             EditCommand::SetAngleRange { .. } => "cmd.switch_angle",
+            EditCommand::SetKeyframe { .. } => "cmd.keyframe",
+            EditCommand::RemoveKeyframe { .. } => "cmd.remove_keyframe",
+            EditCommand::MoveKeyframes { .. } => "cmd.move_keyframes",
+            EditCommand::SetKeyframeEase { .. } => "cmd.keyframe_ease",
+            EditCommand::ClearAnimation { .. } => "cmd.clear_animation",
             EditCommand::Batch { label, .. } => return label.clone(),
         };
         k.to_string()
@@ -169,6 +189,7 @@ impl EditCommand {
             EditError::NoOp => "err.edit.noop",
             EditError::TrackNotEmpty => "err.edit.track_not_empty",
             EditError::LastTrack => "err.edit.last_track",
+            EditError::KeyframeCollision => "err.edit.keyframe_collision",
         }
     }
 
@@ -296,6 +317,12 @@ impl EditCommand {
                     ClipProperty::Enabled(v) => c.enabled = *v,
                     ClipProperty::Name(v) => c.name = v.clone(),
                     ClipProperty::Link(v) => c.link = *v,
+                    ClipProperty::VideoFade(f) => {
+                        if f.fade_in < Time::ZERO || f.fade_out < Time::ZERO || f.fade_in + f.fade_out > c.duration() {
+                            return Err(EditError::InvalidRange);
+                        }
+                        c.video_fade = *f;
+                    }
                     ClipProperty::Speed(speed) => {
                         if !(speed.is_finite() && (0.05..=20.0).contains(speed)) {
                             return Err(EditError::InvalidRange);
@@ -476,6 +503,58 @@ impl EditCommand {
                 }
                 if changed { Ok(()) } else { Err(EditError::NoOp) }
             }
+            EditCommand::SetKeyframe { clip, param, at, value, ease } => {
+                if !value.is_finite() {
+                    return Err(EditError::InvalidRange);
+                }
+                anim_clip(seq, *clip)?.animation.set_key(*param, *at, *value, ease.clone());
+                Ok(())
+            }
+            EditCommand::RemoveKeyframe { clip, param, at, keep } => {
+                let c = anim_clip(seq, *clip)?;
+                let k = c.animation.remove_key(*param, *at).ok_or(EditError::NoOp)?;
+                if !c.animation.is_animated(*param) {
+                    param.write(&mut c.transform, &mut c.color, keep.filter(|v| v.is_finite()).unwrap_or(k.value));
+                }
+                Ok(())
+            }
+            EditCommand::MoveKeyframes { clip, moves } => {
+                let c = anim_clip(seq, *clip)?;
+                if moves.is_empty() {
+                    return Err(EditError::NoOp);
+                }
+                // Remove every moving keyframe first, so keyframes can swap past each other.
+                let mut taken = vec![];
+                for (p, from, to) in moves {
+                    let k = c.animation.remove_key(*p, *from).ok_or(EditError::NoOp)?;
+                    taken.push((*p, *to, k));
+                }
+                for (p, to, k) in taken {
+                    if c.animation.track(p).iter().any(|x| x.at == to) {
+                        return Err(EditError::KeyframeCollision); // the engine restores the snapshot
+                    }
+                    c.animation.set_key(p, to, k.value, Some(k.ease));
+                }
+                Ok(())
+            }
+            EditCommand::SetKeyframeEase { clip, param, at, ease } => {
+                anim_clip(seq, *clip)?.animation.set_ease(*param, *at, ease.clone()).map_err(anim_err)
+            }
+            EditCommand::ClearAnimation { clip, statics } => {
+                let c = anim_clip(seq, *clip)?;
+                if statics.is_empty() {
+                    return Err(EditError::NoOp);
+                }
+                if statics.iter().any(|(_, v)| !v.is_finite()) {
+                    return Err(EditError::InvalidRange);
+                }
+                for (p, v) in statics {
+                    c.animation.clear(*p);
+                    p.write(&mut c.transform, &mut c.color, *v);
+                }
+                Ok(())
+            }
+
             EditCommand::Batch { commands, .. } => {
                 let mut applied = 0;
                 for c in commands {
@@ -489,6 +568,26 @@ impl EditCommand {
                 if applied == 0 { Err(EditError::NoOp) } else { Ok(()) }
             }
         }
+    }
+}
+
+/// The unlocked video clip `id` for an animation edit.
+fn anim_clip(seq: &mut Sequence, id: ClipId) -> Result<&mut Clip, EditError> {
+    let (ti, ci) = seq.locate_clip(id).ok_or(EditError::ClipNotFound)?;
+    let t = &mut seq.tracks[ti];
+    if t.locked {
+        return Err(EditError::TrackLocked(t.name.clone()));
+    }
+    if t.kind != TrackKind::Video {
+        return Err(EditError::KindMismatch);
+    }
+    Ok(&mut t.clips[ci])
+}
+
+fn anim_err(e: AnimError) -> EditError {
+    match e {
+        AnimError::NoKeyframe => EditError::NoOp,
+        AnimError::Collision => EditError::KeyframeCollision,
     }
 }
 

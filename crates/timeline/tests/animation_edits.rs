@@ -66,3 +66,68 @@ fn moving_a_clip_touches_neither_fades_nor_keyframes() {
     let c = p.sequence().clip(id).unwrap();
     assert_eq!((&c.video_fade, &c.animation), (&before.video_fade, &before.animation));
 }
+
+fn scale_track(p: &Project, id: kadr_core::ClipId) -> Vec<(i64, f64)> {
+    p.sequence().clip(id).unwrap().animation.track(AnimParam::Scale).iter().map(|k| (k.at.0.as_millis(), k.value)).collect()
+}
+
+#[test]
+fn set_and_remove_keyframe_are_one_undo_step_each() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
+    assert_eq!(scale_track(&p, id), vec![(105_000, 2.0), (108_000, 3.0)]);
+    e.undo(&mut p);
+    assert_eq!(scale_track(&p, id), vec![(105_000, 2.0)]);
+}
+
+#[test]
+fn removing_the_last_keyframe_keeps_the_picture_at_the_playhead() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: Some(2.0) }).unwrap();
+    let c = p.sequence().clip(id).unwrap();
+    assert!(!c.animation.is_animated(AnimParam::Scale));
+    assert_eq!(c.transform.scale, 2.0);
+}
+
+#[test]
+fn moving_keyframes_onto_another_is_rejected_whole() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
+    let before = p.sequence().clone();
+    let r = e.execute(&mut p, EditCommand::MoveKeyframes { clip: id, moves: vec![(AnimParam::Scale, SourceTime(s(105)), SourceTime(s(108)))] });
+    assert_eq!(r, Err(EditError::KeyframeCollision));
+    assert_eq!(p.sequence(), &before);
+    assert_eq!(EditCommand::error_key(&EditError::KeyframeCollision), "err.edit.keyframe_collision");
+}
+
+#[test]
+fn ease_and_clear_animation() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::SetKeyframeEase { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), ease: Ease::Hold }).unwrap();
+    assert_eq!(p.sequence().clip(id).unwrap().animation.track(AnimParam::Scale)[0].ease, Ease::Hold);
+    e.execute(&mut p, EditCommand::ClearAnimation { clip: id, statics: vec![(AnimParam::Scale, 1.0), (AnimParam::X, 0.0)] }).unwrap();
+    let c = p.sequence().clip(id).unwrap();
+    assert!(c.animation.is_empty());
+    assert_eq!((c.transform.scale, c.transform.x), (1.0, 0.0));
+}
+
+#[test]
+fn keyframes_are_video_only_and_values_finite() {
+    let (mut p, mut e, id) = setup();
+    let bad = EditCommand::SetKeyframe { clip: id, param: AnimParam::X, at: SourceTime(s(101)), value: f64::NAN, ease: None };
+    assert_eq!(e.execute(&mut p, bad), Err(EditError::InvalidRange));
+    let a = Clip::new(kadr_core::AssetId::new(), "a", TimeRange::new(s(0), s(5)), s(0));
+    let aid = a.id;
+    p.sequence_mut().tracks[1].clips.push(a); // A1
+    let on_audio = EditCommand::SetKeyframe { clip: aid, param: AnimParam::X, at: SourceTime(s(1)), value: 1.0, ease: None };
+    assert_eq!(e.execute(&mut p, on_audio), Err(EditError::KindMismatch));
+}
+
+#[test]
+fn video_fade_property_is_validated() {
+    let (mut p, mut e, id) = setup();
+    e.execute(&mut p, EditCommand::SetClipProperty { clip: id, prop: ClipProperty::VideoFade(EdgeFades { fade_in: s(1), fade_out: s(2) }) }).unwrap();
+    assert_eq!(fades(&p, id), (1_000, 2_000));
+    let too_long = EditCommand::SetClipProperty { clip: id, prop: ClipProperty::VideoFade(EdgeFades { fade_in: s(6), fade_out: s(5) }) };
+    assert_eq!(e.execute(&mut p, too_long), Err(EditError::InvalidRange));
+}
