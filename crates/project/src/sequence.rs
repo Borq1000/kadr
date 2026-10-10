@@ -240,6 +240,33 @@ impl Clip {
         self.timeline_in = t;
         self.timeline_out = t + d;
     }
+
+    /// The value property `p` has at timeline time `t`: the keyframe track
+    /// when it exists (source time extrapolated past the clip's edges),
+    /// otherwise the static field.
+    pub fn anim_value(&self, p: crate::AnimParam, t: Time) -> f64 {
+        self.animation
+            .value_at(p, crate::SourceTime(self.source_time_at(t)))
+            .unwrap_or_else(|| p.read(&self.transform, &self.color))
+    }
+
+    /// The keyframe of `p` shown within `tol` (exclusive) of timeline `t`, nearest first.
+    pub fn key_near(&self, p: crate::AnimParam, t: Time, tol: Time) -> Option<crate::SourceTime> {
+        self.animation
+            .track(p)
+            .iter()
+            .map(|k| (k.at, (self.timeline_time_of(k.at.0) - t).abs()))
+            .filter(|(_, d)| *d < tol)
+            .min_by_key(|(_, d)| *d)
+            .map(|(at, _)| at)
+    }
+
+    /// Re-establishes `fade_in + fade_out ≤ duration` for picture and sound.
+    pub fn clamp_fades(&mut self, first: crate::FadeEdge) {
+        let d = self.duration();
+        crate::clamp_fades(&mut self.video_fade.fade_in, &mut self.video_fade.fade_out, d, first);
+        crate::clamp_fades(&mut self.audio.fade_in, &mut self.audio.fade_out, d, first);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -363,4 +390,48 @@ impl Marker {
 pub struct MulticamSelection {
     pub group: kadr_core::MulticamId,
     pub angle: u32,
+}
+
+#[cfg(test)]
+mod animation_clip_tests {
+    use super::*;
+    use crate::{AnimParam, FadeEdge, SourceTime};
+
+    fn clip_2x() -> Clip {
+        // Source 10..30 s shown over timeline 0..10 s: 2× speed.
+        let mut c = Clip::new(AssetId::new(), "c", TimeRange::new(Time::from_secs(10), Time::from_secs(30)), Time::ZERO);
+        c.timeline_out = Time::from_secs(10);
+        c
+    }
+
+    #[test]
+    fn anim_value_reads_static_or_animated_in_source_time() {
+        let mut c = clip_2x();
+        c.transform.scale = 1.5;
+        assert_eq!(c.anim_value(AnimParam::Scale, Time::from_secs(1)), 1.5);
+        c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(10)), 1.0, Some(crate::Ease::Linear));
+        c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(14)), 2.0, None);
+        assert_eq!(c.anim_value(AnimParam::Scale, Time::from_secs(1)), 1.5, "timeline 1 s = source 12 s");
+    }
+
+    #[test]
+    fn key_near_uses_timeline_distance_strictly_inside_the_tolerance() {
+        let mut c = clip_2x();
+        c.animation.set_key(AnimParam::X, SourceTime(Time::from_secs(14)), 1.0, None); // timeline 2 s
+        let half = Time::from_millis(16);
+        assert_eq!(c.key_near(AnimParam::X, Time::from_millis(2_010), half), Some(SourceTime(Time::from_secs(14))));
+        assert_eq!(c.key_near(AnimParam::X, Time::from_millis(2_016), half), None);
+        assert_eq!(c.key_near(AnimParam::Y, Time::from_secs(2), half), None);
+    }
+
+    #[test]
+    fn clamp_fades_covers_video_and_audio() {
+        let mut c = clip_2x();
+        c.video_fade = crate::EdgeFades { fade_in: Time::from_secs(8), fade_out: Time::from_secs(8) };
+        c.audio.fade_in = Time::from_secs(8);
+        c.audio.fade_out = Time::from_secs(8);
+        c.clamp_fades(FadeEdge::Out);
+        assert_eq!((c.video_fade.fade_in, c.video_fade.fade_out), (Time::from_secs(8), Time::from_secs(2)));
+        assert_eq!((c.audio.fade_in, c.audio.fade_out), (Time::from_secs(8), Time::from_secs(2)));
+    }
 }

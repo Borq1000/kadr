@@ -216,6 +216,15 @@ pub struct Keyframe {
     pub ease: Ease,
 }
 
+/// Why a keyframe edit was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimError {
+    /// No keyframe at the given time.
+    NoKeyframe,
+    /// Another keyframe of the same parameter already sits at the target time.
+    Collision,
+}
+
 /// Per-parameter keyframe tracks. Invariant: every stored track is
 /// non-empty and sorted by strictly increasing `at`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -271,6 +280,84 @@ impl Animation {
                 keys.insert(i, Keyframe { at, value, ease: ease.unwrap_or(inherited) });
             }
         }
+    }
+
+    /// The animated value of `p` at source time `s`: the first/last
+    /// keyframe's value outside the track, the eased blend between two.
+    /// `None` when `p` is not animated.
+    pub fn value_at(&self, p: AnimParam, s: SourceTime) -> Option<f64> {
+        let keys = self.tracks.get(&p)?;
+        let i = keys.partition_point(|k| k.at <= s);
+        Some(match (i.checked_sub(1).map(|j| &keys[j]), keys.get(i)) {
+            (None, Some(first)) => first.value,
+            (Some(last), None) => last.value,
+            (Some(k0), Some(k1)) => {
+                let u = (s.0 - k0.at.0).flicks() as f64 / (k1.at.0 - k0.at.0).flicks() as f64;
+                k0.value + (k1.value - k0.value) * k0.ease.curve().apply(u)
+            }
+            (None, None) => return None,
+        })
+    }
+
+    /// Removes the keyframe at `at`; the track goes away with its last key.
+    pub fn remove_key(&mut self, p: AnimParam, at: SourceTime) -> Option<Keyframe> {
+        let keys = self.tracks.get_mut(&p)?;
+        let i = keys.binary_search_by_key(&at, |k| k.at).ok()?;
+        let k = keys.remove(i);
+        if keys.is_empty() {
+            self.tracks.remove(&p);
+        }
+        Some(k)
+    }
+
+    /// Moves the keyframe at `from` to `to` (keeping value and ease).
+    pub fn move_key(&mut self, p: AnimParam, from: SourceTime, to: SourceTime) -> Result<(), AnimError> {
+        let keys = self.tracks.get_mut(&p).ok_or(AnimError::NoKeyframe)?;
+        let i = keys.binary_search_by_key(&from, |k| k.at).map_err(|_| AnimError::NoKeyframe)?;
+        if from == to {
+            return Ok(());
+        }
+        if keys.iter().any(|k| k.at == to) {
+            return Err(AnimError::Collision);
+        }
+        keys[i].at = to;
+        keys.sort_by_key(|k| k.at);
+        Ok(())
+    }
+
+    /// Sets the curve of the segment after the keyframe at `at`.
+    pub fn set_ease(&mut self, p: AnimParam, at: SourceTime, ease: Ease) -> Result<(), AnimError> {
+        let keys = self.tracks.get_mut(&p).ok_or(AnimError::NoKeyframe)?;
+        let i = keys.binary_search_by_key(&at, |k| k.at).map_err(|_| AnimError::NoKeyframe)?;
+        keys[i].ease = ease;
+        Ok(())
+    }
+
+    /// Drops the whole track of `p`, returning its keyframes.
+    pub fn clear(&mut self, p: AnimParam) -> Vec<Keyframe> {
+        self.tracks.remove(&p).unwrap_or_default()
+    }
+
+    /// Moves every keyframe of every known track by `delta`.
+    pub fn shift_all(&mut self, delta: Time) {
+        for keys in self.tracks.values_mut() {
+            for k in keys {
+                k.at = SourceTime(k.at.0 + delta);
+            }
+        }
+    }
+
+    /// Every distinct keyframe time across the known tracks, sorted.
+    pub fn times(&self) -> Vec<SourceTime> {
+        let mut t: Vec<SourceTime> = self.tracks.values().flatten().map(|k| k.at).collect();
+        t.sort();
+        t.dedup();
+        t
+    }
+
+    /// The parameters with a keyframe exactly at `at`.
+    pub fn params_at(&self, at: SourceTime) -> Vec<AnimParam> {
+        self.tracks.iter().filter(|(_, keys)| keys.binary_search_by_key(&at, |k| k.at).is_ok()).map(|(p, _)| *p).collect()
     }
 }
 
@@ -411,5 +498,82 @@ mod tests {
         let t: Vec<(i64, f64)> = a.track(AnimParam::X).iter().map(|k| (k.at.0.flicks(), k.value)).collect();
         assert_eq!(t, vec![(10, 1.0), (20, 3.0)], "the last of equal times wins");
         assert_eq!(a.track(AnimParam::X)[0].ease, Ease::EaseInOut, "missing ease = default");
+    }
+
+    fn two(p: AnimParam, e: Ease) -> Animation {
+        let mut a = Animation::default();
+        a.set_key(p, st(10_000), 0.0, Some(e));
+        a.set_key(p, st(12_000), 1.0, None);
+        a
+    }
+
+    #[test]
+    fn value_before_between_and_after_keyframes() {
+        let a = two(AnimParam::Opacity, Ease::Linear);
+        assert_eq!(a.value_at(AnimParam::Opacity, st(0)), Some(0.0), "before the first: its value");
+        assert_eq!(a.value_at(AnimParam::Opacity, st(11_000)), Some(0.5));
+        assert_eq!(a.value_at(AnimParam::Opacity, st(99_000)), Some(1.0), "after the last: its value");
+        assert_eq!(a.value_at(AnimParam::X, st(11_000)), None, "not animated");
+    }
+
+    #[test]
+    fn the_segment_uses_the_first_keyframes_ease() {
+        let a = two(AnimParam::Opacity, Ease::EaseInOut);
+        assert_eq!(a.value_at(AnimParam::Opacity, st(10_500)), Some(0.0625));
+        let h = two(AnimParam::Opacity, Ease::Hold);
+        assert_eq!(h.value_at(AnimParam::Opacity, st(11_999)), Some(0.0));
+        assert_eq!(h.value_at(AnimParam::Opacity, st(12_000)), Some(1.0));
+    }
+
+    #[test]
+    fn a_new_keyframe_inside_a_segment_inherits_its_ease_otherwise_smooth() {
+        let mut a = two(AnimParam::X, Ease::Linear);
+        a.set_key(AnimParam::X, st(11_000), 0.3, None);
+        assert_eq!(a.track(AnimParam::X)[1].ease, Ease::Linear, "inherited from 10 s");
+        a.set_key(AnimParam::X, st(20_000), 2.0, None);
+        assert_eq!(a.track(AnimParam::X)[3].ease, Ease::EaseInOut, "after the last");
+        a.set_key(AnimParam::X, st(1_000), 2.0, None);
+        assert_eq!(a.track(AnimParam::X)[0].ease, Ease::EaseInOut, "before the first");
+        let mut b = Animation::default();
+        b.set_key(AnimParam::Y, st(0), 1.0, None);
+        assert_eq!(b.track(AnimParam::Y)[0].ease, Ease::EaseInOut, "first of a property");
+    }
+
+    #[test]
+    fn updating_a_keyframe_keeps_its_ease_unless_given() {
+        let mut a = two(AnimParam::X, Ease::Hold);
+        a.set_key(AnimParam::X, st(10_000), 5.0, None);
+        assert_eq!((a.track(AnimParam::X)[0].value, &a.track(AnimParam::X)[0].ease), (5.0, &Ease::Hold));
+    }
+
+    #[test]
+    fn removing_the_last_keyframe_drops_the_track() {
+        let mut a = two(AnimParam::X, Ease::Linear);
+        assert!(a.remove_key(AnimParam::X, st(10_000)).is_some());
+        assert!(a.is_animated(AnimParam::X));
+        assert!(a.remove_key(AnimParam::X, st(12_000)).is_some());
+        assert!(!a.is_animated(AnimParam::X));
+        assert!(a.remove_key(AnimParam::X, st(12_000)).is_none());
+    }
+
+    #[test]
+    fn moving_onto_another_keyframe_is_a_collision() {
+        let mut a = two(AnimParam::X, Ease::Linear);
+        assert_eq!(a.move_key(AnimParam::X, st(10_000), st(12_000)), Err(AnimError::Collision));
+        assert_eq!(a.move_key(AnimParam::X, st(1), st(2)), Err(AnimError::NoKeyframe));
+        a.move_key(AnimParam::X, st(10_000), st(13_000)).unwrap();
+        let t: Vec<i64> = a.track(AnimParam::X).iter().map(|k| k.at.0.as_millis()).collect();
+        assert_eq!(t, vec![12_000, 13_000], "resorted");
+    }
+
+    #[test]
+    fn times_are_distinct_across_params_and_shift_all_moves_everything() {
+        let mut a = two(AnimParam::X, Ease::Linear);
+        a.set_key(AnimParam::Scale, st(12_000), 2.0, None);
+        a.set_key(AnimParam::Scale, st(15_000), 2.0, None);
+        assert_eq!(a.times(), vec![st(10_000), st(12_000), st(15_000)]);
+        assert_eq!(a.params_at(st(12_000)), vec![AnimParam::X, AnimParam::Scale]);
+        a.shift_all(Time::from_millis(-2_000));
+        assert_eq!(a.times(), vec![st(8_000), st(10_000), st(13_000)]);
     }
 }
