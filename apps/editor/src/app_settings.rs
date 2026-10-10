@@ -49,9 +49,22 @@ pub struct Layout {
     pub ai_open: bool,
 }
 
+/// Inspector width bounds in logical px (the splitter clamp in `app.slint`
+/// uses the same numbers). Below the minimum an animatable slider's track,
+/// squeezed by `◀ ◆ ▶`, gets too short to drag.
+pub const INSPECTOR_MIN_WIDTH: f32 = 290.0;
+pub const INSPECTOR_MAX_WIDTH: f32 = 520.0;
+
 impl Default for Layout {
     fn default() -> Self {
-        Layout { library_width: 300.0, inspector_width: 300.0, ai_width: 350.0, timeline_height: 340.0, ai_open: true }
+        Layout { library_width: 300.0, inspector_width: 340.0, ai_width: 350.0, timeline_height: 340.0, ai_open: true }
+    }
+}
+
+impl Layout {
+    /// The saved inspector width within today's bounds.
+    pub fn inspector_width_clamped(&self) -> f32 {
+        self.inspector_width.clamp(INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH)
     }
 }
 
@@ -104,6 +117,16 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyframe controls need a wide enough inspector (keyframes R15): a
+    /// width saved by an older Kadr (minimum 250 px) opens at today's minimum.
+    #[test]
+    fn a_narrow_saved_inspector_opens_at_the_minimum() {
+        let old = Layout { inspector_width: 250.0, ..Layout::default() };
+        assert_eq!(old.inspector_width_clamped(), INSPECTOR_MIN_WIDTH);
+        assert_eq!(Layout { inspector_width: 900.0, ..Layout::default() }.inspector_width_clamped(), INSPECTOR_MAX_WIDTH);
+        assert_eq!(Layout::default().inspector_width_clamped(), 340.0);
+    }
 
     #[test]
     fn read_only_settings_are_never_written() {

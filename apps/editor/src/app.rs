@@ -639,7 +639,7 @@ impl App {
         let ui = self.ui();
         let l = &self.settings.layout;
         ui.set_library_width(l.library_width);
-        ui.set_inspector_width(l.inspector_width);
+        ui.set_inspector_width(l.inspector_width_clamped());
         ui.set_ai_width(l.ai_width);
         ui.set_timeline_height(l.timeline_height);
         ui.set_ai_open(l.ai_open);
@@ -691,7 +691,7 @@ impl App {
         let mut insp = ui.get_inspector_width();
         let mut ai_w = ai;
         let mut over = lib + insp + ai_w + 20.0 + PREVIEW_MIN - w;
-        for (v, min) in [(&mut ai_w, 290.0f32), (&mut insp, 250.0), (&mut lib, 220.0)] {
+        for (v, min) in [(&mut ai_w, 290.0f32), (&mut insp, crate::app_settings::INSPECTOR_MIN_WIDTH), (&mut lib, 220.0)] {
             if over <= 0.0 {
                 break;
             }

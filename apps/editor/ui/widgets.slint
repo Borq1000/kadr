@@ -363,8 +363,9 @@ export component KeyNav inherits HorizontalLayout {
     callback nav(string); // "prev" | "toggle" | "next"
     // Right press on an active button (window coordinates), see PropSlider.
     callback menu-requested(length, length);
+    // Compact (14 px per glyph, 26 px tall hit areas): the slider keeps its
+    // track in a narrow inspector. The value's right inset is the gap.
     spacing: 0;
-    padding-left: 2px;
     width: Theme.key-nav;
     for b[i] in [{ g: "◀", a: "prev", tip: Tr.t("inspector.key.prev") }, { g: root.k.state == 2 ? "◆" : "◇", a: "toggle", tip: Tr.t("inspector.key.toggle") }, { g: "▶", a: "next", tip: Tr.t("inspector.key.next") }]: Rectangle {
         property <bool> on: i == 0 ? root.k.prev : i == 2 ? root.k.next : root.k.enabled;

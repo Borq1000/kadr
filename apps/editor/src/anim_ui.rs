@@ -62,6 +62,12 @@ pub fn shown_time(clip: &Clip, playhead: Time, frame: Time) -> Time {
         .unwrap_or_else(|| playhead.max(clip.timeline_in).min((clip.timeline_out - frame).max(clip.timeline_in)))
 }
 
+/// Show "move the playhead onto the clip to edit its animation": the clip
+/// has animation and the playhead is off it.
+pub fn outside_hint(clip: &Clip, playhead: Time, frame: Time) -> bool {
+    !clip.animation.is_empty() && edit_time(clip, playhead, frame).is_none()
+}
+
 /// The keyframe of `p` at the playhead (within half a frame, spec §5),
 /// only while the playhead is on the clip.
 pub fn key_here(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> Option<&Keyframe> {
@@ -158,6 +164,17 @@ mod tests {
         let last = Time::from_secs(20) - Time(F.flicks() / 3);
         assert_eq!(shown_time(&c, Time::from_secs(12), F), Time::from_secs(12));
         assert_eq!(shown_time(&c, last, F), last);
+    }
+
+    /// "Move the playhead onto the clip" only matters for a clip with animation.
+    #[test]
+    fn the_outside_hint_needs_animation_and_a_playhead_off_the_clip() {
+        let mut c = clip();
+        assert!(!outside_hint(&c, Time::from_secs(5), F), "no animation: nothing to explain");
+        c.animation.set_key(AnimParam::Opacity, SourceTime(Time::from_secs(2)), 1.0, None);
+        assert!(outside_hint(&c, Time::from_secs(5), F));
+        assert!(outside_hint(&c, Time::from_secs(20), F), "timeline_out is outside");
+        assert!(!outside_hint(&c, Time::from_secs(12), F));
     }
 
     /// The interpolation menu marks the curve of the keyframe at the playhead;

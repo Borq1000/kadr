@@ -163,7 +163,7 @@ export component AppWindow inherits Window {
 
     // ---- Layout (persisted by Rust)
     in-out property <length> library-width: 300px;
-    in-out property <length> inspector-width: 300px;
+    in-out property <length> inspector-width: 340px;
     in-out property <length> ai-width: 350px;
     in-out property <length> timeline-height: 340px;
 
@@ -431,7 +431,8 @@ export component AppWindow inherits Window {
                 Splitter {
                     property <length> start;
                     pressed => { self.start = root.inspector-width; }
-                    moved(d) => { root.inspector-width = clamp(self.start - d, 250px, 520px); }
+                    // INSPECTOR_MIN_WIDTH / _MAX_WIDTH in app_settings.rs: room for ◀ ◆ ▶ and a usable slider.
+                    moved(d) => { root.inspector-width = clamp(self.start - d, 290px, 520px); }
                     released => { root.layout-changed(); }
                 }
                 Inspector {

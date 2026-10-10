@@ -60,6 +60,8 @@ export struct InspectorData {
     // The playhead is off the inspected clip: animated values show its
     // nearest edge and cannot be edited there.
     outside: bool,
+    // Off the clip *and* the clip has animation: explain why it is locked.
+    outside-hint: bool,
     vfade-in: float,
     vfade-out: float,
     // Clip duration in seconds: fade-in + fade-out never exceed it.
@@ -237,7 +239,7 @@ export component Inspector inherits Rectangle {
                 if root.d.has-video-props: AnimRow { prop: "crop-r"; k: root.d.keys[6]; outside: root.d.outside; label: Tr.t("inspector.crop_r"); value: root.d.crop-r; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
                 if root.d.has-video-props: AnimRow { prop: "crop-t"; k: root.d.keys[7]; outside: root.d.outside; label: Tr.t("inspector.crop_t"); value: root.d.crop-t; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
                 if root.d.has-video-props: AnimRow { prop: "crop-b"; k: root.d.keys[8]; outside: root.d.outside; label: Tr.t("inspector.crop_b"); value: root.d.crop-b; minimum: 0; maximum: 0.5; default-value: 0; display-scale: 100; decimals: 0; unit: "%"; live(p, v) => { root.live(p, v); } commit(p, v) => { root.commit(p, v); } key-action(p, a) => { root.key-action(p, a); } }
-                if root.d.has-video-props && root.d.outside: Text { text: Tr.t("inspector.key.outside"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                if root.d.has-video-props && root.d.outside-hint: Text { text: Tr.t("inspector.key.outside"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
 
                 SectionTitle { text: root.d.has-video-props ? Tr.t("inspector.video") : Tr.t("inspector.timing"); resettable: root.d.has-video-props; reset => { root.reset("color"); } }
                 // Video rows keep the ◀ ◆ ▶ column free so the values line up.
