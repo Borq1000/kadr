@@ -7,11 +7,11 @@ use crate::anim_ui;
 use crate::app::{App, Prompt};
 use crate::util::rgb;
 use crate::{InspectorData, KeyState, MarkerRow};
-use kadr_core::{Time, Timecode};
+use kadr_core::{ClipId, Time, Timecode};
 use kadr_i18n::{duration, t, tf, tn};
-use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, SourceTime, TrackKind, Transform};
+use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, Sequence, SourceTime, TrackKind, Transform};
 use kadr_timeline::{ClipProperty, EditCommand};
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 
 fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
     // Fade durations from a slider: seconds → whole frames (rounded).
@@ -41,6 +41,50 @@ fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
         "vfade-in" => c.video_fade.fade_in = frames(v).min(c.duration() - c.video_fade.fade_out),
         "vfade-out" => c.video_fade.fade_out = frames(v).min(c.duration() - c.video_fade.fade_in),
         _ => {}
+    }
+}
+
+/// The recorded (pre-drag) state of the clip an inspector slider changes
+/// live. A drag ends with a commit, which rolls back and records one
+/// command; anything else that edits the project rolls back first, so live
+/// changes never outlive their drag and no stale state is ever restored.
+#[derive(Default)]
+pub struct LiveEdit(Option<(ClipId, Clip)>);
+
+impl LiveEdit {
+    /// Before a live change of `id`: remembers its recorded state once per
+    /// drag. An abandoned drag on another clip is rolled back first.
+    pub fn arm(&mut self, seq: &mut Sequence, id: ClipId) {
+        if self.0.as_ref().is_some_and(|(sid, _)| *sid != id) {
+            self.roll_back(seq);
+        }
+        if self.0.is_none() {
+            self.0 = seq.clip(id).map(|c| (id, c.clone()));
+        }
+    }
+
+    /// Restores the recorded state and disarms; `true` when a clip was restored.
+    pub fn roll_back(&mut self, seq: &mut Sequence) -> bool {
+        let Some((id, orig)) = self.0.take() else { return false };
+        let Some((ti, ci)) = seq.locate_clip(id) else { return false };
+        seq.tracks[ti].clips[ci] = orig;
+        true
+    }
+
+    /// Drops the drag without touching the project (another one was loaded).
+    pub fn forget(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// `old` when it already holds `rows`: a new model makes Slint rebuild every
+/// row of its `for` (a press in flight is lost, hovers reset), which a
+/// periodic refresh during playback must not do.
+fn same_or_new<T: Clone + PartialEq + 'static>(old: ModelRc<T>, rows: Vec<T>) -> ModelRc<T> {
+    if old.row_count() == rows.len() && old.iter().zip(&rows).all(|(a, b)| a == *b) {
+        old
+    } else {
+        ModelRc::new(VecModel::from(rows))
     }
 }
 
@@ -80,6 +124,9 @@ impl App {
         let fr = seq.frame_rate;
         let multi = if self.inspected().is_some() { 0 } else { self.tl.selection.len() as i32 };
         let mut d = InspectorData { multi_count: multi, ..Default::default() };
+        // Lists keep their model when unchanged (`same_or_new`): this runs ~10
+        // times a second during playback of an animated clip.
+        let shown = ui.get_inspector();
         // Sequence summary (always filled; shown when no single clip is selected).
         let clips: usize = seq.tracks.iter().map(|t| t.clips.len()).sum();
         let vt = seq.tracks_of(TrackKind::Video).count();
@@ -100,7 +147,7 @@ impl App {
             .enumerate()
             .map(|(i, m)| MarkerRow { index: i as i32, name: m.name.clone().into(), time: Timecode::from_time(m.time, fr).to_string().into(), color: rgb(&m.color) })
             .collect();
-        d.markers = ModelRc::new(VecModel::from(markers));
+        d.markers = same_or_new(shown.markers, markers);
 
         if let Some((ti, ci)) = self.inspected().and_then(|id| seq.locate_clip(id)) {
             let c = &seq.tracks[ti].clips[ci];
@@ -150,7 +197,7 @@ impl App {
                     KeyState { state: k.state, prev: k.prev.is_some(), next: k.next.is_some(), enabled: !outside, ease: ease.into() }
                 })
                 .collect();
-            d.keys = ModelRc::new(VecModel::from(keys));
+            d.keys = same_or_new(shown.keys, keys);
             d.vfade_in = c.video_fade.fade_in.as_secs_f64() as f32;
             d.vfade_out = c.video_fade.fade_out.as_secs_f64() as f32;
             d.fade_max = c.duration().as_secs_f64() as f32;
@@ -161,10 +208,10 @@ impl App {
             d.fade_out = c.audio.fade_out.as_secs_f64() as f32;
             d.enabled = c.enabled;
             let fx: Vec<SharedString> = c.effects.iter().map(|e| SharedString::from(e.kind.as_str())).collect();
-            d.effects = ModelRc::new(VecModel::from(fx));
+            d.effects = same_or_new(shown.effects, fx);
             if !is_audio {
                 let (rows, graded) = self.inspector_shots(c);
-                d.shots = ModelRc::new(VecModel::from(rows));
+                d.shots = same_or_new(shown.shots, rows);
                 d.shots_graded = graded;
             }
         }
@@ -180,9 +227,7 @@ impl App {
         if self.project.sequence().tracks[ti].locked {
             return;
         }
-        if self.inspector_snapshot.as_ref().is_none_or(|(sid, _)| *sid != id) {
-            self.inspector_snapshot = Some((id, self.project.sequence().tracks[ti].clips[ci].clone()));
-        }
+        self.inspector_snapshot.arm(self.project.sequence_mut(), id);
         let frame = self.project.sequence().frame_rate.frame_duration();
         let playhead = self.playhead;
         let c = &mut self.project.sequence_mut().tracks[ti].clips[ci];
@@ -206,14 +251,14 @@ impl App {
     }
 
     pub fn inspector_commit(&mut self, prop: &str, v: f32) {
-        let Some(id) = self.inspected() else { return };
-        let Some((ti, ci)) = self.project.sequence().locate_clip(id) else { return };
         // Restore the pre-drag state, then apply as one undoable command.
-        if let Some((sid, orig)) = self.inspector_snapshot.take() {
-            if sid == id {
-                self.project.sequence_mut().tracks[ti].clips[ci] = orig;
+        let rolled_back = self.inspector_snapshot.roll_back(self.project.sequence_mut());
+        let Some((id, (ti, ci))) = self.inspected().and_then(|id| Some((id, self.project.sequence().locate_clip(id)?))) else {
+            if rolled_back {
+                self.show_rolled_back();
             }
-        }
+            return;
+        };
         let seq = self.project.sequence();
         let frame = seq.frame_rate.frame_duration();
         let cur = &seq.tracks[ti].clips[ci];
@@ -250,6 +295,16 @@ impl App {
         self.preview.invalidate();
         self.refresh_inspector();
         self.request_frame();
+    }
+
+    /// Any other edit (command, undo, redo) first ends an inspector drag
+    /// whose release never came: its live changes were never recorded, so
+    /// the edit and its undo must not see them, and no stale snapshot may
+    /// be restored over the edit later.
+    pub fn end_live_edit(&mut self) {
+        if self.inspector_snapshot.roll_back(self.project.sequence_mut()) {
+            self.show_rolled_back();
+        }
     }
 
     /// `◀ ◆ ▶` and the row menu of an animatable property: `prev`, `next`,
@@ -345,5 +400,83 @@ impl App {
             let name = self.project.sequence().name.clone();
             self.prompt(&t("dlg.rename_seq.title"), &t("dlg.rename_seq.label"), &name, Prompt::RenameSequence);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kadr_core::{AssetId, FrameRate, TimeRange};
+
+    fn seq_with_two_clips() -> (Sequence, ClipId, ClipId) {
+        let mut seq = Sequence::new("s", FrameRate::FPS_30, 1920, 1080);
+        let src = TimeRange::new(Time::ZERO, Time::from_secs(5));
+        let a = Clip::new(AssetId::new(), "a", src, Time::ZERO);
+        let b = Clip::new(AssetId::new(), "b", src, Time::from_secs(5));
+        let ids = (a.id, b.id);
+        seq.tracks[0].clips = vec![a, b];
+        (seq, ids.0, ids.1)
+    }
+
+    fn opacity(seq: &Sequence, id: ClipId) -> f64 {
+        seq.clip(id).unwrap().transform.opacity
+    }
+
+    fn set_opacity(seq: &mut Sequence, id: ClipId, v: f64) {
+        let (ti, ci) = seq.locate_clip(id).unwrap();
+        seq.tracks[ti].clips[ci].transform.opacity = v;
+    }
+
+    /// Fix round 1: a drag whose release never comes (slider disabled
+    /// mid-drag) must not leave live, unrecorded changes behind, nor a stale
+    /// snapshot that a later commit would restore over recorded edits.
+    #[test]
+    fn rolling_back_restores_the_pre_drag_clip_once() {
+        let (mut seq, a, _) = seq_with_two_clips();
+        let mut live = LiveEdit::default();
+        live.arm(&mut seq, a);
+        set_opacity(&mut seq, a, 0.3);
+        live.arm(&mut seq, a); // the next live step keeps the first snapshot
+        set_opacity(&mut seq, a, 0.2);
+        assert!(live.roll_back(&mut seq));
+        assert_eq!(opacity(&seq, a), 1.0, "the recorded state is back");
+        set_opacity(&mut seq, a, 0.5); // a recorded edit made afterwards
+        assert!(!live.roll_back(&mut seq), "disarmed: nothing stale to restore");
+        assert_eq!(opacity(&seq, a), 0.5);
+    }
+
+    #[test]
+    fn a_live_change_of_another_clip_rolls_the_abandoned_one_back() {
+        let (mut seq, a, b) = seq_with_two_clips();
+        let mut live = LiveEdit::default();
+        live.arm(&mut seq, a);
+        set_opacity(&mut seq, a, 0.3);
+        live.arm(&mut seq, b);
+        assert_eq!(opacity(&seq, a), 1.0, "a's unrecorded change is gone");
+        set_opacity(&mut seq, b, 0.4);
+        assert!(live.roll_back(&mut seq));
+        assert_eq!(opacity(&seq, b), 1.0);
+    }
+
+    #[test]
+    fn rolling_back_a_deleted_clip_just_disarms() {
+        let (mut seq, a, _) = seq_with_two_clips();
+        let mut live = LiveEdit::default();
+        live.arm(&mut seq, a);
+        seq.tracks[0].clips.remove(0);
+        assert!(!live.roll_back(&mut seq));
+        assert!(!live.roll_back(&mut seq));
+    }
+
+    /// Rows a periodic refresh did not change keep their model: a new one
+    /// makes Slint rebuild every row (a press in flight is lost).
+    #[test]
+    fn unchanged_rows_keep_the_model_on_screen() {
+        let old: ModelRc<i32> = ModelRc::new(VecModel::from(vec![1, 2]));
+        assert!(same_or_new(old.clone(), vec![1, 2]) == old);
+        let changed = same_or_new(old.clone(), vec![1, 3]);
+        assert!(changed != old);
+        assert_eq!(changed.iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert!(same_or_new(old.clone(), vec![1]) != old);
     }
 }

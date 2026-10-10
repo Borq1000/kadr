@@ -168,6 +168,7 @@ impl App {
             "apply" => self.apply_plan(i),
             "undo" => {
                 let id = self.ai.plans[i].plan.id;
+                self.end_live_edit();
                 if self.engine.undo_action(&mut self.project, id).is_some() {
                     self.ai.plans[i].state = 3;
                     self.log_action(i, AIActionStatus::Undone);

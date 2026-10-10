@@ -130,6 +130,10 @@ mod tests {
         for p in AnimParam::ALL.into_iter().filter(|p| *p != AnimParam::Temperature) {
             assert!(PROPS.iter().any(|(_, q)| *q == p), "{p:?} has an inspector row");
         }
+        // The Slint rows read `keys[i]` in this order: it must be `AnimParam::index()`.
+        for (i, (name, p)) in PROPS.iter().enumerate() {
+            assert_eq!(p.index(), i, "row {name}");
+        }
     }
 
     /// Review focus 1.

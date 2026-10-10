@@ -251,6 +251,7 @@ export component PropSlider inherits Rectangle {
     // TouchAreas take it, so a surrounding ContextMenuArea never sees it.
     callback menu-requested(length, length);
     property <bool> editing;
+    property <bool> dragging; // left button down on the track
     height: 26px;
     property <float> t: (root.value - root.minimum) / (root.maximum - root.minimum);
     property <float> shown: root.value * root.display-scale;
@@ -269,7 +270,7 @@ export component PropSlider inherits Rectangle {
             text: root.label;
             vertical-alignment: center;
             font-size: Theme.font-sm;
-            color: root.animated ? Theme.accent : root.enabled ? (root.value != root.default-value ? Theme.text : Theme.text-dim) : Theme.text-faint;
+            color: !root.enabled ? Theme.text-faint : root.animated ? Theme.accent : root.value != root.default-value ? Theme.text : Theme.text-dim;
             overflow: elide;
         }
         track := Rectangle {
@@ -303,8 +304,12 @@ export component PropSlider inherits Rectangle {
                 mouse-cursor: ew-resize;
                 property <float> v: root.minimum + clamp(self.mouse-x / self.width, 0, 1) * (root.maximum - root.minimum);
                 pointer-event(e) => {
-                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.changed(self.v); }
-                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) { root.committed(self.v); }
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.dragging = true; root.changed(self.v); }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) { root.dragging = false; root.committed(self.v); }
+                    // Disabled mid-drag (an animated row when the playhead leaves the
+                    // clip) or the grab lost: no release follows, so the drag ends
+                    // here with its one commit.
+                    if (e.kind == PointerEventKind.cancel && root.dragging) { root.dragging = false; root.committed(self.v); }
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) { root.menu-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y); }
                 }
                 moved => { if (self.pressed) { root.changed(self.v); } }
@@ -367,10 +372,13 @@ export component KeyNav inherits HorizontalLayout {
     // track in a narrow inspector. The value's right inset is the gap.
     spacing: 0;
     width: Theme.key-nav;
-    for b[i] in [{ g: "◀", a: "prev", tip: Tr.t("inspector.key.prev") }, { g: root.k.state == 2 ? "◆" : "◇", a: "toggle", tip: Tr.t("inspector.key.toggle") }, { g: "▶", a: "next", tip: Tr.t("inspector.key.next") }]: Rectangle {
+    // The model must not depend on `k`: a changed model rebuilds the buttons
+    // (losing a press in flight, resetting the hover), and `k` changes on
+    // every inspector refresh — ~10 times a second during playback.
+    for b[i] in [{ a: "prev", tip: Tr.t("inspector.key.prev") }, { a: "toggle", tip: Tr.t("inspector.key.toggle") }, { a: "next", tip: Tr.t("inspector.key.next") }]: Rectangle {
         property <bool> on: i == 0 ? root.k.prev : i == 2 ? root.k.next : root.k.enabled;
         Text {
-            text: b.g;
+            text: i == 0 ? "◀" : i == 2 ? "▶" : root.k.state == 2 ? "◆" : "◇";
             font-size: i == 1 ? 13px : 9px;
             horizontal-alignment: center;
             vertical-alignment: center;

@@ -19,7 +19,7 @@ use kadr_core::{AssetId, BinId, ClipId, Time};
 use kadr_i18n::{t, tf};
 use kadr_jobs::JobSystem;
 use kadr_media::MediaBackend;
-use kadr_project::{Clip, EditSource, Project};
+use kadr_project::{EditSource, Project};
 use kadr_timeline::{EditCommand, EditEngine, EditError};
 use slint::{ComponentHandle, Global};
 use std::cell::RefCell;
@@ -94,7 +94,8 @@ pub struct App {
     pub preview: PreviewController,
     pub ai: AiUi,
     pub export: ExportUi,
-    pub inspector_snapshot: Option<(ClipId, Clip)>,
+    /// Pre-drag state of the clip an inspector slider changes live.
+    pub inspector_snapshot: crate::inspector::LiveEdit,
     /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
     pub inspector_refreshed: Option<Instant>,
     pub library_drag: Option<LibDrag>,
@@ -201,7 +202,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         audio,
         ai: AiUi::new(Assistant::new(ai_settings)),
         export: ExportUi::default(),
-        inspector_snapshot: None,
+        inspector_snapshot: Default::default(),
         inspector_refreshed: None,
         library_drag: None,
         mc: Default::default(),
@@ -495,6 +496,7 @@ impl App {
     }
 
     pub fn execute_as(&mut self, cmd: EditCommand, source: EditSource, action: Option<kadr_core::ActionId>) -> bool {
+        self.end_live_edit();
         let label = cmd_label(&cmd.label());
         match self.engine.execute_as(&mut self.project, cmd, source, action) {
             Ok(()) => {
@@ -534,6 +536,7 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        self.end_live_edit();
         match self.engine.undo(&mut self.project) {
             Some(l) => {
                 self.ai.on_history_changed(&self.engine);
@@ -546,6 +549,7 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        self.end_live_edit();
         match self.engine.redo(&mut self.project) {
             Some(l) => {
                 self.ai.on_history_changed(&self.engine);
