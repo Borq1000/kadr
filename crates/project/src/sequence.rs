@@ -247,6 +247,40 @@ impl Clip {
             .unwrap_or_else(|| p.read(&self.transform, &self.color))
     }
 
+    /// The static (un-animated) value of a track's property: the clip
+    /// field, or the effect's stored `Number`. `None` for an effect or a
+    /// parameter the clip does not have.
+    pub fn static_value(&self, k: &crate::TrackKey) -> Option<f64> {
+        match k {
+            crate::TrackKey::Clip(p) => Some(p.read(&self.transform, &self.color)),
+            crate::TrackKey::Fx(f) => self.effect(f.effect)?.number(&f.key),
+        }
+    }
+
+    /// Stores `v` as the static value of `k`; `false` when the clip has no
+    /// such effect (nothing is written).
+    pub fn write_static(&mut self, k: &crate::TrackKey, v: f64) -> bool {
+        match k {
+            crate::TrackKey::Clip(p) => {
+                p.write(&mut self.transform, &mut self.color, v);
+                true
+            }
+            crate::TrackKey::Fx(f) => match self.effect_mut(f.effect) {
+                Some(e) => {
+                    e.params.insert(f.key.clone(), crate::ParamValue::Number(v));
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The value of `k` at timeline time `t`: its track (in source time) or
+    /// the static value.
+    pub fn track_value(&self, k: &crate::TrackKey, t: Time) -> Option<f64> {
+        self.animation.value_at(k, crate::SourceTime(self.source_time_at(t))).or_else(|| self.static_value(k))
+    }
+
     /// Re-establishes `fade_in + fade_out ≤ duration` for picture and sound.
     pub fn clamp_fades(&mut self, first: crate::FadeEdge) {
         let d = self.duration();
@@ -389,6 +423,25 @@ mod animation_clip_tests {
         c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(10)), 1.0, Some(crate::Ease::Linear));
         c.animation.set_key(AnimParam::Scale, SourceTime(Time::from_secs(14)), 2.0, None);
         assert_eq!(c.anim_value(AnimParam::Scale, Time::from_secs(1)), 1.5, "timeline 1 s = source 12 s");
+    }
+
+    #[test]
+    fn effect_params_have_static_values_like_clip_properties() {
+        let mut c = clip_2x();
+        let mut e = crate::AppliedEffect::new("smooth_zoom", 1, Default::default());
+        e.params.insert("strength".into(), crate::ParamValue::Number(0.6));
+        let id = e.id;
+        c.effects.push(e);
+        let k = crate::TrackKey::fx(id, "strength");
+        assert_eq!(c.static_value(&k), Some(0.6));
+        assert!(c.write_static(&k, 0.9));
+        assert_eq!(c.track_value(&k, Time::from_secs(1)), Some(0.9));
+        c.animation.set_key(k.clone(), SourceTime(Time::from_secs(10)), 0.3, None);
+        assert_eq!(c.track_value(&k, Time::from_secs(1)), Some(0.3), "the track wins");
+        let gone = crate::TrackKey::fx(kadr_core::EffectId::new(), "strength");
+        assert_eq!(c.static_value(&gone), None);
+        assert!(!c.write_static(&gone, 1.0), "no such effect: nothing written");
+        assert_eq!(c.track_value(&AnimParam::Scale.into(), Time::ZERO), Some(1.0));
     }
 
     #[test]

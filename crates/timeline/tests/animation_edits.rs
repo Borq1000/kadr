@@ -74,7 +74,7 @@ fn scale_track(p: &Project, id: kadr_core::ClipId) -> Vec<(i64, f64)> {
 #[test]
 fn set_and_remove_keyframe_are_one_undo_step_each() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
     assert_eq!(scale_track(&p, id), vec![(105_000, 2.0), (108_000, 3.0)]);
     e.undo(&mut p);
     assert_eq!(scale_track(&p, id), vec![(105_000, 2.0)]);
@@ -83,12 +83,12 @@ fn set_and_remove_keyframe_are_one_undo_step_each() {
 #[test]
 fn removing_the_last_keyframe_keeps_the_picture_at_the_playhead() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: Some(1.5) }).unwrap();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(105)), keep: Some(1.5) }).unwrap();
     let c = p.sequence().clip(id).unwrap();
     assert!(!c.animation.is_animated(AnimParam::Scale));
     assert_eq!(c.transform.scale, 1.5, "the caller's value at the playhead wins");
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), keep: None }).unwrap();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(105)), keep: None }).unwrap();
     assert_eq!(p.sequence().clip(id).unwrap().transform.scale, 2.0, "without keep, the removed value");
 }
 
@@ -101,11 +101,11 @@ fn a_failed_move_inside_a_batch_loses_no_keyframe() {
             EditCommand::MoveKeyframes {
                 clip: id,
                 moves: vec![
-                    (AnimParam::Scale, SourceTime(s(105)), SourceTime(s(106))),
-                    (AnimParam::Scale, SourceTime(s(101)), SourceTime(s(102))), // no such keyframe
+                    (AnimParam::Scale.into(), SourceTime(s(105)), SourceTime(s(106))),
+                    (AnimParam::Scale.into(), SourceTime(s(101)), SourceTime(s(102))), // no such keyframe
                 ],
             },
-            EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None },
+            EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(108)), value: 3.0, ease: None },
         ],
     };
     e.execute(&mut p, batch).unwrap();
@@ -115,9 +115,9 @@ fn a_failed_move_inside_a_batch_loses_no_keyframe() {
 #[test]
 fn moving_keyframes_onto_another_is_rejected_whole() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale, at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(108)), value: 3.0, ease: None }).unwrap();
     let before = p.sequence().clone();
-    let r = e.execute(&mut p, EditCommand::MoveKeyframes { clip: id, moves: vec![(AnimParam::Scale, SourceTime(s(105)), SourceTime(s(108)))] });
+    let r = e.execute(&mut p, EditCommand::MoveKeyframes { clip: id, moves: vec![(AnimParam::Scale.into(), SourceTime(s(105)), SourceTime(s(108)))] });
     assert_eq!(r, Err(EditError::KeyframeCollision));
     assert_eq!(p.sequence(), &before);
     assert_eq!(EditCommand::error_key(&EditError::KeyframeCollision), "err.edit.keyframe_collision");
@@ -128,10 +128,10 @@ fn moving_keyframes_onto_another_is_rejected_whole() {
 #[test]
 fn a_diamond_drag_moves_every_property_of_that_moment() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::X, at: SourceTime(s(105)), value: 9.0, ease: None }).unwrap();
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: AnimParam::X.into(), at: SourceTime(s(105)), value: 9.0, ease: None }).unwrap();
     let c = p.sequence().clip(id).unwrap();
     let at = SourceTime(s(105));
-    let moves = c.animation.params_at(at).into_iter().map(|q| (q, at, SourceTime(s(107)))).collect();
+    let moves = c.animation.keys_at(at).into_iter().map(|q| (q, at, SourceTime(s(107)))).collect();
     e.execute(&mut p, EditCommand::MoveKeyframes { clip: id, moves }).unwrap();
     assert_eq!(p.sequence().clip(id).unwrap().animation.times(), vec![SourceTime(s(107))]);
     e.undo(&mut p);
@@ -141,9 +141,9 @@ fn a_diamond_drag_moves_every_property_of_that_moment() {
 #[test]
 fn ease_and_clear_animation() {
     let (mut p, mut e, id) = setup();
-    e.execute(&mut p, EditCommand::SetKeyframeEase { clip: id, param: AnimParam::Scale, at: SourceTime(s(105)), ease: Ease::Hold }).unwrap();
+    e.execute(&mut p, EditCommand::SetKeyframeEase { clip: id, param: AnimParam::Scale.into(), at: SourceTime(s(105)), ease: Ease::Hold }).unwrap();
     assert_eq!(p.sequence().clip(id).unwrap().animation.track(AnimParam::Scale)[0].ease, Ease::Hold);
-    e.execute(&mut p, EditCommand::ClearAnimation { clip: id, statics: vec![(AnimParam::Scale, 1.0), (AnimParam::X, 0.0)] }).unwrap();
+    e.execute(&mut p, EditCommand::ClearAnimation { clip: id, statics: vec![(AnimParam::Scale.into(), 1.0), (AnimParam::X.into(), 0.0)] }).unwrap();
     let c = p.sequence().clip(id).unwrap();
     assert!(c.animation.is_empty());
     assert_eq!((c.transform.scale, c.transform.x), (1.0, 0.0));
@@ -152,12 +152,12 @@ fn ease_and_clear_animation() {
 #[test]
 fn keyframes_are_video_only_and_values_finite() {
     let (mut p, mut e, id) = setup();
-    let bad = EditCommand::SetKeyframe { clip: id, param: AnimParam::X, at: SourceTime(s(101)), value: f64::NAN, ease: None };
+    let bad = EditCommand::SetKeyframe { clip: id, param: AnimParam::X.into(), at: SourceTime(s(101)), value: f64::NAN, ease: None };
     assert_eq!(e.execute(&mut p, bad), Err(EditError::InvalidRange));
     let a = Clip::new(kadr_core::AssetId::new(), "a", TimeRange::new(s(0), s(5)), s(0));
     let aid = a.id;
     p.sequence_mut().tracks[1].clips.push(a); // A1
-    let on_audio = EditCommand::SetKeyframe { clip: aid, param: AnimParam::X, at: SourceTime(s(1)), value: 1.0, ease: None };
+    let on_audio = EditCommand::SetKeyframe { clip: aid, param: AnimParam::X.into(), at: SourceTime(s(1)), value: 1.0, ease: None };
     assert_eq!(e.execute(&mut p, on_audio), Err(EditError::KindMismatch));
 }
 
@@ -168,4 +168,27 @@ fn video_fade_property_is_validated() {
     assert_eq!(fades(&p, id), (1_000, 2_000));
     let too_long = EditCommand::SetClipProperty { clip: id, prop: ClipProperty::VideoFade(EdgeFades { fade_in: s(6), fade_out: s(5) }) };
     assert_eq!(e.execute(&mut p, too_long), Err(EditError::InvalidRange));
+}
+
+#[test]
+fn effect_parameter_keyframes_need_their_effect_and_keep_its_static_value() {
+    let (mut p, mut e, id) = setup();
+    let fx = AppliedEffect::new("smooth_zoom", 1, [("strength".to_string(), ParamValue::Number(0.6))].into());
+    let fid = fx.id;
+    let k = TrackKey::fx(fid, "strength");
+    let set = EditCommand::SetKeyframe { clip: id, param: k.clone(), at: SourceTime(s(102)), value: 0.2, ease: None };
+    assert_eq!(e.execute(&mut p, set.clone()), Err(EditError::EffectNotFound), "no effect, no track");
+    assert_eq!(EditCommand::error_key(&EditError::EffectNotFound), "err.edit.effect_not_found");
+    let (ti, ci) = p.sequence().locate_clip(id).unwrap();
+    p.sequence_mut().tracks[ti].clips[ci].effects.push(fx);
+    e.execute(&mut p, set).unwrap();
+    e.execute(&mut p, EditCommand::RemoveKeyframe { clip: id, param: k.clone(), at: SourceTime(s(102)), keep: Some(0.4) }).unwrap();
+    let c = p.sequence().clip(id).unwrap();
+    assert!(!c.animation.is_animated(&k));
+    assert_eq!(c.effect(fid).unwrap().params["strength"], ParamValue::Number(0.4), "the last key leaves the picture as it was");
+    e.execute(&mut p, EditCommand::SetKeyframe { clip: id, param: k.clone(), at: SourceTime(s(103)), value: 0.1, ease: None }).unwrap();
+    e.execute(&mut p, EditCommand::ClearAnimation { clip: id, statics: vec![(k.clone(), 0.7)] }).unwrap();
+    let c = p.sequence().clip(id).unwrap();
+    assert!(!c.animation.is_animated(&k));
+    assert_eq!(c.effect(fid).unwrap().params["strength"], ParamValue::Number(0.7));
 }

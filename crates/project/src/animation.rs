@@ -5,7 +5,7 @@
 
 use crate::{ColorAdjust, Transform};
 use kadr_core::ease::Curve;
-use kadr_core::Time;
+use kadr_core::{EffectId, Time};
 use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 #[serde(transparent)]
 pub struct SourceTime(pub Time);
 
-/// An animatable clip property. Future effect parameters will be added as
-/// `Effect { effect, key }` with typed values (`AnimValue`); today every
-/// parameter is an `f64`.
+/// An animatable clip property — the closed set the inspector lists by
+/// `index()`. Effect parameters are tracked as `TrackKey::Fx` (effects
+/// spec §2: JSON key `fx:<effect-id>:<key>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AnimParam {
     X,
@@ -142,6 +142,93 @@ impl<'de> Deserialize<'de> for AnimParam {
     }
 }
 
+/// A numeric parameter of an effect on the clip (effects spec §2).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FxParam {
+    pub effect: EffectId,
+    pub key: String,
+}
+
+/// What a keyframe track animates: a clip property or an effect parameter.
+/// Clip properties sort first, in `AnimParam::ALL` order.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrackKey {
+    Clip(AnimParam),
+    Fx(FxParam),
+}
+
+impl From<AnimParam> for TrackKey {
+    fn from(p: AnimParam) -> Self {
+        TrackKey::Clip(p)
+    }
+}
+
+impl From<FxParam> for TrackKey {
+    fn from(f: FxParam) -> Self {
+        TrackKey::Fx(f)
+    }
+}
+
+impl From<&TrackKey> for TrackKey {
+    fn from(k: &TrackKey) -> Self {
+        k.clone()
+    }
+}
+
+impl TrackKey {
+    pub fn fx(effect: EffectId, key: impl Into<String>) -> TrackKey {
+        TrackKey::Fx(FxParam { effect, key: key.into() })
+    }
+
+    /// The JSON key of the track: `scale`, `fx:<effect-id>:strength`.
+    pub fn key_string(&self) -> String {
+        match self {
+            TrackKey::Clip(p) => p.key().to_string(),
+            TrackKey::Fx(f) => format!("fx:{}:{}", f.effect, f.key),
+        }
+    }
+
+    /// Inverse of [`TrackKey::key_string`]; `None` for keys this build cannot
+    /// run. Only the id form `key_string` writes is accepted, so a parsed key
+    /// is saved back exactly as it was read (keyframes spec §2.1) and two
+    /// stored keys never parse into one track.
+    pub fn parse(s: &str) -> Option<TrackKey> {
+        if let Some(rest) = s.strip_prefix("fx:") {
+            let (id, key) = rest.split_once(':')?;
+            let effect = EffectId::parse(id).filter(|e| e.to_string() == id)?;
+            return (!key.is_empty()).then(|| TrackKey::fx(effect, key));
+        }
+        AnimParam::from_key(s).map(TrackKey::Clip)
+    }
+
+    pub fn as_clip(&self) -> Option<AnimParam> {
+        match self {
+            TrackKey::Clip(p) => Some(*p),
+            TrackKey::Fx(_) => None,
+        }
+    }
+
+    pub fn as_fx(&self) -> Option<&FxParam> {
+        match self {
+            TrackKey::Fx(f) => Some(f),
+            TrackKey::Clip(_) => None,
+        }
+    }
+}
+
+impl Serialize for TrackKey {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.key_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TrackKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        TrackKey::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("unknown animation track {s}")))
+    }
+}
+
 /// Curve of the segment *after* a keyframe (the last keyframe's is unused).
 /// Reserved for later, not implemented: `Auto` (monotone cubic spline with
 /// continuous tangents across a chain) and `Bezier { out, in }` — new
@@ -225,11 +312,11 @@ pub enum AnimError {
     Collision,
 }
 
-/// Per-parameter keyframe tracks. Invariant: every stored track is
-/// non-empty and sorted by strictly increasing `at`.
+/// Keyframe tracks of clip properties and effect parameters. Invariant:
+/// every stored track is non-empty and sorted by strictly increasing `at`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Animation {
-    tracks: BTreeMap<AnimParam, Vec<Keyframe>>,
+    tracks: BTreeMap<TrackKey, Vec<Keyframe>>,
     unknown: BTreeMap<String, Value>,
 }
 
@@ -242,17 +329,22 @@ impl Animation {
     pub fn is_stored_empty(&self) -> bool {
         self.tracks.is_empty() && self.unknown.is_empty()
     }
-    /// The animated parameters, in [`AnimParam::ALL`] order.
+    /// The animated clip properties, in [`AnimParam::ALL`] order (effect
+    /// parameters: [`Animation::keys`]).
     pub fn params(&self) -> Vec<AnimParam> {
-        self.tracks.keys().copied().collect()
+        self.tracks.keys().filter_map(TrackKey::as_clip).collect()
+    }
+    /// Every animated track: clip properties first, then effect parameters.
+    pub fn keys(&self) -> Vec<TrackKey> {
+        self.tracks.keys().cloned().collect()
     }
     /// The keyframes of `p` sorted by time; empty when `p` is not animated.
-    pub fn track(&self, p: AnimParam) -> &[Keyframe] {
-        self.tracks.get(&p).map_or(&[], Vec::as_slice)
+    pub fn track(&self, p: impl Into<TrackKey>) -> &[Keyframe] {
+        self.tracks.get(&p.into()).map_or(&[], Vec::as_slice)
     }
     /// `p` has at least one keyframe.
-    pub fn is_animated(&self, p: AnimParam) -> bool {
-        self.tracks.contains_key(&p)
+    pub fn is_animated(&self, p: impl Into<TrackKey>) -> bool {
+        self.tracks.contains_key(&p.into())
     }
     /// Number of tracks kept verbatim because this build cannot run them.
     pub fn unknown_len(&self) -> usize {
@@ -262,10 +354,11 @@ impl Animation {
     /// Adds a keyframe or, at an existing time, replaces its value (and its
     /// ease when one is given). A new keyframe inside a segment inherits
     /// that segment's ease; elsewhere it gets `ease` or the default.
-    pub fn set_key(&mut self, p: AnimParam, at: SourceTime, value: f64, ease: Option<Ease>) {
+    pub fn set_key(&mut self, p: impl Into<TrackKey>, at: SourceTime, value: f64, ease: Option<Ease>) {
+        let p = p.into();
         if !self.tracks.contains_key(&p) {
-            // The user's edit supersedes an unreadable stored track of this param.
-            self.unknown.remove(p.key());
+            // The user's edit supersedes an unreadable stored track of this key.
+            self.unknown.remove(&p.key_string());
         }
         let keys = self.tracks.entry(p).or_default();
         match keys.binary_search_by_key(&at, |k| k.at) {
@@ -285,8 +378,8 @@ impl Animation {
     /// The animated value of `p` at source time `s`: the first/last
     /// keyframe's value outside the track, the eased blend between two.
     /// `None` when `p` is not animated.
-    pub fn value_at(&self, p: AnimParam, s: SourceTime) -> Option<f64> {
-        let keys = self.tracks.get(&p)?;
+    pub fn value_at(&self, p: impl Into<TrackKey>, s: SourceTime) -> Option<f64> {
+        let keys = self.tracks.get(&p.into())?;
         let i = keys.partition_point(|k| k.at <= s);
         Some(match (i.checked_sub(1).map(|j| &keys[j]), keys.get(i)) {
             (None, Some(first)) => first.value,
@@ -300,7 +393,8 @@ impl Animation {
     }
 
     /// Removes the keyframe at `at`; the track goes away with its last key.
-    pub fn remove_key(&mut self, p: AnimParam, at: SourceTime) -> Option<Keyframe> {
+    pub fn remove_key(&mut self, p: impl Into<TrackKey>, at: SourceTime) -> Option<Keyframe> {
+        let p = p.into();
         let keys = self.tracks.get_mut(&p)?;
         let i = keys.binary_search_by_key(&at, |k| k.at).ok()?;
         let k = keys.remove(i);
@@ -311,8 +405,8 @@ impl Animation {
     }
 
     /// Moves the keyframe at `from` to `to` (keeping value and ease).
-    pub fn move_key(&mut self, p: AnimParam, from: SourceTime, to: SourceTime) -> Result<(), AnimError> {
-        let keys = self.tracks.get_mut(&p).ok_or(AnimError::NoKeyframe)?;
+    pub fn move_key(&mut self, p: impl Into<TrackKey>, from: SourceTime, to: SourceTime) -> Result<(), AnimError> {
+        let keys = self.tracks.get_mut(&p.into()).ok_or(AnimError::NoKeyframe)?;
         let i = keys.binary_search_by_key(&from, |k| k.at).map_err(|_| AnimError::NoKeyframe)?;
         if from == to {
             return Ok(());
@@ -326,16 +420,16 @@ impl Animation {
     }
 
     /// Sets the curve of the segment after the keyframe at `at`.
-    pub fn set_ease(&mut self, p: AnimParam, at: SourceTime, ease: Ease) -> Result<(), AnimError> {
-        let keys = self.tracks.get_mut(&p).ok_or(AnimError::NoKeyframe)?;
+    pub fn set_ease(&mut self, p: impl Into<TrackKey>, at: SourceTime, ease: Ease) -> Result<(), AnimError> {
+        let keys = self.tracks.get_mut(&p.into()).ok_or(AnimError::NoKeyframe)?;
         let i = keys.binary_search_by_key(&at, |k| k.at).map_err(|_| AnimError::NoKeyframe)?;
         keys[i].ease = ease;
         Ok(())
     }
 
     /// Drops the whole track of `p`, returning its keyframes.
-    pub fn clear(&mut self, p: AnimParam) -> Vec<Keyframe> {
-        self.tracks.remove(&p).unwrap_or_default()
+    pub fn clear(&mut self, p: impl Into<TrackKey>) -> Vec<Keyframe> {
+        self.tracks.remove(&p.into()).unwrap_or_default()
     }
 
     /// Moves every keyframe of every known track by `delta`.
@@ -355,19 +449,30 @@ impl Animation {
         t
     }
 
-    /// The parameters with a keyframe exactly at `at`.
-    pub fn params_at(&self, at: SourceTime) -> Vec<AnimParam> {
-        self.tracks.iter().filter(|(_, keys)| keys.binary_search_by_key(&at, |k| k.at).is_ok()).map(|(p, _)| *p).collect()
+    /// The tracks with a keyframe exactly at `at`.
+    pub fn keys_at(&self, at: SourceTime) -> Vec<TrackKey> {
+        self.tracks.iter().filter(|(_, keys)| keys.binary_search_by_key(&at, |k| k.at).is_ok()).map(|(p, _)| p.clone()).collect()
+    }
+
+    /// Drops every track of `effect`'s parameters — unreadable ones kept
+    /// verbatim too (removing an effect takes its tracks, effects spec §2).
+    /// `true` when something went.
+    pub fn remove_effect(&mut self, effect: EffectId) -> bool {
+        let before = self.tracks.len() + self.unknown.len();
+        self.tracks.retain(|k, _| k.as_fx().is_none_or(|f| f.effect != effect));
+        let prefix = format!("fx:{effect}:");
+        self.unknown.retain(|k, _| !k.starts_with(&prefix));
+        before != self.tracks.len() + self.unknown.len()
     }
 }
 
 impl Serialize for Animation {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Never write an unknown entry under the key of a stored known track.
-        let unknown: Vec<_> = self.unknown.iter().filter(|(k, _)| AnimParam::from_key(k).is_none_or(|p| !self.tracks.contains_key(&p))).collect();
+        let unknown: Vec<_> = self.unknown.iter().filter(|(k, _)| TrackKey::parse(k).is_none_or(|p| !self.tracks.contains_key(&p))).collect();
         let mut m = s.serialize_map(Some(self.tracks.len() + unknown.len()))?;
         for (p, keys) in &self.tracks {
-            m.serialize_entry(p.key(), keys)?;
+            m.serialize_entry(&p.key_string(), keys)?;
         }
         for (k, v) in unknown {
             m.serialize_entry(k, v)?;
@@ -410,7 +515,7 @@ impl<'de> Deserialize<'de> for Animation {
         };
         let mut a = Animation::default();
         for (k, v) in raw {
-            let parsed = AnimParam::from_key(&k).and_then(|p| serde_json::from_value::<Vec<Keyframe>>(v.clone()).ok().map(|keys| (p, keys)));
+            let parsed = TrackKey::parse(&k).and_then(|p| serde_json::from_value::<Vec<Keyframe>>(v.clone()).ok().map(|keys| (p, keys)));
             match parsed {
                 Some((p, mut keys)) if keys.iter().all(Keyframe::runnable) && !keys.is_empty() => {
                     // Stable sort keeps file order among equal times; keep the last of each.
@@ -631,8 +736,76 @@ mod tests {
         a.set_key(AnimParam::Scale, st(12_000), 2.0, None);
         a.set_key(AnimParam::Scale, st(15_000), 2.0, None);
         assert_eq!(a.times(), vec![st(10_000), st(12_000), st(15_000)]);
-        assert_eq!(a.params_at(st(12_000)), vec![AnimParam::X, AnimParam::Scale]);
+        assert_eq!(a.keys_at(st(12_000)), vec![TrackKey::from(AnimParam::X), TrackKey::from(AnimParam::Scale)]);
         a.shift_all(Time::from_millis(-2_000));
         assert_eq!(a.times(), vec![st(8_000), st(10_000), st(13_000)]);
+    }
+
+    #[test]
+    fn effect_tracks_are_saved_under_their_fx_key_after_the_clip_properties() {
+        let fx = kadr_core::EffectId::new();
+        let mut a = Animation::default();
+        a.set_key(TrackKey::fx(fx, "strength"), st(0), 0.2, Some(Ease::Linear));
+        a.set_key(AnimParam::Opacity, st(0), 1.0, None);
+        let v = serde_json::to_value(&a).unwrap();
+        let key = format!("fx:{fx}:strength");
+        assert_eq!(v[&key], json!([{"at": 0, "value": 0.2, "ease": "linear"}]));
+        assert_eq!(a.keys(), vec![TrackKey::Clip(AnimParam::Opacity), TrackKey::fx(fx, "strength")]);
+        assert_eq!(a.params(), vec![AnimParam::Opacity], "params() lists clip properties only");
+        assert_eq!(serde_json::from_value::<Animation>(v).unwrap(), a);
+        assert_eq!(TrackKey::parse(&key), Some(TrackKey::fx(fx, "strength")));
+        assert_eq!(TrackKey::parse("scale"), Some(TrackKey::Clip(AnimParam::Scale)));
+    }
+
+    #[test]
+    fn malformed_fx_keys_are_kept_as_unknown() {
+        let bad = json!({
+            "fx:not-a-uuid:strength": [{"at": 0, "value": 1.0}],
+            "fx:": [],
+            "fx:00000000-0000-0000-0000-000000000000:": [{"at": 0, "value": 1.0}]
+        });
+        let a: Animation = serde_json::from_value(bad.clone()).unwrap();
+        assert!(a.is_empty());
+        assert_eq!(serde_json::to_value(&a).unwrap(), bad, "kept verbatim");
+    }
+
+    /// Keyframes spec §2.1: a key is saved back as it was read. An effect id
+    /// in another spelling than the one Kadr writes (upper case, no hyphens)
+    /// is not this build's key: it stays verbatim instead of being rewritten
+    /// — or merged with the canonical key of the same effect.
+    #[test]
+    fn an_effect_id_in_another_spelling_is_kept_verbatim() {
+        let fx = kadr_core::EffectId::new();
+        let upper = format!("fx:{}:strength", fx.to_string().to_uppercase());
+        let simple = format!("fx:{}:strength", fx.0.simple());
+        let canonical = format!("fx:{fx}:strength");
+        let mut stored = serde_json::Map::new();
+        stored.insert(upper.clone(), json!([{"at": 0, "value": 0.1}]));
+        stored.insert(simple.clone(), json!([{"at": 0, "value": 0.2}]));
+        stored.insert(canonical.clone(), json!([{"at": 0, "value": 0.3, "ease": "ease_in_out"}]));
+        let a: Animation = serde_json::from_value(Value::Object(stored.clone())).unwrap();
+        assert_eq!(a.keys(), vec![TrackKey::fx(fx, "strength")]);
+        assert_eq!(a.unknown_len(), 2);
+        let saved = serde_json::to_value(&a).unwrap();
+        assert_eq!(saved[&canonical][0]["value"], 0.3);
+        assert_eq!(saved, Value::Object(stored), "nothing rewritten or lost");
+        assert_eq!((TrackKey::parse(&upper), TrackKey::parse(&simple)), (None, None));
+    }
+
+    /// Review focus 5: removing an effect takes all its tracks — also one
+    /// this build could not read.
+    #[test]
+    fn removing_an_effect_drops_its_tracks_readable_or_not() {
+        let (fx, other) = (kadr_core::EffectId::new(), kadr_core::EffectId::new());
+        let mut stored = serde_json::Map::new();
+        stored.insert(format!("fx:{fx}:point"), json!("unreadable"));
+        let mut a: Animation = serde_json::from_value(Value::Object(stored)).unwrap();
+        a.set_key(TrackKey::fx(fx, "strength"), st(0), 0.5, None);
+        a.set_key(TrackKey::fx(other, "strength"), st(0), 0.5, None);
+        a.set_key(AnimParam::X, st(0), 1.0, None);
+        assert!(a.remove_effect(fx));
+        assert_eq!(a.keys(), vec![TrackKey::Clip(AnimParam::X), TrackKey::fx(other, "strength")]);
+        assert_eq!(a.unknown_len(), 0);
+        assert!(!a.remove_effect(fx), "nothing left to remove");
     }
 }

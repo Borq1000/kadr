@@ -9,7 +9,7 @@
 use crate::anim_ui;
 use kadr_core::{ClipId, Time};
 use kadr_mcp_bridge::BridgeError;
-use kadr_project::{AnimParam, Clip, EdgeFades, Ease, Project, Sequence, SourceTime, TrackKind};
+use kadr_project::{AnimParam, Clip, EdgeFades, Ease, Project, Sequence, SourceTime, TrackKey, TrackKind};
 use kadr_timeline::{ClipProperty, EditCommand};
 use serde_json::Value;
 
@@ -120,11 +120,11 @@ fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, sr
             if t < c.timeline_in - h || t >= c.timeline_out + h {
                 return Err(outside(c, ms));
             }
-            anim_ui::visible_key_near(c, p, t, frame)
+            anim_ui::visible_key_near(c, p.map(TrackKey::from), t, frame)
         }
         When::Source(ms) => {
             let s = Time::from_millis(ms);
-            c.animation.times().into_iter().filter(|a| p.is_none_or(|q| c.animation.params_at(*a).contains(&q))).filter(|a| (a.0 - s).abs() < h).min_by_key(|a| (a.0 - s).abs())
+            c.animation.times().into_iter().filter(|a| p.is_none_or(|q| c.animation.keys_at(*a).contains(&TrackKey::from(q)))).filter(|a| (a.0 - s).abs() < h).min_by_key(|a| (a.0 - s).abs())
         }
     })
 }
@@ -168,7 +168,7 @@ fn set_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<Edit
         }
         None => new_time(seq, c, op, "at_ms", "source_ms")?,
     };
-    Ok(EditCommand::SetKeyframe { clip: id, param: p, at, value, ease })
+    Ok(EditCommand::SetKeyframe { clip: id, param: p.into(), at, value, ease })
 }
 
 fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
@@ -186,7 +186,7 @@ fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<E
         return Err(bad(if listed.is_some() { "clip has no animation on the listed params" } else { "clip has no animation" }));
     }
     let keep = ms_arg(op, "keep_ms")?.map(|ms| seq.frame_rate.snap(Time::from_millis(ms)));
-    let statics = animated.into_iter().map(|p| (p, keep.map_or(p.default_value(), |t| c.anim_value(p, t)))).collect();
+    let statics = animated.into_iter().map(|p| (p.into(), keep.map_or(p.default_value(), |t| c.anim_value(p, t)))).collect();
     Ok(EditCommand::ClearAnimation { clip: id, statics })
 }
 
@@ -237,7 +237,7 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
             "remove_keyframe" => {
                 let p = param(op)?;
                 let at = existing(seq, c, Some(p), op, "at_ms", "source_ms")?;
-                EditCommand::RemoveKeyframe { clip: id, param: p, at, keep: None }
+                EditCommand::RemoveKeyframe { clip: id, param: p.into(), at, keep: None }
             }
             "set_keyframe_ease" => {
                 let p = param(op)?;
@@ -246,7 +246,7 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                 if c.animation.track(p).iter().any(|k| k.at == at && k.ease == ease) {
                     return Err(bad("no change: that keyframe already has this ease"));
                 }
-                EditCommand::SetKeyframeEase { clip: id, param: p, at, ease }
+                EditCommand::SetKeyframeEase { clip: id, param: p.into(), at, ease }
             }
             "move_keyframes" => {
                 let p = op.get("param").filter(|v| !v.is_null()).map(|_| param(op)).transpose()?;
@@ -256,9 +256,9 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                 if to == from {
                     return Err(bad("no change: the keyframes are already at that moment"));
                 }
-                let params = p.map_or_else(|| c.animation.params_at(from), |p| vec![p]);
-                if let Some(q) = params.iter().find(|q| c.animation.track(**q).iter().any(|k| k.at == to)) {
-                    return Err(bad(format!("{} already has a keyframe at {to_ms} ms; move or remove it first", q.key())));
+                let params: Vec<TrackKey> = p.map_or_else(|| c.animation.keys_at(from), |p| vec![p.into()]);
+                if let Some(q) = params.iter().find(|q| c.animation.track(*q).iter().any(|k| k.at == to)) {
+                    return Err(bad(format!("{} already has a keyframe at {to_ms} ms; move or remove it first", q.key_string())));
                 }
                 EditCommand::MoveKeyframes { clip: id, moves: params.into_iter().map(|q| (q, from, to)).collect() }
             }

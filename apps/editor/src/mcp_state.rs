@@ -73,7 +73,7 @@ pub fn timeline_json(seq: &Sequence, selection: &[ClipId], playhead: Time) -> Va
                 "start_ms": ms(c.timeline_in), "end_ms": ms(c.timeline_out),
                 "source_in_ms": ms(c.source_in), "enabled": c.enabled,
                 "video_fade": {"fade_in_ms": ms(c.video_fade.fade_in), "fade_out_ms": ms(c.video_fade.fade_out)},
-                "animation": c.animation.params().into_iter().map(|p| (p.key().to_string(), json!(c.animation.track(p).iter().map(|k| {
+                "animation": c.animation.keys().into_iter().map(|p| (p.key_string(), json!(c.animation.track(&p).iter().map(|k| {
                     let tl = c.timeline_time_of(k.at.0);
                     json!({"at_ms": ms(tl), "source_ms": ms(k.at.0), "value": k.value, "ease": k.ease.key().unwrap_or("unknown"), "visible": tl >= c.timeline_in && tl < c.timeline_out})
                 }).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
@@ -125,6 +125,19 @@ mod tests {
         assert_eq!((k[0]["at_ms"].as_i64(), k[0]["source_ms"].as_i64(), k[0]["visible"].as_bool()), (Some(2_000), Some(12_000), Some(true)));
         assert_eq!(k[0]["ease"], "ease_in_out");
         assert_eq!(k[1]["visible"], false, "source 25 s is past the clip's out point");
+    }
+
+    #[test]
+    fn effect_tracks_show_under_their_fx_key() {
+        let mut p = Project::new("t");
+        let mut c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::ZERO);
+        let e = kadr_project::AppliedEffect::new("smooth_zoom", 1, Default::default());
+        let k = kadr_project::TrackKey::fx(e.id, "strength");
+        c.effects.push(e);
+        c.animation.set_key(k.clone(), kadr_project::SourceTime(Time::from_secs(1)), 0.3, None);
+        p.sequence_mut().tracks[0].clips.push(c);
+        let v = timeline_json(p.sequence(), &[], Time::ZERO);
+        assert_eq!(v["tracks"][0]["clips"][0]["animation"][k.key_string()][0]["value"], 0.3);
     }
 
     #[test]

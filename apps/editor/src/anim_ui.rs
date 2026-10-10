@@ -1,7 +1,7 @@
 //! Pure keyframe/fade UI logic shared by the inspector and the timeline.
 
 use kadr_core::{FrameRate, Time};
-use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, SourceTime};
+use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, SourceTime, TrackKey};
 
 /// Inspector property names of the animatable rows (Temperature has no row).
 pub const PROPS: [(&str, AnimParam); 12] = [
@@ -54,17 +54,17 @@ pub fn whole_frames(t: Time, frame: Time) -> Time {
     Time((t.flicks() + f / 2) / f * f)
 }
 
-/// "The keyframe here" (spec §5): the keyframe moment of `p` (of any
-/// property when `None`) whose timeline time is nearest to `t` and strictly
-/// within half a `frame` of it — among the **visible** ones only. A key
-/// hidden past an edge of the clip never counts, even within half a frame
-/// of it (review focus 1): it is not on screen, and only MCP `source_ms`
-/// addresses it. The inspector and MCP `at_ms` share this rule.
-pub fn visible_key_near(c: &Clip, p: Option<AnimParam>, t: Time, frame: Time) -> Option<SourceTime> {
+/// "The keyframe here" (spec §5): the keyframe moment of `p` (of any track
+/// — clip property or effect parameter — when `None`) whose timeline time
+/// is nearest to `t` and strictly within half a `frame` of it — among the
+/// **visible** ones only. A key hidden past an edge of the clip never
+/// counts, even within half a frame of it (review focus 1): it is not on
+/// screen, and only MCP `source_ms` addresses it. The inspector and MCP
+/// `at_ms` share this rule.
+pub fn visible_key_near(c: &Clip, p: Option<TrackKey>, t: Time, frame: Time) -> Option<SourceTime> {
     let half = half_frame(frame);
-    let params = p.map_or_else(|| c.animation.params(), |p| vec![p]);
-    params
-        .into_iter()
+    let keys = p.map_or_else(|| c.animation.keys(), |p| vec![p]);
+    keys.iter()
         .flat_map(|q| c.animation.track(q).iter().map(|k| k.at))
         .map(|at| (at, c.timeline_time_of(at.0)))
         .filter(|(_, tl)| *tl >= c.timeline_in && *tl < c.timeline_out && (*tl - t).abs() < half)
@@ -94,10 +94,11 @@ pub fn outside_hint(clip: &Clip, playhead: Time, frame: Time) -> bool {
 
 /// The keyframe of `p` at the playhead (`visible_key_near`), only while
 /// the playhead is on the clip.
-pub fn key_here(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> Option<&Keyframe> {
+pub fn key_here(clip: &Clip, p: impl Into<TrackKey>, playhead: Time, frame: Time) -> Option<&Keyframe> {
+    let p = p.into();
     let t = edit_time(clip, playhead, frame)?;
-    let at = visible_key_near(clip, Some(p), t, frame)?;
-    clip.animation.track(p).iter().find(|k| k.at == at)
+    let at = visible_key_near(clip, Some(p.clone()), t, frame)?;
+    clip.animation.track(&p).iter().find(|k| k.at == at)
 }
 
 /// The UI name of a curve: its saved key, `"other"` for one from a newer Kadr.
@@ -115,20 +116,21 @@ pub struct KeyInfo {
 
 /// Keyframe state of `p` at the playhead; `prev`/`next` are the nearest
 /// **visible** keyframes (timeline time in `[in, out)`) other than the one here.
-pub fn key_info(clip: &Clip, p: AnimParam, playhead: Time, frame: Time) -> KeyInfo {
-    if !clip.animation.is_animated(p) {
+pub fn key_info(clip: &Clip, p: impl Into<TrackKey>, playhead: Time, frame: Time) -> KeyInfo {
+    let p = p.into();
+    if !clip.animation.is_animated(&p) {
         return KeyInfo { state: 0, prev: None, next: None };
     }
     let half = half_frame(frame);
     let visible: Vec<Time> = clip
         .animation
-        .track(p)
+        .track(&p)
         .iter()
         .map(|k| clip.timeline_time_of(k.at.0))
         .filter(|t| *t >= clip.timeline_in && *t < clip.timeline_out)
         .collect();
     KeyInfo {
-        state: if key_here(clip, p, playhead, frame).is_some() { 2 } else { 1 },
+        state: if key_here(clip, &p, playhead, frame).is_some() { 2 } else { 1 },
         prev: visible.iter().rev().copied().find(|t| *t <= playhead - half),
         next: visible.iter().copied().find(|t| *t >= playhead + half),
     }
@@ -314,24 +316,20 @@ pub fn key_drag_to(c: &Clip, from: Time, dt: Time, fr: FrameRate) -> Time {
     fr.snap(from + dt).max(c.timeline_in).min(last)
 }
 
-/// The UI name of the curve every property's keyframe at `at` shares;
+/// The UI name of the curve every track's keyframe at `at` shares;
 /// `""` when they differ or there is none (the menu marks nothing).
 pub fn moment_ease(c: &Clip, at: SourceTime) -> &'static str {
-    let mut keys = c.animation.params_at(at).into_iter().filter_map(|p| c.animation.track(p).iter().find(|k| k.at == at).map(|k| ease_key(&k.ease)));
+    let mut keys = c.animation.keys_at(at).into_iter().filter_map(|p| c.animation.track(&p).iter().find(|k| k.at == at).map(|k| ease_key(&k.ease)));
     match keys.next() {
         Some(first) if keys.all(|k| k == first) => first,
         _ => "",
     }
 }
 
-/// The properties whose keyframe at `at` does not have curve `e` yet: the
+/// The tracks whose keyframe at `at` does not have curve `e` yet: the
 /// keyframe menu changes only those (none — no command at all).
-pub fn ease_targets(c: &Clip, at: SourceTime, e: &Ease) -> Vec<AnimParam> {
-    c.animation
-        .params_at(at)
-        .into_iter()
-        .filter(|p| c.animation.track(*p).iter().any(|k| k.at == at && k.ease != *e))
-        .collect()
+pub fn ease_targets(c: &Clip, at: SourceTime, e: &Ease) -> Vec<TrackKey> {
+    c.animation.keys_at(at).into_iter().filter(|p| c.animation.track(p).iter().any(|k| k.at == at && k.ease != *e)).collect()
 }
 
 #[cfg(test)]
@@ -448,10 +446,10 @@ mod tests {
         let half = half_frame(F);
         assert_eq!(half, Time(F.flicks() / 2));
         let at = |t: Time, p| visible_key_near(&c, p, t, F);
-        assert_eq!(at(Time::from_secs(12) + half - Time(1), Some(AnimParam::Scale)), Some(SourceTime(Time::from_secs(4))));
+        assert_eq!(at(Time::from_secs(12) + half - Time(1), Some(AnimParam::Scale.into())), Some(SourceTime(Time::from_secs(4))));
         assert_eq!(at(Time::from_secs(12) - half + Time(1), None), Some(SourceTime(Time::from_secs(4))));
-        assert_eq!(at(Time::from_secs(12) + half, Some(AnimParam::Scale)), None, "exactly half a frame away is not near");
-        assert_eq!(at(Time::from_secs(12), Some(AnimParam::X)), None, "another property");
+        assert_eq!(at(Time::from_secs(12) + half, Some(AnimParam::Scale.into())), None, "exactly half a frame away is not near");
+        assert_eq!(at(Time::from_secs(12), Some(AnimParam::X.into())), None, "another property");
     }
 
     /// Fade lengths are whole frames, rounded to the nearest (ties up).
@@ -691,8 +689,8 @@ mod tests {
         assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![], "nothing to change: no command");
         c.animation.set_key(AnimParam::Y, at, 1.0, Some(Ease::Hold));
         assert_eq!(moment_ease(&c, at), "", "mixed: nothing marked");
-        assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![AnimParam::Y]);
-        assert_eq!(ease_targets(&c, at, &Ease::Hold), vec![AnimParam::X, AnimParam::Opacity]);
+        assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![TrackKey::from(AnimParam::Y)]);
+        assert_eq!(ease_targets(&c, at, &Ease::Hold), vec![TrackKey::from(AnimParam::X), TrackKey::from(AnimParam::Opacity)]);
         let other = SourceTime(Time::from_secs(6));
         c.animation.set_key(AnimParam::X, other, 1.0, Some(Ease::Unknown(Default::default())));
         assert_eq!(moment_ease(&c, other), "other");

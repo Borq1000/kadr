@@ -730,5 +730,6 @@
   "toast.link_needs_two": "Select at least two clips to link them",
   "toast.no_video_part": "No video in the selection",
   "toast.no_audio_part": "No audio in the selection",
-  "keys.unlink_link": "Unlink audio and video / link the selection"
+  "keys.unlink_link": "Unlink audio and video / link the selection",
+  "err.edit.effect_not_found": "Effect not found"
 }

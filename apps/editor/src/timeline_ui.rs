@@ -495,7 +495,7 @@ impl App {
         let live = self.live_edit.recorded(d.clip);
         let armed = live.is_some();
         let rec = live.unwrap_or(&seq.tracks[ti].clips[ci]);
-        let params = rec.animation.params_at(d.at);
+        let params = rec.animation.keys_at(d.at);
         if params.is_empty() {
             self.ui().set_tl_tip_text("".into()); // the moment is gone: the drag ends
             return;
@@ -509,7 +509,7 @@ impl App {
         let preview = moved.then(|| {
             let mut anim = rec.animation.clone();
             let new_at = SourceTime(rec.source_time_at(to));
-            params.iter().all(|p| anim.move_key(*p, d.at, new_at).is_ok()).then_some(anim)
+            params.iter().all(|p| anim.move_key(p, d.at, new_at).is_ok()).then_some(anim)
         });
         let tip = match preview {
             Some(None) => t("err.edit.keyframe_collision"),
@@ -563,7 +563,7 @@ impl App {
         let cmd = d.to.and_then(|to| {
             let to = to.max(c.timeline_in).min((c.timeline_out - frame).max(c.timeline_in));
             let new_at = SourceTime(c.source_time_at(to));
-            let moves: Vec<_> = c.animation.params_at(d.at).into_iter().map(|p| (p, d.at, new_at)).collect();
+            let moves: Vec<_> = c.animation.keys_at(d.at).into_iter().map(|p| (p, d.at, new_at)).collect();
             (new_at != d.at && !moves.is_empty()).then_some(EditCommand::MoveKeyframes { clip: d.clip, moves })
         });
         let recorded = cmd.is_some_and(|cmd| self.execute(cmd));
@@ -593,9 +593,12 @@ impl App {
                 let shown = anim_ui::shown_time(c, self.playhead, seq.frame_rate.frame_duration());
                 let commands: Vec<EditCommand> = c
                     .animation
-                    .params_at(at)
+                    .keys_at(at)
                     .into_iter()
-                    .map(|param| EditCommand::RemoveKeyframe { clip, param, at, keep: Some(c.anim_value(param, shown)) })
+                    .map(|param| {
+                        let keep = c.track_value(&param, shown);
+                        EditCommand::RemoveKeyframe { clip, param, at, keep }
+                    })
                     .collect();
                 (t(if commands.len() > 1 { "cmd.remove_keyframes" } else { "cmd.remove_keyframe" }), commands)
             }

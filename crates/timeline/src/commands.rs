@@ -6,8 +6,8 @@
 use crate::ops::{self, LinkRemap};
 use kadr_core::{AssetId, ClipId, MarkerId, MediaKind, Time, TimeRange, TrackId, TransitionId};
 use kadr_project::{
-    AnimError, AnimParam, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, Sequence,
-    SourceTime, Track, TrackKind, Transform, Transition,
+    AnimError, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, Sequence, SourceTime,
+    Track, TrackKey, TrackKind, Transform, Transition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -35,6 +35,8 @@ pub enum EditError {
     LastTrack,
     #[error("a keyframe already exists at that time")]
     KeyframeCollision,
+    #[error("effect not found")]
+    EffectNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,17 +107,17 @@ pub enum EditCommand {
     /// Shows `angle` over `range` on the topmost video track that has a
     /// multicam clip at `range.start`, cutting at both edges (AI camera picks).
     SetAngleRange { range: TimeRange, angle: u32 },
-    /// Inserts or updates a keyframe (`ease: None` -> keep / inherit, spec §3.1).
-    SetKeyframe { clip: ClipId, param: AnimParam, at: SourceTime, value: f64, ease: Option<Ease> },
-    /// Removes a keyframe; if it was the property's last, the static value
+    /// Inserts or updates a keyframe (`ease: None` -> keep / inherit, keyframes spec §3.1).
+    SetKeyframe { clip: ClipId, param: TrackKey, at: SourceTime, value: f64, ease: Option<Ease> },
+    /// Removes a keyframe; if it was the track's last, the static value
     /// becomes `keep` (the value at the playhead) or the removed value.
-    RemoveKeyframe { clip: ClipId, param: AnimParam, at: SourceTime, keep: Option<f64> },
+    RemoveKeyframe { clip: ClipId, param: TrackKey, at: SourceTime, keep: Option<f64> },
     /// Moves keyframes (all or nothing); a move onto another keyframe of the
-    /// same property is rejected.
-    MoveKeyframes { clip: ClipId, moves: Vec<(AnimParam, SourceTime, SourceTime)> },
-    SetKeyframeEase { clip: ClipId, param: AnimParam, at: SourceTime, ease: Ease },
-    /// Drops the tracks of the listed properties and sets their static values.
-    ClearAnimation { clip: ClipId, statics: Vec<(AnimParam, f64)> },
+    /// same track is rejected.
+    MoveKeyframes { clip: ClipId, moves: Vec<(TrackKey, SourceTime, SourceTime)> },
+    SetKeyframeEase { clip: ClipId, param: TrackKey, at: SourceTime, ease: Ease },
+    /// Drops the listed tracks and sets their static values.
+    ClearAnimation { clip: ClipId, statics: Vec<(TrackKey, f64)> },
     /// Applied atomically; one undo step (e.g. an AI edit).
     Batch { label: String, commands: Vec<EditCommand> },
 }
@@ -190,6 +192,7 @@ impl EditCommand {
             EditError::TrackNotEmpty => "err.edit.track_not_empty",
             EditError::LastTrack => "err.edit.last_track",
             EditError::KeyframeCollision => "err.edit.keyframe_collision",
+            EditError::EffectNotFound => "err.edit.effect_not_found",
         }
     }
 
@@ -505,14 +508,20 @@ impl EditCommand {
                 if !value.is_finite() {
                     return Err(EditError::InvalidRange);
                 }
-                anim_clip(seq, *clip)?.animation.set_key(*param, *at, *value, ease.clone());
+                let c = anim_clip(seq, *clip)?;
+                // An effect parameter's track needs its effect (its static value lives there).
+                if param.as_fx().is_some_and(|f| c.effect(f.effect).is_none()) {
+                    return Err(EditError::EffectNotFound);
+                }
+                c.animation.set_key(param, *at, *value, ease.clone());
                 Ok(())
             }
             EditCommand::RemoveKeyframe { clip, param, at, keep } => {
                 let c = anim_clip(seq, *clip)?;
-                let k = c.animation.remove_key(*param, *at).ok_or(EditError::NoOp)?;
-                if !c.animation.is_animated(*param) {
-                    param.write(&mut c.transform, &mut c.color, keep.filter(|v| v.is_finite()).unwrap_or(k.value));
+                let k = c.animation.remove_key(param, *at).ok_or(EditError::NoOp)?;
+                if !c.animation.is_animated(param) {
+                    // A track of a removed effect has no static slot: nothing to keep.
+                    c.write_static(param, keep.filter(|v| v.is_finite()).unwrap_or(k.value));
                 }
                 Ok(())
             }
@@ -527,11 +536,11 @@ impl EditCommand {
                 let mut anim = c.animation.clone();
                 let mut taken = vec![];
                 for (p, from, to) in moves {
-                    let k = anim.remove_key(*p, *from).ok_or(EditError::NoOp)?;
-                    taken.push((*p, *to, k));
+                    let k = anim.remove_key(p, *from).ok_or(EditError::NoOp)?;
+                    taken.push((p.clone(), *to, k));
                 }
                 for (p, to, k) in taken {
-                    if anim.track(p).iter().any(|x| x.at == to) {
+                    if anim.track(&p).iter().any(|x| x.at == to) {
                         return Err(EditError::KeyframeCollision);
                     }
                     anim.set_key(p, to, k.value, Some(k.ease));
@@ -540,7 +549,7 @@ impl EditCommand {
                 Ok(())
             }
             EditCommand::SetKeyframeEase { clip, param, at, ease } => {
-                anim_clip(seq, *clip)?.animation.set_ease(*param, *at, ease.clone()).map_err(anim_err)
+                anim_clip(seq, *clip)?.animation.set_ease(param, *at, ease.clone()).map_err(anim_err)
             }
             EditCommand::ClearAnimation { clip, statics } => {
                 let c = anim_clip(seq, *clip)?;
@@ -550,9 +559,12 @@ impl EditCommand {
                 if statics.iter().any(|(_, v)| !v.is_finite()) {
                     return Err(EditError::InvalidRange);
                 }
+                if statics.iter().any(|(p, _)| c.static_value(p).is_none()) {
+                    return Err(EditError::EffectNotFound);
+                }
                 for (p, v) in statics {
-                    c.animation.clear(*p);
-                    p.write(&mut c.transform, &mut c.color, *v);
+                    c.animation.clear(p);
+                    c.write_static(p, *v);
                 }
                 Ok(())
             }

@@ -9,7 +9,7 @@ use crate::util::{fmt_secs, rgb};
 use crate::{InspectorData, KeyState, MarkerRow};
 use kadr_core::{ClipId, Time, Timecode};
 use kadr_i18n::{duration, t, tf, tn};
-use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, Sequence, SourceTime, TrackKind, Transform};
+use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, Sequence, SourceTime, TrackKey, TrackKind, Transform};
 use kadr_timeline::commands::duration_at_speed;
 use kadr_timeline::{ClipProperty, EditCommand};
 use slint::{Model, ModelRc, SharedString, VecModel};
@@ -313,7 +313,7 @@ impl App {
                 }
                 let at = here.map_or(SourceTime(cur.source_time_at(tt)), |k| k.at);
                 let label = tf("cmd.keyframe_named", &[("name", &t(anim_ui::label_key(p)))]);
-                let set = EditCommand::SetKeyframe { clip: id, param: p, at, value: v as f64, ease: None };
+                let set = EditCommand::SetKeyframe { clip: id, param: p.into(), at, value: v as f64, ease: None };
                 EditCommand::Batch { label, commands: vec![set] }
             }
             _ if prop == "speed" => {
@@ -389,17 +389,17 @@ impl App {
                 return;
             }
             "toggle" => match (edit, here) {
-                (Some(_), Some(k)) => EditCommand::RemoveKeyframe { clip: id, param: p, at: k.at, keep: Some(value_here) },
-                (Some(tt), None) => EditCommand::SetKeyframe { clip: id, param: p, at: SourceTime(c.source_time_at(tt)), value: value_here, ease: None },
+                (Some(_), Some(k)) => EditCommand::RemoveKeyframe { clip: id, param: p.into(), at: k.at, keep: Some(value_here) },
+                (Some(tt), None) => EditCommand::SetKeyframe { clip: id, param: p.into(), at: SourceTime(c.source_time_at(tt)), value: value_here, ease: None },
                 (None, _) => return,
             },
-            "clear" if c.animation.is_animated(p) => EditCommand::ClearAnimation { clip: id, statics: vec![(p, value_here)] },
+            "clear" if c.animation.is_animated(p) => EditCommand::ClearAnimation { clip: id, statics: vec![(p.into(), value_here)] },
             a if a.starts_with("ease:") => {
                 let (Some(k), Some(e)) = (here, Ease::from_key(&a[5..])) else { return };
                 if k.ease == e {
                     return;
                 }
-                EditCommand::SetKeyframeEase { clip: id, param: p, at: k.at, ease: e }
+                EditCommand::SetKeyframeEase { clip: id, param: p.into(), at: k.at, ease: e }
             }
             _ => return,
         };
@@ -422,7 +422,7 @@ impl App {
             "color" => (ClipProperty::Color(ColorAdjust::default()), c.color == ColorAdjust::default()),
             _ => (ClipProperty::Audio(AudioProps::default()), c.audio == AudioProps::default()),
         };
-        let animated: Vec<(AnimParam, f64)> = params.iter().filter(|p| c.animation.is_animated(**p)).map(|p| (*p, p.default_value())).collect();
+        let animated: Vec<(TrackKey, f64)> = params.iter().filter(|p| c.animation.is_animated(**p)).map(|p| ((*p).into(), p.default_value())).collect();
         if unchanged && animated.is_empty() {
             return; // already at the defaults: no undo entry
         }
@@ -545,11 +545,11 @@ mod tests {
     /// reset has a sentence-case label, not its uppercase title.
     #[test]
     fn keyframe_actions_and_section_resets_have_their_own_labels() {
-        let (clip, param, at) = (ClipId::new(), AnimParam::Scale, SourceTime(Time::ZERO));
-        assert_eq!(key_label(&EditCommand::SetKeyframe { clip, param, at, value: 1.0, ease: None }), "cmd.keyframe_named");
-        assert_eq!(key_label(&EditCommand::RemoveKeyframe { clip, param, at, keep: None }), "cmd.remove_keyframe_named");
+        let (clip, param, at) = (ClipId::new(), TrackKey::from(AnimParam::Scale), SourceTime(Time::ZERO));
+        assert_eq!(key_label(&EditCommand::SetKeyframe { clip, param: param.clone(), at, value: 1.0, ease: None }), "cmd.keyframe_named");
+        assert_eq!(key_label(&EditCommand::RemoveKeyframe { clip, param: param.clone(), at, keep: None }), "cmd.remove_keyframe_named");
         assert_eq!(key_label(&EditCommand::ClearAnimation { clip, statics: vec![] }), "cmd.clear_animation_named");
-        assert_eq!(key_label(&EditCommand::SetKeyframeEase { clip, param, at, ease: Ease::Linear }), "cmd.keyframe_ease_named");
+        assert_eq!(key_label(&EditCommand::SetKeyframeEase { clip, param: param.clone(), at, ease: Ease::Linear }), "cmd.keyframe_ease_named");
         assert_eq!(["transform", "color", "audio"].map(reset_label), ["cmd.reset_transform", "cmd.reset_color", "cmd.reset_audio"]);
     }
 
