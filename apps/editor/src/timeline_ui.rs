@@ -88,11 +88,15 @@ pub struct TimelineUi {
 }
 
 impl TimelineUi {
-    /// Fade handles are offered on a clip at least `FADE_MIN_W` wide, on an
-    /// unlocked track, outside blade mode, while it is selected or hovered
-    /// or has a fade (spec §6.2). The view and hit-testing share this.
-    fn fade_handles(&self, id: ClipId, selected: bool, locked: bool, width: f64, (fi, fo): (Time, Time)) -> bool {
-        width >= anim_ui::FADE_MIN_W && !locked && !self.blade && (selected || self.hover_clip == Some(id) || fi > Time::ZERO || fo > Time::ZERO)
+    /// The fade handles (in, out) a clip offers: none on a locked track or
+    /// in blade mode, otherwise `anim_ui::shown_handles` — each with its own
+    /// fade, both while the clip is selected or hovered. The view and
+    /// hit-testing share this, so a hidden handle is never hit.
+    fn fade_handles(&self, id: ClipId, selected: bool, locked: bool, width: f64, (fi, fo): (Time, Time)) -> (bool, bool) {
+        if locked || self.blade {
+            return (false, false);
+        }
+        anim_ui::shown_handles(width, selected || self.hover_clip == Some(id), fi, fo)
     }
 }
 
@@ -181,11 +185,10 @@ impl App {
         {
             let (x0, x1) = (self.time_to_x(c.timeline_in), self.time_to_x(c.timeline_out));
             let fades = clip_fades(c, track.kind == TrackKind::Audio);
-            if self.tl.fade_handles(c.id, self.tl.selection.contains(&c.id), track.locked, x1 - x0, fades) {
-                let px = |f: Time| f.as_secs_f64() * self.tl.pps;
-                if let Some(edge) = anim_ui::pick_handle(x, x0, x1, px(fades.0), px(fades.1)) {
-                    return Hit::Fade { id: c.id, edge };
-                }
+            let shown = self.tl.fade_handles(c.id, self.tl.selection.contains(&c.id), track.locked, x1 - x0, fades);
+            let px = |f: Time| f.as_secs_f64() * self.tl.pps;
+            if let Some(edge) = anim_ui::pick_handle(x, x0, x1, px(fades.0), px(fades.1), shown) {
+                return Hit::Fade { id: c.id, edge };
             }
         }
         let tol = Time::from_secs_f64(TRIM_ZONE / self.tl.pps);
@@ -1078,6 +1081,7 @@ impl App {
                 let speed = c.speed();
                 let marks: Vec<ClipMark> = if is_audio { vec![] } else { self.clip_marks(c, width) };
                 let fades = clip_fades(c, is_audio);
+                let (show_in, show_out) = self.tl.fade_handles(c.id, sel.contains(&c.id), t.locked, width, fades);
                 clips.push(ClipView {
                     id: c.id.to_string().into(),
                     x: x as f32,
@@ -1098,7 +1102,8 @@ impl App {
                     wave_width: wave_w as f32,
                     fade_in: (fades.0.as_secs_f64() * self.tl.pps) as f32,
                     fade_out: (fades.1.as_secs_f64() * self.tl.pps) as f32,
-                    show_fade_handles: self.tl.fade_handles(c.id, sel.contains(&c.id), t.locked, width, fades),
+                    show_fade_in_handle: show_in,
+                    show_fade_out_handle: show_out,
                     offline: rt.is_some_and(|r| r.status == crate::app::AssetStatus::Missing),
                     marks: ModelRc::new(VecModel::from(marks)),
                 });
@@ -1264,7 +1269,7 @@ mod tests {
             for (fi, fo) in [(0.0, 0.0), (3.0, 5.0), (w / 2.0, w / 2.0), (w, 0.0), (0.0, w), (w * 0.8, w * 0.1)] {
                 let mut x = x0 - 2.0 * TRIM_ZONE;
                 while x <= x1 + 2.0 * TRIM_ZONE {
-                    if anim_ui::pick_handle(x, x0, x1, fi, fo).is_some() {
+                    if anim_ui::pick_handle(x, x0, x1, fi, fo, (true, true)).is_some() {
                         assert!((x - x0).abs() >= TRIM_ZONE && (x1 - x).abs() >= TRIM_ZONE, "x {x} on [{x0}, {x1}] with fades ({fi}, {fo})");
                     }
                     x += 0.25;
@@ -1288,22 +1293,22 @@ mod tests {
         assert_eq!((c.video_fade.fade_in, c.audio.fade_out), (Time::from_secs(1), Time::from_secs(2)), "the others stay");
     }
 
-    /// Handles show on a wide enough, unlocked clip outside blade mode
-    /// while it is selected or hovered, and always when it has a fade.
+    /// Handles show on a wide enough, unlocked clip outside blade mode:
+    /// each with its own fade (R18), both while selected or hovered.
     #[test]
     fn fade_handles_show_when_they_can_be_used() {
         let mut tl = TimelineUi::default();
         let id = ClipId::new();
         let none = (Time::ZERO, Time::ZERO);
-        let faded = (Time::ZERO, Time::from_secs(1));
-        assert!(!tl.fade_handles(id, false, false, 100.0, none), "idle clip without fades");
-        assert!(tl.fade_handles(id, false, false, 100.0, faded), "a fade keeps them visible");
-        assert!(tl.fade_handles(id, true, false, 100.0, none), "selected");
-        assert!(!tl.fade_handles(id, true, false, anim_ui::FADE_MIN_W - 1.0, faded), "too narrow");
-        assert!(!tl.fade_handles(id, true, true, 100.0, faded), "locked track");
+        let faded_out = (Time::ZERO, Time::from_secs(1));
+        assert_eq!(tl.fade_handles(id, false, false, 100.0, none), (false, false), "idle clip without fades");
+        assert_eq!(tl.fade_handles(id, false, false, 100.0, faded_out), (false, true), "only the set fade's handle stays");
+        assert_eq!(tl.fade_handles(id, true, false, 100.0, none), (true, true), "selected");
+        assert_eq!(tl.fade_handles(id, true, false, anim_ui::FADE_MIN_W - 1.0, faded_out), (false, false), "too narrow");
+        assert_eq!(tl.fade_handles(id, true, true, 100.0, faded_out), (false, false), "locked track");
         tl.hover_clip = Some(id);
-        assert!(tl.fade_handles(id, false, false, 100.0, none), "hovered");
+        assert_eq!(tl.fade_handles(id, false, false, 100.0, none), (true, true), "hovered");
         tl.blade = true;
-        assert!(!tl.fade_handles(id, true, false, 100.0, faded), "the blade cuts, handles would mislead");
+        assert_eq!(tl.fade_handles(id, true, false, 100.0, faded_out), (false, false), "the blade cuts, handles would mislead");
     }
 }

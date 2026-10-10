@@ -48,8 +48,10 @@ export struct ClipView {
     // Fade diagonals: the picture's on a video track, the sound's on an audio track.
     fade-in: length,
     fade-out: length,
-    // Fade handles (Rust decides: wide enough, unlocked, hovered, selected or faded).
-    show-fade-handles: bool,
+    // Fade handles (Rust decides): each with its own fade, both while the
+    // clip is hovered or selected; never on narrow or locked clips.
+    show-fade-in-handle: bool,
+    show-fade-out-handle: bool,
     offline: bool,
     marks: [ClipMark],
 }
@@ -255,7 +257,7 @@ component ClipRect inherits Rectangle {
     }
     // Fade handles over the name bar, on the fade boundary but at least 12 px
     // (anim_ui::HANDLE_INSET) inside the clip; Rust hit-tests the same spots.
-    if root.cv.show-fade-handles: Rectangle {
+    if root.cv.show-fade-in-handle: Rectangle {
         x: clamp(root.cv.fade-in, 12px, parent.width - 12px) - 5px;
         y: 3px;
         width: 10px;
@@ -265,7 +267,7 @@ component ClipRect inherits Rectangle {
         border-width: 1px;
         border-color: #00000080;
     }
-    if root.cv.show-fade-handles: Rectangle {
+    if root.cv.show-fade-out-handle: Rectangle {
         x: clamp(parent.width - root.cv.fade-out, 12px, parent.width - 12px) - 5px;
         y: 3px;
         width: 10px;
