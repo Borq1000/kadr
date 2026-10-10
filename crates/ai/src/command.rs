@@ -6,7 +6,7 @@
 //! rejected with a reason the user can see.
 
 use kadr_core::{ClipId, Time, TimeRange};
-use kadr_project::{Marker, Project, TrackKind, Transform, Transition, TransitionKind};
+use kadr_project::{AnimParam, Marker, Project, TrackKind, Transform, Transition, TransitionKind};
 use kadr_timeline::{ClipProperty, EditCommand, TrimEdge};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -168,6 +168,10 @@ pub enum ValidationError {
     Permission { index: usize, msg: String },
     #[error("command {index}: {what} is not supported yet")]
     Unsupported { index: usize, what: &'static str },
+    /// The property has keyframes, so its static value is ignored (keyframes
+    /// spec §3.2): writing it would succeed and change nothing (R24).
+    #[error("command {index}: {param} is animated (keyframes); use set_keyframe or clear_animation")]
+    Animated { index: usize, param: &'static str },
     #[error("too many commands ({0})")]
     TooMany(usize),
     #[error("sequence id does not match the active sequence")]
@@ -263,7 +267,12 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
             }
             AiCommand::SetTransform { clip_id, scale, x, y, rotation_deg, opacity, .. } => {
                 let id = clip(i, clip_id)?;
-                let mut t: Transform = seq.clip(id).unwrap().transform.clone();
+                let c = seq.clip(id).unwrap();
+                let given = [(scale, AnimParam::Scale), (x, AnimParam::X), (y, AnimParam::Y), (rotation_deg, AnimParam::Rotation), (opacity, AnimParam::Opacity)];
+                if let Some((_, p)) = given.iter().find(|(v, p)| v.is_some() && c.animation.is_animated(*p)) {
+                    return Err(ValidationError::Animated { index: i, param: p.key() });
+                }
+                let mut t: Transform = c.transform.clone();
                 if let Some(v) = scale {
                     check(i, "scale", *v, 0.01, 16.0)?;
                     t.scale = *v;
@@ -386,7 +395,7 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"delete_clip","clip_id":string,"ripple":bool,"reason":string}
  {"type":"trim_clip","clip_id":string,"edge":"start"|"end","to_ms":int,"ripple":bool,"reason":string}
  {"type":"move_clip","clip_id":string,"to_ms":int,"reason":string}
- {"type":"set_transform","clip_id":string,"scale"?:num,"x"?:num,"y"?:num,"rotation_deg"?:num,"opacity"?:num,"reason":string}
+ {"type":"set_transform","clip_id":string,"scale"?:num,"x"?:num,"y"?:num,"rotation_deg"?:num,"opacity"?:num,"reason":string} (not for a property with keyframes: rejected)
  {"type":"change_speed","clip_id":string,"speed":num,"reason":string}
  {"type":"set_audio_gain","clip_id":string,"gain_db":num,"reason":string}
  {"type":"add_marker","at_ms":int,"name":string,"reason":string}
@@ -457,6 +466,39 @@ mod tests {
         let cmds = validate(&[select(4_000, clip_end.as_millis(), "CAM2")], &p, &Permissions::default()).unwrap();
         let EditCommand::SetAngleRange { range, .. } = &cmds[0] else { panic!() };
         assert_eq!(range.end, clip_end, "the end names the clip edge, not a frame 3 ms before it");
+    }
+
+    /// R24: an animated property ignores its static value (spec §3.2), so
+    /// writing it would report success and change nothing.
+    #[test]
+    fn set_transform_rejects_animated_properties() {
+        use kadr_project::{AnimParam, SourceTime};
+        let mut p = multicam_project();
+        let id = p.sequence().tracks[0].clips[0].id.to_string();
+        let set = |field: &str, v: f64| {
+            let mut j = serde_json::json!({"type": "set_transform", "clip_id": id});
+            j[field] = v.into();
+            serde_json::from_value::<AiCommand>(j).unwrap()
+        };
+        let fields = [("scale", AnimParam::Scale, 2.0), ("x", AnimParam::X, 10.0), ("y", AnimParam::Y, 10.0), ("rotation_deg", AnimParam::Rotation, 45.0), ("opacity", AnimParam::Opacity, 0.5)];
+        let perms = Permissions::default();
+        for (field, _, v) in fields {
+            assert!(validate(&[set(field, v)], &p, &perms).is_ok(), "{field}: static, accepted");
+        }
+        fn anim(p: &mut Project) -> &mut kadr_project::Animation {
+            &mut p.sequence_mut().tracks[0].clips[0].animation
+        }
+        for (_, param, _) in fields {
+            anim(&mut p).set_key(param, SourceTime(Time::from_secs(1)), param.default_value(), None);
+        }
+        for (field, param, v) in fields {
+            let err = validate(&[set(field, v)], &p, &perms).unwrap_err();
+            assert_eq!(err, ValidationError::Animated { index: 0, param: param.key() }, "{field}");
+            assert_eq!(err.to_string(), format!("command 0: {} is animated (keyframes); use set_keyframe or clear_animation", param.key()));
+        }
+        // Only the fields given count: animating scale does not block opacity.
+        anim(&mut p).clear(AnimParam::Opacity);
+        assert!(validate(&[set("opacity", 0.5)], &p, &perms).is_ok());
     }
 
     #[test]

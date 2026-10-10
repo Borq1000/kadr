@@ -486,6 +486,19 @@ mod tests {
         assert!(anim_op(&p, p.sequence(), &json!({"type": "split_clip", "at_ms": 1})).is_none());
     }
 
+    // R24: set_transform on an animated property would change nothing; it is
+    // rejected with the way out instead of a silent success.
+    #[test]
+    fn set_transform_on_an_animated_property_is_rejected() {
+        let (mut p, id) = project();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "rotation", "at_ms": 6_000, "value": 30.0})).unwrap();
+        let edit = |op: Value| crate::mcp_api::edit_commands(&p, &[], &json!([op]));
+        let e = edit(json!({"type": "set_transform", "clip_id": id, "rotation_deg": 45.0})).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        assert_eq!(e.message, "op #0: rotation is animated (keyframes); use set_keyframe or clear_animation");
+        assert!(edit(json!({"type": "set_transform", "clip_id": id, "scale": 1.5})).is_ok(), "a static property still takes it");
+    }
+
     // R20 (a): clear_animation resets only what is animated.
     #[test]
     fn clear_animation_without_params_leaves_static_properties_alone() {

@@ -21,7 +21,7 @@ const EDIT_DESCRIPTION: &str = "Apply an undoable batch of timeline edit ops (un
 - \"delete_clip\": clip_id, ripple? (default false)
 - \"trim_clip\": clip_id, edge (\"start\"|\"end\"), to_ms, ripple? (default false)
 - \"move_clip\": clip_id, to_ms
-- \"set_transform\": clip_id, scale?, x?, y?, rotation_deg?, opacity? (numbers)
+- \"set_transform\": clip_id, scale?, x?, y?, rotation_deg?, opacity? (numbers, static values; a given property that has keyframes is rejected as \"<param> is animated\": use set_keyframe or clear_animation for it)
 - \"change_speed\": clip_id, speed (number, 1.0 = normal)
 - \"set_audio_gain\": clip_id, gain_db (number)
 - \"add_marker\": at_ms, name

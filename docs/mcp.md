@@ -134,6 +134,12 @@ General)».
 точно на стык при 29.97. Если стыка рядом нет или их несколько, `at` остаётся
 как передан (переход без пары клипов на стыке вычислитель считает устаревшим).
 
+`set_transform` задаёт статические значения. Если у переданного свойства есть
+ключевые кадры, статическое значение не действует (значение берётся из ключей),
+поэтому операция отклоняется: `edit_rejected` «<param> is animated (keyframes);
+use set_keyframe or clear_animation» (`rotation_deg` называется `rotation`).
+Так же отвечает и встроенный ассистент.
+
 Ключевые кадры и затухания клипа: `set_keyframe`, `remove_keyframe`,
 `set_keyframe_ease`, `move_keyframes`, `clear_animation`, `set_video_fade`
 (реализация — `apps/editor/src/mcp_anim.rs`). Момент задаётся одним из двух
