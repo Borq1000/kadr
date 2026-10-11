@@ -131,9 +131,15 @@ impl AppliedEffect {
 
     /// The halves' ranges for a split at `frac` of the visible length:
     /// `(from, c)` and `(c, to)`, `c = progress_at(frac)` — the picture at
-    /// the joint stays as it was (spec §1).
+    /// the joint stays as it was (spec §1). A cut lies inside the clip, so
+    /// `frac` is clamped into 0..1 (a non-finite one — a zero-length clip's
+    /// 0 / 0 — counts as 0), and a cut that still is not finite (a range
+    /// too wide for f64 arithmetic) falls back to `from`: a non-finite
+    /// progress would not survive a save (written `null`, the effect
+    /// dropped on reload).
     pub fn split_progress(&self, frac: f64) -> ((f64, f64), (f64, f64)) {
-        let c = self.progress_at(frac);
+        let frac = if frac.is_finite() { frac.clamp(0.0, 1.0) } else { 0.0 };
+        let c = Some(self.progress_at(frac)).filter(|c| c.is_finite()).unwrap_or(self.progress.0);
         ((self.progress.0, c), (c, self.progress.1))
     }
 
@@ -282,6 +288,25 @@ mod tests {
         e.progress = (0.5, 1.0);
         assert_eq!(e.progress_at(0.5), 0.75);
         assert_eq!(e.split_progress(0.5), ((0.5, 0.75), (0.75, 1.0)));
+    }
+
+    /// A non-finite progress is written `[null, x]` and drops the whole
+    /// effect on reload: a degenerate split point (a zero-length clip's
+    /// 0 / 0, an infinite fraction) or an absurd range from a file never
+    /// produces one.
+    #[test]
+    fn a_split_never_produces_a_non_finite_progress() {
+        let mut e = AppliedEffect::new("smooth_zoom", 1, BTreeMap::new());
+        e.progress = (0.2, 0.6);
+        for frac in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -3.0, 7.0] {
+            let ((a, c), (c2, b)) = e.split_progress(frac);
+            assert!([a, c, c2, b].iter().all(|v| v.is_finite()), "{frac}");
+            assert_eq!((a, b, c), (0.2, 0.6, c2), "{frac}: the outer ends stay, the halves meet");
+            assert!((0.2..=0.6).contains(&c), "{frac}: the cut lies within the range, {c}");
+        }
+        e.progress = (-1e308, 1e308);
+        let ((_, c), _) = e.split_progress(0.5);
+        assert!(c.is_finite(), "{c}");
     }
 
     #[test]

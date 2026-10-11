@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kadr-core = { path = "../core" }
+kadr-effects = { path = "../effects" }
 kadr-project = { path = "../project" }
 kadr-scene = { path = "../scene" }
 serde.workspace = true

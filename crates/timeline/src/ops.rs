@@ -48,6 +48,14 @@ pub fn split_clip(clip: &Clip, t: Time, links: &mut LinkRemap) -> (Clip, Clip) {
     right.video_fade.fade_in = Time::ZERO;
     trim_end(&mut left, t);
     trim_start(&mut right, t);
+    // Effects spec §1: each effect's progress range is cut where the cut is,
+    // so the picture at the joint does not change; both halves keep the
+    // effect's id (its `fx:` tracks and noise seed). Never 0 / 0, and
+    // `split_progress` keeps the cut finite.
+    let frac = crate::fx::visible_fraction(clip, t);
+    for (l, r) in left.effects.iter_mut().zip(right.effects.iter_mut()) {
+        (l.progress, r.progress) = l.split_progress(frac);
+    }
     right.id = ClipId::new();
     right.link = links.right_link(clip.link);
     (left, right)
@@ -179,6 +187,31 @@ mod tests {
         assert_eq!(t.clips[1].source_in, s(104));
         // Splitting exactly on a boundary is a no-op.
         assert!(split_track_at(&mut t, s(4), &mut LinkRemap::default()).is_none());
+    }
+
+    #[test]
+    fn split_cuts_effect_progress_at_the_cut() {
+        let mut t = track_with(&[(0, 10)]);
+        t.clips[0].effects.push(kadr_project::AppliedEffect::new("smooth_zoom", 1, Default::default()));
+        split_track_at(&mut t, s(4), &mut LinkRemap::default()).unwrap();
+        assert_eq!(t.clips[0].effects[0].progress, (0.0, 0.4));
+        assert_eq!(t.clips[1].effects[0].progress, (0.4, 1.0));
+        assert_eq!(t.clips[0].effects[0].id, t.clips[1].effects[0].id, "one effect, two halves: the same id (noise seed, fx tracks)");
+    }
+
+    /// Every effect is cut — a part of a range and one this build cannot
+    /// run (an unknown recipe keeps its progress semantics, spec §1, §2).
+    #[test]
+    fn split_cuts_every_effect_range_including_unknown_ones() {
+        let mut t = track_with(&[(0, 10)]);
+        let mut part = kadr_project::AppliedEffect::new("smooth_zoom", 1, Default::default());
+        part.progress = (0.5, 1.0);
+        t.clips[0].effects.push(part);
+        t.clips[0].effects.push(kadr_project::AppliedEffect::new("glitch_v2", 9, Default::default()));
+        split_track_at(&mut t, s(5), &mut LinkRemap::default()).unwrap();
+        assert_eq!(t.clips[0].effects[0].progress, (0.5, 0.75));
+        assert_eq!(t.clips[1].effects[0].progress, (0.75, 1.0));
+        assert_eq!((t.clips[0].effects[1].progress, t.clips[1].effects[1].progress), ((0.0, 0.5), (0.5, 1.0)));
     }
 
     #[test]

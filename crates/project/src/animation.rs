@@ -379,17 +379,22 @@ impl Animation {
     /// keyframe's value outside the track, the eased blend between two.
     /// `None` when `p` is not animated.
     pub fn value_at(&self, p: impl Into<TrackKey>, s: SourceTime) -> Option<f64> {
-        let keys = self.tracks.get(&p.into())?;
-        let i = keys.partition_point(|k| k.at <= s);
-        Some(match (i.checked_sub(1).map(|j| &keys[j]), keys.get(i)) {
-            (None, Some(first)) => first.value,
-            (Some(last), None) => last.value,
-            (Some(k0), Some(k1)) => {
-                let u = (s.0 - k0.at.0).flicks() as f64 / (k1.at.0 - k0.at.0).flicks() as f64;
-                k0.value + (k1.value - k0.value) * k0.ease.curve().apply(u)
-            }
-            (None, None) => return None,
-        })
+        sample(self.tracks.get(&p.into())?, s)
+    }
+
+    /// `value_at` of effect parameter `key` of `effect` without building a
+    /// `TrackKey` (whose `String` would be allocated per call): the
+    /// evaluator asks this for every parameter of every effect, every frame.
+    pub fn fx_value_at(&self, effect: EffectId, key: &str, s: SourceTime) -> Option<f64> {
+        // The smallest key of `effect` (`String::new` does not allocate);
+        // its tracks follow it in key order.
+        let first = TrackKey::Fx(FxParam { effect, key: String::new() });
+        let (_, keys) = self
+            .tracks
+            .range(first..)
+            .map_while(|(k, keys)| k.as_fx().filter(|f| f.effect == effect).map(|f| (f.key.as_str(), keys)))
+            .find(|(k, _)| *k == key)?;
+        sample(keys, s)
     }
 
     /// Removes the keyframe at `at`; the track goes away with its last key.
@@ -464,6 +469,20 @@ impl Animation {
         self.unknown.retain(|k, _| !k.starts_with(&prefix));
         before != self.tracks.len() + self.unknown.len()
     }
+}
+
+/// A sorted track's value at `s` (`Animation::value_at`); `None` when empty.
+fn sample(keys: &[Keyframe], s: SourceTime) -> Option<f64> {
+    let i = keys.partition_point(|k| k.at <= s);
+    Some(match (i.checked_sub(1).map(|j| &keys[j]), keys.get(i)) {
+        (None, Some(first)) => first.value,
+        (Some(last), None) => last.value,
+        (Some(k0), Some(k1)) => {
+            let u = (s.0 - k0.at.0).flicks() as f64 / (k1.at.0 - k0.at.0).flicks() as f64;
+            k0.value + (k1.value - k0.value) * k0.ease.curve().apply(u)
+        }
+        (None, None) => return None,
+    })
 }
 
 impl Serialize for Animation {
@@ -790,6 +809,30 @@ mod tests {
         assert_eq!(saved[&canonical][0]["value"], 0.3);
         assert_eq!(saved, Value::Object(stored), "nothing rewritten or lost");
         assert_eq!((TrackKey::parse(&upper), TrackKey::parse(&simple)), (None, None));
+    }
+
+    /// The evaluator's per-frame lookup of an effect parameter's track: the
+    /// same value as `value_at` with a built key, and only that track's.
+    #[test]
+    fn fx_value_at_reads_one_effect_parameter_without_building_a_key() {
+        let (fx, other) = (kadr_core::EffectId::new(), kadr_core::EffectId::new());
+        let mut a = Animation::default();
+        a.set_key(AnimParam::Scale, st(0), 2.0, None);
+        a.set_key(TrackKey::fx(fx, "strength"), st(0), 0.25, Some(Ease::Linear));
+        a.set_key(TrackKey::fx(fx, "strength"), st(10_000), 0.75, None);
+        a.set_key(TrackKey::fx(fx, "amount"), st(0), 0.3, None);
+        a.set_key(TrackKey::fx(fx, "strength2"), st(0), 0.9, None);
+        a.set_key(TrackKey::fx(other, "strength"), st(0), 0.4, None);
+        for ms in [-5_000, 0, 2_500, 10_000, 15_000] {
+            assert_eq!(a.fx_value_at(fx, "strength", st(ms)), a.value_at(TrackKey::fx(fx, "strength"), st(ms)), "{ms}");
+        }
+        assert_eq!(a.fx_value_at(fx, "strength", st(5_000)), Some(0.5));
+        assert_eq!(a.fx_value_at(fx, "amount", st(0)), Some(0.3));
+        assert_eq!(a.fx_value_at(other, "strength", st(0)), Some(0.4));
+        for (e, key) in [(fx, "streng"), (fx, ""), (fx, "point"), (other, "amount"), (kadr_core::EffectId::new(), "strength")] {
+            assert_eq!(a.fx_value_at(e, key, st(0)), None, "{key}");
+        }
+        assert_eq!(Animation::default().fx_value_at(fx, "strength", st(0)), None);
     }
 
     /// Review focus 5: removing an effect takes all its tracks — also one

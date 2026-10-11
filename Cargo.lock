@@ -3038,6 +3038,7 @@ name = "kadr-project-scenes"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
+ "kadr-effects",
  "kadr-media",
  "kadr-playback",
  "kadr-project",
@@ -3069,6 +3070,7 @@ name = "kadr-timeline"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
+ "kadr-effects",
  "kadr-project",
  "kadr-scene",
  "serde",

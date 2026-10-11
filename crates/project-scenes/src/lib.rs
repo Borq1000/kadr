@@ -6,7 +6,7 @@
 
 use kadr_core::{AssetId, FrameRate, MediaKind, Time};
 use kadr_playback::{MediaSource, SceneSource};
-use kadr_project::{Project, TrackKind};
+use kadr_project::{Project, Sequence, TrackKind};
 use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, OutputSpec, SizeU, SourceKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +15,8 @@ pub struct ProjectScenes {
     /// The active sequence and the assets its clips use — nothing else
     /// (analysis, history and AI records are not copied).
     project: Arc<Project>,
-    /// "Before" view: the clips' effects (colour) are dropped, geometry is kept.
+    /// "Before" («До») view: the clips' colour and applied effects (motion
+    /// too) are dropped; the clips' own geometry is kept.
     bypass: bool,
     media: HashMap<AssetId, MediaSource>,
     duration: Time,
@@ -27,23 +28,32 @@ impl ProjectScenes {
     /// Snapshots `project`'s active sequence. Whether each file exists is
     /// checked here, once.
     pub fn new(project: &Project, bypass: bool) -> Self {
-        let seq = project.sequence();
+        Self::new_with(project, bypass, |_| {})
+    }
+
+    /// As `new`, with `edit` applied to the snapshot's copy of the sequence
+    /// (the hover preview of an effect, effects spec §6.1): the project
+    /// itself is never touched. In the «До» view (`bypass`) the copy's clips
+    /// have no effects at all — colour is stripped from the layers below,
+    /// motion is dropped here (refinement 9).
+    pub fn new_with(project: &Project, bypass: bool, edit: impl FnOnce(&mut Sequence)) -> Self {
+        let mut seq = project.sequence().clone();
+        edit(&mut seq);
+        if bypass {
+            for c in seq.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+                c.effects.clear();
+            }
+        }
         let used: std::collections::HashSet<AssetId> = seq.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.asset)).collect();
         let mut slim = Project::new(project.name.clone());
         slim.id = project.id;
         slim.assets = project.assets.iter().filter(|a| used.contains(&a.id)).cloned().collect();
-        slim.sequences = vec![seq.clone()];
-        slim.active_sequence = seq.id;
         let rate = seq.frame_rate;
+        let (duration, canvas) = (seq.duration(), SizeU::new(seq.width.max(1), seq.height.max(1)));
+        slim.active_sequence = seq.id;
+        slim.sequences = vec![seq];
         let media = slim.assets.iter().filter_map(|a| Some((a.id, media_source(a, rate)?))).collect();
-        ProjectScenes {
-            duration: seq.duration(),
-            rate,
-            canvas: SizeU::new(seq.width.max(1), seq.height.max(1)),
-            project: Arc::new(slim),
-            bypass,
-            media,
-        }
+        ProjectScenes { duration, rate, canvas, project: Arc::new(slim), bypass, media }
     }
 
     pub fn bypass(&self) -> bool {
@@ -280,6 +290,61 @@ mod tests {
         assert_eq!(normal.top_clip(&scene), Some(top));
         assert_eq!(normal.top_clip(&ProjectScenes::new(&p, false).scene_at(Time::from_millis(5000), &out())), None, "past the end: nothing");
         let _ = base;
+    }
+
+    fn zoomed(p: &mut Project, id: kadr_core::ClipId) {
+        let (ti, ci) = p.sequence().locate_clip(id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &p.sequence().tracks[ti].clips[ci], Time::ZERO);
+        p.sequence_mut().tracks[ti].clips[ci].effects.push(e);
+    }
+
+    /// Refinement 9: «До» shows the clips without any effect, motion too.
+    #[test]
+    fn bypass_also_drops_motion_effects() {
+        let mut p = Project::new("t");
+        let a = asset(std::path::Path::new("a.mp4"), MediaKind::Video, 1920, 1080, Some(FrameRate::FPS_30), false);
+        let id = place(&mut p, 0, &a, 0, 4000);
+        zoomed(&mut p, id);
+        let t = Time::from_millis(3000);
+        assert!(ProjectScenes::new(&p, false).scene_at(t, &out()).layers[0].placement.scale.x > 1.0);
+        assert_eq!(ProjectScenes::new(&p, true).scene_at(t, &out()).layers[0].placement.scale.x, 1.0);
+    }
+
+    /// Review focus 1: an edit of the snapshot's copy shows in its scenes only.
+    #[test]
+    fn new_with_changes_the_snapshot_only() {
+        let mut p = Project::new("t");
+        let a = asset(std::path::Path::new("a.mp4"), MediaKind::Video, 1920, 1080, Some(FrameRate::FPS_30), false);
+        let id = place(&mut p, 0, &a, 0, 4000);
+        let before = p.clone();
+        let mut copy_of_effect = None;
+        let s = ProjectScenes::new_with(&p, false, |seq| {
+            let (ti, ci) = seq.locate_clip(id).unwrap();
+            let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &seq.tracks[ti].clips[ci], Time::ZERO);
+            copy_of_effect = Some(e.clone());
+            seq.tracks[ti].clips[ci].effects.push(e);
+        });
+        assert!(copy_of_effect.is_some());
+        assert!(s.scene_at(Time::from_millis(3000), &out()).layers[0].placement.scale.x > 1.0, "the snapshot shows it");
+        assert_eq!(p, before, "the project does not");
+    }
+
+    /// The hover preview in the «До» view: the edit lands in the copy, and
+    /// the copy's effects are dropped after it — also an effect the edit
+    /// just added.
+    #[test]
+    fn new_with_in_bypass_drops_the_edits_effects_too() {
+        let mut p = Project::new("t");
+        let a = asset(std::path::Path::new("a.mp4"), MediaKind::Video, 1920, 1080, Some(FrameRate::FPS_30), false);
+        let id = place(&mut p, 0, &a, 0, 4000);
+        let s = ProjectScenes::new_with(&p, true, |seq| {
+            let (ti, ci) = seq.locate_clip(id).unwrap();
+            let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &seq.tracks[ti].clips[ci], Time::ZERO);
+            seq.tracks[ti].clips[ci].effects.push(e);
+            seq.tracks[ti].clips[ci].transform.scale = 0.5;
+        });
+        let l = &s.scene_at(Time::from_millis(3000), &out()).layers[0];
+        assert_eq!(l.placement.scale.x, 0.5, "the edit's geometry shows, its effect does not");
     }
 
     #[test]

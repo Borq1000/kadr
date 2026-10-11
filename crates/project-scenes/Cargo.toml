@@ -13,6 +13,7 @@ kadr-scene = { path = "../scene" }
 kadr-playback = { path = "../playback" }
 
 [dev-dependencies]
+kadr-effects = { path = "../effects" }
 kadr-media = { path = "../media" }
 kadr-render = { path = "../render" }
 tempfile.workspace = true

@@ -228,6 +228,10 @@ pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU, frame:
     }
     let placement = placement_of(&st.transform, fit_contain(display_size, canvas), canvas);
     let crop = crop_of(&st.transform, placement.size)?;
+    // Motion effects move the picture inside the clip's own placement, in
+    // its visible crop window (effects spec §3, ruling R6); the picture's
+    // size, and so the crop in its local pixels, stays.
+    let placement = crate::fx::place_in_window(clip, t, canvas, placement, crate::fx::crop_window(&st.transform));
     let mut effects = vec![];
     let color = color_of(&st.color);
     if !color.is_neutral() {
