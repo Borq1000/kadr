@@ -431,12 +431,13 @@ impl Gen {
         }
     }
 
-    /// A chain of one to four primitives of any kind now and then (D2).
+    /// A chain of one to five primitives of any kind now and then (D2) — as
+    /// long as a Look's.
     fn effects(&mut self) -> Vec<Effect> {
         if !self.rng.chance(0.4) {
             return vec![];
         }
-        let n = self.rng.int(1, 4);
+        let n = self.rng.int(1, 5);
         (0..n).map(|_| self.effect()).collect()
     }
 
@@ -777,6 +778,69 @@ fn cpu_renderer_matches_the_reference_on_spatial_and_clamped_chains() {
             }
         }
     }
+}
+
+/// Every Look preset as the editor compiles it (`look_effects`: correction, curve, split tone,
+/// vignette and grain fused in one chain) at «Обычно» and at 100 % (k = 1 and 1.67), on a
+/// landscape and a vertical canvas, each into a letterboxed or pillarboxed output and a scaled
+/// one, on a full-frame and on a turned picture-in-picture layer. The grain is compiled for the
+/// canvas drawn (a 1-pixel cell here) and for one 40 times as big (2-pixel cells, as at 1080p).
+#[test]
+fn cpu_renderer_matches_the_reference_on_every_look_preset() {
+    use kadr_effects::look::{look_effects, preset, preset_keys};
+    use kadr_effects::{intensity, CompileCtx};
+    let ramp = |w: u32, h: u32| {
+        let data: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x * 255 / (w - 1)) as u8, (y * 255 / (h - 1)) as u8, (255 - (x * y * 255 / ((w - 1) * (h - 1)))) as u8, 255])).collect();
+        Arc::new(CpuFrame::from_rgba8(w, h, ColorInfo { alpha: AlphaMode::Opaque, ..ColorInfo::WORKING_SDR }, data))
+    };
+    // (canvas, letterboxed or pillarboxed output, scaled output)
+    let canvases = [((48, 27), (40, 30), (96, 54)), ((27, 48), (40, 30), (18, 32))];
+    let time = Time::from_millis(1_234);
+    let mut renderer = CpuRenderer::new();
+    let (mut renders, mut longest, mut grain_cells) = (0, 0, std::collections::BTreeSet::new());
+    for ((cw, ch), boxed, scaled) in canvases {
+        let canvas = SizeU::new(cw, ch);
+        let frame = ramp(cw, ch);
+        let pip = Placement { size: Vec2::new(cw as f32, ch as f32), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(cw as f32 * 0.7, ch as f32 * 0.33), scale: Vec2::new(0.45, 0.45), rotation: 0.3 };
+        for key in preset_keys() {
+            for strength in [0.6, 1.0] {
+                for compiled_for in [canvas, SizeU::new(cw * 40, ch * 40)] {
+                    let chain = look_effects(preset(key).unwrap(), intensity(strength), &CompileCtx::still(compiled_for, time, 7));
+                    assert!(!chain.is_empty(), "{key}");
+                    longest = longest.max(chain.len());
+                    grain_cells.extend(chain.iter().filter_map(|e| if let Effect::Grain(g) = e { Some(g.size as u32) } else { None }));
+                    for (ow, oh) in [boxed, scaled] {
+                        let out = SizeU::new(ow, oh);
+                        assert!(!has_boundary_tie(canvas, out), "{cw}x{ch} into {ow}x{oh}");
+                        for placement in [Placement::fill(canvas), pip] {
+                            let m = MediaRef { media: AssetId::new(), stream: 0, kind: SourceKind::Video, display_size: canvas, color: frame.color };
+                            let layer = Layer { id: LayerId(1), content: LayerContent::Media { media: m, source_time: Time::ZERO }, crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: chain.clone() };
+                            let scene = FrameScene { time, canvas, output: OutputSpec::new(out, RenderQuality::Export), background: Rgba::BLACK, layers: vec![layer] };
+                            let inputs = RenderInputs { layers: vec![LayerInput::Cpu(frame.clone())] };
+                            let (expected, ties) = render_reference_with_ties(&scene, &inputs);
+                            let mut actual = vec![0xAAu8; ow as usize * oh as usize * 4];
+                            renderer.render(&PreparedFrame { scene: &scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(ow, oh, &mut actual))).unwrap();
+                            for (at, (e, a)) in expected.iter().zip(&actual).enumerate() {
+                                let pix = at / 4;
+                                assert!(
+                                    e.abs_diff(*a) <= 1 + ties[pix].min(1),
+                                    "{key} at strength {strength}, compiled for {compiled_for:?}, canvas {cw}x{ch} into {ow}x{oh}, {}: pixel ({}, {}) channel {}: reference {e}, renderer {a}",
+                                    if placement == pip { "picture in picture" } else { "full frame" },
+                                    pix % ow as usize,
+                                    pix / ow as usize,
+                                    at % 4
+                                );
+                            }
+                            renders += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(renders, 2 * preset_keys().len() * 2 * 2 * 2 * 2);
+    assert_eq!(longest, 5, "a preset with all five primitives (Винтаж) ran in one chain");
+    assert_eq!(grain_cells.into_iter().collect::<Vec<_>>(), [1, 2], "both grain cells were drawn");
 }
 
 /// The generator itself is deterministic and covers what the parity test claims to cover.
