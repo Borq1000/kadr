@@ -160,10 +160,13 @@ fn migrate_transitions(seq: &mut serde_json::Value) {
     list.retain_mut(|tr| {
         let Some(o) = tr.as_object_mut() else { return true };
         if o.contains_key("recipe") {
-            // The recipe names it; old fields beside it would land in `extra`
-            // and be written back (E3-R4): they go.
-            for k in ["kind", "track", "at"] {
-                o.remove(k);
+            // A legacy entry — it still has the old `kind` — given a recipe
+            // (a hand-edited file): the recipe names it, and its old fields
+            // would land in `extra` and be written back (E3-R4), so they go.
+            // Without `kind`, `track` and `at` are a newer Kadr's: kept.
+            if o.remove("kind").is_some() {
+                o.remove("track");
+                o.remove("at");
             }
             return true;
         }
@@ -460,7 +463,9 @@ mod tests {
 
     /// E3-R4: a transition with both a `recipe` and the old `kind` (a
     /// hand-edited file) is read by its recipe; `kind`, `track` and `at`
-    /// are dropped, never kept in `extra` and written back.
+    /// are dropped, never kept in `extra` and written back. Only a legacy
+    /// entry loses them: beside a recipe alone they are a newer Kadr's
+    /// fields, kept (E3-R6).
     #[test]
     fn old_fields_beside_a_recipe_are_dropped() {
         let f = |s: i64| s * kadr_core::FLICKS_PER_SECOND;
@@ -474,6 +479,11 @@ mod tests {
         let saved = serde_json::to_value(&p).unwrap();
         let s = &saved["sequences"][0]["transitions"][0];
         assert!(s.get("kind").is_none() && s.get("track").is_none() && s.get("at").is_none(), "the old fields are never written: {s}");
+
+        v["sequences"][0]["transitions"] = serde_json::json!([{"id": kadr_core::TransitionId::new(), "recipe": "wipe", "track": "V1", "at": 5, "from": a, "to": b, "duration": f(1)}]);
+        let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("newer.kadr")).unwrap();
+        let s = &serde_json::to_value(&p).unwrap()["sequences"][0]["transitions"][0];
+        assert_eq!((s["track"].clone(), s["at"].clone()), (serde_json::json!("V1"), serde_json::json!(5)), "no `kind`: a newer Kadr's fields, kept");
     }
 
     /// Bad transition data never fails the project and never panics.

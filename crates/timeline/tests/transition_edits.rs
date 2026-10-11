@@ -120,6 +120,51 @@ fn transitions_follow_every_clip_command() {
         &|_, _| EditCommand::Batch { label: "x".into(), commands: vec![EditCommand::Split { at: s(1), clips: None }, EditCommand::Split { at: s(3), clips: None }] },
         &|p, _, [t1, _]| assert_eq!(p.sequence().clip(p.sequence().transition(t1).unwrap().from).unwrap().timeline_in, s(3), "the last piece"),
     );
+
+    // E3-R6: only the clip that now ends at the cut is judged — `from`, or
+    // one of its file — whatever lies between.
+    fn other(p: &Project, at: i64, len: i64, mode: InsertMode) -> EditCommand {
+        let x = Clip::new(p.assets[2].id, "x", TimeRange::new(s(30), s(30 + len)), s(at));
+        EditCommand::InsertClip { track: p.sequence().tracks[0].id, clip: x, mode }
+    }
+    check("a cutaway of another file inserted inside from", &|p, _| other(p, 2, 2, InsertMode::Insert), &|p, ids, tids| on_a_piece_of_a(p, ids, tids, s(6)));
+    check("a cutaway of another file overwritten inside from", &|p, _| other(p, 1, 1, InsertMode::Overwrite), &|p, ids, tids| on_a_piece_of_a(p, ids, tids, s(4)));
+    check("from's tail overwritten by another file", &|p, _| other(p, 3, 1, InsertMode::Overwrite), &|p, _, [t1, t2]| assert_eq!(kept(p, [t1, t2]), vec![t2], "another file at the cut"));
+    check(
+        "a clip of from's file inserted at the cut",
+        &|p, _| EditCommand::InsertClip { track: p.sequence().tracks[0].id, clip: Clip::new(p.assets[0].id, "y", TimeRange::new(s(30), s(32)), s(4)), mode: InsertMode::Insert },
+        &|p, ids, tids| {
+            on_a_piece_of_a(p, ids, tids, s(6));
+            assert_eq!(p.sequence().clip(p.sequence().transition(tids[0]).unwrap().from).unwrap().timeline_in, s(4), "re-anchored to the inserted clip (accepted, E3-R6)");
+        },
+    );
+    // E3-R6: inside a batch transitions follow each command and are dropped
+    // only at its end, so a batch does what its commands do one by one.
+    for ripple in [false, true] {
+        check(
+            &format!("a batch splitting from, then deleting its left half (ripple {ripple})"),
+            &move |_, [a, _, _]| EditCommand::Batch { label: "x".into(), commands: vec![EditCommand::Split { at: s(2), clips: Some(vec![a]) }, EditCommand::DeleteClips { clips: vec![a], ripple }] },
+            &move |p, ids, tids| on_a_piece_of_a(p, ids, tids, if ripple { s(2) } else { s(4) }),
+        );
+    }
+    check(
+        "a batch moving from away and back",
+        &|_, [a, _, _]| EditCommand::Batch { label: "x".into(), commands: vec![EditCommand::MoveClips { clips: vec![a], delta: s(30), track_delta: 0 }, EditCommand::MoveClips { clips: vec![a], delta: -s(30), track_delta: 0 }] },
+        &|p, [a, b, c], tids| {
+            assert_eq!(kept(p, tids), tids.to_vec(), "both ids kept");
+            assert_eq!(cuts(p).iter().map(|t| (t.1, t.2)).collect::<Vec<_>>(), [(a, b), (b, c)]);
+        },
+    );
+}
+
+/// The a|b transition kept on its cut, now at `cut`, from a clip of `a`'s
+/// file that is not `a` (what an edit inside `a` left at its end).
+fn on_a_piece_of_a(p: &Project, [a, b, _]: [ClipId; 3], tids: [TransitionId; 2], cut: Time) {
+    assert_eq!(kept(p, tids), tids.to_vec(), "both transitions stay");
+    let t = p.sequence().transition(tids[0]).unwrap();
+    let from = p.sequence().clip(t.from).unwrap();
+    assert_ne!(t.from, a, "re-anchored to the clip now at the cut");
+    assert_eq!((t.to, from.asset, from.timeline_out), (b, p.assets[0].id, cut));
 }
 
 /// `setup` with `a` an angle of a two-camera group: CAM1 is `a`'s medium,
@@ -175,11 +220,11 @@ fn edits_inside_the_outgoing_clip_keep_its_transition() {
 fn set_transition_validates_fills_defaults_and_replaces_in_place() {
     let (mut p, mut e, [a, b, c], [t1, _]) = setup();
     let entries = p.history_log.len();
-    e.execute(&mut p, set(a, b, "smooth_push", &[], ms(500))).unwrap();
+    e.execute(&mut p, set(a, b, "smooth_push", &[], ms(480))).unwrap();
     let t = p.sequence().transition(t1).expect("the cut's transition keeps its id");
-    assert_eq!((t.recipe.as_str(), t.params["direction"].clone(), t.duration), ("smooth_push", ParamValue::Choice("left".into()), ms(500)));
+    assert_eq!((t.recipe.as_str(), t.params["direction"].clone(), t.duration), ("smooth_push", ParamValue::Choice("left".into()), ms(480)));
     assert_eq!(p.sequence().transitions.len(), 2, "one per cut");
-    assert_eq!(e.execute(&mut p, set(a, b, "smooth_push", &[("direction", ParamValue::Choice("left".into()))], ms(500))), Err(EditError::NoOp), "the same again");
+    assert_eq!(e.execute(&mut p, set(a, b, "smooth_push", &[("direction", ParamValue::Choice("left".into()))], ms(480))), Err(EditError::NoOp), "the same again");
     assert_eq!(p.history_log.len(), entries + 1);
     e.execute(&mut p, EditCommand::RemoveTransition(t1)).unwrap();
     e.execute(&mut p, set(a, b, "light_sweep", &[("color", ParamValue::Choice("cold".into()))], s(1))).unwrap();
@@ -189,7 +234,10 @@ fn set_transition_validates_fills_defaults_and_replaces_in_place() {
     assert_eq!(e.execute(&mut p, set(a, b, "iris", &[], s(1))), Err(EditError::UnknownRecipe("iris".into())));
     assert_eq!(e.execute(&mut p, set(a, b, "look", &[], s(1))), Err(EditError::EffectTarget), "a clip recipe is no transition");
     assert!(matches!(e.execute(&mut p, set(a, b, "wipe", &[("softness", ParamValue::Number(3.0))], s(1))), Err(EditError::InvalidParam(m)) if m.contains("softness")));
-    assert_eq!(e.execute(&mut p, set(a, b, "wipe", &[], ms(70))), Err(EditError::InvalidRange), "under two frames (80 ms at 25 fps)");
+    assert_eq!(e.execute(&mut p, set(a, b, "wipe", &[], ms(50))), Err(EditError::InvalidRange), "one frame (50 ms snaps to 40 ms at 25 fps): under two");
+    let wipe = kadr_effects::recipe("wipe").unwrap().version;
+    let newer = EditCommand::SetTransition { from: a, to: b, recipe: "wipe".into(), version: wipe + 1, params: BTreeMap::new(), duration: s(1) };
+    assert_eq!(e.execute(&mut p, newer), Err(EditError::UnknownRecipe("wipe".into())), "a version this build does not have");
     assert_eq!(e.execute(&mut p, set(a, c, "wipe", &[], s(1))), Err(EditError::NotACut));
     assert_eq!(e.execute(&mut p, set(b, a, "wipe", &[], s(1))), Err(EditError::NotACut));
     let mut audio = p.clone();
@@ -222,6 +270,46 @@ fn a_locked_track_keeps_its_transitions() {
     assert!(matches!(e.execute(&mut p, set(a, b, "wipe", &[], s(1))), Err(EditError::TrackLocked(_))));
     assert!(matches!(e.execute(&mut p, EditCommand::UpdateTransition { id: t1, params: BTreeMap::new(), duration: Some(s(2)) }), Err(EditError::TrackLocked(_))));
     assert!(matches!(e.execute(&mut p, EditCommand::RemoveTransition(t1)), Err(EditError::TrackLocked(_))));
+
+    // E3-R6: edits over every track (a clip on V2 under the cuts) pass the
+    // locked V1 by, and its transitions with it.
+    let x = Clip::new(p.assets[2].id, "x", TimeRange::new(s(20), s(32)), s(0));
+    p.sequence_mut().tracks[1].clips.push(x);
+    let v1 = p.sequence().tracks[0].clone();
+    let transitions = p.sequence().transitions.clone();
+    for cmd in [
+        EditCommand::DeleteRange { range: TimeRange::new(s(3), s(5)), ripple: false },
+        EditCommand::DeleteRange { range: TimeRange::new(s(3), s(5)), ripple: true },
+        EditCommand::Split { at: s(4), clips: None },
+        EditCommand::Split { at: s(2), clips: None },
+    ] {
+        let what = format!("{cmd:?}");
+        let v2 = p.sequence().tracks[1].clone();
+        e.execute(&mut p, cmd).unwrap_or_else(|err| panic!("{what}: {err}"));
+        assert_ne!(p.sequence().tracks[1], v2, "{what}: V2 was edited");
+        assert_eq!((&p.sequence().tracks[0], &p.sequence().transitions), (&v1, &transitions), "{what}: the locked V1 and its transitions are as they were");
+        e.undo(&mut p);
+    }
+}
+
+/// E3-R6: a transition's length is whole frames, so the length shown is
+/// the length stored, and setting the shown one again changes nothing.
+#[test]
+fn transition_lengths_are_whole_frames() {
+    let (mut p, mut e, [a, b, _], [t1, _]) = setup();
+    let fr = FrameRate::FPS_29_97;
+    p.sequence_mut().frame_rate = fr;
+    e.execute(&mut p, set(a, b, "wipe", &[], ms(500))).unwrap();
+    let d = p.sequence().transition(t1).unwrap().duration;
+    assert_eq!(d, fr.frame_to_time(15), "500 ms is 14.985 frames at 29.97 fps: 15 of them");
+    assert_ne!(d, ms(500));
+    for shown in [ms(500), ms(501), d] {
+        let r = e.execute(&mut p, EditCommand::UpdateTransition { id: t1, params: BTreeMap::new(), duration: Some(shown) });
+        assert_eq!(r, Err(EditError::NoOp), "{shown:?} is the stored length");
+    }
+    assert_eq!(e.execute(&mut p, set(a, b, "wipe", &[], ms(500))), Err(EditError::NoOp), "the same transition again");
+    e.execute(&mut p, EditCommand::UpdateTransition { id: t1, params: BTreeMap::new(), duration: Some(ms(700)) }).unwrap();
+    assert_eq!(p.sequence().transition(t1).unwrap().duration, fr.frame_to_time(21), "700 ms is 20.979 frames: 21");
 }
 
 #[test]

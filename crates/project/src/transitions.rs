@@ -134,11 +134,11 @@ impl Sequence {
     }
 
     /// Keeps every transition on its cut after the clips changed (D2,
-    /// refinement 10, ruling E3-R4): one stays while `to` is on a video
-    /// track and the clip now ending where `to` starts is `from` — or what
-    /// an edit inside `from` left of it, reached from it through the clips
-    /// before the cut that show `from`'s medium or its multicam group (a
-    /// split, a range deleted inside it, a camera cut) — to which it is
+    /// refinement 10, rulings E3-R4, E3-R6): one stays while `to` is on a
+    /// video track, `from` is still on that track before the cut, and the
+    /// clip now ending where `to` starts is `from` or shows `from`'s medium
+    /// or its multicam group (what a split, a range deleted inside `from`, a
+    /// cutaway inside it or a camera cut left at its end) — to which it is
     /// re-anchored; one transition per cut (the first). The rest are removed
     /// and returned. A switched-off clip keeps its transition.
     pub fn reconcile_transitions(&mut self) -> Vec<Transition> {
@@ -158,40 +158,43 @@ impl Sequence {
         });
         dropped
     }
+
+    /// Re-anchors every transition whose cut still holds (as
+    /// `reconcile_transitions` judges it) and drops none: between the
+    /// commands of a batch, where a cut can come back before the batch ends
+    /// and a later command can remove the clip a transition was anchored to
+    /// (E3-R6). The batch's final reconcile drops what is really gone.
+    pub fn reanchor_transitions(&mut self) {
+        let tracks = &self.tracks;
+        for tr in &mut self.transitions {
+            if let Some(from) = follow(tracks, tr.from, tr.to) {
+                tr.from = from;
+            }
+        }
+    }
 }
 
-/// The clip ending where `to` starts, reached from `from` through what an
-/// edit inside `from` made of it (ruling E3-R4): each next clip on the
-/// track before the cut that shows `from`'s medium or an angle of
-/// `from`'s multicam group — the pieces of a split, of a range deleted
-/// inside it (gap or ripple), of a live camera cut. No timeline or source
-/// continuity is asked: a range taken out of the middle leaves neither.
-/// `None` when `from` or `to` is gone, `to` is not on a video track, or a
-/// gap or another clip stands right before the cut.
+/// The clip ending where `to` starts, when it carries `from`'s transition
+/// (rulings E3-R4, E3-R6): `from` itself, or a clip of `from`'s medium or
+/// of its multicam group — what an edit inside `from` left at its end (a
+/// split, a range deleted inside it, ripple or not, a cutaway of another
+/// file inserted or overwritten inside it, a camera cut). Only that clip is
+/// judged: what lies between `from` and it does not matter. `None` when
+/// `from` or `to` is gone, `to` is not on a video track, `from` is not on
+/// that track before the cut, or a gap or another file's clip stands right
+/// before the cut (another file at the cut, `from`'s tail overwritten).
 fn follow(tracks: &[Track], from: ClipId, to: ClipId) -> Option<ClipId> {
     let track = tracks.iter().find(|t| t.clips.iter().any(|c| c.id == to))?;
     if track.kind != TrackKind::Video {
         return None;
     }
-    let cut = track.clips.iter().find(|c| c.id == to)?.timeline_in;
-    let mut i = track.clips.iter().position(|c| c.id == from)?;
-    let origin = &track.clips[i];
+    let ti = track.clips.iter().position(|c| c.id == to)?;
+    let cut = track.clips[ti].timeline_in;
+    let origin = track.clips.iter().find(|c| c.id == from).filter(|c| c.timeline_out <= cut)?;
+    let end = track.clips[..ti].last().filter(|c| c.timeline_out == cut)?;
     let group = origin.multicam.as_ref().map(|m| m.group);
-    let same = |c: &crate::Clip| c.asset == origin.asset || group.is_some_and(|g| c.multicam.as_ref().is_some_and(|m| m.group == g));
-    loop {
-        let c = &track.clips[i];
-        if c.timeline_out == cut {
-            return Some(c.id);
-        }
-        // Tracks are sorted and disjoint: the next clip starts at or after
-        // `c` ends. One starting at the cut or later is `to` or beyond: a
-        // gap or another clip stands before the cut.
-        let next = track.clips.get(i + 1)?;
-        if c.timeline_out > cut || next.timeline_in >= cut || !same(next) {
-            return None;
-        }
-        i += 1;
-    }
+    let carries = end.id == from || end.asset == origin.asset || group.is_some_and(|g| end.multicam.as_ref().is_some_and(|m| m.group == g));
+    carries.then_some(end.id)
 }
 
 #[cfg(test)]
@@ -263,10 +266,33 @@ mod tests {
         assert!(seq.reconcile_transitions().is_empty(), "a live camera cut inside a");
         assert_eq!((seq.transitions[0].from, seq.transitions[0].to), (a2, b));
 
+        // E3-R6: only the clip at the cut is judged.
+        let (mut seq, [a, b, _]) = seq3();
+        let a2 = split(&mut seq, a, s(1));
+        let x = split(&mut seq, a2, s(2));
+        let a3 = split(&mut seq, x, s(3));
+        seq.tracks[0].clips[2].asset = AssetId::new();
+        assert!(seq.reconcile_transitions().is_empty(), "a cutaway of another file inside a");
+        assert_eq!((seq.transitions[0].from, seq.transitions[0].to), (a3, b));
+
         let (mut seq, [a, ..]) = seq3();
         split(&mut seq, a, s(2));
         seq.tracks[0].clips[1].asset = AssetId::new();
-        assert_eq!(seq.reconcile_transitions().len(), 1, "another medium before the cut: not a piece of a");
+        assert_eq!(seq.reconcile_transitions().len(), 1, "another file at the cut (a's tail overwritten): not a piece of a");
+    }
+
+    /// E3-R6: between a batch's commands a transition follows what it can
+    /// and is never dropped; where its cut is gone it is left as it is.
+    #[test]
+    fn reanchoring_drops_nothing() {
+        let (mut seq, [a, b, _]) = seq3();
+        let a2 = split(&mut seq, a, s(2));
+        let before = seq.transitions.clone();
+        seq.tracks[0].clips[3].timeline_in += s(1);
+        seq.tracks[0].clips[3].timeline_out += s(1);
+        seq.reanchor_transitions();
+        assert_eq!((seq.transitions.len(), seq.transitions[0].from, seq.transitions[0].to), (before.len(), a2, b), "a|b followed to a's right half");
+        assert_eq!(seq.transitions[1], before[1], "c moved off the b|c cut: that transition is left as it is");
     }
 
     #[test]

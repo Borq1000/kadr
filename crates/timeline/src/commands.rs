@@ -103,13 +103,14 @@ pub enum EditCommand {
     /// Puts a transition on the cut where `from` ends and `to` starts (D3,
     /// effects spec §7): both on one unlocked video track; a cut recipe at
     /// its current version, valid parameters (missing ones get defaults), a
-    /// duration of at least two frames (the evaluator clamps it to both
-    /// clips). The cut's transition, if any, is replaced in place (same
-    /// id); the same transition again is a `NoOp`.
+    /// duration snapped to whole frames and at least two of them (the
+    /// evaluator clamps it to both clips). The cut's transition, if any, is
+    /// replaced in place (same id); the same transition again is a `NoOp`.
     SetTransition { from: ClipId, to: ClipId, recipe: String, version: u16, params: BTreeMap<String, ParamValue>, duration: Time },
     /// Sets the given parameters (validated, merged into the stored ones;
-    /// none = unchanged) and/or the duration of a transition. One the
-    /// registry cannot run (a newer Kadr's) cannot be changed, only removed.
+    /// none = unchanged) and/or the duration of a transition (whole frames,
+    /// at least two, as `SetTransition`). One the registry cannot run (a
+    /// newer Kadr's) cannot be changed, only removed.
     UpdateTransition { id: TransitionId, params: BTreeMap<String, ParamValue>, duration: Option<Time> },
     RemoveTransition(TransitionId),
     AddMarker(Marker),
@@ -247,8 +248,10 @@ impl EditCommand {
 
     /// Applies the command, then keeps every transition on its cut (D2):
     /// what a command does to clips it does to their transitions, in the
-    /// same undo entry (`Sequence::reconcile_transitions`). A `Batch`'s
-    /// commands run first, the transitions follow once at its end.
+    /// same undo entry (`Sequence::reconcile_transitions`). Inside a
+    /// `Batch` transitions only follow each command
+    /// (`Sequence::reanchor_transitions`); what is dead is dropped once, at
+    /// its end.
     pub fn apply(&self, seq: &mut Sequence, ctx: &EditContext) -> Result<(), EditError> {
         self.apply_one(seq, ctx)?;
         for t in seq.reconcile_transitions() {
@@ -408,7 +411,9 @@ impl EditCommand {
                     return Err(EditError::EffectTarget);
                 }
                 kadr_effects::validate(def.params, params).map_err(EditError::InvalidParam)?;
-                if *duration < fr.frame_to_time(2) {
+                // Whole frames (E3-R6), so the length shown is the one stored.
+                let duration = fr.snap(*duration);
+                if duration < fr.frame_to_time(2) {
                     return Err(EditError::InvalidRange);
                 }
                 let (ti, ci) = seq.locate_clip(*from).ok_or(EditError::ClipNotFound)?;
@@ -426,13 +431,13 @@ impl EditCommand {
                 values.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
                 match seq.transitions.iter_mut().find(|t| t.to == *to) {
                     Some(t) => {
-                        let next = Transition { id: t.id, ..Transition::new(def.id, def.version, values, *from, *to, *duration) };
+                        let next = Transition { id: t.id, ..Transition::new(def.id, def.version, values, *from, *to, duration) };
                         if *t == next {
                             return Err(EditError::NoOp);
                         }
                         *t = next;
                     }
-                    None => seq.transitions.push(Transition::new(def.id, def.version, values, *from, *to, *duration)),
+                    None => seq.transitions.push(Transition::new(def.id, def.version, values, *from, *to, duration)),
                 }
                 Ok(())
             }
@@ -443,13 +448,14 @@ impl EditCommand {
                 // A recipe this build cannot run cannot be validated, so it is not changed (spec §7).
                 let def = kadr_effects::transition_definition(tr).ok_or_else(|| EditError::UnknownRecipe(tr.recipe.clone()))?;
                 kadr_effects::validate(def.params, params).map_err(EditError::InvalidParam)?;
+                let duration = duration.map(|d| fr.snap(d));
                 if duration.is_some_and(|d| d < fr.frame_to_time(2)) {
                     return Err(EditError::InvalidRange);
                 }
                 let mut next = tr.clone();
                 next.params.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
                 if let Some(d) = duration {
-                    next.duration = *d;
+                    next.duration = d;
                 }
                 if next == *tr {
                     return Err(EditError::NoOp);
@@ -738,7 +744,13 @@ impl EditCommand {
                 let mut applied = 0;
                 for c in commands {
                     match c.apply_one(seq, ctx) {
-                        Ok(()) => applied += 1,
+                        Ok(()) => {
+                            applied += 1;
+                            // Transitions follow each step without being
+                            // dropped: a later step can remove the clip one
+                            // was anchored to, or bring its cut back (E3-R6).
+                            seq.reanchor_transitions();
+                        }
                         // A no-op inside a batch (e.g. range already empty) is fine.
                         Err(EditError::NoOp) => {}
                         Err(e) => return Err(e),
