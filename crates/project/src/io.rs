@@ -160,6 +160,11 @@ fn migrate_transitions(seq: &mut serde_json::Value) {
     list.retain_mut(|tr| {
         let Some(o) = tr.as_object_mut() else { return true };
         if o.contains_key("recipe") {
+            // The recipe names it; old fields beside it would land in `extra`
+            // and be written back (E3-R4): they go.
+            for k in ["kind", "track", "at"] {
+                o.remove(k);
+            }
             return true;
         }
         let Some(kind) = o.get("kind").and_then(|k| serde_json::from_value::<crate::TransitionKind>(k.clone()).ok()) else { return true };
@@ -451,6 +456,24 @@ mod tests {
                 assert_eq!(saved["format_version"], serde_json::json!(3), "no new format (R2)");
             }
         }
+    }
+
+    /// E3-R4: a transition with both a `recipe` and the old `kind` (a
+    /// hand-edited file) is read by its recipe; `kind`, `track` and `at`
+    /// are dropped, never kept in `extra` and written back.
+    #[test]
+    fn old_fields_beside_a_recipe_are_dropped() {
+        let f = |s: i64| s * kadr_core::FLICKS_PER_SECOND;
+        let mut v = v2_project();
+        let (a, b) = with_pair(&mut v);
+        let track = v["sequences"][0]["tracks"][0]["id"].clone();
+        v["sequences"][0]["transitions"] = serde_json::json!([{"id": kadr_core::TransitionId::new(), "recipe": "wipe", "kind": "cross_dissolve", "track": track, "at": f(10), "from": a, "to": b, "duration": f(1)}]);
+        let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("both.kadr")).unwrap();
+        let t = &p.sequence().transitions;
+        assert_eq!((t.len(), t[0].recipe.as_str(), t[0].from, t[0].to, t[0].extra.is_empty()), (1, "wipe", a, b, true));
+        let saved = serde_json::to_value(&p).unwrap();
+        let s = &saved["sequences"][0]["transitions"][0];
+        assert!(s.get("kind").is_none() && s.get("track").is_none() && s.get("at").is_none(), "the old fields are never written: {s}");
     }
 
     /// Bad transition data never fails the project and never panics.

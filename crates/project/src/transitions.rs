@@ -101,7 +101,8 @@ impl Sequence {
     /// one meeting there — as `(from, to, cut)`; `None` when there is none
     /// or more than one (MCP and AI name a cut by a millisecond time, D9).
     pub fn cut_near(&self, track: TrackId, at: Time, slack: Time) -> Option<(ClipId, ClipId, Time)> {
-        let t = self.track(track)?;
+        // Transitions live on video tracks only (D11): sound has no cuts to name.
+        let t = self.track(track).filter(|t| t.kind == TrackKind::Video)?;
         let mut cuts = t.clips.windows(2).filter(|w| w[0].timeline_out == w[1].timeline_in && (w[0].timeline_out - at).abs() <= slack);
         match (cuts.next(), cuts.next()) {
             (Some(w), None) => Some((w[0].id, w[1].id, w[0].timeline_out)),
@@ -122,17 +123,22 @@ impl Sequence {
         (t.kind == TrackKind::Video).then_some((ti, next.timeline_in))
     }
 
-    /// The longest `tr` can be: the shorter of its two clips (`None` where it has no cut).
+    /// The longest `tr` can be: the shorter of its two clips (`None` where
+    /// it has no cut). It can be under the two frames a transition needs (a
+    /// one-frame clip): a caller clamping a length into [two frames, limit]
+    /// must let the lower bound win (`limit.max(min)`), never `clamp` with
+    /// min > max.
     pub fn transition_limit(&self, tr: &Transition) -> Option<Time> {
         self.transition_cut(tr)?;
         Some(self.clip(tr.from)?.duration().min(self.clip(tr.to)?.duration()))
     }
 
     /// Keeps every transition on its cut after the clips changed (D2,
-    /// refinement 10): one stays while `to` is on a video track and the clip
-    /// now ending where `to` starts is `from` — or a piece `from` was split
-    /// into, reached from it through pieces each continuing the one before
-    /// (same medium, next timeline and source time) — to which it is
+    /// refinement 10, ruling E3-R4): one stays while `to` is on a video
+    /// track and the clip now ending where `to` starts is `from` — or what
+    /// an edit inside `from` left of it, reached from it through the clips
+    /// before the cut that show `from`'s medium or its multicam group (a
+    /// split, a range deleted inside it, a camera cut) — to which it is
     /// re-anchored; one transition per cut (the first). The rest are removed
     /// and returned. A switched-off clip keeps its transition.
     pub fn reconcile_transitions(&mut self) -> Vec<Transition> {
@@ -154,9 +160,14 @@ impl Sequence {
     }
 }
 
-/// The clip ending where `to` starts, reached from `from` through the
-/// pieces a split cut `from` into; `None` when `to` is gone or not on a
-/// video track, or the chain breaks before the cut.
+/// The clip ending where `to` starts, reached from `from` through what an
+/// edit inside `from` made of it (ruling E3-R4): each next clip on the
+/// track before the cut that shows `from`'s medium or an angle of
+/// `from`'s multicam group — the pieces of a split, of a range deleted
+/// inside it (gap or ripple), of a live camera cut. No timeline or source
+/// continuity is asked: a range taken out of the middle leaves neither.
+/// `None` when `from` or `to` is gone, `to` is not on a video track, or a
+/// gap or another clip stands right before the cut.
 fn follow(tracks: &[Track], from: ClipId, to: ClipId) -> Option<ClipId> {
     let track = tracks.iter().find(|t| t.clips.iter().any(|c| c.id == to))?;
     if track.kind != TrackKind::Video {
@@ -164,13 +175,19 @@ fn follow(tracks: &[Track], from: ClipId, to: ClipId) -> Option<ClipId> {
     }
     let cut = track.clips.iter().find(|c| c.id == to)?.timeline_in;
     let mut i = track.clips.iter().position(|c| c.id == from)?;
+    let origin = &track.clips[i];
+    let group = origin.multicam.as_ref().map(|m| m.group);
+    let same = |c: &crate::Clip| c.asset == origin.asset || group.is_some_and(|g| c.multicam.as_ref().is_some_and(|m| m.group == g));
     loop {
         let c = &track.clips[i];
         if c.timeline_out == cut {
             return Some(c.id);
         }
+        // Tracks are sorted and disjoint: the next clip starts at or after
+        // `c` ends. One starting at the cut or later is `to` or beyond: a
+        // gap or another clip stands before the cut.
         let next = track.clips.get(i + 1)?;
-        if next.timeline_in != c.timeline_out || next.asset != c.asset || next.source_in != c.source_out {
+        if c.timeline_out > cut || next.timeline_in >= cut || !same(next) {
             return None;
         }
         i += 1;
@@ -226,6 +243,32 @@ mod tests {
         assert_eq!((seq.transitions[0].to, seq.transitions[1].from), (b, b2), "b keeps its start, and b|c follows b's right half");
     }
 
+    /// Ruling E3-R4: what an edit inside `from` leaves of it — pieces with
+    /// a gap or a jump in source time between them, an angle of its
+    /// multicam group — still carries the transition; another medium does not.
+    #[test]
+    fn what_an_edit_inside_from_leaves_of_it_keeps_the_transition() {
+        let (mut seq, [a, b, _]) = seq3();
+        let a2 = split(&mut seq, a, s(2));
+        (seq.tracks[0].clips[0].timeline_out, seq.tracks[0].clips[0].source_out) = (s(1), s(101));
+        assert!(seq.reconcile_transitions().is_empty(), "1..2 s taken out of a, leaving a gap");
+        assert_eq!((seq.transitions[0].from, seq.transitions[0].to), (a2, b));
+
+        let (mut seq, [a, b, _]) = seq3();
+        let group = kadr_core::MulticamId::new();
+        seq.tracks[0].clips[0].multicam = Some(crate::MulticamSelection { group, angle: 0 });
+        let a2 = split(&mut seq, a, s(2));
+        seq.tracks[0].clips[1].asset = AssetId::new();
+        seq.tracks[0].clips[1].multicam = Some(crate::MulticamSelection { group, angle: 1 });
+        assert!(seq.reconcile_transitions().is_empty(), "a live camera cut inside a");
+        assert_eq!((seq.transitions[0].from, seq.transitions[0].to), (a2, b));
+
+        let (mut seq, [a, ..]) = seq3();
+        split(&mut seq, a, s(2));
+        seq.tracks[0].clips[1].asset = AssetId::new();
+        assert_eq!(seq.reconcile_transitions().len(), 1, "another medium before the cut: not a piece of a");
+    }
+
     #[test]
     fn a_pair_that_no_longer_meets_is_dropped_and_a_disabled_one_stays() {
         let (mut seq, _) = seq3();
@@ -269,7 +312,10 @@ mod tests {
         assert_eq!(seq.cut_near(track, s(4) + Time(half.flicks() - 1), half).map(|c| c.2), Some(s(4)));
         assert_eq!(seq.cut_near(track, s(4) + half + Time(1), half), None, "more than half a frame away");
         assert_eq!(seq.cut_near(track, s(6), s(3)), None, "two cuts within reach: neither is named");
-        assert_eq!(seq.cut_near(seq.tracks[1].id, s(4), half), None, "the audio track has no cut");
+        let mut sound = seq.clone();
+        sound.tracks[1].clips = sound.tracks[0].clips.clone();
+        assert_eq!(sound.cut_near(sound.tracks[1].id, s(4), half), None, "clips meet on the audio track too, but sound has no cut (D11)");
+        assert_eq!(sound.cut_near(sound.tracks[0].id, s(4), half), Some((a, b, s(4))));
     }
 
     #[test]

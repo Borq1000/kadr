@@ -122,6 +122,52 @@ fn transitions_follow_every_clip_command() {
     );
 }
 
+/// `setup` with `a` an angle of a two-camera group: CAM1 is `a`'s medium,
+/// CAM2 (60 s) started 2 s later (sync offset −2 s).
+fn setup_multicam() -> (Project, EditEngine, [ClipId; 3], [TransitionId; 2]) {
+    let (mut p, e, ids, tids) = setup();
+    let cam2 = MediaAsset::new("cam2.mp4", video(s(60)));
+    let angle = |asset, label: &str, sync_offset| MulticamAngle { asset, label: label.into(), description: String::new(), sync_offset, sync_method: SyncMethod::Manual };
+    let group = MulticamGroup { id: kadr_core::MulticamId::new(), name: "show".into(), angles: vec![angle(p.assets[0].id, "CAM1", s(0)), angle(cam2.id, "CAM2", s(-2))], master_audio: None };
+    p.sequence_mut().tracks[0].clips[0].multicam = Some(MulticamSelection { group: group.id, angle: 0 });
+    p.assets.push(cam2);
+    p.multicam_groups.push(group);
+    (p, e, ids, tids)
+}
+
+/// Ruling E3-R4: an edit inside the outgoing clip — a range taken out of
+/// it (gap or ripple), a live camera cut, a camera range — keeps its
+/// transition on the cut, re-anchored to the piece that now ends there; in
+/// one undo entry that restores clips and transitions together.
+#[test]
+fn edits_inside_the_outgoing_clip_keep_its_transition() {
+    let check = |name: &str, cmd: &dyn Fn(ClipId) -> EditCommand, cut: Time, want: &dyn Fn(&Project, &Clip)| {
+        let (mut p, mut e, [a, b, _], tids) = setup_multicam();
+        let before = p.sequence().clone();
+        let entries = p.history_log.len();
+        e.execute(&mut p, cmd(a)).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(p.history_log.len(), entries + 1, "{name}: one undo entry");
+        assert_eq!(kept(&p, tids), tids.to_vec(), "{name}: both transitions stay");
+        let t = p.sequence().transition(tids[0]).unwrap();
+        let from = p.sequence().clip(t.from).unwrap();
+        assert_ne!(t.from, a, "{name}: re-anchored to the piece at the cut");
+        assert_eq!((t.to, from.timeline_out, p.sequence().transition_cut(t).map(|c| c.1)), (b, cut, Some(cut)), "{name}");
+        want(&p, from);
+        e.undo(&mut p);
+        assert_eq!(p.sequence(), &before, "{name}: undo restores clips and transitions together");
+    };
+    let range = |from, to, ripple| EditCommand::DeleteRange { range: TimeRange::new(s(from), s(to)), ripple };
+    check("a range taken out of from, leaving a gap", &|_| range(1, 2, false), s(4), &|_, c| assert_eq!((c.timeline_in, c.source_in), (s(2), s(12))));
+    check("a range rippled out of from", &|_| range(1, 2, true), s(3), &|_, c| assert_eq!((c.timeline_in, c.source_in), (s(1), s(12))));
+    check("a live camera cut inside from", &|a| EditCommand::SwitchAngle { clip: a, angle: 1, at: Some(s(2)) }, s(4), &|p, c| {
+        let cam2 = p.multicam_groups[0].angles[1].asset;
+        assert_eq!((c.asset, c.timeline_in, c.multicam.as_ref().map(|m| m.angle)), (cam2, s(2), Some(1)), "the piece on CAM2");
+    });
+    check("a camera range inside from", &|_| EditCommand::SetAngleRange { range: TimeRange::new(s(1), s(2)), angle: 1 }, s(4), &|_, c| {
+        assert_eq!((c.timeline_in, c.multicam.as_ref().map(|m| m.angle)), (s(2), Some(0)), "back on CAM1 after the range");
+    });
+}
+
 /// D3: a recipe on a cut — validated, its missing parameters at their
 /// defaults — replacing the cut's transition in place; the same again is
 /// no entry.
