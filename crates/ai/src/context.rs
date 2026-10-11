@@ -27,7 +27,7 @@ pub fn project_context(project: &Project, st: &EditorState) -> serde_json::Value
                 .iter()
                 .take(MAX_CLIPS.saturating_sub(n))
                 .map(|c| {
-                    json!({
+                    let mut j = json!({
                         "id": c.id.to_string(),
                         "name": c.name,
                         "start_ms": c.timeline_in.as_millis(),
@@ -35,7 +35,11 @@ pub fn project_context(project: &Project, st: &EditorState) -> serde_json::Value
                         "source_in_ms": c.source_in.as_millis(),
                         "speed": (c.speed() * 1000.0).round() / 1000.0,
                         "selected": st.selection.contains(&c.id),
-                    })
+                    });
+                    if !c.effects.is_empty() {
+                        j["effects"] = c.effects.iter().map(|e| kadr_effects::json::effect_json(c, e)).collect();
+                    }
+                    j
                 })
                 .collect();
             n += clips.len();

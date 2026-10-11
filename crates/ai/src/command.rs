@@ -5,8 +5,8 @@
 //! deterministic `kadr_timeline::EditCommand` after validation, or it is
 //! rejected with a reason the user can see.
 
-use kadr_core::{ClipId, Time, TimeRange};
-use kadr_project::{AnimParam, Marker, Project, TrackKind, Transform, Transition, TransitionKind};
+use kadr_core::{ClipId, EffectId, Time, TimeRange};
+use kadr_project::{AnimParam, AppliedEffect, Marker, Project, TrackKey, TrackKind, Transform, Transition, TransitionKind};
 use kadr_timeline::{ClipProperty, EditCommand, TrimEdge};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -103,6 +103,33 @@ pub enum AiCommand {
         #[serde(default)]
         reason: String,
     },
+    /// Applies an effect from the library (effects spec §7); one instance
+    /// per recipe per clip: a recipe the clip has is replaced.
+    AddEffect {
+        clip_id: String,
+        recipe: String,
+        #[serde(default)]
+        params: serde_json::Map<String, serde_json::Value>,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Changes the given parameters and/or switches the effect on or off.
+    SetEffect {
+        clip_id: String,
+        effect_id: String,
+        #[serde(default)]
+        params: serde_json::Map<String, serde_json::Value>,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        reason: String,
+    },
+    RemoveEffect {
+        clip_id: String,
+        effect_id: String,
+        #[serde(default)]
+        reason: String,
+    },
     /// Reserved: captions (V0.3).
     AddCaption {
         start_ms: i64,
@@ -135,7 +162,10 @@ impl AiCommand {
             | AiCommand::SetAudioGain { reason, .. }
             | AiCommand::AddMarker { reason, .. }
             | AiCommand::AddTransition { reason, .. }
-            | AiCommand::SelectCamera { reason, .. } => reason,
+            | AiCommand::SelectCamera { reason, .. }
+            | AiCommand::AddEffect { reason, .. }
+            | AiCommand::SetEffect { reason, .. }
+            | AiCommand::RemoveEffect { reason, .. } => reason,
             AiCommand::AddCaption { .. } => "",
         }
     }
@@ -371,6 +401,56 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                     .ok_or(ValidationError::Range { index: i, msg: format!("unknown angle {angle:?}") })?;
                 EditCommand::SetAngleRange { range: TimeRange::new(s, e), angle: idx as u32 }
             }
+            AiCommand::AddEffect { clip_id, recipe, params, .. } => {
+                let id = clip(i, clip_id)?;
+                let c = seq.clip(id).unwrap();
+                let range = |msg: String| ValidationError::Range { index: i, msg };
+                let ids = || kadr_effects::registry().iter().map(|d| d.id).collect::<Vec<_>>().join(", ");
+                let def = kadr_effects::recipe(recipe).ok_or_else(|| range(format!("unknown effect {recipe:?} (one of {})", ids())))?;
+                let (ti, _) = seq.locate_clip(id).unwrap();
+                if !kadr_effects::fits(def.target, seq.tracks[ti].kind) {
+                    return Err(range(format!("{recipe} is for video clips")));
+                }
+                let mut values = kadr_effects::json::params_from_json(def, c, params).map_err(range)?;
+                kadr_effects::complete(def, &mut values, c, c.timeline_in + Time(c.duration().flicks() / 2));
+                let effect = AppliedEffect::new(def.id, def.version, values);
+                if !c.clone().put_effect(effect.clone()) {
+                    return Err(range(format!("no change: the clip already has {recipe} with these parameters")));
+                }
+                EditCommand::AddEffect { clip: id, effect }
+            }
+            AiCommand::SetEffect { clip_id, effect_id, params, enabled, .. } => {
+                let id = clip(i, clip_id)?;
+                let c = seq.clip(id).unwrap();
+                let range = |msg: String| ValidationError::Range { index: i, msg };
+                let e = EffectId::parse(effect_id).and_then(|e| c.effect(e)).ok_or_else(|| range(format!("the clip has no effect {effect_id}")))?;
+                let def = kadr_effects::definition(e).ok_or_else(|| range(format!("effect {} ({}) was made by a newer Kadr and cannot be changed", e.id, e.recipe)))?;
+                if params.is_empty() && enabled.is_none() {
+                    return Err(range("give params and/or enabled".into()));
+                }
+                let values = kadr_effects::json::params_from_json(def, c, params).map_err(range)?;
+                // R24: a number with keyframes ignores its stored value.
+                if let Some(d) = def.params.iter().find(|d| values.contains_key(d.key) && c.animation.is_animated(TrackKey::fx(e.id, d.key))) {
+                    return Err(ValidationError::Animated { index: i, param: d.key });
+                }
+                let mut probe = e.clone();
+                probe.params.extend(values.clone());
+                if let Some(on) = enabled {
+                    probe.enabled = *on;
+                }
+                if probe == *e {
+                    return Err(range("no change: the effect already has these settings".into()));
+                }
+                EditCommand::UpdateEffect { clip: id, id: e.id, params: values, enabled: *enabled }
+            }
+            AiCommand::RemoveEffect { clip_id, effect_id, .. } => {
+                destructive(i)?;
+                let id = clip(i, clip_id)?;
+                let e = EffectId::parse(effect_id)
+                    .filter(|e| seq.clip(id).unwrap().effect(*e).is_some())
+                    .ok_or_else(|| ValidationError::Range { index: i, msg: format!("the clip has no effect {effect_id}") })?;
+                EditCommand::RemoveEffect { clip: id, id: e }
+            }
             AiCommand::AddCaption { .. } => return Err(ValidationError::Unsupported { index: i, what: "captions" }),
         };
         out.push(cmd);
@@ -387,8 +467,24 @@ fn check(index: usize, name: &str, v: f64, lo: f64, hi: f64) -> Result<(), Valid
 }
 
 /// JSON schema description embedded in LLM prompts.
-pub fn schema_for_prompt() -> &'static str {
-    r#"Respond with ONLY a JSON object: {"summary": string, "confidence": 0..1, "commands": [Command...]}
+pub fn schema_for_prompt() -> String {
+    let effects: Vec<String> = kadr_effects::registry()
+        .iter()
+        .map(|d| {
+            let params: Vec<String> = d
+                .params
+                .iter()
+                .map(|p| match p.kind {
+                    kadr_effects::ParamKind::Number { min, max, default } => format!("{} {min}..{max} (default {default})", p.key),
+                    kadr_effects::ParamKind::Choice { options, .. } => format!("{} {}", p.key, options.join("|")),
+                    kadr_effects::ParamKind::Point => format!("{} {{\"x\":0..1,\"y\":0..1}}", p.key),
+                    kadr_effects::ParamKind::Moment => format!("{} {{\"at_ms\":int}}", p.key),
+                })
+                .collect();
+            format!("   {}: {}", d.id, params.join(", "))
+        })
+        .collect();
+    let head = r#"Respond with ONLY a JSON object: {"summary": string, "confidence": 0..1, "commands": [Command...]}
 Command is one of (times are sequence milliseconds, integers):
  {"type":"split_clip","at_ms":int,"clip_id"?:string,"reason":string}
  {"type":"delete_range","start_ms":int,"end_ms":int,"ripple":bool,"reason":string}
@@ -400,15 +496,23 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"set_audio_gain","clip_id":string,"gain_db":num,"reason":string}
  {"type":"add_marker","at_ms":int,"name":string,"reason":string}
  {"type":"add_transition","at_ms":int,"kind":"cross_dissolve"|"dip_to_black"|"wipe","duration_ms":int,"reason":string}
+ {"type":"add_effect","clip_id":string,"recipe":string,"params"?:{...},"reason":string} (video clips; one per recipe per clip: an existing one is replaced; omitted params get defaults, strength 0.6 = normal)
+ {"type":"set_effect","clip_id":string,"effect_id":string,"params"?:{...},"enabled"?:bool,"reason":string} (effect ids are in each clip's "effects"; not for a param with keyframes: rejected)
+ {"type":"remove_effect","clip_id":string,"effect_id":string,"reason":string}
+Effects (recipe: params):
+"#;
+    let tail = r#"
 When deleting several ranges with ripple, list them from the LATEST to the EARLIEST.
-If the request cannot be done with these commands, return an empty commands list and explain in summary."#
+If the request cannot be done with these commands, return an empty commands list and explain in summary."#;
+    format!("{head}{}{tail}", effects.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kadr_core::{MediaInfo, MediaKind, MulticamId, Time, TimeRange};
-    use kadr_project::{Clip, MediaAsset, MulticamAngle, MulticamGroup, MulticamSelection, SyncMethod};
+    use kadr_project::{AppliedEffect, Clip, MediaAsset, MulticamAngle, MulticamGroup, MulticamSelection, ParamValue, SourceTime, SyncMethod, TrackKey};
+    use serde_json::json;
 
     fn multicam_project() -> Project {
         let mut p = Project::new("mc");
@@ -506,5 +610,94 @@ mod tests {
         let p = multicam_project();
         assert!(validate(&[select(2_000, 6_000, "CAM9")], &p, &Permissions::default()).is_err());
         assert!(validate(&[select(30_000, 32_000, "CAM2")], &p, &Permissions::default()).is_err(), "no multicam clip there");
+    }
+
+    /// V1 10..20 s (source 30..40 s) and a sound clip on A1.
+    fn fx_project() -> (Project, String) {
+        let mut p = Project::new("fx");
+        let c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(Time::from_secs(30), Time::from_secs(40)), Time::from_secs(10));
+        let id = c.id.to_string();
+        p.sequence_mut().tracks[0].clips.push(c);
+        let a = Clip::new(kadr_core::AssetId::new(), "a", TimeRange::new(Time::ZERO, Time::from_secs(5)), Time::ZERO);
+        p.sequence_mut().tracks[1].clips.push(a);
+        (p, id)
+    }
+
+    fn cmd(j: serde_json::Value) -> AiCommand {
+        serde_json::from_value(j).unwrap()
+    }
+
+    #[test]
+    fn add_effect_is_checked_against_the_registry() {
+        let (p, id) = fx_project();
+        let perms = Permissions::default();
+        let ok = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "punch_in", "params": {"strength": 0.9, "moment": {"at_ms": 12_000}}}))], &p, &perms).unwrap();
+        let EditCommand::AddEffect { effect, .. } = &ok[0] else { panic!("{ok:?}") };
+        assert_eq!(effect.params["strength"], ParamValue::Number(0.9));
+        assert_eq!(effect.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32))));
+        assert_eq!(effect.params["point"], ParamValue::Point { x: 0.5, y: 0.5 }, "defaults filled");
+        let err = |j: serde_json::Value| validate(&[cmd(j)], &p, &perms).unwrap_err().to_string();
+        assert!(err(json!({"type": "add_effect", "clip_id": id, "recipe": "glitch"})).contains("unknown effect \"glitch\""));
+        assert!(err(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "params": {"strength": 2.0}})).contains("strength"));
+        assert!(err(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "params": {"speed": 1}})).contains("no parameter"));
+        assert!(err(json!({"type": "add_effect", "clip_id": id, "recipe": "punch_in", "params": {"moment": {"at_ms": 25_000}}})).contains("outside the clip"));
+        let audio = p.sequence().tracks[1].clips[0].id.to_string();
+        assert!(err(json!({"type": "add_effect", "clip_id": audio, "recipe": "handheld"})).contains("video clips"));
+        assert!(serde_json::from_value::<AiCommand>(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "extra": 1})).is_err(), "unknown fields are rejected");
+    }
+
+    /// R24 for effects: a number with keyframes ignores its stored value,
+    /// so writing it is rejected with the reason.
+    #[test]
+    fn set_effect_rejects_animated_params_no_change_and_newer_effects() {
+        let (mut p, id) = fx_project();
+        let cid = kadr_core::ClipId::parse(&id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), p.sequence().clip(cid).unwrap(), Time::from_secs(12));
+        let fid = e.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let perms = Permissions::default();
+        let set = |params: serde_json::Value| cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": fid.to_string(), "params": params}));
+        let ok = validate(&[set(json!({"direction": "out"}))], &p, &perms).unwrap();
+        assert!(matches!(&ok[0], EditCommand::UpdateEffect { params, enabled: None, .. } if params["direction"] == ParamValue::Choice("out".into())));
+        assert!(validate(&[set(json!({"direction": "in"}))], &p, &perms).unwrap_err().to_string().contains("no change"));
+        p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(fid, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
+        assert_eq!(validate(&[set(json!({"strength": 0.9}))], &p, &perms).unwrap_err(), ValidationError::Animated { index: 0, param: "strength" });
+        assert!(validate(&[set(json!({"direction": "out"}))], &p, &perms).is_ok(), "only the given params count");
+        let future = AppliedEffect::new("glitch_v2", 1, Default::default());
+        let gid = future.id.to_string();
+        p.sequence_mut().tracks[0].clips[0].effects.push(future);
+        let msg = validate(&[cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": gid, "enabled": false}))], &p, &perms).unwrap_err().to_string();
+        assert!(msg.contains("newer Kadr"), "{msg}");
+    }
+
+    #[test]
+    fn remove_effect_is_a_destructive_edit() {
+        let (mut p, id) = fx_project();
+        let cid = kadr_core::ClipId::parse(&id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
+        let fid = e.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let rm = cmd(json!({"type": "remove_effect", "clip_id": id, "effect_id": fid.to_string()}));
+        assert_eq!(validate(&[rm.clone()], &p, &Permissions::default()).unwrap(), vec![EditCommand::RemoveEffect { clip: cid, id: fid }]);
+        let no = Permissions { allow_destructive: false, max_commands: 10 };
+        assert!(matches!(validate(&[rm], &p, &no), Err(ValidationError::Permission { .. })));
+        let gone = cmd(json!({"type": "remove_effect", "clip_id": id, "effect_id": kadr_core::EffectId::new().to_string()}));
+        assert!(validate(&[gone], &p, &Permissions::default()).unwrap_err().to_string().contains("no effect"));
+    }
+
+    #[test]
+    fn the_prompt_schema_and_context_know_the_effects() {
+        let s = schema_for_prompt();
+        for d in kadr_effects::registry() {
+            assert!(s.contains(d.id), "schema lacks {}", d.id);
+        }
+        assert!(s.contains("\"add_effect\"") && s.contains("\"set_effect\"") && s.contains("\"remove_effect\""));
+        let (mut p, id) = fx_project();
+        let cid = kadr_core::ClipId::parse(&id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let ctx = crate::context::project_context(&p, &Default::default());
+        assert_eq!(ctx["tracks"][0]["clips"][0]["effects"][0]["recipe"], "handheld");
+        assert!(ctx["tracks"][1]["clips"][0].get("effects").is_none(), "a clip without effects says nothing");
     }
 }

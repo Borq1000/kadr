@@ -2850,6 +2850,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "kadr-core",
+ "kadr-effects",
  "kadr-i18n",
  "kadr-project",
  "kadr-timeline",

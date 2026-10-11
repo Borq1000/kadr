@@ -5,6 +5,7 @@
 //! `kadr-timeline` calls it, renderers never see a recipe.
 
 pub mod delta;
+pub mod json;
 pub mod motion;
 pub mod noise;
 pub mod params;

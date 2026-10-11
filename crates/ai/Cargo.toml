@@ -8,6 +8,7 @@ license.workspace = true
 kadr-core = { path = "../core" }
 kadr-project = { path = "../project" }
 kadr-timeline = { path = "../timeline" }
+kadr-effects = { path = "../effects" }
 kadr-i18n = { path = "../i18n" }
 serde.workspace = true
 serde_json.workspace = true
