@@ -370,6 +370,33 @@ mod tests {
         }
     }
 
+    /// Migration leniency (plan, Global Constraints): a valid format-2
+    /// project whose old effects list holds garbage loads, the garbage
+    /// dropped and a readable entry kept — bad effect data never costs the
+    /// project.
+    #[test]
+    fn garbage_in_a_format_2_effects_list_is_dropped_not_fatal() {
+        let ok = serde_json::json!({"id": kadr_core::EffectId::new(), "kind": "smooth_zoom", "params": {"strength": 0.5}});
+        for (effects, kept) in [
+            (serde_json::json!("x"), 0),
+            (serde_json::json!(null), 0),
+            (serde_json::json!({"kind": "blur"}), 0),
+            (serde_json::json!([7, "s", null, [1]]), 0),
+            (serde_json::json!([{"kind": 5}, {"id": "nope", "kind": "a"}, {"kind": "a", "params": [1]}]), 0),
+            (serde_json::json!([{"id": kadr_core::EffectId::new(), "kind": "a", "enabled": "yes"}, ok.clone(), 7]), 1),
+        ] {
+            let mut v = v2_project();
+            v["sequences"][0]["tracks"][0]["clips"][0]["effects"] = effects.clone();
+            let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap_or_else(|e| panic!("{effects}: {e}"));
+            let fx = &p.sequence().tracks[0].clips[0].effects;
+            assert_eq!(fx.len(), kept, "{effects}: {fx:?}");
+            if kept == 1 {
+                assert_eq!((fx[0].recipe.as_str(), &fx[0].params["strength"]), ("smooth_zoom", &crate::ParamValue::Number(0.5)));
+            }
+            assert_eq!(serde_json::to_value(&p).unwrap()["format_version"], serde_json::json!(3));
+        }
+    }
+
     #[test]
     fn malformed_pre_v2_structure_is_a_parse_error_not_a_panic() {
         for json in [

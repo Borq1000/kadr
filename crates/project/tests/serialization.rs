@@ -60,6 +60,35 @@ fn save_load_roundtrip_is_lossless() {
     assert_eq!(loaded.assets[0].relative_path.as_deref(), Some(std::path::Path::new("cam1.mp4")));
 }
 
+/// Review focus 5 at the project level: an effect from a newer Kadr — an
+/// unknown recipe with an unknown parameter variant, a field this build
+/// lacks and an `fx:` track of its own — comes through `io::parse` and a
+/// save as the same JSON.
+#[test]
+fn an_unknown_effect_with_its_track_survives_parse_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = sample_project(dir.path());
+    let id = kadr_core::EffectId::new();
+    let future: AppliedEffect = serde_json::from_value(serde_json::json!({
+        "id": id, "recipe": "glitch_v2", "version": 4, "enabled": true, "progress": [0.25, 1.0],
+        "params": {"amount": {"number": 0.3}, "curve": {"bezier": [0.1, 0.2]}},
+        "mask": {"shape": "oval", "feather": 0.2}
+    }))
+    .unwrap();
+    let c = &mut p.sequence_mut().tracks[0].clips[0];
+    c.effects.push(future);
+    c.animation.set_key(TrackKey::fx(id, "amount"), SourceTime(Time::from_secs(6)), 0.8, Some(Ease::Linear));
+    let json = |p: &Project| serde_json::from_slice::<serde_json::Value>(&io::to_json(p)).unwrap();
+    let saved = json(&p);
+    let clip = &saved["sequences"][0]["tracks"][0]["clips"][0];
+    assert_eq!(clip["effects"][0]["mask"], serde_json::json!({"shape": "oval", "feather": 0.2}), "the newer Kadr's field is written");
+    assert_eq!(clip["effects"][0]["params"]["curve"], serde_json::json!({"bezier": [0.1, 0.2]}), "and its parameter variant");
+    assert!(clip["animation"].get(format!("fx:{id}:amount")).is_some(), "and its track");
+    let loaded = io::parse(&io::to_json(&p), std::path::Path::new("future.kadr")).unwrap();
+    assert_eq!(json(&loaded), saved, "parse → save gives the same JSON");
+    assert_eq!(loaded, p);
+}
+
 #[test]
 fn time_is_stored_as_integer_flicks() {
     let dir = tempfile::tempdir().unwrap();

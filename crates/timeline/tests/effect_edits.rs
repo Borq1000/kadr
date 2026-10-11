@@ -159,6 +159,33 @@ fn an_unknown_effect_is_kept_moved_or_removed_but_not_changed() {
     assert_eq!(effects(&p, v).iter().map(|x| x.recipe.as_str()).collect::<Vec<_>>(), ["smooth_zoom"]);
 }
 
+/// Review focus 5: removing an effect from a newer Kadr takes its `fx:`
+/// tracks along — the one this build reads and one it keeps verbatim —
+/// leaves another effect's track alone, and undo brings them back.
+#[test]
+fn removing_an_unknown_effect_drops_its_tracks() {
+    let (mut p, mut e, v, _) = setup();
+    let future = AppliedEffect::new("glitch_v2", 3, BTreeMap::from([("amount".to_string(), ParamValue::Number(0.5))]));
+    let (fid, other) = (future.id, zoom());
+    let zid = other.id;
+    push(&mut p, v, future);
+    push(&mut p, v, other);
+    let mut tracks = serde_json::Map::new();
+    tracks.insert(format!("fx:{fid}:amount"), serde_json::json!([{"at": s(101).flicks(), "value": 0.7}]));
+    tracks.insert(format!("fx:{fid}:curve"), serde_json::json!("a shape this build cannot read"));
+    tracks.insert(format!("fx:{zid}:strength"), serde_json::json!([{"at": s(101).flicks(), "value": 0.2}]));
+    clip_mut(&mut p, v).animation = serde_json::from_value(serde_json::Value::Object(tracks)).unwrap();
+    let before = p.sequence().clip(v).unwrap().clone();
+    assert!(before.animation.is_animated(TrackKey::fx(fid, "amount")) && before.animation.unknown_len() == 1, "both kinds of track are there");
+    e.execute(&mut p, EditCommand::RemoveEffect { clip: v, id: fid }).unwrap();
+    let c = p.sequence().clip(v).unwrap();
+    assert!(!c.animation.has_effect_tracks(fid), "its readable and its unreadable track went");
+    assert_eq!(c.animation.unknown_len(), 0);
+    assert!(c.animation.is_animated(TrackKey::fx(zid, "strength")), "the other effect's track stays");
+    e.undo(&mut p);
+    assert_eq!(p.sequence().clip(v).unwrap(), &before);
+}
+
 #[test]
 fn move_effect_reorders_clamps_and_rejects_no_change() {
     let (mut p, mut e, v, _) = setup();
