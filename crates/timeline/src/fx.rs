@@ -43,6 +43,10 @@ pub fn crop_window(tr: &Transform) -> (f64, f64, f64, f64) {
 /// effects applied in list order, in the crop window the clip has at `t`
 /// (its animated crop). Unknown recipes, newer versions and unknown
 /// variants are skipped; strength 0 compiles nothing (§3).
+///
+/// Test support only (the integration tests read a clip's motion through
+/// it): the evaluator goes through `apply_effects` in `clip_layer`.
+#[doc(hidden)]
 pub fn place_with_effects(clip: &Clip, t: Time, canvas: SizeU, base: Placement) -> Placement {
     if clip.effects.is_empty() || clip.duration() <= Time::ZERO {
         return base;
