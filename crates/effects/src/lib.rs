@@ -5,9 +5,12 @@
 //! `kadr-timeline` calls it, renderers never see a recipe.
 
 pub mod delta;
+pub mod motion;
 pub mod noise;
 pub mod params;
+pub mod registry;
 
 pub use delta::PlacementDelta;
 pub use noise::Noise1D;
 pub use params::*;
+pub use registry::*;
