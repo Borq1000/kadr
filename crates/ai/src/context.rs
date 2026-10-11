@@ -3,7 +3,7 @@
 
 use crate::local_ops::timeline_silences;
 use kadr_core::{format_duration, ClipId, Time, TimeRange};
-use kadr_project::Project;
+use kadr_project::{Project, TrackKey};
 use serde_json::json;
 
 #[derive(Clone, Debug, Default)]
@@ -37,12 +37,20 @@ pub fn project_context(project: &Project, st: &EditorState) -> serde_json::Value
                         "selected": st.selection.contains(&c.id),
                     });
                     if !c.effects.is_empty() {
-                        // An effect this version cannot run: no raw parameters leave the machine.
                         j["effects"] = c
                             .effects
                             .iter()
                             .map(|e| match kadr_effects::definition(e) {
-                                Some(_) => kadr_effects::json::effect_json(c, e),
+                                Some(def) => {
+                                    let mut v = kadr_effects::json::effect_json(c, e);
+                                    // Numbers with keyframes ignore their stored value: set_effect rejects them.
+                                    let animated: Vec<&str> = def.params.iter().map(|d| d.key).filter(|k| c.animation.is_animated(TrackKey::fx(e.id, *k))).collect();
+                                    if !animated.is_empty() {
+                                        v["animated"] = json!(animated);
+                                    }
+                                    v
+                                }
+                                // An effect this version cannot run: no raw parameters leave the machine.
                                 None => json!({"id": e.id.to_string(), "recipe": e.recipe, "known": false, "enabled": e.enabled}),
                             })
                             .collect();

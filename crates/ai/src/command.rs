@@ -543,7 +543,7 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"add_marker","at_ms":int,"name":string,"reason":string}
  {"type":"add_transition","at_ms":int,"kind":"cross_dissolve"|"dip_to_black"|"wipe","duration_ms":int,"reason":string}
  {"type":"add_effect","clip_id":string,"recipe":string,"params"?:{...},"reason":string} (video clips; one per recipe per clip: an existing one is replaced; omitted params get defaults, strength 0.6 = normal)
- {"type":"set_effect","clip_id":string,"effect_id":string,"params"?:{...},"enabled"?:bool,"reason":string} (effect ids are in each clip's "effects"; not for a param with keyframes: rejected)
+ {"type":"set_effect","clip_id":string,"effect_id":string,"params"?:{...},"enabled"?:bool,"reason":string} (effect ids are in each clip's "effects"; an effect's "animated" lists its params that have keyframes: set_effect rejects those, leave them out)
  {"type":"remove_effect","clip_id":string,"effect_id":string,"reason":string}
 Effects (recipe: params):
 "#;
@@ -748,6 +748,24 @@ mod tests {
         let ctx = crate::context::project_context(&p, &Default::default());
         assert_eq!(ctx["tracks"][0]["clips"][0]["effects"][0]["recipe"], "handheld");
         assert!(ctx["tracks"][1]["clips"][0].get("effects").is_none(), "a clip without effects says nothing");
+    }
+
+    /// An effect's numbers with keyframes are marked, so the model does not
+    /// try to set them statically (set_effect would be rejected).
+    #[test]
+    fn the_context_marks_animated_effect_params() {
+        let (mut p, id) = fx_project();
+        let zoom = with_effect(&mut p, "smooth_zoom");
+        with_effect(&mut p, "handheld");
+        let effects = |p: &Project| crate::context::project_context(p, &Default::default())["tracks"][0]["clips"][0]["effects"].clone();
+        assert!(effects(&p)[0].get("animated").is_none(), "no keyframes: nothing marked");
+        p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(zoom, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
+        let e = effects(&p);
+        assert_eq!(e[0]["animated"], json!(["strength"]));
+        assert!(e[1].get("animated").is_none(), "only the effect with the keyframes");
+        let set = cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": zoom.to_string(), "params": {"strength": 0.9}}));
+        assert!(matches!(validate(&[set], &p, &Permissions::default()), Err(ValidationError::Animated { param: "strength", .. })), "what the mark warns of");
+        assert!(schema_for_prompt().contains("\"animated\" lists its params that have keyframes"));
     }
 
     fn with_effect(p: &mut Project, recipe: &str) -> kadr_core::EffectId {
