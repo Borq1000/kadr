@@ -369,13 +369,9 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
             // The recipe's variants (a Look's presets) are a named list,
             // other choices icon segments (D7).
             row.kind = if def.is_some_and(|d| d.variants == Some(p.key)) { 4 } else { 1 };
-            // A missing value is the default, as the recipe reads it (and
-            // the block's title names it, refinement 3).
-            let current = match e.params.get(p.key) {
-                Some(ParamValue::Choice(v)) => v.as_str(),
-                None => default,
-                _ => "",
-            };
+            // What the recipe reads (and the block's title names, refinement
+            // 3): a missing or invalid value is the default.
+            let current = resolved_choice(e, p.key, options, default);
             row.current = options.iter().position(|o| *o == current).map_or(-1, |i| i as i32);
             row.options = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(*o)).collect::<Vec<_>>()));
             let name_key = |o: &str| def.map_or_else(|| format!("fx.choice.{o}"), |d| d.option_name_key(p.key, o));
@@ -413,6 +409,16 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
     row
 }
 
+/// The option a choice parameter shows and the recipe reads
+/// (`Params::resolve`): the stored one when it is among the options, else
+/// the default.
+fn resolved_choice(e: &AppliedEffect, key: &str, options: &[&'static str], default: &'static str) -> &'static str {
+    match e.params.get(key) {
+        Some(ParamValue::Choice(v)) => options.iter().copied().find(|o| *o == v.as_str()).unwrap_or(default),
+        _ => default,
+    }
+}
+
 /// Where «к плейхеду» puts a moment: the source frame under the playhead,
 /// only while the playhead is on the clip. The row's enabled state and the
 /// action both use it, so an enabled button always does something (R14).
@@ -443,11 +449,14 @@ pub fn has_moment(c: &Clip) -> bool {
 pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) -> Option<Vec<EditCommand>> {
     let mut defaults = kadr_effects::fresh(def, c, at).params;
     // A Look's preset is what the effect is (its card): a reset keeps it, as
-    // it keeps a moment (refinement 5).
-    if let Some(key) = def.variants
-        && let Some(v @ ParamValue::Choice(_)) = e.params.get(key)
-    {
-        defaults.insert(key.to_string(), v.clone());
+    // it keeps a moment (refinement 5). A missing one already reads as the
+    // default (refinement 3): filling it in would change nothing on screen,
+    // so it is not a change to make (R14).
+    if let Some(key) = def.variants {
+        match e.params.get(key) {
+            Some(v) => defaults.insert(key.to_string(), v.clone()),
+            None => defaults.remove(key),
+        };
     }
     for p in def.params.iter().filter(|p| p.kind == ParamKind::Moment) {
         if let Some(m @ ParamValue::Moment(_)) = e.params.get(p.key) {
@@ -556,6 +565,26 @@ fn same_list(old: ModelRc<SharedString>, new: ModelRc<SharedString>) -> ModelRc<
 /// `rows` into the model on screen, each row keeping its nested option
 /// lists (a fresh `ModelRc` would make every row look changed and rebuild
 /// its elements on each refresh).
+/// The block of the clip's `i`-th effect (spec §6.2): its name, state and
+/// parameter rows — none for an effect this build cannot run, shown
+/// «Недоступен» (`known: false`). `old`: the block's parameter model on
+/// screen, updated in place (`reuse_param_rows`).
+pub fn fx_row(c: &Clip, i: usize, playhead: Time, rate: FrameRate, picking: impl Fn(&str) -> bool, old: Option<ModelRc<FxParamRow>>) -> FxRow {
+    let e = &c.effects[i];
+    let def = kadr_effects::definition(e);
+    let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, playhead, rate, picking(p.key))).collect());
+    FxRow {
+        id: e.id.to_string().into(),
+        name: fx_name(e).into(),
+        enabled: e.enabled,
+        known: def.is_some(),
+        resettable: can_reset(c, e, playhead),
+        first: i == 0,
+        last: i + 1 == c.effects.len(),
+        params: reuse_param_rows(old, params),
+    }
+}
+
 fn reuse_param_rows(old: Option<ModelRc<FxParamRow>>, mut rows: Vec<FxParamRow>) -> ModelRc<FxParamRow> {
     if let Some(old) = &old {
         for (i, r) in rows.iter_mut().enumerate() {
@@ -941,17 +970,11 @@ impl App {
     pub fn fx_rows(&self, c: &Clip, old: ModelRc<FxRow>) -> ModelRc<FxRow> {
         let rate = self.project.sequence().frame_rate;
         let old_params: HashMap<SharedString, ModelRc<FxParamRow>> = old.iter().map(|r| (r.id, r.params)).collect();
-        let rows: Vec<FxRow> = c
-            .effects
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let def = kadr_effects::definition(e);
+        let rows: Vec<FxRow> = (0..c.effects.len())
+            .map(|i| {
+                let e = &c.effects[i];
                 let picking = |key: &str| self.fx.picking.as_ref().is_some_and(|pk| pk.clip == c.id && pk.effect == e.id && pk.key == key);
-                let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, self.playhead, rate, picking(p.key))).collect());
-                let id: SharedString = e.id.to_string().into();
-                let params = reuse_param_rows(old_params.get(&id).cloned(), params);
-                FxRow { id, name: fx_name(e).into(), enabled: e.enabled, known: def.is_some(), resettable: can_reset(c, e, self.playhead), first: i == 0, last: i + 1 == c.effects.len(), params }
+                fx_row(c, i, self.playhead, rate, picking, old_params.get(&SharedString::from(e.id.to_string())).cloned())
             })
             .collect();
         crate::util::reuse_rows(Some(old), rows)
@@ -1124,12 +1147,14 @@ pub fn action_commands(c: &Clip, eid: EffectId, action: &str, playhead: Time, ra
         "reset" => (tf("cmd.reset_effect_named", &[("name", &name)]), reset_commands(c, e, def?, playhead)?),
         a if a.starts_with("choice:") => {
             let (key, index) = a["choice:".len()..].rsplit_once(':')?;
-            let ParamKind::Choice { options, .. } = def?.param(key)?.kind else { return None };
-            let v = ParamValue::Choice(options.get(index.parse::<usize>().ok()?)?.to_string());
-            if e.params.get(key) == Some(&v) {
+            let ParamKind::Choice { options, default } = def?.param(key)?.kind else { return None };
+            let pick = *options.get(index.parse::<usize>().ok()?)?;
+            // The option shown (a missing or invalid value shows the default):
+            // picking it changes nothing on screen, so nothing is sent (R14).
+            if pick == resolved_choice(e, key, options, default) {
                 return None;
             }
-            (tf("cmd.update_effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
+            (tf("cmd.update_effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), ParamValue::Choice(pick.to_string()))]), None)])
         }
         a if a.starts_with("moment:") => {
             let key = &a["moment:".len()..];
@@ -1470,6 +1495,67 @@ mod tests {
         let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
         let z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
         assert_eq!(param_row(&c, &z, zoom.param("direction").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false).kind, 1, "icon choices stay segments");
+    }
+
+    /// R14: «Сбросить» of a Look without a stored preset (a hand-edited
+    /// file; it reads as Кино) does not count filling in the default as a
+    /// change, and picking Кино from its list sends nothing.
+    #[test]
+    fn a_look_without_a_stored_preset_resets_and_picks_as_the_default_it_shows() {
+        let mut c = clip_10_20();
+        let look = kadr_effects::recipe("look").unwrap();
+        let mut bare = kadr_effects::fresh(look, &c, Time::from_secs(12));
+        bare.params.remove("preset");
+        c.effects.push(bare.clone());
+        let at = Time::from_secs(12);
+        assert!(reset_commands(&c, &bare, look, at).is_none(), "already at its defaults");
+        assert!(!can_reset(&c, &bare, at));
+        assert!(action_commands(&c, bare.id, "choice:preset:0", at, FrameRate::FPS_30).is_none(), "Кино is what it shows");
+        assert!(action_commands(&c, bare.id, "choice:preset:1", at, FrameRate::FPS_30).is_some());
+        c.effects[0].params.insert("strength".into(), ParamValue::Number(0.9));
+        let e = c.effects[0].clone();
+        let reset = vec![EditCommand::UpdateEffect { clip: c.id, id: e.id, params: BTreeMap::from([("strength".to_string(), ParamValue::Number(0.6))]), enabled: None }];
+        assert_eq!(reset_commands(&c, &e, look, at), Some(reset), "the strength only: the preset stays as it reads");
+    }
+
+    /// A choice shows what the recipe reads: a missing or invalid stored
+    /// value (a hand-edited file) is the default, never −1; picking the
+    /// option shown sends nothing.
+    #[test]
+    fn a_choice_shows_and_compares_with_the_value_the_recipe_reads() {
+        let mut c = clip_10_20();
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        let mut z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
+        z.params.insert("direction".into(), ParamValue::Choice("diagonal".into()));
+        c.effects.push(z.clone());
+        let at = Time::from_secs(12);
+        let current = |e: &AppliedEffect| param_row(&c, e, zoom.param("direction").unwrap(), at, FrameRate::FPS_30, false).current;
+        assert_eq!(current(&z), 0, "an invalid value: «in», the default");
+        assert!(action_commands(&c, z.id, "choice:direction:0", at, FrameRate::FPS_30).is_none(), "what is shown: nothing to send");
+        assert!(action_commands(&c, z.id, "choice:direction:1", at, FrameRate::FPS_30).is_some());
+        let mut bare = z.clone();
+        bare.params.remove("direction");
+        assert_eq!(current(&bare), 0, "a missing value: the default");
+    }
+
+    /// Refinement 3 on the editor side: a Look whose preset this build lacks
+    /// is a newer Kadr's effect — named «Look» (no preset to name), marked
+    /// unavailable in the badge's tip, its block without rows or reset; it
+    /// can be removed but not changed.
+    #[test]
+    fn a_look_of_a_preset_this_build_lacks_is_unavailable() {
+        let mut c = clip_10_20();
+        let mut e = card("look:warm").fresh(&c, Time::from_secs(12));
+        e.params.insert("preset".into(), ParamValue::Choice("bleach_bypass".into()));
+        c.effects.push(e.clone());
+        let at = Time::from_secs(12);
+        assert_eq!(fx_name(&e), t("fx.look"));
+        assert_eq!(fx_tip(&c), tf("fx.tip", &[("list", &tf("fx.tip.unavailable", &[("name", &t("fx.look"))]))]));
+        let row = fx_row(&c, 0, at, FrameRate::FPS_30, |_| false, None);
+        assert_eq!((row.name.as_str(), row.known, row.params.row_count(), row.resettable), (t("fx.look").as_str(), false, 0, false), "«Недоступен»");
+        assert!(action_commands(&c, e.id, "choice:preset:0", at, FrameRate::FPS_30).is_none(), "not changed");
+        assert!(action_commands(&c, e.id, "toggle", at, FrameRate::FPS_30).is_none(), "not switched");
+        assert!(action_commands(&c, e.id, "remove", at, FrameRate::FPS_30).is_some(), "but removed");
     }
 
     #[test]
