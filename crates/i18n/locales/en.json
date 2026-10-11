@@ -832,5 +832,11 @@
   "fx.choice.pink": "Pink",
   "fx.choice.1": "1",
   "fx.choice.2": "2",
-  "fx.choice.3": "3"
+  "fx.choice.3": "3",
+  "cmd.set_transition": "Transition",
+  "cmd.update_transition": "Edit transition",
+  "cmd.transition_named": "Transition: {name}",
+  "cmd.update_transition_named": "Edit transition: {name}",
+  "err.edit.not_a_cut": "the clips do not meet at a cut",
+  "err.edit.transition_not_found": "transition not found"
 }

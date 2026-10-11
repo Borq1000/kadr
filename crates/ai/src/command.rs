@@ -6,7 +6,7 @@
 //! rejected with a reason the user can see.
 
 use kadr_core::{ClipId, EffectId, Time, TimeRange};
-use kadr_project::{AnimParam, AppliedEffect, Marker, Project, TrackKey, TrackKind, Transform, Transition, TransitionKind};
+use kadr_project::{AnimParam, AppliedEffect, Marker, Project, TrackKey, TrackKind, Transform, TransitionKind};
 use kadr_timeline::{ClipProperty, EditCommand, TrimEdge};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -382,7 +382,11 @@ fn validate_each(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
                 let (from, to, _) = seq
                     .cut_near(track.id, at, half_frame)
                     .ok_or_else(|| ValidationError::Range { index: i, msg: format!("no cut within half a frame of {at_ms} ms on track {}", track.name) })?;
-                EditCommand::AddTransition(Transition::legacy(*kind, from, to, ms(*duration_ms)))
+                let (recipe, params) = kind.recipe();
+                let def = kadr_effects::recipe(recipe).ok_or_else(|| ValidationError::Range { index: i, msg: format!("{recipe} is not in this build") })?;
+                let mut values = kadr_effects::transition_params(def);
+                values.extend(params);
+                EditCommand::SetTransition { from, to, recipe: recipe.into(), version: def.version, params: values, duration: ms(*duration_ms) }
             }
             AiCommand::SelectCamera { start_ms, end_ms, angle, .. } => {
                 // Milliseconds can't name flick-exact positions: a bound within

@@ -44,6 +44,10 @@ pub enum EditError {
     EffectTarget,
     #[error("invalid effect parameter: {0}")]
     InvalidParam(String),
+    #[error("the clips do not meet at a cut")]
+    NotACut,
+    #[error("transition not found")]
+    TransitionNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +100,17 @@ pub enum EditCommand {
     /// Removes a time range on every unlocked track (sync-preserving).
     DeleteRange { range: TimeRange, ripple: bool },
     SetClipProperty { clip: ClipId, prop: ClipProperty },
-    AddTransition(Transition),
+    /// Puts a transition on the cut where `from` ends and `to` starts (D3,
+    /// effects spec §7): both on one unlocked video track; a cut recipe at
+    /// its current version, valid parameters (missing ones get defaults), a
+    /// duration of at least two frames (the evaluator clamps it to both
+    /// clips). The cut's transition, if any, is replaced in place (same
+    /// id); the same transition again is a `NoOp`.
+    SetTransition { from: ClipId, to: ClipId, recipe: String, version: u16, params: BTreeMap<String, ParamValue>, duration: Time },
+    /// Sets the given parameters (validated, merged into the stored ones;
+    /// none = unchanged) and/or the duration of a transition. One the
+    /// registry cannot run (a newer Kadr's) cannot be changed, only removed.
+    UpdateTransition { id: TransitionId, params: BTreeMap<String, ParamValue>, duration: Option<Time> },
     RemoveTransition(TransitionId),
     AddMarker(Marker),
     RemoveMarker(MarkerId),
@@ -179,7 +193,8 @@ impl EditCommand {
             EditCommand::DeleteClips { .. } => "cmd.delete",
             EditCommand::DeleteRange { .. } => "cmd.delete_range",
             EditCommand::SetClipProperty { .. } => "cmd.property",
-            EditCommand::AddTransition(_) => "cmd.add_transition",
+            EditCommand::SetTransition { .. } => "cmd.set_transition",
+            EditCommand::UpdateTransition { .. } => "cmd.update_transition",
             EditCommand::RemoveTransition(_) => "cmd.remove_transition",
             EditCommand::AddMarker(_) => "cmd.add_marker",
             EditCommand::RemoveMarker(_) => "cmd.remove_marker",
@@ -225,10 +240,24 @@ impl EditCommand {
             EditError::UnknownRecipe(_) => "err.edit.unknown_recipe",
             EditError::EffectTarget => "err.edit.effect_target",
             EditError::InvalidParam(_) => "err.edit.invalid_param",
+            EditError::NotACut => "err.edit.not_a_cut",
+            EditError::TransitionNotFound => "err.edit.transition_not_found",
         }
     }
 
+    /// Applies the command, then keeps every transition on its cut (D2):
+    /// what a command does to clips it does to their transitions, in the
+    /// same undo entry (`Sequence::reconcile_transitions`). A `Batch`'s
+    /// commands run first, the transitions follow once at its end.
     pub fn apply(&self, seq: &mut Sequence, ctx: &EditContext) -> Result<(), EditError> {
+        self.apply_one(seq, ctx)?;
+        for t in seq.reconcile_transitions() {
+            tracing::debug!(id = %t.id, recipe = %t.recipe, "a transition's clips no longer meet: removed with the edit");
+        }
+        Ok(())
+    }
+
+    fn apply_one(&self, seq: &mut Sequence, ctx: &EditContext) -> Result<(), EditError> {
         let fr = seq.frame_rate;
         match self {
             EditCommand::InsertClip { track, clip, mode } => {
@@ -373,27 +402,66 @@ impl EditCommand {
                 Ok(())
             }
 
-            EditCommand::AddTransition(tr) => {
-                // Interim (E3 Task 3; Task 4 replaces it with SetTransition):
-                // the transition on its cut — its clips must meet on one
-                // unlocked video track — in place of the cut's.
-                let (ti, ci) = seq.locate_clip(tr.from).ok_or(EditError::ClipNotFound)?;
+            EditCommand::SetTransition { from, to, recipe, version, params, duration } => {
+                let def = kadr_effects::recipe(recipe).filter(|d| d.version == *version).ok_or_else(|| EditError::UnknownRecipe(recipe.clone()))?;
+                if def.target != kadr_effects::Target::Cut {
+                    return Err(EditError::EffectTarget);
+                }
+                kadr_effects::validate(def.params, params).map_err(EditError::InvalidParam)?;
+                if *duration < fr.frame_to_time(2) {
+                    return Err(EditError::InvalidRange);
+                }
+                let (ti, ci) = seq.locate_clip(*from).ok_or(EditError::ClipNotFound)?;
                 let track = &seq.tracks[ti];
+                if track.kind != TrackKind::Video {
+                    return Err(EditError::KindMismatch);
+                }
                 if track.locked {
                     return Err(EditError::TrackLocked(track.name.clone()));
                 }
-                let meets = track.clips.get(ci + 1).is_some_and(|n| n.id == tr.to && n.timeline_in == track.clips[ci].timeline_out);
-                if track.kind != TrackKind::Video || !meets {
+                if !track.clips.get(ci + 1).is_some_and(|n| n.id == *to && n.timeline_in == track.clips[ci].timeline_out) {
+                    return Err(EditError::NotACut);
+                }
+                let mut values = kadr_effects::transition_params(def);
+                values.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+                match seq.transitions.iter_mut().find(|t| t.to == *to) {
+                    Some(t) => {
+                        let next = Transition { id: t.id, ..Transition::new(def.id, def.version, values, *from, *to, *duration) };
+                        if *t == next {
+                            return Err(EditError::NoOp);
+                        }
+                        *t = next;
+                    }
+                    None => seq.transitions.push(Transition::new(def.id, def.version, values, *from, *to, *duration)),
+                }
+                Ok(())
+            }
+            EditCommand::UpdateTransition { id, params, duration } => {
+                let i = seq.transitions.iter().position(|t| t.id == *id).ok_or(EditError::TransitionNotFound)?;
+                transition_track_unlocked(seq, &seq.transitions[i])?;
+                let tr = &seq.transitions[i];
+                // A recipe this build cannot run cannot be validated, so it is not changed (spec §7).
+                let def = kadr_effects::transition_definition(tr).ok_or_else(|| EditError::UnknownRecipe(tr.recipe.clone()))?;
+                kadr_effects::validate(def.params, params).map_err(EditError::InvalidParam)?;
+                if duration.is_some_and(|d| d < fr.frame_to_time(2)) {
                     return Err(EditError::InvalidRange);
                 }
-                seq.transitions.retain(|t| t.to != tr.to);
-                seq.transitions.push(tr.clone());
+                let mut next = tr.clone();
+                next.params.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+                if let Some(d) = duration {
+                    next.duration = *d;
+                }
+                if next == *tr {
+                    return Err(EditError::NoOp);
+                }
+                seq.transitions[i] = next;
                 Ok(())
             }
             EditCommand::RemoveTransition(id) => {
-                let n = seq.transitions.len();
-                seq.transitions.retain(|t| t.id != *id);
-                if seq.transitions.len() == n { Err(EditError::NoOp) } else { Ok(()) }
+                let Some(i) = seq.transitions.iter().position(|t| t.id == *id) else { return Err(EditError::NoOp) };
+                transition_track_unlocked(seq, &seq.transitions[i])?;
+                seq.transitions.remove(i);
+                Ok(())
             }
             EditCommand::AddMarker(m) => {
                 let mut m = m.clone();
@@ -477,7 +545,7 @@ impl EditCommand {
                         return Err(EditError::NoOp);
                     }
                     if t > c.timeline_in {
-                        EditCommand::Split { at: t, clips: Some(vec![*clip]) }.apply(seq, ctx)?;
+                        EditCommand::Split { at: t, clips: Some(vec![*clip]) }.apply_one(seq, ctx)?;
                         target = seq.tracks[ti].clip_at(t).ok_or(EditError::ClipNotFound)?.id;
                     }
                 }
@@ -519,7 +587,7 @@ impl EditCommand {
                 for at in [range.start, range.end] {
                     if let Some(c) = seq.tracks[ti].clip_at(at).filter(|c| c.timeline_in < at && c.multicam.is_some()) {
                         let id = c.id;
-                        EditCommand::Split { at, clips: Some(vec![id]) }.apply(seq, ctx)?;
+                        EditCommand::Split { at, clips: Some(vec![id]) }.apply_one(seq, ctx)?;
                     }
                 }
                 let inside: Vec<ClipId> = seq.tracks[ti]
@@ -530,7 +598,7 @@ impl EditCommand {
                     .collect();
                 let mut changed = false;
                 for id in inside {
-                    match (EditCommand::SwitchAngle { clip: id, angle: *angle, at: None }).apply(seq, ctx) {
+                    match (EditCommand::SwitchAngle { clip: id, angle: *angle, at: None }).apply_one(seq, ctx) {
                         Ok(()) => changed = true,
                         Err(EditError::NoOp) => {}
                         Err(e) => return Err(e),
@@ -669,7 +737,7 @@ impl EditCommand {
             EditCommand::Batch { commands, .. } => {
                 let mut applied = 0;
                 for c in commands {
-                    match c.apply(seq, ctx) {
+                    match c.apply_one(seq, ctx) {
                         Ok(()) => applied += 1,
                         // A no-op inside a batch (e.g. range already empty) is fine.
                         Err(EditError::NoOp) => {}
@@ -759,6 +827,15 @@ fn unlocked_mut(seq: &mut Sequence, id: TrackId) -> Result<&mut Track, EditError
         return Err(EditError::TrackLocked(t.name.clone()));
     }
     Ok(t)
+}
+
+/// A transition is changed only on an unlocked track (a lock protects its
+/// cuts too); one whose clips are gone can always go.
+fn transition_track_unlocked(seq: &Sequence, tr: &Transition) -> Result<(), EditError> {
+    match seq.locate_clip(tr.to).map(|(ti, _)| &seq.tracks[ti]) {
+        Some(t) if t.locked => Err(EditError::TrackLocked(t.name.clone())),
+        _ => Ok(()),
+    }
 }
 
 /// Expands a clip list with every linked partner, deduplicated, stable order.

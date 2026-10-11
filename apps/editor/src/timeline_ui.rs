@@ -7,7 +7,7 @@ use crate::app::App;
 use crate::util::{fmt_ruler, fmt_secs, rgb};
 use crate::{ClipMark, ClipView, KeyMark, MarkerView, TickView, TrackView, TransitionView};
 use kadr_core::{ClipId, LinkId, MediaKind, Time, TimeRange, TrackId};
-use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, Sequence, SourceTime, TrackKind, Transition, TransitionKind};
+use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, Sequence, SourceTime, TrackKind};
 use kadr_timeline::snap::{snap, snap_move, snap_points};
 use kadr_timeline::{ClipProperty, EditCommand, InsertMode, TrackFlag, TrimEdge};
 use kadr_i18n::{t, tf};
@@ -1071,8 +1071,12 @@ impl App {
         }
         match best {
             Some((from, to, _)) => {
-                self.execute(EditCommand::AddTransition(Transition::legacy(TransitionKind::CrossDissolve, from, to, Time::from_secs(1))));
-                self.toast(t("toast.dissolve_added"));
+                let def = kadr_effects::recipe("clean_fade").expect("a registry recipe");
+                let cmd = EditCommand::SetTransition { from, to, recipe: def.id.into(), version: def.version, params: kadr_effects::transition_params(def), duration: Time::from_secs(1) };
+                let label = tf("cmd.transition_named", &[("name", &t(&def.name_key()))]);
+                if self.execute(EditCommand::Batch { label, commands: vec![cmd] }) {
+                    self.toast(t("toast.dissolve_added"));
+                }
             }
             None => self.toast(t("toast.no_cut_near")),
         }
