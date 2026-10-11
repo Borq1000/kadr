@@ -303,7 +303,9 @@ fn covers_canvas(g: &Grid, layer: &Layer, input: &LayerInput) -> bool {
 /// `ColorAdjust`s fold into one affine map — every adjust step is affine,
 /// exposure `(c^2.4 · 2^ev)^(1/2.4)` being `c · 2^(ev/2.4)` for `c ≥ 0` —
 /// then the other primitives in list order, the clamp once at the end.
-/// Built once per layer and frame; run inside the layer's one pass.
+/// Built with the layer's [`Plan`] — once per layer and frame, and once
+/// more for the first layer, whose plan [`covers_canvas`] builds to decide
+/// the background fill — and run inside the layer's one pass.
 struct PointFx {
     ops: Vec<Op>,
     /// Some op reads the pixel's canvas position (vignette, grain).
@@ -404,7 +406,8 @@ impl PointFx {
         if ops.is_empty() {
             return None;
         }
-        let spatial = ops.iter().any(|o| matches!(o, Op::Vignette { .. } | Op::Grain { .. }));
+        // Every spatial primitive this renderer implements made an op above.
+        let spatial = effects.iter().any(|e| !e.is_neutral() && e.is_spatial());
         Some(PointFx { ops, spatial })
     }
 
