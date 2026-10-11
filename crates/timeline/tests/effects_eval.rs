@@ -435,3 +435,29 @@ fn grain_changes_every_frame_and_a_split_or_trim_keeps_it() {
         assert_eq!(layer(&trimmed, t).effects, layer(&p, t).effects, "trimmed, {t:?}");
     }
 }
+
+/// A Look through a cross dissolve: each side of the transition carries its
+/// own clip's colour primitives — as that clip shows them outside the
+/// window (grain seeds aside: they follow the frame) — throughout the window.
+#[test]
+fn a_look_survives_a_cross_dissolve_on_both_sides() {
+    use kadr_scene::LayerContent;
+    let (mut p, _) = project(vec![look("dramatic")]);
+    let asset = p.assets[0].id;
+    let mut b = Clip::new(asset, "b", TimeRange::new(Time::from_secs(50), Time::from_secs(60)), Time::from_secs(20));
+    b.effects = vec![look("vintage")];
+    let track = p.sequence().tracks[0].id;
+    p.sequence_mut().tracks[0].clips.push(b);
+    p.sequence_mut().transitions.push(Transition { id: kadr_core::TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: Time::from_secs(20), duration: Time::from_secs(1) });
+    let unseeded = |l: &Layer| -> Vec<Effect> { l.effects.iter().map(|e| if let Effect::Grain(g) = e { Effect::Grain(kadr_scene::Grain { seed: 0, ..*g }) } else { e.clone() }).collect() };
+    let (own_a, own_b) = (unseeded(&layer(&p, Time::from_secs(15))), unseeded(&layer(&p, Time::from_secs(25))));
+    assert!(kinds(&layer(&p, Time::from_secs(25))).contains(&"grain") && !own_a.is_empty());
+    for ms in [19_600, 20_000, 20_400] {
+        let l = layer(&p, Time::from_millis(ms));
+        let LayerContent::Transition(t) = &l.content else { panic!("{ms} ms: a transition, {:?}", l.content) };
+        assert_eq!((t.from.len(), t.to.len()), (1, 1), "{ms} ms");
+        assert_eq!(unseeded(&t.from[0]), own_a, "{ms} ms: the outgoing clip's Look");
+        assert_eq!(unseeded(&t.to[0]), own_b, "{ms} ms: the incoming clip's Look");
+        assert!(l.effects.is_empty(), "{ms} ms: none on the transition layer itself");
+    }
+}

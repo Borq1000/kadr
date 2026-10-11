@@ -1,7 +1,9 @@
-//! Evaluator → renderer with motion effects (effects spec §9): strength 0
-//! and a switched-off effect are pixel-identical to no effect; a split
-//! keeps every pixel; Smooth Zoom magnifies about its point. No decoder:
-//! the media layer gets a synthetic gradient frame.
+//! Evaluator → renderer with motion and colour effects (effects spec §9):
+//! strength 0 and a switched-off effect are pixel-identical to no effect; a
+//! split keeps every pixel, of a motion and of a Look with its grain; Smooth
+//! Zoom magnifies about its point; every Look changes the picture, and
+//! strength 0 or the «До» view do not. No decoder: the media layer gets a
+//! synthetic gradient frame.
 
 use kadr_core::color::AlphaMode;
 use kadr_core::{ColorInfo, CpuFrame, FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
@@ -141,4 +143,25 @@ fn a_split_keeps_every_pixel_of_a_look() {
         assert!(worst <= 1, "frame {f}: off by {worst}");
     }
     assert_eq!(graded, 15, "the Look shows on every frame");
+    // The Look and the vignette hold still: only the grain moves, so the
+    // test keeps covering grain whatever looks.json's numbers become.
+    let [a, b] = [40, 41].map(|f| render(&split, FrameRate::FPS_30.frame_to_time(f)));
+    assert_ne!(a, b, "the grain moves from frame to frame");
+}
+
+/// The hover preview's snapshot carries colour too (spec §6.1): a Look put
+/// on the snapshot's copy of the sequence reaches the layer's effects and
+/// the picture; the project itself has none.
+#[test]
+fn the_hover_snapshot_carries_a_look_s_colour() {
+    let p = project(vec![]);
+    let t = Time::from_secs(2);
+    let look = fx("look", &[("preset", ParamValue::Choice("dramatic".into()))]);
+    let hovered = ProjectScenes::new_with(&p, false, |seq| {
+        seq.tracks[0].clips[0].put_effect(look.clone());
+    });
+    let scene = hovered.scene_at(t, &out());
+    assert!(!scene.layers[0].effects.is_empty(), "the Look's colour primitives");
+    assert_ne!(render_scene(&scene), render(&p, t));
+    assert!(ProjectScenes::new(&p, false).scene_at(t, &out()).layers[0].effects.is_empty(), "the project has none");
 }
