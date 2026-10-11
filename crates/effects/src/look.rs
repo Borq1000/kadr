@@ -238,9 +238,13 @@ mod tests {
         let k = curve(&c);
         assert!(k[1].1 < k[1].0 && k[3].1 > k[3].0, "a soft S: shadows down, highlights up");
 
+        // Tuned up from the spec's 0.25 / 0.05, invisible on real footage (E2-R5).
         let w = at_normal("warm");
-        assert_eq!((adjust(&w).temperature, adjust(&w).tint), (0.25, 0.05), "Тёплый");
+        assert!(adjust(&w).temperature >= 0.5 && adjust(&w).tint > 0.0, "Тёплый: clearly warm, {:?}", adjust(&w));
         assert!(curve(&w).iter().any(|&(x, y)| x == 0.5 && y > 0.5), "the mids lifted");
+        let ws = split(&w).expect("warm highlights and a touch in the shadows");
+        assert!((20.0..=60.0).contains(&ws.highlight_hue_deg) && (20.0..=60.0).contains(&ws.shadow_hue_deg));
+        assert!(ws.highlight_amount > ws.shadow_amount && ws.shadow_amount > 0.0);
 
         let f = at_normal("soft_film");
         let fc = curve(&f);

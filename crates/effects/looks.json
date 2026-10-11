@@ -10,7 +10,8 @@
     {
       "key": "warm",
       "curve": [[0.0, 0.0], [0.5, 0.54], [1.0, 1.0]],
-      "adjust": { "temperature": 0.25, "tint": 0.05 }
+      "split_tone": { "shadow_hue": 30, "shadow_amount": 0.03, "highlight_hue": 35, "highlight_amount": 0.06, "balance": 0.0 },
+      "adjust": { "temperature": 0.7, "tint": 0.08 }
     },
     {
       "key": "soft_film",
