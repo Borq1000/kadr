@@ -395,43 +395,52 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 vertical-stretch: 1;
                 max-height: 100000px;
-                if root.left-tab == 0: MediaLibrary {
+                // The left panel. Both tabs stay alive (scroll positions, element
+                // handles); only the one shown draws and takes input. A plain
+                // container: `visible` alone would still take room in the layout.
+                Rectangle {
                     width: root.library-width;
                     max-height: 100000px;
-                    assets: root.assets;
-                    bins: root.bins;
-                    summary: root.media-summary;
-                    total-count: root.media-total;
-                    search <=> root.media-search;
-                    import => { root.import-media(); }
-                    new-bin => { root.new-bin(); }
-                    select-bin(id) => { root.select-bin(id); }
-                    bin-action(id, a) => { root.bin-action(id, a); }
-                    rename-bin(id, n) => { root.rename-bin(id, n); root.focus-editor(); }
-                    search-changed(t) => { root.media-search-changed(t); }
-                    asset-pressed(id, x, y) => { root.asset-pressed(id, x, y); }
-                    asset-moved(id, x, y) => { root.asset-moved(id, x, y); }
-                    asset-released(id, x, y) => { root.asset-released(id, x, y); root.focus-editor(); }
-                    asset-activated(id) => { root.asset-activated(id); }
-                    asset-action(id, a) => { root.asset-action(id, a); }
-                    tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); }
-                }
-                if root.left-tab == 1: EffectsPanel {
-                    width: root.library-width;
-                    max-height: 100000px;
-                    categories: root.fx-categories;
-                    category: root.fx-category;
-                    cards: root.fx-cards;
-                    hint: root.fx-hint;
-                    drag-refused: root.drag-refused;
-                    search <=> root.fx-search;
-                    tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); }
-                    category-selected(k) => { root.fx-category-selected(k); }
-                    search-changed(t) => { root.fx-search-changed(t); }
-                    card-hover(id, on) => { root.fx-card-hover(id, on); }
-                    card-pressed(id, x, y) => { root.fx-card-pressed(id, x, y); }
-                    card-moved(id, x, y) => { root.fx-card-moved(id, x, y); }
-                    card-released(id, x, y) => { root.fx-card-released(id, x, y); root.focus-editor(); }
+                    MediaLibrary {
+                        visible: root.left-tab == 0;
+                        width: parent.width;
+                        height: parent.height;
+                        assets: root.assets;
+                        bins: root.bins;
+                        summary: root.media-summary;
+                        total-count: root.media-total;
+                        search <=> root.media-search;
+                        import => { root.import-media(); }
+                        new-bin => { root.new-bin(); }
+                        select-bin(id) => { root.select-bin(id); }
+                        bin-action(id, a) => { root.bin-action(id, a); }
+                        rename-bin(id, n) => { root.rename-bin(id, n); root.focus-editor(); }
+                        search-changed(t) => { root.media-search-changed(t); }
+                        asset-pressed(id, x, y) => { root.asset-pressed(id, x, y); }
+                        asset-moved(id, x, y) => { root.asset-moved(id, x, y); }
+                        asset-released(id, x, y) => { root.asset-released(id, x, y); root.focus-editor(); }
+                        asset-activated(id) => { root.asset-activated(id); }
+                        asset-action(id, a) => { root.asset-action(id, a); }
+                        tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); root.focus-editor(); }
+                    }
+                    EffectsPanel {
+                        visible: root.left-tab == 1;
+                        width: parent.width;
+                        height: parent.height;
+                        categories: root.fx-categories;
+                        category: root.fx-category;
+                        cards: root.fx-cards;
+                        hint: root.fx-hint;
+                        drag-refused: root.drag-refused;
+                        search <=> root.fx-search;
+                        tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); root.focus-editor(); }
+                        category-selected(k) => { root.fx-category-selected(k); }
+                        search-changed(t) => { root.fx-search-changed(t); }
+                        card-hover(id, on) => { root.fx-card-hover(id, on); }
+                        card-pressed(id, x, y) => { root.fx-card-pressed(id, x, y); }
+                        card-moved(id, x, y) => { root.fx-card-moved(id, x, y); }
+                        card-released(id, x, y) => { root.fx-card-released(id, x, y); root.focus-editor(); }
+                    }
                 }
                 Splitter {
                     property <length> start;

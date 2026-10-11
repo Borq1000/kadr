@@ -973,6 +973,7 @@ impl App {
             "reveal-media" => {
                 if let Some(c) = self.tl.selection.first().and_then(|id| self.project.sequence().clip(*id)) {
                     self.selected_asset = Some(c.asset);
+                    self.show_media_tab();
                     self.bin_filter = None;
                     self.media_search.clear();
                     self.ui().set_media_search("".into());

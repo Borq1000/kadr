@@ -65,7 +65,9 @@ component FxCard inherits Rectangle {
         }
     }
     ta := TouchArea {
-        mouse-cursor: self.pressed ? (root.refused ? no-drop : grabbing) : !root.c.enabled ? not-allowed : pointer;
+        // A dimmed card still drags onto a clip it fits: a pointer, not "not
+        // allowed" (its tooltip says why a click does nothing).
+        mouse-cursor: self.pressed ? (root.refused ? no-drop : grabbing) : pointer;
         changed has-hover => { root.hover(self.has-hover); }
         pointer-event(e) => {
             if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) { root.pressed(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
@@ -95,12 +97,16 @@ export component EffectsPanel inherits Rectangle {
     callback card-released(string, length, length);
     // The card under the pointer (its hint shows when it is inactive) and
     // its box in panel coordinates. Drawn by the panel, not the card: the
-    // scroll area would clip a card's own tooltip at its edges.
+    // scroll area would clip a card's own tooltip at its edges. A card
+    // filtered out is destroyed without a pointer leave: the id check (and
+    // the resets on search / chip / hiding) keep its hint from staying.
     property <int> tip-index: -1;
+    property <string> tip-id;
     property <length> tip-x;
     property <length> tip-top;
     property <length> tip-bottom;
     background: Theme.bg1;
+    changed visible => { root.tip-index = -1; }
 
     VerticalLayout {
         PanelTabs {
@@ -117,7 +123,10 @@ export component EffectsPanel inherits Rectangle {
             LineEdit {
                 placeholder-text: Tr.t("fx.search");
                 text <=> root.search;
-                edited(t) => { root.search-changed(t); }
+                edited(t) => {
+                    root.tip-index = -1;
+                    root.search-changed(t);
+                }
             }
             HorizontalLayout {
                 spacing: 4px;
@@ -134,7 +143,10 @@ export component EffectsPanel inherits Rectangle {
                     ct := Text { text: cat.label; font-size: Theme.font-sm; color: root.category == cat.key ? Theme.text : Theme.text-dim; }
                     cta := TouchArea {
                         mouse-cursor: pointer;
-                        clicked => { root.category-selected(cat.key); }
+                        clicked => {
+                            root.tip-index = -1;
+                            root.category-selected(cat.key);
+                        }
                     }
                 }
             }
@@ -164,6 +176,7 @@ export component EffectsPanel inherits Rectangle {
                 hover(on) => {
                     if (on) {
                         root.tip-index = i;
+                        root.tip-id = card.id;
                         root.tip-x = self.absolute-position.x - root.absolute-position.x + self.width / 2;
                         root.tip-top = self.absolute-position.y - root.absolute-position.y;
                         root.tip-bottom = root.tip-top + self.height;
@@ -188,7 +201,7 @@ export component EffectsPanel inherits Rectangle {
     }
 
     // The inactive card's hint: below it, or above when that leaves the panel.
-    if root.tip-index >= 0 && root.cards[root.tip-index].hint != "": Tooltip {
+    if root.tip-index >= 0 && root.cards[root.tip-index].id == root.tip-id && root.cards[root.tip-index].hint != "": Tooltip {
         text: root.cards[root.tip-index].hint;
         x: max(4px, min(root.width - self.width - 4px, root.tip-x - self.width / 2));
         y: root.tip-bottom + 4px + self.height <= root.height - 4px ? root.tip-bottom + 4px : root.tip-top - self.height - 4px;

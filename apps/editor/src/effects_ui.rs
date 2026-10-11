@@ -84,6 +84,13 @@ pub fn visible_recipes(category: &str, query: &str) -> Vec<&'static RecipeDef> {
         .collect()
 }
 
+/// Whether the hovered card (`hover`, a recipe id) is not among the
+/// `listed` cards any more: a card filtered out under a resting pointer is
+/// destroyed without a pointer leave, so its hover must end without one.
+pub fn hover_gone(hover: Option<&str>, listed: &[&RecipeDef]) -> bool {
+    hover.is_some_and(|r| !listed.iter().any(|d| d.id == r))
+}
+
 /// The selected clips an effect of `def` goes on: those it fits, on unlocked tracks.
 pub fn targets(seq: &Sequence, selection: &[ClipId], def: &RecipeDef) -> Vec<ClipId> {
     selection
@@ -156,11 +163,14 @@ impl App {
         }
     }
 
-    /// Switches the left panel to «Медиа» (an import lands there).
+    /// Switches the left panel to «Медиа» (an import lands there, «Показать
+    /// в медиатеке» points there). The hidden tab's search field must not
+    /// keep the keyboard: the editor takes it, as after a tab click.
     pub fn show_media_tab(&mut self) {
         let ui = self.ui();
         if ui.get_left_tab() != 0 {
             ui.set_left_tab(0);
+            ui.invoke_focus_editor();
             self.fx_tab_changed(0);
         }
     }
@@ -185,8 +195,9 @@ impl App {
         crate::util::sync_rows_by_key(ui.get_fx_categories(), chips, |c| c.key.clone(), |m| ui.set_fx_categories(m));
         ui.set_fx_category(self.fx.category.clone().into());
         let sel = &self.tl.selection;
-        let cards: Vec<FxCardView> = visible_recipes(&self.fx.category, &self.fx.search)
-            .into_iter()
+        let listed = visible_recipes(&self.fx.category, &self.fx.search);
+        let cards: Vec<FxCardView> = listed
+            .iter()
             .map(|d| {
                 let hint = card_hint(seq, sel, d);
                 FxCardView {
@@ -202,10 +213,14 @@ impl App {
             .collect();
         crate::util::sync_rows_by_key(ui.get_fx_cards(), cards, |c| c.id.clone(), |m| ui.set_fx_cards(m));
         ui.set_fx_hint(t(if sel.is_empty() { "fx.hint.select_clip" } else { "fx.hint.apply" }).into());
-        // A shown hover preview follows the selection: the hovered card's
-        // effect on the clips it now fits, or none.
+        // A hovered card filtered out (search, category) ends its hover; a
+        // shown preview follows the selection: the hovered card's effect on
+        // the clips it now fits, or none.
+        let gone = hover_gone(self.fx.hover.map(|(r, _)| r), &listed);
         let stale = self.fx.preview.as_ref().is_some_and(|o| kadr_effects::recipe(o.recipe).is_none_or(|d| targets(seq, sel, d) != o.clips()));
-        if stale {
+        if gone {
+            self.fx_clear_hover();
+        } else if stale {
             let next = self.fx.hover.and_then(|(r, _)| kadr_effects::recipe(r)).and_then(|d| self.fx_override(d));
             self.fx_set_preview(next);
         }
@@ -432,6 +447,17 @@ mod tests {
         assert_eq!(ids(visible_recipes("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
         assert_eq!(ids(visible_recipes("motion", "HAND")), ["handheld"], "English name, any case");
         assert_eq!(ids(visible_recipes("", "  Ручная ")), ["handheld"], "trimmed");
+    }
+
+    /// Review focus 1: a card filtered out under a resting pointer is
+    /// destroyed without a pointer leave — its hover (and preview) ends here.
+    #[test]
+    fn a_hovered_card_filtered_out_ends_its_hover() {
+        let listed = visible_recipes("", "наезд");
+        assert!(!hover_gone(Some("smooth_zoom"), &listed));
+        assert!(hover_gone(Some("handheld"), &listed), "searched away");
+        assert!(hover_gone(Some("handheld"), &[]), "no cards at all");
+        assert!(!hover_gone(None, &[]), "nothing hovered");
     }
 
     /// Review focus 3: a drop lands only on the clip under the pointer.
