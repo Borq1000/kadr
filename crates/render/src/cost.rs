@@ -45,17 +45,19 @@ impl std::ops::Add for Cost {
 /// Relative cost of one effect per covered pixel (one bilinear sample +
 /// blend ≈ 1). Point operations run fused into the layer's pass, so each
 /// costs less than a pass (refinement 11); `quality` will only change how
-/// closely a future neighbourhood effect is approximated.
+/// closely a future neighbourhood effect is approximated. Calibrated on the
+/// E2 bench (`weights_follow_the_bench`): each primitive alone on a
+/// full-frame sampled layer, release, 1080p and 4K agreeing.
 fn effect_ops(e: &Effect, _quality: RenderQuality) -> f64 {
     if e.is_neutral() {
         return 0.0;
     }
     match e {
-        Effect::ColorAdjust(_) => 0.5,
-        Effect::ToneCurve(_) => 0.3,
-        Effect::SplitTone(_) => 0.3,
+        Effect::ColorAdjust(_) => 0.2,
+        Effect::ToneCurve(_) => 0.45,
+        Effect::SplitTone(_) => 0.25,
         Effect::Vignette(_) => 0.4,
-        Effect::Grain(_) => 0.6,
+        Effect::Grain(_) => 0.5,
         // A primitive this estimate does not know yet: assume a full extra pass.
         _ => 1.0,
     }
@@ -155,5 +157,31 @@ mod tests {
         look.effects = live.to_vec();
         look.effects.insert(0, Effect::ColorAdjust(ColorAdjust { saturation: 0.9, ..ColorAdjust::NEUTRAL }));
         assert_eq!(layer_cost(&scene, &look).class, CostClass::Medium);
+    }
+
+    /// The E2 bench (release, Винтаж's primitives each alone on a
+    /// full-frame sampled 1080p / 4K layer, against the sampled layer
+    /// without effects — both sizes agree): the correction adds ≈ 0.16 of a
+    /// sampled layer, the curve ≈ 0.43, the split-tone ≈ 0.27, the vignette
+    /// ≈ 0.42, the grain ≈ 0.53; the fused Look draws in ≈ 2.3 layers' time.
+    /// Every weight stays within 2× of its measurement (the correction's
+    /// 0.5 before E2 was 3× off).
+    #[test]
+    fn weights_follow_the_bench() {
+        let q = RenderQuality::Export;
+        let measured = [
+            (Effect::ColorAdjust(ColorAdjust { saturation: 0.85, ..ColorAdjust::NEUTRAL }), 0.16),
+            (Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.1), (0.5, 0.52), (1.0, 0.92)] }), 0.43),
+            (Effect::SplitTone(SplitTone { shadow_amount: 0.2, ..SplitTone::NEUTRAL }), 0.27),
+            (Effect::Vignette(Vignette { amount: 0.3, midpoint: 0.45, feather: 0.5 }), 0.42),
+            (Effect::Grain(Grain { amount: 0.05, size: 2.0, seed: 1 }), 0.53),
+        ];
+        let within_2x = |w: f64, m: f64| w <= 2.0 * m && m <= 2.0 * w;
+        for (e, m) in &measured {
+            let w = effect_ops(e, q);
+            assert!(within_2x(w, *m), "{e:?}: weight {w}, measured {m}");
+        }
+        let look = 1.0 + measured.iter().map(|(e, _)| effect_ops(e, q)).sum::<f64>();
+        assert!(within_2x(look, 2.3), "a full Look: {look} layers predicted, 2.3 measured");
     }
 }
