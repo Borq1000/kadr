@@ -16,22 +16,30 @@ use crate::effects_ui::visible_recipes;
 use crate::scene_source::ProjectScenes;
 use kadr_core::color::AlphaMode;
 use kadr_core::{CancelToken, ClipId, ColorInfo, CpuFrame, EffectId, FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
-use kadr_effects::{Category, ParamKind, RecipeDef};
+use kadr_effects::{ParamKind, RecipeDef};
 use kadr_playback::{Mode, Resolver, SceneSource};
 use kadr_project::{AnimParam, AppliedEffect, Clip, EdgeFades, MediaAsset, ParamValue, Project, SourceTime, Track, TrackKey, TrackKind, Transform};
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, PreparedFrame, RenderInputs, RenderTarget, Renderer};
 use kadr_scene::{LayerContent, OutputSpec, RenderQuality, SizeU};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub const THUMB_W: u32 = 160;
 pub const THUMB_H: u32 = 90;
 /// Frames of a hovered card's loop (~1 s at 12 fps).
 pub const LOOP_FRAMES: u8 = 12;
 pub const LOOP_TICK: Duration = Duration::from_millis(83);
+/// The real time a loop spans, first frame to last (0.913 s).
+pub const LOOP_SECS: f64 = (LOOP_FRAMES - 1) as f64 * LOOP_TICK.as_secs_f64();
+/// Recipes whose motion runs on the effect's own clock (`progress ×
+/// clip_secs`) rather than through the clip: their loop gets real time.
+const ON_ITS_CLOCK: &[&str] = &["handheld"];
+/// Quiet time before a batch renders: a newer one arriving meanwhile takes
+/// its place, so paused playhead steps in a row render their last frame only.
+const DEBOUNCE: Duration = Duration::from_millis(100);
 /// The phase byte of a still thumbnail.
 pub const STILL: u8 = u8::MAX;
 /// A still shows the motion well under way.
@@ -88,14 +96,16 @@ impl<H: Hasher> std::io::Write for HashWriter<'_, H> {
 
 /// A hash of the clip's look beyond its id and the source frame (ruling
 /// R3: the spec's key alone would keep a card's old picture after an edit
-/// of the clip): its file, source range and speed, transform and crop,
-/// colour, animation, effects, multicam angle, and the sequence's format.
-/// Its place on the timeline, name, sound, fades and on/off are not part of
-/// it — the cards never show them.
+/// of the clip) — of exactly what [`thumb_project`] keeps of it: its file,
+/// source range and speed, colour and colour keyframes, multicam angle,
+/// and the sequence's format. What the cards never show is not part of it
+/// (M3): its place on the timeline, name, sound, fades, on/off, transform
+/// and crop, motion keyframes and its own effects.
 pub fn clip_state(project: &Project, clip: &Clip) -> u64 {
     let seq = project.sequence();
-    let file = project.asset(clip.asset).map(|a| (&a.path, a.source_mtime_ms));
-    let look = (clip.asset, (clip.source_in, clip.source_out, clip.duration()), &clip.transform, &clip.color, &clip.animation, &clip.effects, &clip.multicam, file, (seq.width, seq.height, seq.frame_rate));
+    let c = card_clip(clip);
+    let file = project.asset(c.asset).map(|a| (&a.path, a.source_mtime_ms));
+    let look = (c.asset, (c.source_in, c.source_out, c.duration()), &c.color, &c.animation, &c.multicam, file, (seq.width, seq.height, seq.frame_rate));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // These types always serialise; a failure would only make the key coarser.
     let _ = serde_json::to_writer(HashWriter(&mut h), &look);
@@ -135,10 +145,17 @@ impl ThumbKey {
 /// the way through. The frame is `0.3·phase − 0.22` s of screen time past
 /// the moment: Punch In's 0.12 s snap, which ends at its moment (R17), runs
 /// from phase ≈ 0.33 to ≈ 0.73 — just ahead at 0, done well before 1.
+///
+/// An effect on its own clock (Handheld's noise runs at `progress ×
+/// clip_secs`) gets a real-time demo clock instead: loop frame to loop
+/// frame is one [`LOOP_TICK`] of it, so the card sways as the clip will —
+/// not a jitter of samples ~1/11 of the clip apart (I6).
 pub fn demo_effect(def: &RecipeDef, clip: &Clip, at: Time, phase: f64) -> AppliedEffect {
     let mut e = kadr_effects::fresh(def, clip, at);
     e.id = EffectId::parse(DEMO_EFFECT_ID).unwrap_or(e.id);
-    e.progress = (phase, phase);
+    let secs = clip.duration().as_secs_f64();
+    let p = if ON_ITS_CLOCK.contains(&def.id) && secs > 0.0 { phase * LOOP_SECS / secs } else { phase };
+    e.progress = (p, p);
     let s = clip.source_time_at(at);
     for d in def.params.iter().filter(|d| matches!(d.kind, ParamKind::Moment)) {
         let lead = Time::from_secs_f64((phase * 0.3 - 0.22) * clip.speed());
@@ -147,11 +164,11 @@ pub fn demo_effect(def: &RecipeDef, clip: &Clip, at: Time, phase: f64) -> Applie
     e
 }
 
-/// A one-clip project of `clip`'s own picture at full frame (transform,
-/// its motion keys, fades and other effects dropped; its colour, animated
-/// or not, kept) with only `effect`.
-pub fn thumb_project(project: &Project, clip: &Clip, effect: AppliedEffect) -> Project {
-    let mut c = clip.clone();
+/// `clip` as the cards show it: its own picture at full frame — transform
+/// and crop, motion keys, fades and on/off dropped; its colour, animated or
+/// not, kept — without effects. [`clip_state`] hashes what is left.
+fn card_clip(clip: &Clip) -> Clip {
+    let mut c = Clip { effects: vec![], ..clip.clone() };
     c.transform = Transform::default();
     for k in c.animation.keys() {
         if !matches!(k, TrackKey::Clip(AnimParam::Exposure | AnimParam::Contrast | AnimParam::Saturation | AnimParam::Temperature)) {
@@ -160,6 +177,13 @@ pub fn thumb_project(project: &Project, clip: &Clip, effect: AppliedEffect) -> P
     }
     c.video_fade = EdgeFades::default();
     c.enabled = true;
+    c
+}
+
+/// A one-clip project of `clip`'s own picture at full frame ([`card_clip`])
+/// with only `effect`.
+pub fn thumb_project(project: &Project, clip: &Clip, effect: AppliedEffect) -> Project {
+    let mut c = card_clip(clip);
     c.effects = vec![effect];
     let src = project.sequence();
     let mut p = Project::new("thumb");
@@ -259,11 +283,79 @@ struct Batch {
     sample: Arc<CpuFrame>,
 }
 
-/// The thumbnail thread: batches in order, one render at a time; a
-/// cancelled batch stops at its next job. Holds nothing between batches
-/// (the resolver goes with its batch); ends when the app drops its sender.
-fn work(rx: Receiver<Batch>) {
-    while let Ok(Batch { token, jobs, resolver, sample }) = rx.recv() {
+/// The thumbnail thread's inbox: one batch not started yet — a newer one
+/// takes its place (latest wins: never a queue of stale batches holding
+/// their project copies) — and whether the app closed it.
+struct Inbox<T> {
+    slot: Mutex<Slot<T>>,
+    wake: Condvar,
+}
+
+struct Slot<T> {
+    next: Option<T>,
+    closed: bool,
+}
+
+impl<T> Inbox<T> {
+    fn new() -> Self {
+        Inbox { slot: Mutex::new(Slot { next: None, closed: false }), wake: Condvar::new() }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Slot<T>> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Puts `item` in, dropping one not started yet; gives it back once closed.
+    fn put(&self, item: T) -> Result<(), T> {
+        let mut s = self.lock();
+        if s.closed {
+            return Err(item);
+        }
+        s.next = Some(item);
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    /// Takes nothing more: the worker ends.
+    fn close(&self) {
+        let mut s = self.lock();
+        s.closed = true;
+        s.next = None;
+        self.wake.notify_all();
+    }
+
+    /// The next item once `quiet` has passed without a newer one (a newer
+    /// one replaces it and the wait starts again); `None` once closed.
+    fn take(&self, quiet: Duration) -> Option<T> {
+        let mut s = self.lock();
+        while s.next.is_none() && !s.closed {
+            s = self.wake.wait(s).unwrap_or_else(PoisonError::into_inner);
+        }
+        let mut item = s.next.take()?;
+        let mut until = Instant::now() + quiet;
+        loop {
+            if s.closed {
+                return None;
+            }
+            if let Some(newer) = s.next.take() {
+                item = newer;
+                until = Instant::now() + quiet;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Some(item);
+            }
+            s = self.wake.wait_timeout(s, until - now).unwrap_or_else(PoisonError::into_inner).0;
+        }
+    }
+}
+
+/// The thumbnail thread: the latest batch after a quiet [`DEBOUNCE`], one
+/// render at a time; a cancelled batch stops at its next job. Holds nothing
+/// between batches (the resolver goes with its batch); ends when the inbox
+/// is closed (app shutdown, or `Thumbs` dropped).
+fn work(inbox: Arc<Inbox<Batch>>) {
+    while let Some(Batch { token, jobs, resolver, sample }) = inbox.take(DEBOUNCE) {
         for Job { key, project, at } in jobs {
             if token.is_cancelled() {
                 break;
@@ -285,12 +377,25 @@ pub struct Thumbs {
     sample: Option<Arc<CpuFrame>>,
     /// The picture each card showed last: it stays while the new one renders.
     last: HashMap<&'static str, slint::Image>,
-    /// The thumbnail thread's inbox (started on first use).
-    worker: Option<Sender<Batch>>,
-    /// The hovered card's loop frame.
+    /// The thumbnail thread's inbox and the thread (started on first use).
+    worker: Option<(Arc<Inbox<Batch>>, JoinHandle<()>)>,
+    /// The app is closing: nothing starts the thread again.
+    closed: bool,
+    /// The card whose loop plays (the hovered motion card, once its hover
+    /// delay is over) and its frame.
+    looping: Option<&'static str>,
     pub loop_frame: u8,
-    /// Advances `loop_frame` while a card is hovered (dropping it stops it).
-    pub timer: Option<slint::Timer>,
+    /// Advances `loop_frame` while the loop plays (dropping it stops it).
+    timer: Option<slint::Timer>,
+}
+
+impl Drop for Thumbs {
+    /// The thread ends with its owner, as it did with a dropped channel.
+    fn drop(&mut self) {
+        if let Some((inbox, _)) = &self.worker {
+            inbox.close();
+        }
+    }
 }
 
 impl Thumbs {
@@ -303,12 +408,34 @@ impl Thumbs {
         self.images.len()
     }
 
-    /// What `d`'s card shows of `base`: while `hovered`, its loop frame once
-    /// the whole loop is rendered (no flicker between the still and the
+    /// What `d`'s card shows of `base`: while its loop plays, its loop frame
+    /// once the whole loop is rendered (no flicker between the still and the
     /// frames as they arrive); else its still.
-    pub fn card(&self, d: &RecipeDef, base: &ThumbBase, hovered: bool) -> Option<slint::Image> {
-        let looping = hovered && (0..LOOP_FRAMES).all(|i| self.images.contains_key(&ThumbKey::new(base, d, i)));
+    pub fn card(&self, d: &RecipeDef, base: &ThumbBase) -> Option<slint::Image> {
+        let looping = self.looping == Some(d.id) && (0..LOOP_FRAMES).all(|i| self.images.contains_key(&ThumbKey::new(base, d, i)));
         looping.then(|| self.get(&ThumbKey::new(base, d, self.loop_frame))).flatten().or_else(|| self.get(&ThumbKey::new(base, d, STILL)))
+    }
+
+    /// The card whose loop plays.
+    pub fn looping(&self) -> Option<&'static str> {
+        self.looping
+    }
+
+    /// `recipe`'s card starts its loop, from its first frame; `tick`
+    /// advances it every [`LOOP_TICK`].
+    pub fn start_loop(&mut self, recipe: &'static str, tick: impl FnMut() + 'static) {
+        let timer = slint::Timer::default();
+        timer.start(slint::TimerMode::Repeated, LOOP_TICK, tick);
+        self.timer = Some(timer);
+        self.looping = Some(recipe);
+        self.loop_frame = 0;
+    }
+
+    /// The loop stops (its card shows its still); `true` when one played.
+    pub fn stop_loop(&mut self) -> bool {
+        self.timer = None;
+        self.loop_frame = 0;
+        self.looping.take().is_some()
     }
 
     /// The keys a new batch must render — every wanted key not cached — or
@@ -373,39 +500,48 @@ impl Thumbs {
         self.cancel();
         self.images.clear();
         self.last.clear();
-        self.timer = None;
-        self.loop_frame = 0;
+        self.stop_loop();
     }
 
-    /// The app is closing: the work stops and the thread ends.
+    /// The app is closing: the work stops and the thread ends — for good: a
+    /// late result's refresh asking for pictures starts nothing (M4).
     pub fn shutdown(&mut self) {
         self.clear();
-        self.worker = None;
+        self.closed = true;
+        if let Some((inbox, _)) = self.worker.take() {
+            inbox.close();
+        }
     }
 
     pub fn sample(&mut self) -> Arc<CpuFrame> {
         self.sample.get_or_insert_with(sample_frame).clone()
     }
 
-    /// Hands `batch` to the thumbnail thread, starting it on first use (or
-    /// again if it died).
+    /// Hands `batch` to the thumbnail thread — in place of one it has not
+    /// started — starting the thread on first use (or again if it died);
+    /// after `shutdown` the batch is dropped.
     fn submit(&mut self, batch: Batch) {
+        if self.closed {
+            return self.cancel();
+        }
         let batch = match &self.worker {
-            Some(tx) => match tx.send(batch) {
+            Some((inbox, thread)) if !thread.is_finished() => match inbox.put(batch) {
                 Ok(()) => return,
-                Err(e) => e.0,
+                Err(batch) => batch,
             },
-            None => batch,
+            _ => batch,
         };
-        let (tx, rx) = channel();
-        match std::thread::Builder::new().name("kadr-fx-thumbs".into()).spawn(move || work(rx)) {
-            Ok(_) => {
-                let _ = tx.send(batch);
-                self.worker = Some(tx);
+        let inbox = Arc::new(Inbox::new());
+        let theirs = inbox.clone();
+        match std::thread::Builder::new().name("kadr-fx-thumbs".into()).spawn(move || work(theirs)) {
+            Ok(thread) => {
+                let _ = inbox.put(batch);
+                if let Some((old, _)) = self.worker.replace((inbox, thread)) {
+                    old.close();
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "thumbnail thread not started");
-                self.worker = None;
                 self.cancel();
             }
         }
@@ -413,19 +549,21 @@ impl Thumbs {
 }
 
 impl App {
-    /// What a card shows for `d`: its loop frame while hovered, else its still.
+    /// What a card shows for `d`: its loop frame while its loop plays, else its still.
     pub fn fx_thumb(&self, d: &RecipeDef, base: &ThumbBase) -> Option<slint::Image> {
-        self.fx.thumbs.card(d, base, self.fx.hover.is_some_and(|(r, _)| r == d.id))
+        self.fx.thumbs.card(d, base)
     }
 
     /// Starts rendering what the tab needs and lacks: stills of the listed
-    /// cards and the hovered motion card's loop. Not while playing.
+    /// cards and the loop that plays (a hovered motion card's, once its
+    /// hover delay is over — not every card the pointer crosses). Not while
+    /// playing.
     pub fn fx_request_thumbs(&mut self, base: ThumbBase) {
         if self.playing {
             return;
         }
         let mut wanted: Vec<(ThumbKey, &'static RecipeDef)> = visible_recipes(&self.fx.category, &self.fx.search).into_iter().map(|d| (ThumbKey::new(&base, d, STILL), d)).collect();
-        if let Some(d) = self.fx.hover.and_then(|(r, _)| kadr_effects::recipe(r)).filter(|d| d.category == Category::Motion) {
+        if let Some(d) = self.fx.thumbs.looping().and_then(kadr_effects::recipe) {
             wanted.extend((0..LOOP_FRAMES).map(|i| (ThumbKey::new(&base, d, i), d)));
         }
         let Some(need) = self.fx.thumbs.plan(wanted.iter().map(|(k, _)| *k)) else { return };
@@ -466,8 +604,12 @@ impl App {
         }
     }
 
-    /// The hovered card's loop advances (~12 fps).
+    /// The hovered card's loop advances (~12 fps) — not while playing:
+    /// playback has the machine, the cards wait for the stop (M4).
     pub fn fx_loop_tick(&mut self) {
+        if self.playing {
+            return;
+        }
         self.fx.thumbs.loop_frame = (self.fx.thumbs.loop_frame + 1) % LOOP_FRAMES;
         self.refresh_effects();
     }
@@ -507,6 +649,30 @@ mod tests {
         assert_eq!(done.id, e.id, "one id: Handheld's shake (seeded by it) is the same on every render and loop frame");
         assert_eq!(ThumbKey { phase: STILL, ..key(0) }.phase_f(), 0.85);
         assert_eq!(ThumbKey { phase: LOOP_FRAMES - 1, ..key(0) }.phase_f(), 1.0);
+    }
+
+    /// I6: Handheld runs on its own clock (`progress × clip_secs`): its loop
+    /// gets real time — one loop tick of noise time from frame to frame,
+    /// whatever the clip's length — still at «Обычно»; a zoom, driven by its
+    /// progress, still goes through its whole motion.
+    #[test]
+    fn a_clock_driven_card_loops_in_real_time() {
+        let hand = kadr_effects::recipe("handheld").unwrap();
+        let long = Clip::new(AssetId::new(), "l", TimeRange::new(Time::ZERO, Time::from_secs(120)), Time::ZERO);
+        for c in [clip(), long] {
+            let clock = |i: u8| {
+                let e = demo_effect(hand, &c, c.timeline_in, ThumbKey { phase: i, ..key(0) }.phase_f());
+                assert_eq!(e.progress.0, e.progress.1, "held");
+                assert_eq!(e.params["strength"], ParamValue::Number(0.6), "«Обычно»");
+                e.progress.0 * c.duration().as_secs_f64()
+            };
+            for i in 1..LOOP_FRAMES {
+                let step = clock(i) - clock(i - 1);
+                assert!((step - LOOP_TICK.as_secs_f64()).abs() < 1e-9, "{}: {step}", c.name);
+            }
+        }
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        assert_eq!(demo_effect(zoom, &clip(), Time::from_secs(12), 1.0).progress, (1.0, 1.0));
     }
 
     #[test]
@@ -587,8 +753,9 @@ mod tests {
         assert_eq!(thumb_base(&p, None, Time::ZERO), ThumbBase { clip: None, at: SAMPLE_AT, frame: SAMPLE_AT, state: 0 });
     }
 
-    /// Ruling R3: an edit of what the clip looks like gives its cards new
-    /// keys (they render again); a change elsewhere keeps them (the cache holds).
+    /// Ruling R3: an edit of what the clip looks like *in the cards* gives
+    /// them new keys (they render again); a change elsewhere — or of what
+    /// `thumb_project` drops (M3) — keeps them (the cache holds).
     #[test]
     fn an_edit_of_the_clip_renders_again_and_an_unrelated_change_does_not() {
         let mut p = Project::new("t");
@@ -609,25 +776,31 @@ mod tests {
         let k0 = key_at(&p, 12);
         assert_eq!(key_at(&p, 12), k0, "stable");
 
+        let src = SourceTime(Time::from_secs(31));
         let mut unrelated = edited(&p, &|c| {
             c.name = "renamed".into();
             c.audio.gain_db = -6.0;
             c.video_fade.fade_in = Time::from_secs(1);
             c.enabled = false;
+            // The cards show the clip at full frame with only their own effect.
+            c.transform.scale = 0.5;
+            c.transform.crop_left = 0.1;
+            c.animation.set_key(AnimParam::Scale, src, 0.8, None);
+            c.effects.push(AppliedEffect::new("handheld", 1, Default::default()));
         });
         unrelated.sequence_mut().tracks[1].clips.push(Clip::new(AssetId::new(), "o", TimeRange::new(Time::ZERO, Time::from_secs(2)), Time::ZERO));
         unrelated.sequence_mut().name = "other".into();
-        assert_eq!(key_at(&unrelated, 12), k0, "its name, sound, fades (cards show none) and on/off, another clip, the sequence's name: same pictures");
+        assert_eq!(
+            key_at(&unrelated, 12),
+            k0,
+            "its name, sound, fades and on/off, transform, crop, motion keys and effects (cards show none), another clip, the sequence's name: same pictures"
+        );
         assert_eq!(key_at(&edited(&p, &|c| c.move_to(Time::from_secs(20))), 22), k0, "moved with the playhead: the same frame, the same picture");
 
-        let src = SourceTime(Time::from_secs(31));
         type Edit<'a> = (&'a str, &'a dyn Fn(&mut Clip));
-        let edits: [Edit; 8] = [
+        let edits: [Edit; 5] = [
             ("colour", &|c| c.color.saturation = 0.5),
-            ("crop", &|c| c.transform.crop_left = 0.1),
-            ("transform", &|c| c.transform.scale = 0.5),
-            ("animation", &|c| c.animation.set_key(AnimParam::Exposure, src, 1.0, None)),
-            ("effects", &|c| c.effects.push(AppliedEffect::new("handheld", 1, Default::default()))),
+            ("colour keyframes", &|c| c.animation.set_key(AnimParam::Exposure, src, 1.0, None)),
             ("speed", &|c| c.timeline_out = Time::from_secs(15)),
             ("source range", &|c| (c.source_in, c.source_out) = (Time::from_secs(29), Time::from_secs(39))),
             ("asset", &|c| c.asset = AssetId::new()),
@@ -688,8 +861,9 @@ mod tests {
         assert!(th.shown("smooth_zoom", None).is_none());
     }
 
-    /// A hovered card loops only once every loop frame is there; until
-    /// then, and when not hovered, it shows its still.
+    /// A card loops only while its loop plays (a hovered motion card, once
+    /// its hover delay is over — M4) and once every loop frame is there;
+    /// until then, and otherwise, it shows its still.
     #[test]
     fn a_hovered_card_loops_once_its_whole_loop_is_rendered() {
         let def = kadr_effects::recipe("smooth_zoom").unwrap();
@@ -702,12 +876,67 @@ mod tests {
         for i in 0..LOOP_FRAMES - 1 {
             th.insert(ThumbKey::new(&base, def, i), frames[i as usize].clone());
         }
-        th.loop_frame = 3;
-        assert_eq!(th.card(def, &base, true), Some(still.clone()), "one frame missing: the still");
         th.insert(ThumbKey::new(&base, def, LOOP_FRAMES - 1), frames[LOOP_FRAMES as usize - 1].clone());
-        assert_eq!(th.card(def, &base, true), Some(frames[3].clone()), "the loop plays");
-        assert_ne!(th.card(def, &base, true), Some(still.clone()));
-        assert_eq!(th.card(def, &base, false), Some(still), "not hovered: the still");
+        assert_eq!(th.card(def, &base), Some(still.clone()), "no loop plays: the still");
+        th.looping = Some(def.id);
+        th.loop_frame = 3;
+        assert_eq!(th.card(def, &base), Some(frames[3].clone()), "the loop plays");
+        th.images.remove(&ThumbKey::new(&base, def, 5));
+        assert_eq!(th.card(def, &base), Some(still.clone()), "one frame missing: the still");
+        th.insert(ThumbKey::new(&base, def, 5), frames[5].clone());
+        th.looping = Some("handheld");
+        assert_eq!(th.card(def, &base), Some(still.clone()), "another card's loop");
+        th.looping = Some(def.id);
+        assert!(th.stop_loop(), "it played");
+        assert_eq!((th.card(def, &base), th.looping(), th.loop_frame), (Some(still), None, 0), "stopped: the still, from the first frame next time");
+        assert!(!th.stop_loop(), "nothing plays");
+    }
+
+    /// The thumbnail thread's inbox holds one batch, the latest (M4): steps
+    /// in a row never queue stale batches; a batch waits for a quiet spell,
+    /// a newer one arriving meanwhile takes its place; closed, it ends.
+    #[test]
+    fn the_inbox_keeps_the_latest_and_waits_for_quiet() {
+        let inbox = Arc::new(Inbox::new());
+        inbox.put(1).unwrap();
+        inbox.put(2).unwrap();
+        let quiet = Duration::from_millis(40);
+        let started = Instant::now();
+        assert_eq!(inbox.take(quiet), Some(2), "latest wins");
+        assert!(started.elapsed() >= quiet, "after the quiet spell");
+
+        inbox.put(3).unwrap();
+        let other = inbox.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            other.put(4).unwrap();
+        });
+        assert_eq!(inbox.take(Duration::from_millis(400)), Some(4), "a newer one during the wait takes its place");
+        late.join().unwrap();
+
+        let other = inbox.clone();
+        let taker = std::thread::spawn(move || other.take(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(20));
+        inbox.close();
+        assert_eq!(taker.join().unwrap(), None, "closed: the worker ends");
+        assert_eq!(inbox.put(5), Err(5), "and takes nothing more");
+    }
+
+    /// After shutdown nothing starts the thread again (M4): a late result's
+    /// refresh asking for pictures drops its batch.
+    #[test]
+    fn after_shutdown_no_batch_restarts_the_thread() {
+        let mut th = Thumbs::default();
+        let batch = |th: &mut Thumbs| Batch { token: th.start([key(STILL)].into()), jobs: vec![], resolver: None, sample: th.sample() };
+        let b = batch(&mut th);
+        th.submit(b);
+        assert!(th.worker.is_some(), "started on first use");
+        th.shutdown();
+        assert!(th.worker.is_none());
+        let b = batch(&mut th);
+        th.submit(b);
+        assert!(th.worker.is_none(), "not started again");
+        assert!(!th.wants(&key(STILL)), "its batch is dropped");
     }
 
     /// The cache is bounded: when full, only the pictures of the frame

@@ -1199,33 +1199,37 @@ impl App {
         let x = self.time_to_x(self.playhead);
         ui.set_playhead_x(x as f32);
         ui.set_show_playhead(x >= -1.0);
-        // The effect cards show the selected clip's frame under the playhead
-        // (effects spec §6.1) — while paused: nothing renders during play.
-        if !self.playing {
-            self.refresh_effects();
-        }
         let seq = self.project.sequence();
         ui.set_timecode(kadr_core::Timecode::from_time(self.playhead, seq.frame_rate).to_string().into());
         let dur = seq.duration();
         ui.set_duration_label(format!("/ {}", kadr_core::Timecode::from_time(dur, seq.frame_rate)).into());
         ui.set_scrub_fraction(if dur > Time::ZERO { (self.playhead.as_secs_f64() / dur.as_secs_f64()) as f32 } else { 0.0 });
-        // The inspector follows the playhead (keyframes spec §6.1): animated
-        // values and ◆ states ~10 Hz while playing, at once when paused or
-        // scrubbing; entering or leaving the clip (◆ enabled, hint) at once.
-        // An effect moment's «к плейхеду» only while paused — no 10 Hz
-        // refresh for it during playback; stopping passes here once more.
-        let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return };
+        if self.inspector_due() {
+            self.inspector_refreshed = Some(std::time::Instant::now());
+            self.refresh_inspector(); // refreshes the effect cards too
+        } else if !self.playing {
+            // The effect cards show the selected clip's frame under the
+            // playhead (effects spec §6.1) — while paused: nothing renders
+            // during play. Once per step (M4).
+            self.refresh_effects();
+        }
+    }
+
+    /// Whether the inspector follows this playhead move (keyframes spec
+    /// §6.1): animated values and ◆ states ~10 Hz while playing, at once
+    /// when paused or scrubbing; entering or leaving the clip (◆ enabled,
+    /// hint) at once. An effect moment's «к плейхеду» only while paused — no
+    /// 10 Hz refresh for it during playback; stopping passes here once more.
+    fn inspector_due(&self) -> bool {
+        let seq = self.project.sequence();
+        let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return false };
         let outside = crate::anim_ui::edit_time(c, self.playhead, seq.frame_rate.frame_duration()).is_none();
-        let crossed = ui.get_inspector().outside != outside;
+        let crossed = self.ui().get_inspector().outside != outside;
         let moment = !self.playing && crate::effects_ui::has_moment(c);
         if c.animation.is_empty() && !moment && !crossed {
-            return;
+            return false;
         }
-        let due = crossed || !self.playing || self.inspector_refreshed.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
-        if due {
-            self.inspector_refreshed = Some(std::time::Instant::now());
-            self.refresh_inspector();
-        }
+        crossed || !self.playing || self.inspector_refreshed.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100))
     }
 
     pub fn refresh_timeline(&mut self) {

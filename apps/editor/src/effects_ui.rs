@@ -612,24 +612,19 @@ impl App {
             slint::Timer::single_shot(HOVER_DELAY, move || {
                 crate::app::with_app(|app| app.fx_hover_fire(generation));
             });
-            // A motion card plays its motion in a short loop while hovered
-            // (spec §6.1); another card's loop stops with its timer.
-            self.fx.thumbs.loop_frame = 0;
-            self.fx.thumbs.timer = (def.category == Category::Motion).then(|| {
-                let timer = slint::Timer::default();
-                timer.start(slint::TimerMode::Repeated, crate::fx_thumbs::LOOP_TICK, || {
-                    crate::app::with_app(|app| app.fx_loop_tick());
-                });
-                timer
-            });
-            self.refresh_effects();
+            // Another card's loop stops now (its card shows its still).
+            if self.fx.thumbs.stop_loop() {
+                self.refresh_effects();
+            }
         } else if self.fx.hover.is_some_and(|(r, _)| r == def.id) {
             self.fx_clear_hover();
         }
     }
 
     /// The delayed hover: the card's effect on the selected clips, in the
-    /// frame under the playhead (spec §6.1).
+    /// frame under the playhead (spec §6.1), and a motion card's short loop
+    /// of its motion — started here, not on entering: a pointer crossing
+    /// cards renders no loops (M4).
     fn fx_hover_fire(&mut self, generation: u64) {
         let Some((recipe, g)) = self.fx.hover else { return };
         if g != generation || self.fx.drag.as_ref().is_some_and(|d| d.active) {
@@ -638,6 +633,12 @@ impl App {
         let Some(def) = kadr_effects::recipe(recipe) else { return };
         let next = self.fx_override(def);
         self.fx_set_preview(next);
+        if def.category == Category::Motion {
+            self.fx.thumbs.start_loop(def.id, || {
+                crate::app::with_app(|app| app.fx_loop_tick());
+            });
+            self.refresh_effects();
+        }
     }
 
     /// `def` at «Обычно» on the selected clips it goes on, made at the
@@ -664,8 +665,7 @@ impl App {
     pub fn fx_clear_hover(&mut self) {
         self.fx.hover = None;
         self.fx_clear_preview();
-        self.fx.thumbs.loop_frame = 0;
-        if self.fx.thumbs.timer.take().is_some() {
+        if self.fx.thumbs.stop_loop() {
             self.refresh_effects();
         }
     }
