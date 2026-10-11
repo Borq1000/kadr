@@ -5,8 +5,8 @@
 
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { Icon, IconButton, PanelTabs, EmptyState, Tooltip, AnimRow, KeyState } from "widgets.slint";
-import { ScrollView, LineEdit, Switch } from "std-widgets.slint";
+import { Icon, IconButton, PanelTabs, EmptyState, Tooltip, AnimRow, KeyState, BoundSwitch } from "widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
 
 export struct FxCategoryView {
     key: string,
@@ -242,6 +242,8 @@ export struct FxRow {
     enabled: bool,
     // false: a recipe or version from a newer Kadr (kept, never run).
     known: bool,
+    // «Сбросить» would change something (greyed out otherwise).
+    resettable: bool,
     first: bool,
     last: bool,
     params: [FxParamRow],
@@ -317,16 +319,11 @@ export component FxBlock inherits VerticalLayout {
     callback live(string, float);
     callback commit(string, float);
     callback key-action(string, string);
-    // The switch shows the project, never just the click: a click sets
-    // `checked` itself (which drops its binding), so it is put back at once
-    // and then follows every change of the row — the command, an undo, a
-    // refused edit, another effect taking this block's place.
-    changed fx => { sw.checked = root.fx.enabled; }
     spacing: 2px;
     padding-top: 6px;
     menu := ContextMenuArea {
         Menu {
-            MenuItem { title: Tr.t("fx.menu.reset"); enabled: root.fx.known; activated => { root.action(root.fx.id, "reset"); } }
+            MenuItem { title: Tr.t("fx.menu.reset"); enabled: root.fx.known && root.fx.resettable; activated => { root.action(root.fx.id, "reset"); } }
             MenuItem { title: Tr.t("fx.menu.remove"); activated => { root.action(root.fx.id, "remove"); } }
             MenuSeparator {}
             MenuItem { title: Tr.t("fx.menu.up"); enabled: !root.fx.first; activated => { root.action(root.fx.id, "up"); } }
@@ -344,13 +341,11 @@ export component FxBlock inherits VerticalLayout {
                     spacing: 6px;
                     VerticalLayout {
                         alignment: center;
-                        sw := Switch {
+                        // Follows the project: the command, an undo, a refused edit.
+                        BoundSwitch {
                             enabled: root.fx.known;
                             checked: root.fx.enabled;
-                            toggled => {
-                                self.checked = root.fx.enabled;
-                                root.action(root.fx.id, "toggle");
-                            }
+                            toggled => { root.action(root.fx.id, "toggle"); }
                         }
                     }
                     Text { text: root.fx.name; font-size: Theme.font; font-weight: 600; color: root.fx.known && root.fx.enabled ? Theme.text : Theme.text-faint; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }

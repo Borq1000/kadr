@@ -325,7 +325,7 @@ impl App {
                 let label = tf("cmd.keyframe_named", &[("name", &anim_ui::track_label(cur, &k))]);
                 EditCommand::Batch { label, commands: vec![EditCommand::SetKeyframe { clip: id, param: k, at, value, ease: None }] }
             }
-            // An effect's number: one UpdateEffect («Эффект: Плавный наезд»).
+            // An effect's number: one UpdateEffect («Изменение эффекта: Плавный наезд»).
             Some(TrackKey::Fx(f)) => {
                 let k = TrackKey::Fx(f.clone());
                 let value = anim_ui::slider_value(&k, v);
@@ -333,7 +333,7 @@ impl App {
                 if cur.static_value(&k) == Some(value) {
                     return self.show_rolled_back(); // nothing changed: no undo entry
                 }
-                let label = tf("cmd.effect_named", &[("name", &crate::effects_ui::fx_name(e))]);
+                let label = tf("cmd.update_effect_named", &[("name", &crate::effects_ui::fx_name(e))]);
                 let set = EditCommand::UpdateEffect { clip: id, id: f.effect, params: BTreeMap::from([(f.key.clone(), ParamValue::Number(value))]), enabled: None };
                 EditCommand::Batch { label, commands: vec![set] }
             }

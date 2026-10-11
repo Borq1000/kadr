@@ -1,6 +1,6 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyState, AnimRow } from "widgets.slint";
+import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyState, AnimRow, BoundSwitch } from "widgets.slint";
 import { FxBlock, FxRow } from "effects.slint";
 import { ScrollView, Switch } from "std-widgets.slint";
 
@@ -161,7 +161,8 @@ export component Inspector inherits Rectangle {
                 HorizontalLayout {
                     padding-top: 4px;
                     Text { text: Tr.t("inspector.enabled"); font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; horizontal-stretch: 1; }
-                    Switch { checked: root.d.enabled; toggled => { root.toggle-enabled(); } }
+                    // Follows the clip after a click and Ctrl+Z (a std Switch would not).
+                    BoundSwitch { checked: root.d.enabled; toggled => { root.toggle-enabled(); } }
                 }
 
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.transform"); resettable: true; reset => { root.reset("transform"); } }

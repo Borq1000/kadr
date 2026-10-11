@@ -1,6 +1,6 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { LineEdit } from "std-widgets.slint";
+import { LineEdit, Switch } from "std-widgets.slint";
 
 export component Icon inherits Path {
     in property <string> icon;
@@ -463,6 +463,29 @@ export component KeyNav inherits HorizontalLayout {
             text: b.tip;
             x: parent.width - self.width;
             y: -self.height - 4px;
+        }
+    }
+}
+
+// A switch that always shows the project, never just the click. The std
+// Switch assigns `checked` itself on a click, which drops a `checked:
+// <model>` binding for good (the switch then goes stale after an undo, a
+// refused edit or another item taking the element's place). Here the click
+// is put back at once and reported; `checked` follows every model change.
+export component BoundSwitch inherits HorizontalLayout {
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled();
+    // Never grows in a row, like the std Switch.
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    changed checked => { sw.checked = root.checked; }
+    sw := Switch {
+        enabled: root.enabled;
+        checked: root.checked;
+        toggled => {
+            self.checked = root.checked;
+            root.toggled();
         }
     }
 }

@@ -201,18 +201,29 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
         }
         ParamKind::Moment => {
             row.kind = 3;
-            row.can_act = on_clip;
-            if let Some(ParamValue::Moment(m)) = e.params.get(p.key) {
+            let current = match e.params.get(p.key) {
+                Some(ParamValue::Moment(m)) => Some(*m),
+                _ => None,
+            };
+            if let Some(m) = current {
                 let tl = c.timeline_time_of(m.0);
                 row.text = Timecode::from_time(tl.max(Time::ZERO), rate).to_string().into();
                 if tl < c.timeline_in || tl >= c.timeline_out {
                     row.hint = t("fx.moment.outside").into();
                 }
-                row.can_act = on_clip && SourceTime(c.source_time_at(playhead)) != *m;
             }
+            // Enabled exactly when the click would move it (`action_commands`).
+            row.can_act = moment_target(c, playhead, rate).is_some_and(|to| current != Some(to));
         }
     }
     row
+}
+
+/// Where «к плейхеду» puts a moment: the source frame under the playhead,
+/// only while the playhead is on the clip. The row's enabled state and the
+/// action both use it, so an enabled button always does something (R14).
+fn moment_target(c: &Clip, playhead: Time, rate: FrameRate) -> Option<SourceTime> {
+    anim_ui::edit_time(c, playhead, rate.frame_duration()).map(|tt| SourceTime(c.source_time_at(tt)))
 }
 
 /// Whether a block of `c` shows a moment: its «к плейхеду» depends on the
@@ -222,10 +233,17 @@ pub fn has_moment(c: &Clip) -> bool {
     c.effects.iter().filter_map(kadr_effects::definition).any(|d| d.params.iter().any(|p| p.kind == ParamKind::Moment))
 }
 
-/// «Сбросить» of one effect: its defaults (the moment: the frame at `at`)
-/// and no keyframes on its numbers — `None` when it is so already.
+/// «Сбросить» of one effect: its settings back to the defaults and no
+/// keyframes on its numbers — `None` when it is so already. Every moment
+/// stays where it was put (ruling R13: a reset never re-times a punch); one
+/// the effect lacks gets its default (the frame at `at`).
 pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) -> Option<Vec<EditCommand>> {
-    let defaults = kadr_effects::fresh(def, c, at).params;
+    let mut defaults = kadr_effects::fresh(def, c, at).params;
+    for p in def.params.iter().filter(|p| p.kind == ParamKind::Moment) {
+        if let Some(m @ ParamValue::Moment(_)) = e.params.get(p.key) {
+            defaults.insert(p.key.to_string(), m.clone());
+        }
+    }
     let animated: Vec<(TrackKey, f64)> = def
         .params
         .iter()
@@ -244,6 +262,12 @@ pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) ->
     }
     commands.push(EditCommand::UpdateEffect { clip: c.id, id: e.id, params: defaults, enabled: None });
     Some(commands)
+}
+
+/// Whether the ⋯ menu's «Сбросить» would change `e` (with the playhead at
+/// `at`): greyed out otherwise (R14). A newer Kadr's effect never resets.
+pub fn can_reset(c: &Clip, e: &AppliedEffect, at: Time) -> bool {
+    kadr_effects::definition(e).and_then(|d| reset_commands(c, e, d, at)).is_some()
 }
 
 /// A row's nested list in the model on screen (an empty one stays as it is).
@@ -578,7 +602,7 @@ impl App {
                 let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, self.playhead, rate, false)).collect());
                 let id: SharedString = e.id.to_string().into();
                 let params = reuse_param_rows(old_params.get(&id).cloned(), params);
-                FxRow { id, name: fx_name(e).into(), enabled: e.enabled, known: def.is_some(), first: i == 0, last: i + 1 == c.effects.len(), params }
+                FxRow { id, name: fx_name(e).into(), enabled: e.enabled, known: def.is_some(), resettable: can_reset(c, e, self.playhead), first: i == 0, last: i + 1 == c.effects.len(), params }
             })
             .collect();
         crate::util::reuse_rows(Some(old), rows)
@@ -638,19 +662,18 @@ pub fn action_commands(c: &Clip, eid: EffectId, action: &str, playhead: Time, ra
             if e.params.get(key) == Some(&v) {
                 return None;
             }
-            (tf("cmd.effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
+            (tf("cmd.update_effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
         }
         a if a.starts_with("moment:") => {
             let key = &a["moment:".len()..];
             if def?.param(key)?.kind != ParamKind::Moment {
                 return None;
             }
-            let tt = anim_ui::edit_time(c, playhead, rate.frame_duration())?;
-            let v = ParamValue::Moment(SourceTime(c.source_time_at(tt)));
+            let v = ParamValue::Moment(moment_target(c, playhead, rate)?);
             if e.params.get(key) == Some(&v) {
                 return None;
             }
-            (tf("cmd.effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
+            (tf("cmd.update_effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
         }
         _ => return None,
     })
@@ -861,6 +884,67 @@ mod tests {
         c.animation.set_key(k.clone(), SourceTime(Time::from_secs(31)), 0.1, None);
         let cmds = reset_commands(&c, &out, def, Time::from_secs(12)).unwrap();
         assert!(matches!(&cmds[..], [EditCommand::ClearAnimation { statics, .. }, EditCommand::UpdateEffect { .. }] if *statics == vec![(k.clone(), 0.6)]));
+
+        // Ruling R13: a reset keeps the moment where it was put — a hand-placed
+        // punch is not re-timed to the playhead, and an untouched Punch In
+        // stays untouched wherever the playhead is.
+        let punch = kadr_effects::recipe("punch_in").unwrap();
+        let mut p = kadr_effects::fresh(punch, &c, Time::from_secs(12));
+        c.effects.push(p.clone());
+        assert!(reset_commands(&c, &p, punch, Time::from_secs(18)).is_none(), "untouched: the playhead elsewhere changes nothing");
+        p.params.insert("strength".into(), ParamValue::Number(0.9));
+        p.params.insert("moment".into(), ParamValue::Moment(SourceTime(Time::from_secs(37))));
+        c.effects[1] = p.clone();
+        let cmds = reset_commands(&c, &p, punch, Time::from_secs(18));
+        let Some([EditCommand::UpdateEffect { params, .. }]) = cmds.as_deref() else { panic!("one UpdateEffect") };
+        assert_eq!(params["strength"], ParamValue::Number(0.6), "the settings go back");
+        assert_eq!(params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(37))), "the moment stays");
+        assert_eq!(params["point"], ParamValue::Point { x: 0.5, y: 0.5 });
+    }
+
+    /// R14: «Сбросить» in the ⋯ menu is greyed out exactly when it would do nothing.
+    #[test]
+    fn the_reset_item_greys_out_when_nothing_would_change() {
+        let mut c = clip_10_20();
+        let punch = kadr_effects::recipe("punch_in").unwrap();
+        let mut p = kadr_effects::fresh(punch, &c, Time::from_secs(12));
+        let future = AppliedEffect::new("glitch_v2", 3, BTreeMap::new());
+        c.effects = vec![p.clone(), future.clone()];
+        assert!(!can_reset(&c, &p, Time::from_secs(18)), "defaults, the moment where it was put");
+        assert!(!can_reset(&c, &future, Time::from_secs(12)), "a newer Kadr's effect is not changed");
+        c.animation.set_key(TrackKey::fx(p.id, "strength"), SourceTime(Time::from_secs(33)), 0.6, None);
+        assert!(can_reset(&c, &p, Time::from_secs(18)), "keyframes to drop");
+        c.animation = Default::default();
+        p.params.insert("point".into(), ParamValue::Point { x: 0.2, y: 0.5 });
+        c.effects[0] = p.clone();
+        assert!(can_reset(&c, &p, Time::from_secs(18)), "a setting to restore");
+    }
+
+    /// R14: «к плейхеду» is enabled exactly when a click does something —
+    /// the row and the action derive the target frame the same way.
+    #[test]
+    fn to_the_playhead_is_enabled_exactly_when_it_does_something() {
+        let mut c = clip_10_20();
+        c.source_out = Time::from_secs(50); // 2×: timeline 10..20 s = source 30..50 s
+        let punch = kadr_effects::recipe("punch_in").unwrap();
+        let mut e = kadr_effects::fresh(punch, &c, Time::from_millis(12_010));
+        c.effects.push(e.clone());
+        let def = punch.param("moment").unwrap();
+        let check = |c: &Clip, e: &AppliedEffect| {
+            for ms in [5_000, 9_999, 10_000, 12_000, 12_010, 12_011, 15_000, 19_999, 20_000, 25_000] {
+                let at = Time::from_millis(ms);
+                let row = param_row(c, e, def, at, FrameRate::FPS_30, false);
+                assert_eq!(row.can_act, action_commands(c, e.id, "moment:moment", at, FrameRate::FPS_30).is_some(), "{ms} ms");
+            }
+        };
+        check(&c, &e);
+        assert!(!param_row(&c, &e, def, Time::from_millis(12_010), FrameRate::FPS_30, false).can_act, "already there");
+        e.params.insert("moment".into(), ParamValue::Moment(SourceTime(Time::from_secs(55))));
+        c.effects[0] = e.clone();
+        check(&c, &e);
+        e.params.remove("moment");
+        c.effects[0] = e.clone();
+        check(&c, &e);
     }
 
     /// One command per click, none when nothing would change (the engine
@@ -886,7 +970,7 @@ mod tests {
 
         assert_eq!(act(z.id, "choice:direction:0", 12), None, "already «in»");
         let out = BTreeMap::from([("direction".to_string(), ParamValue::Choice("out".into()))]);
-        assert_eq!(act(z.id, "choice:direction:1", 12), Some((named("cmd.effect_named"), update(z.id, out, None))));
+        assert_eq!(act(z.id, "choice:direction:1", 12), Some((named("cmd.update_effect_named"), update(z.id, out, None))), "a change of a setting, not applying the effect");
         for bad in ["choice:direction:2", "choice:direction:x", "choice:strength:0", "choice:nope:0", "pick:point", "nonsense"] {
             assert_eq!(act(z.id, bad, 12), None, "{bad}");
         }

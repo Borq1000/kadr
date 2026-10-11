@@ -791,6 +791,7 @@
   "cmd.effect_on_named": "Turn on effect: {name}",
   "cmd.effect_off_named": "Turn off effect: {name}",
   "cmd.remove_effect_named": "Remove effect: {name}",
+  "cmd.update_effect_named": "Change effect: {name}",
   "cmd.reset_effect_named": "Reset effect: {name}",
   "cmd.clear_effects": "Remove clip effects",
   "dlg.clear_effects.title": "Remove all effects of the clip?",
