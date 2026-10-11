@@ -7,7 +7,7 @@ use crate::transition::{self, TransitionBuild, TransitionCtx};
 use crate::params::{default_value, ParamDef, ParamKind, Params, NORMAL};
 use crate::PlacementDelta;
 use kadr_core::Time;
-use kadr_project::{AppliedEffect, Clip, ParamValue, SourceTime, TrackKind};
+use kadr_project::{AppliedEffect, Clip, ParamValue, SourceTime, TrackKind, Transition};
 use kadr_scene::SizeU;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -299,6 +299,13 @@ pub fn definition(e: &AppliedEffect) -> Option<&'static RecipeDef> {
     recipe(&e.recipe).filter(|d| d.version == e.version && (d.variants.is_none() || d.variant_of(&e.params).is_some()))
 }
 
+/// The definition that evaluates transition `tr`: a cut recipe at its
+/// version. `None` for a recipe or version from a newer Kadr (kept, never
+/// run: a hard cut, shown «Недоступен») and for a clip recipe's id.
+pub fn transition_definition(tr: &Transition) -> Option<&'static RecipeDef> {
+    recipe(&tr.recipe).filter(|d| d.target == Target::Cut && d.version == tr.version)
+}
+
 /// Whether an effect for `target` goes on a clip of a `kind` track.
 pub fn fits(target: Target, kind: TrackKind) -> bool {
     matches!((target, kind), (Target::Clip, TrackKind::Video) | (Target::AudioClip, TrackKind::Audio))
@@ -332,6 +339,15 @@ pub fn fresh(def: &RecipeDef, clip: &Clip, at: Time) -> AppliedEffect {
 mod tests {
     use super::*;
     use kadr_core::{AssetId, TimeRange};
+
+    #[test]
+    fn a_transition_runs_only_with_a_cut_recipe_at_its_version() {
+        let mk = |recipe: &str, version: u16| Transition::new(recipe, version, BTreeMap::new(), kadr_core::ClipId::new(), kadr_core::ClipId::new(), Time::from_secs(1));
+        assert_eq!(transition_definition(&mk("wipe", 1)).map(|d| d.id), Some("wipe"));
+        assert!(transition_definition(&mk("wipe", 2)).is_none(), "a newer version");
+        assert!(transition_definition(&mk("iris", 1)).is_none(), "a newer recipe");
+        assert!(transition_definition(&mk("look", 1)).is_none(), "a clip recipe is no transition");
+    }
 
     #[test]
     fn the_registry_holds_motion_looks_light_then_transitions_in_card_order() {

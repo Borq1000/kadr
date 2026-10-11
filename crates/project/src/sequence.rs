@@ -1,7 +1,7 @@
 //! Sequence / track / clip model. Everything here is plain data; the edit
 //! rules (ripple, overlap resolution, undo) live in `kadr-timeline`.
 
-use kadr_core::{AssetId, ClipId, FrameRate, LinkId, MarkerId, SequenceId, Time, TimeRange, TrackId, TransitionId};
+use kadr_core::{AssetId, ClipId, FrameRate, LinkId, MarkerId, SequenceId, Time, TimeRange, TrackId};
 use crate::{Animation, AppliedEffect, EdgeFades};
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,9 @@ pub struct Sequence {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub markers: Vec<Marker>,
-    #[serde(default)]
-    pub transitions: Vec<Transition>,
+    /// Transitions on cuts (`crate::transitions`); read leniently.
+    #[serde(default, deserialize_with = "crate::transitions::deserialize_transitions")]
+    pub transitions: Vec<crate::Transition>,
     #[serde(default)]
     pub in_out: Option<TimeRange>,
 }
@@ -358,24 +359,6 @@ impl Default for AudioProps {
     fn default() -> Self {
         AudioProps { gain_db: 0.0, pan: 0.0, fade_in: Time::ZERO, fade_out: Time::ZERO }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransitionKind {
-    CrossDissolve,
-    DipToBlack,
-    Wipe,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Transition {
-    pub id: TransitionId,
-    pub kind: TransitionKind,
-    pub track: TrackId,
-    /// The cut point the transition is centred on.
-    pub at: Time,
-    pub duration: Time,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

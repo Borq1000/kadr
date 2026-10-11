@@ -374,18 +374,20 @@ impl EditCommand {
             }
 
             EditCommand::AddTransition(tr) => {
-                let track = unlocked_mut(seq, tr.track)?;
-                // Snap to the cut the caller names: when exactly one adjacent
-                // clip pair has its boundary within half a frame of `at`
-                // (MCP clients send ms-rounded times), use that boundary.
-                let half = Time(fr.frame_duration().flicks() / 2);
-                let mut cuts = track.clips.windows(2).filter(|w| w[0].timeline_out == w[1].timeline_in).map(|w| w[0].timeline_out).filter(|c| (*c - tr.at).abs() <= half);
-                let mut tr = tr.clone();
-                if let (Some(cut), None) = (cuts.next(), cuts.next()) {
-                    tr.at = cut;
+                // Interim (E3 Task 3; Task 4 replaces it with SetTransition):
+                // the transition on its cut — its clips must meet on one
+                // unlocked video track — in place of the cut's.
+                let (ti, ci) = seq.locate_clip(tr.from).ok_or(EditError::ClipNotFound)?;
+                let track = &seq.tracks[ti];
+                if track.locked {
+                    return Err(EditError::TrackLocked(track.name.clone()));
                 }
-                seq.transitions.retain(|t| !(t.track == tr.track && t.at == tr.at));
-                seq.transitions.push(tr);
+                let meets = track.clips.get(ci + 1).is_some_and(|n| n.id == tr.to && n.timeline_in == track.clips[ci].timeline_out);
+                if track.kind != TrackKind::Video || !meets {
+                    return Err(EditError::InvalidRange);
+                }
+                seq.transitions.retain(|t| t.to != tr.to);
+                seq.transitions.push(tr.clone());
                 Ok(())
             }
             EditCommand::RemoveTransition(id) => {
@@ -449,9 +451,7 @@ impl EditCommand {
                 if seq.tracks_of(t.kind).count() <= 1 {
                     return Err(EditError::LastTrack);
                 }
-                let id = t.id;
                 seq.tracks.remove(idx);
-                seq.transitions.retain(|tr| tr.track != id);
                 Ok(())
             }
             EditCommand::UpdateMarker(m) => {

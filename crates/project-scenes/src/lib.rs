@@ -354,8 +354,7 @@ mod tests {
         let b = asset(std::path::Path::new("missing-b.mp4"), MediaKind::Video, 1920, 1080, Some(FrameRate::FPS_30), false);
         let ca = place(&mut p, 0, &a, 0, 2000);
         let cb = place(&mut p, 0, &b, 2000, 2000);
-        let track = p.sequence().tracks[0].id;
-        p.sequence_mut().transitions.push(Transition { id: kadr_core::TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: Time::from_secs(2), duration: Time::from_secs(1) });
+        p.sequence_mut().transitions.push(Transition::legacy(TransitionKind::CrossDissolve, ca, cb, Time::from_secs(1)));
         let s = ProjectScenes::new(&p, false);
         let early = s.scene_at(Time::from_millis(1600), &out());
         assert!(matches!(early.layers[0].content, LayerContent::Transition(_)));

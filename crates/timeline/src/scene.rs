@@ -5,7 +5,8 @@
 
 use kadr_core::color::AlphaMode;
 use kadr_core::{MediaKind, Time, TimeRange};
-use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, TransitionKind};
+use kadr_effects::{Params, RecipeDef, TransitionCtx};
+use kadr_project::{Clip, ColorAdjust as ClipColor, Project, Sequence, Track, TrackKind, Transform, Transition};
 use kadr_scene::*;
 
 pub fn evaluate(project: &Project, seq: &Sequence, t: Time, out: &OutputSpec) -> FrameScene {
@@ -97,40 +98,45 @@ fn window(at: Time, d: Time) -> TimeRange {
     TimeRange::new(start, start + d)
 }
 
-/// The transition active on `track` at `t`. A transition is valid only when
-/// both clips at its cut exist and are enabled (the one ending at `at` and
-/// the one starting there); stale ones are skipped, so they never hide a
-/// valid one. Like export, its length is clamped to both neighbours —
-/// `min(duration, outgoing, incoming)` — and under two frames there is no
-/// transition. Among valid transitions whose clamped window contains `t`,
-/// the earlier cut wins. A side whose clip draws nothing at `t` is empty;
-/// with both sides empty there is no layer.
-fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
+/// The valid transition on `track` whose window contains `t` (D1): one of
+/// the two cuts of the clip under `t` — the earlier first — whose clips
+/// meet, are enabled and carry a transition the registry runs (a stale or
+/// unknown one is never a candidate, so it never hides a valid one). Like
+/// export, its length is clamped to both neighbours — `min(duration,
+/// outgoing, incoming)` — and under two frames there is no transition. A
+/// window lies inside its two clips, so only the cuts of the clip under `t`
+/// can reach `t`.
+fn active_transition<'a>(seq: &'a Sequence, track: &'a Track, t: Time) -> Option<(&'a Transition, &'static RecipeDef, &'a Clip, &'a Clip, TimeRange)> {
+    let k = track.clips.partition_point(|c| c.timeline_in <= t).checked_sub(1)?;
+    if t >= track.clips[k].timeline_out {
+        return None; // a gap: no window reaches into it
+    }
     let min_len = seq.frame_rate.frame_to_time(2);
-    let (tr, outgoing, incoming, w) = seq
-        .transitions
-        .iter()
-        .filter(|tr| tr.track == track.id)
-        .filter_map(|tr| {
-            let outgoing = track.clips.iter().find(|c| c.timeline_out == tr.at && c.enabled)?;
-            let incoming = track.clips.iter().find(|c| c.timeline_in == tr.at && c.enabled)?;
-            let d = tr.duration.min(outgoing.duration()).min(incoming.duration());
-            let w = window(tr.at, d);
-            (d >= min_len && w.contains(t)).then_some((tr, outgoing, incoming, w))
-        })
-        .min_by_key(|(tr, ..)| tr.at)?;
-    let progress = ((t - w.start).flicks() as f64 / w.duration().flicks() as f64).clamp(0.0, 1.0) as f32;
-    let op = match tr.kind {
-        TransitionKind::CrossDissolve => TransitionOp::Dissolve,
-        TransitionKind::DipToBlack => TransitionOp::DipToColor(Rgba::BLACK),
-        // Edge moves right → left, the incoming clip enters from the right:
-        // the same picture as export's `xfade=wipeleft`.
-        TransitionKind::Wipe => TransitionOp::Wipe { angle: std::f32::consts::PI, softness: 0.0 },
-    };
-    // A side that draws nothing at `t` (scale ≤ 0, empty crop, no picture) is an empty,
-    // transparent side, and the other side still mixes against it (keyframes
-    // spec §3.5: cull only what provably contributes nothing). An empty side
-    // never makes the transition an occluder (`covers_opaquely`).
+    let pairs = [k.checked_sub(1).map(|j| (j, k)), (k + 1 < track.clips.len()).then_some((k, k + 1))];
+    pairs.into_iter().flatten().find_map(|(a, b)| {
+        let (from, to) = (&track.clips[a], &track.clips[b]);
+        if from.timeline_out != to.timeline_in || !from.enabled || !to.enabled {
+            return None;
+        }
+        let tr = seq.transitions.iter().find(|tr| tr.from == from.id && tr.to == to.id)?;
+        let def = kadr_effects::transition_definition(tr)?;
+        let d = tr.duration.min(from.duration()).min(to.duration());
+        let w = window(to.timeline_in, d);
+        (d >= min_len && w.contains(t)).then_some((tr, def, from, to, w))
+    })
+}
+
+/// The transition layer on `track` at `t` ([`active_transition`]): its
+/// recipe's mix at the window's linear progress (D5). A side that draws
+/// nothing at `t` (scale ≤ 0, empty crop, no picture) is an empty,
+/// transparent side and the other side still mixes against it (keyframes
+/// spec §3.5); with both empty there is no layer. (Task 5 adds the build's
+/// shifts, side colour and overlay, and the output size.)
+fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, canvas: SizeU) -> Option<Layer> {
+    let (tr, def, outgoing, incoming, w) = active_transition(seq, track, t)?;
+    let progress = ((t - w.start).flicks() as f64 / w.duration().flicks() as f64).clamp(0.0, 1.0);
+    let params = Params::resolve(def.params, &tr.params, |_| None);
+    let build = def.compile_cut(&params, &TransitionCtx { progress, canvas, output: canvas, seed: kadr_effects::transition_seed(tr.id) })?;
     let frame = seq.frame_rate.frame_duration();
     let from = clip_layer(project, outgoing, t, canvas, frame);
     let to = clip_layer(project, incoming, t, canvas, frame);
@@ -140,7 +146,7 @@ fn transition_layer(project: &Project, seq: &Sequence, track: &Track, t: Time, c
     let placement = Placement::fill(canvas);
     Some(Layer {
         id: LayerId::from(tr.id),
-        content: LayerContent::Transition(Box::new(TransitionLayer { op, progress, from: from.into_iter().collect(), to: to.into_iter().collect() })),
+        content: LayerContent::Transition(Box::new(TransitionLayer { op: build.op, progress: build.progress, from: from.into_iter().collect(), to: to.into_iter().collect() })),
         crop: placement.full_crop(),
         placement,
         opacity: 1.0,
@@ -451,10 +457,20 @@ mod tests {
     use kadr_core::TransitionId;
     use kadr_project::{Transition, TransitionKind};
 
+    /// A transition of the old `kind` (its D1 recipe) on the cut at `at_ms` of track `track`.
     fn add_transition(p: &mut Project, track: usize, at_ms: i64, dur_ms: i64, kind: TransitionKind) -> TransitionId {
-        let id = TransitionId::new();
-        let track_id = p.sequence().tracks[track].id;
-        p.sequence_mut().transitions.push(Transition { id, kind, track: track_id, at: Time::from_millis(at_ms), duration: Time::from_millis(dur_ms) });
+        let (from, to, _) = p.sequence().cut_near(p.sequence().tracks[track].id, Time::from_millis(at_ms), Time::ZERO).expect("a cut there");
+        let tr = Transition::legacy(kind, from, to, Time::from_millis(dur_ms));
+        let id = tr.id;
+        p.sequence_mut().transitions.push(tr);
+        id
+    }
+
+    /// A dissolve between two clips that need not meet (a stale one, as a hand-edited file may hold).
+    fn pair_transition(p: &mut Project, from: ClipId, to: ClipId, dur_ms: i64) -> TransitionId {
+        let tr = Transition::legacy(TransitionKind::CrossDissolve, from, to, Time::from_millis(dur_ms));
+        let id = tr.id;
+        p.sequence_mut().transitions.push(tr);
         id
     }
 
@@ -519,8 +535,8 @@ mod tests {
         place(&mut p, 0, &hd(), 0, 4_000, 4_000);
         let fr = FrameRate::FPS_29_97;
         let d = fr.frame_to_time(30);
-        let track = p.sequence().tracks[0].id;
-        p.sequence_mut().transitions.push(Transition { id: TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: Time::from_secs(4), duration: d });
+        let (from, to, _) = p.sequence().cut_near(p.sequence().tracks[0].id, Time::from_secs(4), Time::ZERO).unwrap();
+        p.sequence_mut().transitions.push(Transition::legacy(TransitionKind::CrossDissolve, from, to, d));
         let start = Time::from_secs(4) - Time(d.flicks() / 2);
         for k in [0, 1, 7, 15, 29] {
             let t = start + fr.frame_to_time(k);
@@ -545,8 +561,8 @@ mod tests {
     fn missing_neighbour_or_disabled_clip_means_no_transition() {
         let mut p = Project::new("t");
         let a = place(&mut p, 0, &hd(), 0, 0, 2_000);
-        place(&mut p, 0, &hd(), 0, 2_500, 2_000); // gap after the cut
-        add_transition(&mut p, 0, 2_000, 1_000, TransitionKind::CrossDissolve);
+        let b = place(&mut p, 0, &hd(), 0, 2_500, 2_000); // gap after the cut
+        pair_transition(&mut p, a, b, 1_000);
         assert_eq!(scene_at(&p, 1_750).layers[0].id, LayerId::from(a));
         assert!(scene_at(&p, 2_100).layers.is_empty(), "gap stays a gap");
         let mut q = Project::new("t");
@@ -578,7 +594,7 @@ mod tests {
         let mut p = Project::new("t");
         let a = place(&mut p, 0, &hd(), 0, 0, 1_000);
         let b = place(&mut p, 0, &hd(), 0, 1_000, 2_000);
-        add_transition(&mut p, 0, 900, 1_000, TransitionKind::CrossDissolve); // no cut at 900 any more
+        pair_transition(&mut p, b, a, 1_000); // b and a do not meet
         let valid = add_transition(&mut p, 0, 1_000, 1_000, TransitionKind::CrossDissolve);
         let s = scene_at(&p, 700);
         assert_eq!(s.layers[0].id, LayerId::from(valid));

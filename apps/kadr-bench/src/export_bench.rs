@@ -6,7 +6,7 @@
 use crate::avsync;
 use crate::media::{self, TestClip};
 use crate::report::Report;
-use kadr_core::{AssetId, CancelToken, FrameRate, LinkId, Time, TimeRange, TransitionId};
+use kadr_core::{AssetId, CancelToken, FrameRate, LinkId, Time, TimeRange};
 use kadr_media::ffmpeg::FfmpegCli;
 use kadr_media::{EncodeJob, ExportAudio, ExportSettings, MediaBackend};
 use kadr_media::{FrameEncoder, MediaError};
@@ -41,8 +41,8 @@ fn video_track(seq: &Sequence) -> usize {
 }
 
 fn dissolve(seq: &mut Sequence, track: usize, at: Time, duration: Time) {
-    let track = seq.tracks[track].id;
-    seq.transitions.push(Transition { id: TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at, duration });
+    let (from, to, _) = seq.cut_near(seq.tracks[track].id, at, Time::ZERO).expect("a cut at the dissolve");
+    seq.transitions.push(Transition::legacy(TransitionKind::CrossDissolve, from, to, duration));
 }
 
 /// `segments` × (source start, duration) laid end to end on V1.
@@ -352,10 +352,11 @@ fn av_project(source: &MediaAsset, total_secs: i64) -> Project {
         seq.tracks[0].clips.push(v);
         seq.tracks[a1].clips.push(a);
     }
-    let v1 = seq.tracks[0].id;
+    let ids: Vec<kadr_core::ClipId> = seq.tracks[0].clips.iter().map(|c| c.id).collect();
     let len = AV_FPS.frame_to_time(AV_DISSOLVE_FRAMES);
     for c in dissolves {
-        seq.transitions.push(Transition { id: TransitionId::new(), kind: TransitionKind::CrossDissolve, track: v1, at: segs[c].timeline_in, duration: len });
+        // Segment `c` starts at cut `c`: the pair is (c − 1, c).
+        seq.transitions.push(Transition::legacy(TransitionKind::CrossDissolve, ids[c - 1], ids[c], len));
     }
     p.assets.push(source.clone());
     p
@@ -461,7 +462,7 @@ mod tests {
         assert_eq!((v.len(), a.len()), (a.len(), v.len()));
         assert!(v.iter().zip(a).all(|(v, a)| v.link.is_some() && v.link == a.link && v.source_range() == a.source_range() && v.timeline_range() == a.timeline_range()));
         assert!(seq.transitions.len() >= 10);
-        assert!(seq.transitions.iter().all(|t| v.iter().any(|c| c.timeline_in == t.at) && t.duration == AV_FPS.frame_to_time(8)));
+        assert!(seq.transitions.iter().all(|t| seq.transition_cut(t).is_some_and(|(_, at)| v.iter().any(|c| c.timeline_in == at)) && t.duration == AV_FPS.frame_to_time(8)));
     }
 
     #[test]
@@ -475,7 +476,7 @@ mod tests {
         assert_eq!(seq.duration(), Time::from_secs(20));
         assert_eq!(seq.tracks[0].clips.len(), 10);
         assert_eq!(seq.tracks[0].clips[4].source_in, Time::from_secs(20));
-        assert_eq!(seq.transitions.iter().map(|t| t.at).collect::<Vec<_>>(), vec![Time::from_secs(6), Time::from_secs(14)]);
+        assert_eq!(seq.transitions.iter().filter_map(|t| seq.transition_cut(t).map(|(_, at)| at)).collect::<Vec<_>>(), vec![Time::from_secs(6), Time::from_secs(14)]);
         let job = encode_job(&p, "o.mp4".into(), vec![]);
         assert_eq!((job.width, job.height, job.frames), (1920, 1080, 600));
         assert_eq!((job.settings.crf, job.settings.preset.as_str()), (21, "fast"));

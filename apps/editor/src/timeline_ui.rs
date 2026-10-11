@@ -1058,26 +1058,20 @@ impl App {
     fn add_dissolve(&mut self) {
         let seq = self.project.sequence();
         // Nearest cut to the playhead on a video track.
-        let mut best: Option<(TrackId, Time)> = None;
+        let mut best: Option<(ClipId, ClipId, Time)> = None;
         for t in seq.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
             for w in t.clips.windows(2) {
                 if w[0].timeline_out == w[1].timeline_in {
                     let cut = w[0].timeline_out;
-                    if best.is_none_or(|(_, b)| (cut - self.playhead).abs() < (b - self.playhead).abs()) {
-                        best = Some((t.id, cut));
+                    if best.is_none_or(|(_, _, b)| (cut - self.playhead).abs() < (b - self.playhead).abs()) {
+                        best = Some((w[0].id, w[1].id, cut));
                     }
                 }
             }
         }
         match best {
-            Some((track, at)) => {
-                self.execute(EditCommand::AddTransition(Transition {
-                    id: kadr_core::TransitionId::new(),
-                    kind: TransitionKind::CrossDissolve,
-                    track,
-                    at,
-                    duration: Time::from_secs(1),
-                }));
+            Some((from, to, _)) => {
+                self.execute(EditCommand::AddTransition(Transition::legacy(TransitionKind::CrossDissolve, from, to, Time::from_secs(1))));
                 self.toast(t("toast.dissolve_added"));
             }
             None => self.toast(t("toast.no_cut_near")),
@@ -1427,14 +1421,10 @@ impl App {
             .transitions
             .iter()
             .filter_map(|tr| {
-                let r = rs.iter().find(|r| seq.tracks[r.track].id == tr.track)?;
+                let (ti, at) = seq.transition_cut(tr)?;
+                let r = rs.iter().find(|r| r.track == ti)?;
                 let half = tr.duration.as_secs_f64() / 2.0;
-                Some(TransitionView {
-                    x: ((tr.at.as_secs_f64() - half - t0) * self.tl.pps) as f32,
-                    y: r.y as f32,
-                    width: (tr.duration.as_secs_f64() * self.tl.pps) as f32,
-                    height: r.h as f32,
-                })
+                Some(TransitionView { x: ((at.as_secs_f64() - half - t0) * self.tl.pps) as f32, y: r.y as f32, width: (tr.duration.as_secs_f64() * self.tl.pps) as f32, height: r.h as f32 })
             })
             .collect();
 

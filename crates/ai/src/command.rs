@@ -378,16 +378,11 @@ fn validate_each(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
                 if !(40..=10_000).contains(duration_ms) {
                     return Err(ValidationError::Range { index: i, msg: "transition duration 40..10000 ms".into() });
                 }
-                let track = seq.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).ok_or(
-                    ValidationError::Range { index: i, msg: "no video track".into() },
-                )?;
-                EditCommand::AddTransition(Transition {
-                    id: kadr_core::TransitionId::new(),
-                    kind: *kind,
-                    track,
-                    at,
-                    duration: ms(*duration_ms),
-                })
+                let track = seq.tracks.iter().find(|t| t.kind == TrackKind::Video).ok_or(ValidationError::Range { index: i, msg: "no video track".into() })?;
+                let (from, to, _) = seq
+                    .cut_near(track.id, at, half_frame)
+                    .ok_or_else(|| ValidationError::Range { index: i, msg: format!("no cut within half a frame of {at_ms} ms on track {}", track.name) })?;
+                EditCommand::AddTransition(Transition::legacy(*kind, from, to, ms(*duration_ms)))
             }
             AiCommand::SelectCamera { start_ms, end_ms, angle, .. } => {
                 // Milliseconds can't name flick-exact positions: a bound within

@@ -82,16 +82,23 @@ pub fn parse(bytes: &[u8], path: &Path) -> Result<Project, ProjectIoError> {
         return Err(ProjectIoError::TooNew { found, supported: FORMAT_VERSION });
     }
     let value = migrate(value, found);
-    serde_json::from_value(value).map_err(|source| ProjectIoError::Parse { path: path.to_path_buf(), source })
+    let mut project: Project = serde_json::from_value(value).map_err(|source| ProjectIoError::Parse { path: path.to_path_buf(), source })?;
+    // D2: a transition whose clips no longer meet (a hand-edited file) goes, as an edit would remove it.
+    for seq in &mut project.sequences {
+        for t in seq.reconcile_transitions() {
+            tracing::warn!(id = %t.id, recipe = %t.recipe, "dropping a transition whose clips do not meet at a cut");
+        }
+    }
+    Ok(project)
 }
 
 /// Upgrades older JSON layouts in place. Format 1 is the first release;
 /// format 2 replaced the never-evaluated string-keyed `keyframes` with
 /// source-bound `animation` (keyframes spec §2.2); format 3 replaced the
 /// never-evaluated `effects` with `AppliedEffect`s (effects spec §2).
-/// Transitions keep their `kind` in format 3: stage E3 converts a
-/// transition that has `kind` and no `recipe` by content, in this same
-/// function, without another format bump.
+/// Transitions kept their `kind` in format 3: they are converted by content
+/// on every load (`migrate_transitions`, effects E3), without another
+/// format bump.
 fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
     if from < 2 {
         for_each_clip(&mut value, migrate_clip_keyframes);
@@ -103,6 +110,8 @@ fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
             obj.insert("format_version".into(), 3.into());
         }
     }
+    // E3, on every load: transitions named by an old kind become recipes on their cut.
+    for_each_sequence(&mut value, migrate_transitions);
     value
 }
 
@@ -118,6 +127,62 @@ fn for_each_clip(value: &mut serde_json::Value, mut f: impl FnMut(&mut serde_jso
     {
         f(clip);
     }
+}
+
+/// Every sequence object; malformed levels are skipped.
+fn for_each_sequence(value: &mut serde_json::Value, mut f: impl FnMut(&mut serde_json::Value)) {
+    let Some(seqs) = value.get_mut("sequences").and_then(serde_json::Value::as_array_mut) else { return };
+    for s in seqs {
+        f(s);
+    }
+}
+
+/// A transition with `kind` and no `recipe` — as Kadr wrote them before E3,
+/// its cut named by `track` and `at` — becomes the kind's recipe
+/// (`TransitionKind::recipe`, D1) on the clip pair there: the clip of that
+/// track ending at `at` (`from`) and the one starting there (`to`). One on
+/// no cut (invisible before) is dropped with a log line; anything else
+/// malformed is left to the lenient loader. Never panics.
+fn migrate_transitions(seq: &mut serde_json::Value) {
+    use serde_json::{json, Value};
+    // (track id, clip id, timeline_in, timeline_out) of every readable clip.
+    let clips: Vec<(Value, Value, i64, i64)> = seq
+        .get("tracks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|t| {
+            let track = t.get("id").cloned().unwrap_or(Value::Null);
+            t.get("clips").and_then(Value::as_array).into_iter().flatten().filter_map(move |c| Some((track.clone(), c.get("id")?.clone(), c.get("timeline_in")?.as_i64()?, c.get("timeline_out")?.as_i64()?)))
+        })
+        .collect();
+    let Some(list) = seq.get_mut("transitions").and_then(Value::as_array_mut) else { return };
+    list.retain_mut(|tr| {
+        let Some(o) = tr.as_object_mut() else { return true };
+        if o.contains_key("recipe") {
+            return true;
+        }
+        let Some(kind) = o.get("kind").and_then(|k| serde_json::from_value::<crate::TransitionKind>(k.clone()).ok()) else { return true };
+        let pair = o.get("track").cloned().zip(o.get("at").and_then(Value::as_i64)).and_then(|(track, at)| {
+            let from = clips.iter().find(|c| c.0 == track && c.3 == at)?.1.clone();
+            let to = clips.iter().find(|c| c.0 == track && c.2 == at)?.1.clone();
+            Some((from, to))
+        });
+        let Some((from, to)) = pair else {
+            tracing::warn!(transition = ?o.get("id"), "dropping an old transition that sits on no cut");
+            return false;
+        };
+        let (recipe, params) = kind.recipe();
+        for k in ["kind", "track", "at"] {
+            o.remove(k);
+        }
+        o.insert("recipe".into(), json!(recipe));
+        o.insert("version".into(), json!(1));
+        o.insert("params".into(), serde_json::to_value(&params).unwrap_or_else(|_| json!({})));
+        o.insert("from".into(), from);
+        o.insert("to".into(), to);
+        true
+    });
 }
 
 /// Format 2 → 3: `effects: [{id, kind, enabled, params: {name: number}}]`
@@ -348,15 +413,96 @@ mod tests {
         assert_eq!(saved["format_version"], serde_json::json!(3));
     }
 
-    /// The E3 hook: format 3 keeps transitions as they are (E3 converts a
-    /// transition with `kind` and no `recipe` by content, no new format).
+    /// Two clips on V1 of `v2_project` meeting at 10 s; returns their ids.
+    fn with_pair(v: &mut serde_json::Value) -> (kadr_core::ClipId, kadr_core::ClipId) {
+        let f = |s: i64| s * kadr_core::FLICKS_PER_SECOND;
+        let (a, b) = (kadr_core::ClipId::new(), kadr_core::ClipId::new());
+        let clip = |id: kadr_core::ClipId, tin: i64| serde_json::json!({"id": id, "asset": kadr_core::AssetId::new(), "name": "c", "source_in": 0, "source_out": f(10), "timeline_in": f(tin), "timeline_out": f(tin + 10)});
+        v["sequences"][0]["tracks"][0]["clips"] = serde_json::json!([clip(a, 0), clip(b, 10)]);
+        (a, b)
+    }
+
+    /// D1, on every load (format 2 and 3 alike): the old kinds become their
+    /// recipes on the clip pair at their cut; one on no cut is dropped; the
+    /// old fields are never written again.
     #[test]
-    fn transitions_keep_their_kind_in_format_3() {
-        let mut v = v2_project();
-        let track = v["sequences"][0]["tracks"][0]["id"].clone();
-        v["sequences"][0]["transitions"] = serde_json::json!([{"id": kadr_core::TransitionId::new(), "kind": "dip_to_black", "track": track, "at": 0, "duration": 100}]);
-        let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap();
-        assert_eq!(p.sequence().transitions[0].kind, crate::TransitionKind::DipToBlack);
+    fn old_transition_kinds_become_recipes_on_their_cut() {
+        let f = |s: i64| s * kadr_core::FLICKS_PER_SECOND;
+        for format in [2, 3] {
+            let mut v = v2_project();
+            v["format_version"] = serde_json::json!(format);
+            let (a, b) = with_pair(&mut v);
+            let track = v["sequences"][0]["tracks"][0]["id"].clone();
+            let tr = |kind: &str, at: i64| serde_json::json!({"id": kadr_core::TransitionId::new(), "kind": kind, "track": track, "at": at, "duration": f(1)});
+            for (kind, recipe, params) in [
+                ("cross_dissolve", "clean_fade", serde_json::json!({"style": {"choice": "clean"}})),
+                ("dip_to_black", "fade_through_color", serde_json::json!({"color": {"choice": "black"}})),
+                ("wipe", "wipe", serde_json::json!({"direction": {"choice": "left"}, "softness": {"number": 0.0}})),
+            ] {
+                v["sequences"][0]["transitions"] = serde_json::json!([tr(kind, f(10)), tr(kind, f(5))]);
+                let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap();
+                let t = &p.sequence().transitions;
+                assert_eq!(t.len(), 1, "{kind}: the one at 5 s sat on no cut (invisible before): dropped");
+                assert_eq!((t[0].recipe.as_str(), t[0].version, t[0].from, t[0].to, t[0].duration), (recipe, 1, a, b, kadr_core::Time::from_secs(1)), "{kind}");
+                let saved = serde_json::to_value(&p).unwrap();
+                let s = &saved["sequences"][0]["transitions"][0];
+                assert_eq!(s["params"], params, "{kind}");
+                assert!(s.get("kind").is_none() && s.get("track").is_none() && s.get("at").is_none(), "{kind}: the old fields are never written");
+                assert_eq!(saved["format_version"], serde_json::json!(3), "no new format (R2)");
+            }
+        }
+    }
+
+    /// Bad transition data never fails the project and never panics.
+    #[test]
+    fn malformed_transitions_are_dropped_not_fatal() {
+        for transitions in [
+            serde_json::json!("x"),
+            serde_json::json!(null),
+            serde_json::json!([7, "s", null, [1]]),
+            serde_json::json!([{"kind": "cross_dissolve"}]),
+            serde_json::json!([{"kind": "iris", "track": "t", "at": 0, "duration": 5}]),
+            serde_json::json!([{"kind": "wipe", "track": 5, "at": "x"}]),
+            serde_json::json!([{"recipe": "clean_fade"}]),
+        ] {
+            let mut v = v2_project();
+            with_pair(&mut v);
+            v["sequences"][0]["transitions"] = transitions.clone();
+            let p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("bad.kadr")).unwrap_or_else(|e| panic!("{transitions}: {e}"));
+            assert!(p.sequence().transitions.is_empty(), "{transitions}");
+        }
+    }
+
+    /// Spec §2: a transition from a newer Kadr — recipe, version, an unknown
+    /// parameter variant, a field — survives parse → save byte for byte.
+    #[test]
+    fn a_transition_from_a_newer_kadr_survives_parse_and_save() {
+        let mut p = crate::Project::new("future");
+        let f = kadr_core::Time::from_secs;
+        let a = crate::Clip::new(kadr_core::AssetId::new(), "a", kadr_core::TimeRange::new(f(0), f(4)), f(0));
+        let b = crate::Clip::new(kadr_core::AssetId::new(), "b", kadr_core::TimeRange::new(f(0), f(4)), f(4));
+        let params = [("amount".to_string(), crate::ParamValue::Number(0.4)), ("shape".to_string(), crate::ParamValue::Unknown(serde_json::json!({"star": 5})))].into();
+        let mut t = crate::Transition::new("iris_v2", 3, params, a.id, b.id, f(1));
+        t.extra.insert("mask".into(), serde_json::json!({"feather": 0.2}));
+        p.sequence_mut().tracks[0].clips.extend([a, b]);
+        p.sequence_mut().transitions.push(t);
+        let saved = to_json(&p);
+        let loaded = parse(&saved, Path::new("future.kadr")).unwrap();
+        assert_eq!(to_json(&loaded), saved, "parse → save gives the same bytes");
+        assert_eq!(loaded, p);
+    }
+
+    /// D2 at load: a saved transition whose clips no longer meet (a
+    /// hand-edited file) is dropped, as an edit would have removed it.
+    #[test]
+    fn a_saved_transition_whose_clips_do_not_meet_is_dropped_on_load() {
+        let mut p = crate::Project::new("gap");
+        let f = kadr_core::Time::from_secs;
+        let a = crate::Clip::new(kadr_core::AssetId::new(), "a", kadr_core::TimeRange::new(f(0), f(4)), f(0));
+        let b = crate::Clip::new(kadr_core::AssetId::new(), "b", kadr_core::TimeRange::new(f(0), f(4)), f(5));
+        p.sequence_mut().transitions.push(crate::Transition::legacy(crate::TransitionKind::Wipe, a.id, b.id, f(1)));
+        p.sequence_mut().tracks[0].clips.extend([a, b]);
+        assert!(parse(&to_json(&p), Path::new("gap.kadr")).unwrap().sequence().transitions.is_empty());
     }
 
     /// R25: a garbage old effects list never panics the migration.

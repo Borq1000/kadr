@@ -6,7 +6,7 @@
 
 use crate::report::Report;
 use kadr_core::perf::Stats;
-use kadr_core::{FrameRate, MediaInfo, MediaKind, Time, TimeRange, TransitionId, VideoInfo};
+use kadr_core::{FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
 use kadr_project::{AnimParam, Clip, MediaAsset, Project, SourceTime, Track, TrackKind, Transition, TransitionKind};
 use kadr_scene::{OutputSpec, RenderQuality, SizeU};
 use kadr_timeline::scene::evaluate;
@@ -44,8 +44,8 @@ fn project() -> Project {
     clip(0, &a, 30, 30);
     clip(1, &b, 0, 60);
     clip(2, &logo, 0, 60);
-    let track = p.sequence().tracks[0].id;
-    p.sequence_mut().transitions.push(Transition { id: TransitionId::new(), kind: TransitionKind::CrossDissolve, track, at: Time::from_secs(30), duration: Time::from_secs(2) });
+    let (from, to, _) = p.sequence().cut_near(p.sequence().tracks[0].id, Time::from_secs(30), Time::ZERO).expect("the cut at 30 s");
+    p.sequence_mut().transitions.push(Transition::legacy(TransitionKind::CrossDissolve, from, to, Time::from_secs(2)));
     p
 }
 
