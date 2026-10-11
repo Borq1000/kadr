@@ -82,7 +82,7 @@ fn motion_project() -> Project {
     for i in 0..10 {
         let mut c = Clip::new(a.id, "c", TimeRange::new(Time::ZERO, Time::from_secs(60)), Time::ZERO);
         c.transform.scale = 0.3; // none of the ten covers the canvas: nothing is culled
-        for def in kadr_effects::registry() {
+        for def in kadr_effects::registry().iter().filter(|d| d.category == kadr_effects::Category::Motion) {
             let mut e = kadr_effects::fresh(def, &c, Time::from_secs(30));
             e.params.insert("strength".into(), kadr_project::ParamValue::Number(1.0));
             c.effects.push(e);

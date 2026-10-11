@@ -1075,10 +1075,11 @@ mod tests {
 
     #[test]
     fn categories_hide_empty_ones_and_search_matches_either_language() {
-        assert_eq!(categories(), vec![Category::Motion], "E1: motion only");
-        assert_eq!(visible_recipes("", "").len(), 5);
-        assert!(visible_recipes("look", "").is_empty());
+        assert_eq!(categories(), vec![Category::Motion, Category::Look, Category::Light], "E2: motion, Looks, light");
+        assert_eq!(visible_recipes("", "").len(), 7);
+        assert!(visible_recipes("transition", "").is_empty());
         let ids = |v: Vec<&'static RecipeDef>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert_eq!(ids(visible_recipes("look", "")), ["look"]);
         assert_eq!(ids(visible_recipes("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
         assert_eq!(ids(visible_recipes("motion", "HAND")), ["handheld"], "English name, any case");
         assert_eq!(ids(visible_recipes("", "  Ручная ")), ["handheld"], "trimmed");
@@ -1690,7 +1691,7 @@ mod tests {
                 for p in d.params {
                     need.push(p.label_key());
                     if let kadr_effects::ParamKind::Choice { options, .. } = p.kind {
-                        need.extend(options.iter().map(|o| format!("fx.choice.{o}")));
+                        need.extend(options.iter().map(|o| d.option_name_key(p.key, o)));
                     }
                 }
             }

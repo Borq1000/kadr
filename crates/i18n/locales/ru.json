@@ -831,5 +831,15 @@
   "fx.pick.hidden": "Клип не виден в этом кадре",
   "fx.tip": "Эффекты: {list}",
   "fx.tip.off": "{name} (выкл.)",
-  "fx.tip.unavailable": "{name} (недоступен)"
+  "fx.tip.unavailable": "{name} (недоступен)",
+  "fx.look": "Look",
+  "fx.look.cinematic": "Кино",
+  "fx.look.warm": "Тёплый",
+  "fx.look.soft_film": "Мягкая плёнка",
+  "fx.look.dramatic": "Драма",
+  "fx.look.vintage": "Винтаж",
+  "fx.look.natural": "Естественный",
+  "fx.vignette": "Виньетка",
+  "fx.param.preset": "Пресет",
+  "fx.param.softness": "Мягкость"
 }

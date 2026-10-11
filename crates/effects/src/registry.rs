@@ -1,5 +1,6 @@
 //! The recipe registry (effects spec §3) and what a new effect starts with.
 
+use crate::look;
 use crate::motion;
 use crate::params::{default_value, ParamDef, ParamKind, Params, NORMAL};
 use crate::PlacementDelta;
@@ -7,6 +8,7 @@ use kadr_core::Time;
 use kadr_project::{AppliedEffect, Clip, ParamValue, SourceTime, TrackKind};
 use kadr_scene::SizeU;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
@@ -94,11 +96,18 @@ pub struct CompileCtx {
 impl CompileCtx {
     /// The window of a clip without crop: the whole picture.
     pub const UNCROPPED: (f64, f64, f64, f64) = (0.0, 0.0, 1.0, 1.0);
+
+    /// A context for a still outside any clip's timing — golden images,
+    /// benches: progress 0, a 1 s clip at speed 1, source time 0, uncropped,
+    /// the canvas's aspect.
+    pub fn still(canvas: SizeU, frame: Time, seed: u64) -> CompileCtx {
+        CompileCtx { progress: 0.0, clip_secs: 1.0, source_time: SourceTime(Time::ZERO), speed: 1.0, canvas, aspect: canvas.w as f64 / canvas.h.max(1) as f64, window: Self::UNCROPPED, frame, seed }
+    }
 }
 
-/// What one effect adds to a frame. E1 recipes only move the picture;
-/// colour primitives (E2), overlays and transition builds (E3) and audio
-/// operations (E4) join here.
+/// What one effect adds to a frame: motion recipes move the picture, colour
+/// recipes (Look, Vignette) add primitives after the clip's correction;
+/// overlays and transition builds (E3) and audio operations (E4) join here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Compiled {
     pub placement: PlacementDelta,
@@ -108,6 +117,11 @@ pub struct Compiled {
 impl Compiled {
     pub fn motion(placement: PlacementDelta) -> Compiled {
         Compiled { placement, effects: vec![] }
+    }
+
+    /// A colour effect's frame: primitives only, the picture stays where it is.
+    pub fn colour(effects: Vec<kadr_scene::Effect>) -> Compiled {
+        Compiled { placement: PlacementDelta::IDENTITY, effects }
     }
 }
 
@@ -119,6 +133,10 @@ pub struct RecipeDef {
     pub version: u16,
     /// 1–5 parameters, in inspector order.
     pub params: &'static [ParamDef],
+    /// The `Choice` parameter whose options are the recipe's variants —
+    /// one card each, named `fx.<id>.<option>`, picked from a list in the
+    /// inspector (the Look's `preset`, refinement 1); `None`: one card.
+    pub variants: Option<&'static str>,
     pub cost: CostClass,
     pub compile: fn(&Params, &CompileCtx) -> Compiled,
 }
@@ -132,6 +150,34 @@ impl RecipeDef {
     pub fn param(&self, key: &str) -> Option<&'static ParamDef> {
         self.params.iter().find(|p| p.key == key)
     }
+
+    /// The variants (refinement 1): the options of the `variants` parameter, or none.
+    pub fn variant_options(&self) -> &'static [&'static str] {
+        match self.variants.and_then(|k| self.param(k)).map(|p| p.kind) {
+            Some(ParamKind::Choice { options, .. }) => options,
+            _ => &[],
+        }
+    }
+
+    /// i18n key of a choice option's name: `fx.<id>.<option>` for a variant
+    /// (one source for the card, the list and the block's title, D7),
+    /// `fx.choice.<option>` for any other choice.
+    pub fn option_name_key(&self, param: &str, option: &str) -> String {
+        if self.variants == Some(param) { format!("fx.{}.{option}", self.id) } else { format!("fx.choice.{option}") }
+    }
+
+    /// The variant stored `params` hold: their choice when this build has
+    /// it, the default when they hold none; `None` for a recipe without
+    /// variants or a variant this build lacks (a newer Kadr's preset).
+    pub fn variant_of(&self, params: &BTreeMap<String, ParamValue>) -> Option<&'static str> {
+        let key = self.variants?;
+        let ParamKind::Choice { options, default } = self.param(key)?.kind else { return None };
+        match params.get(key) {
+            None => Some(default),
+            Some(ParamValue::Choice(c)) => options.iter().copied().find(|o| *o == c.as_str()),
+            Some(_) => None,
+        }
+    }
 }
 
 const STRENGTH: ParamDef = ParamDef { key: "strength", kind: ParamKind::Number { min: 0.0, max: 1.0, default: NORMAL } };
@@ -140,27 +186,39 @@ const MOMENT: ParamDef = ParamDef { key: "moment", kind: ParamKind::Moment };
 const ZOOM_DIRECTION: ParamDef = ParamDef { key: "direction", kind: ParamKind::Choice { options: &["in", "out"], default: "in" } };
 const PAN_DIRECTION: ParamDef = ParamDef { key: "direction", kind: ParamKind::Choice { options: &["left", "right", "up", "down"], default: "right" } };
 
-static REGISTRY: [RecipeDef; 5] = [
-    RecipeDef { id: "smooth_zoom", category: Category::Motion, target: Target::Clip, version: 1, params: &[ZOOM_DIRECTION, STRENGTH, POINT], cost: CostClass::Cheap, compile: motion::smooth_zoom },
-    RecipeDef { id: "cinematic_push", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, POINT], cost: CostClass::Cheap, compile: motion::cinematic_push },
-    RecipeDef { id: "punch_in", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, MOMENT, POINT], cost: CostClass::Cheap, compile: motion::punch_in },
-    RecipeDef { id: "smooth_pan", category: Category::Motion, target: Target::Clip, version: 1, params: &[PAN_DIRECTION, STRENGTH], cost: CostClass::Cheap, compile: motion::smooth_pan },
-    RecipeDef { id: "handheld", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH], cost: CostClass::Cheap, compile: motion::handheld },
-];
+const SOFTNESS: ParamDef = ParamDef { key: "softness", kind: ParamKind::Number { min: 0.0, max: 1.0, default: 0.5 } };
+
+/// The Look's parameters: its `preset` options are `looks.json`'s keys
+/// (refinement 2), known only at run time.
+static LOOK_PARAMS: LazyLock<[ParamDef; 2]> =
+    LazyLock::new(|| [ParamDef { key: "preset", kind: ParamKind::Choice { options: look::preset_keys(), default: look::DEFAULT_PRESET } }, STRENGTH]);
+
+static REGISTRY: LazyLock<[RecipeDef; 7]> = LazyLock::new(|| {
+    [
+        RecipeDef { id: "smooth_zoom", category: Category::Motion, target: Target::Clip, version: 1, params: &[ZOOM_DIRECTION, STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: motion::smooth_zoom },
+        RecipeDef { id: "cinematic_push", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: motion::cinematic_push },
+        RecipeDef { id: "punch_in", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, MOMENT, POINT], variants: None, cost: CostClass::Cheap, compile: motion::punch_in },
+        RecipeDef { id: "smooth_pan", category: Category::Motion, target: Target::Clip, version: 1, params: &[PAN_DIRECTION, STRENGTH], variants: None, cost: CostClass::Cheap, compile: motion::smooth_pan },
+        RecipeDef { id: "handheld", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH], variants: None, cost: CostClass::Cheap, compile: motion::handheld },
+        RecipeDef { id: "look", category: Category::Look, target: Target::Clip, version: 1, params: &*LOOK_PARAMS, variants: Some("preset"), cost: CostClass::Medium, compile: look::look },
+        RecipeDef { id: "vignette", category: Category::Light, target: Target::Clip, version: 1, params: &[STRENGTH, SOFTNESS], variants: None, cost: CostClass::Cheap, compile: look::vignette },
+    ]
+});
 
 /// Every recipe this build runs, in card order.
 pub fn registry() -> &'static [RecipeDef] {
-    &REGISTRY
+    &REGISTRY[..]
 }
 
 pub fn recipe(id: &str) -> Option<&'static RecipeDef> {
-    REGISTRY.iter().find(|d| d.id == id)
+    registry().iter().find(|d| d.id == id)
 }
 
-/// The definition that evaluates `e`: its recipe at its version. `None`
-/// for a recipe or a version from a newer Kadr (kept, not run — spec §2).
+/// The definition that evaluates `e`: its recipe at its version, holding a
+/// variant this build has. `None` for a recipe, a version or a variant (a
+/// Look preset) from a newer Kadr — kept, not run (spec §2, refinement 3).
 pub fn definition(e: &AppliedEffect) -> Option<&'static RecipeDef> {
-    recipe(&e.recipe).filter(|d| d.version == e.version)
+    recipe(&e.recipe).filter(|d| d.version == e.version && (d.variants.is_none() || d.variant_of(&e.params).is_some()))
 }
 
 /// Whether an effect for `target` goes on a clip of a `kind` track.
@@ -198,20 +256,56 @@ mod tests {
     use kadr_core::{AssetId, TimeRange};
 
     #[test]
-    fn the_registry_holds_the_five_motion_effects_in_card_order() {
+    fn the_registry_holds_motion_then_looks_and_light_in_card_order() {
         let ids: Vec<&str> = registry().iter().map(|d| d.id).collect();
-        assert_eq!(ids, ["smooth_zoom", "cinematic_push", "punch_in", "smooth_pan", "handheld"]);
+        assert_eq!(ids, ["smooth_zoom", "cinematic_push", "punch_in", "smooth_pan", "handheld", "look", "vignette"]);
         for d in registry() {
-            assert_eq!((d.category, d.target, d.version, d.cost), (Category::Motion, Target::Clip, 1, CostClass::Cheap), "{}", d.id);
+            assert_eq!((d.target, d.version), (Target::Clip, 1), "{}", d.id);
             assert!(!d.params.is_empty() && d.params.len() <= 5, "{}: 1–5 parameters", d.id);
             assert!(d.param("strength").is_some(), "{} has a strength", d.id);
             assert_eq!(d.name_key(), format!("fx.{}", d.id));
         }
+        for d in &registry()[..5] {
+            assert_eq!((d.category, d.cost, d.variants), (Category::Motion, CostClass::Cheap, None), "{}", d.id);
+        }
+        let (look, vignette) = (recipe("look").unwrap(), recipe("vignette").unwrap());
+        assert_eq!((look.category, look.cost, look.variants), (Category::Look, CostClass::Medium, Some("preset")));
+        assert_eq!((vignette.category, vignette.cost, vignette.variants), (Category::Light, CostClass::Cheap, None));
         let keys = |id: &str| recipe(id).unwrap().params.iter().map(|p| p.key).collect::<Vec<_>>();
         assert_eq!(keys("smooth_zoom"), ["direction", "strength", "point"], "spec §5 order");
         assert_eq!(keys("punch_in"), ["strength", "moment", "point"]);
         assert_eq!(keys("smooth_pan"), ["direction", "strength"]);
         assert_eq!(keys("handheld"), ["strength"]);
+        assert_eq!(keys("look"), ["preset", "strength"]);
+        assert_eq!(keys("vignette"), ["strength", "softness"]);
+        let c = Clip::new(AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let e = fresh(look, &c, Time::ZERO);
+        assert_eq!((e.params["preset"].clone(), e.params["strength"].clone()), (ParamValue::Choice("cinematic".into()), ParamValue::Number(0.6)));
+        assert_eq!(fresh(vignette, &c, Time::ZERO).params["softness"], ParamValue::Number(0.5));
+    }
+
+    /// Refinements 1–3: the Look's presets are its variants, named from one
+    /// source; a preset this build lacks is a newer Kadr's effect.
+    #[test]
+    fn the_look_has_one_variant_per_preset_named_in_its_own_keys() {
+        let look = recipe("look").unwrap();
+        assert_eq!(look.variant_options(), ["cinematic", "warm", "soft_film", "dramatic", "vintage", "natural"]);
+        assert_eq!(look.variant_options(), crate::look::preset_keys(), "the options are looks.json's keys");
+        assert!(recipe("smooth_zoom").unwrap().variant_options().is_empty());
+        assert_eq!(look.option_name_key("preset", "warm"), "fx.look.warm");
+        assert_eq!(recipe("smooth_zoom").unwrap().option_name_key("direction", "in"), "fx.choice.in");
+        let with = |v: Option<ParamValue>| {
+            let mut e = AppliedEffect::new("look", 1, BTreeMap::new());
+            if let Some(v) = v {
+                e.params.insert("preset".into(), v);
+            }
+            e
+        };
+        assert_eq!(look.variant_of(&with(Some(ParamValue::Choice("vintage".into()))).params), Some("vintage"));
+        assert_eq!(look.variant_of(&with(None).params), Some("cinematic"), "missing: the default");
+        assert!(definition(&with(Some(ParamValue::Choice("bleach_bypass".into())))).is_none(), "a newer Kadr's preset is not run");
+        assert!(definition(&with(Some(ParamValue::Number(1.0)))).is_none());
+        assert!(definition(&with(None)).is_some() && definition(&with(Some(ParamValue::Choice("warm".into())))).is_some());
     }
 
     /// Spec §2: a recipe or a version from a newer Kadr is kept, not run.

@@ -2956,6 +2956,7 @@ dependencies = [
  "kadr-core",
  "kadr-project",
  "kadr-scene",
+ "serde",
  "serde_json",
 ]
 
@@ -3056,6 +3057,7 @@ name = "kadr-render"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
+ "kadr-effects",
  "kadr-scene",
  "png 0.17.16",
  "rayon",

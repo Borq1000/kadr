@@ -1,0 +1,40 @@
+{
+  "presets": [
+    {
+      "key": "cinematic",
+      "curve": [[0.0, 0.0], [0.25, 0.22], [0.5, 0.5], [0.75, 0.78], [1.0, 1.0]],
+      "split_tone": { "shadow_hue": 200, "shadow_amount": 0.2, "highlight_hue": 35, "highlight_amount": 0.15, "balance": 0.0 },
+      "vignette": 0.25,
+      "adjust": { "saturation": 0.9 }
+    },
+    {
+      "key": "warm",
+      "curve": [[0.0, 0.0], [0.5, 0.54], [1.0, 1.0]],
+      "adjust": { "temperature": 0.25, "tint": 0.05 }
+    },
+    {
+      "key": "soft_film",
+      "curve": [[0.0, 0.06], [0.3, 0.31], [0.7, 0.7], [1.0, 0.95]],
+      "grain": 0.04
+    },
+    {
+      "key": "dramatic",
+      "curve": [[0.0, 0.0], [0.25, 0.17], [0.5, 0.5], [0.75, 0.84], [1.0, 1.0]],
+      "vignette": 0.4,
+      "adjust": { "saturation": 0.75 }
+    },
+    {
+      "key": "vintage",
+      "curve": [[0.0, 0.1], [0.5, 0.52], [1.0, 0.92]],
+      "split_tone": { "shadow_hue": 40, "shadow_amount": 0.2, "highlight_hue": 50, "highlight_amount": 0.05, "balance": 0.0 },
+      "vignette": 0.3,
+      "grain": 0.05,
+      "adjust": { "saturation": 0.85 }
+    },
+    {
+      "key": "natural",
+      "curve": [[0.0, 0.0], [0.25, 0.235], [0.5, 0.5], [0.75, 0.765], [1.0, 1.0]],
+      "adjust": { "saturation": 0.95 }
+    }
+  ]
+}

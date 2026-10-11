@@ -142,7 +142,7 @@ pub fn handheld(p: &Params, ctx: &CompileCtx) -> Compiled {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{recipe, registry, CompileCtx};
+    use crate::registry::{recipe, registry, Category, CompileCtx};
     use kadr_core::Time;
     use kadr_project::{ParamValue, SourceTime};
     use kadr_scene::{Placement, SizeU, Vec2};
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn strength_scales_the_motion_and_zero_is_none() {
-        for d in registry() {
+        for d in registry().iter().filter(|d| d.category == Category::Motion) {
             let zero = run(d.id, &[("strength", ParamValue::Number(0.0)), ("moment", ParamValue::Moment(SourceTime(Time::ZERO)))], &ctx(0.7));
             assert!(zero.is_identity(), "{}: {zero:?}", d.id);
         }
@@ -269,7 +269,7 @@ mod tests {
         for aspect in [16.0 / 9.0, 9.0 / 16.0, 1.0] {
             let base = filling(aspect);
             for window in WINDOWS {
-                for d in registry() {
+                for d in registry().iter().filter(|d| d.category == Category::Motion) {
                     let points: &[(f64, f64)] = if d.param("point").is_some() { &[(0.5, 0.5), (0.0, 0.0), (1.0, 0.3)] } else { &[(0.5, 0.5)] };
                     let dirs: &[&str] = if d.param("direction").is_some() { &["in", "out", "left", "right", "up", "down"] } else { &["in"] };
                     for s in [0.3, 0.6, 1.0] {

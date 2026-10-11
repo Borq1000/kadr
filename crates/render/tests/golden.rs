@@ -273,3 +273,15 @@ fn grain() {
     let (s, i) = graded(vec![Effect::Grain(Grain { amount: 0.4, size: 3.0, seed: 7 })]);
     check("grain", s, i);
 }
+
+/// One golden per Look preset at «Обычно» (spec §9): `look_<key>.png`.
+/// Re-bless after the owner tunes `looks.json` (Task 9).
+#[test]
+fn looks() {
+    let ctx = kadr_effects::CompileCtx::still(CANVAS, Time::ZERO, 7);
+    for key in kadr_effects::look::preset_keys() {
+        let preset = kadr_effects::look::preset(key).expect("a listed preset");
+        let (s, i) = graded(kadr_effects::look::look_effects(preset, 1.0, &ctx));
+        check(&format!("look_{key}"), s, i);
+    }
+}

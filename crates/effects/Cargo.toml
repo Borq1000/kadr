@@ -9,4 +9,5 @@ description = "Kadr effect recipes: registry, parameters, compile into scene pri
 kadr-core = { path = "../core" }
 kadr-project = { path = "../project" }
 kadr-scene = { path = "../scene" }
+serde.workspace = true
 serde_json.workspace = true

@@ -11,4 +11,5 @@ kadr-scene = { path = "../scene" }
 rayon.workspace = true
 
 [dev-dependencies]
+kadr-effects = { path = "../effects" }
 png = "0.17"

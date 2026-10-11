@@ -802,5 +802,15 @@
   "fx.pick.hidden": "The clip is not visible in this frame",
   "fx.tip": "Effects: {list}",
   "fx.tip.off": "{name} (off)",
-  "fx.tip.unavailable": "{name} (unavailable)"
+  "fx.tip.unavailable": "{name} (unavailable)",
+  "fx.look": "Look",
+  "fx.look.cinematic": "Cinematic",
+  "fx.look.warm": "Warm",
+  "fx.look.soft_film": "Soft Film",
+  "fx.look.dramatic": "Dramatic",
+  "fx.look.vintage": "Vintage",
+  "fx.look.natural": "Natural",
+  "fx.vignette": "Vignette",
+  "fx.param.preset": "Preset",
+  "fx.param.softness": "Softness"
 }
