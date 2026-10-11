@@ -877,10 +877,15 @@ mod tests {
         assert!(th.shown(zoom(), None).is_none(), "nothing yet: the icon");
         let img = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(2, 2));
         assert!(th.shown(zoom(), Some(img.clone())).is_some());
-        assert_eq!(th.shown(zoom(), None), Some(img), "the next frame is not there yet");
+        assert_eq!(th.shown(zoom(), None), Some(img.clone()), "the next frame is not there yet");
         assert!(th.shown(Card::parse("punch_in").unwrap(), None).is_none(), "per card");
         th.forget_shown(zoom());
         assert!(th.shown(zoom(), None).is_none());
+        // Per preset: one Look card's picture never stands in for another's.
+        let look = |k: &str| Card::parse(&format!("look:{k}")).unwrap();
+        assert!(th.shown(look("warm"), Some(img.clone())).is_some());
+        assert!(th.shown(look("dramatic"), None).is_none(), "another preset of the same recipe");
+        assert_eq!(th.shown(look("warm"), None), Some(img));
     }
 
     /// A card loops only while its loop plays (a hovered motion card, once

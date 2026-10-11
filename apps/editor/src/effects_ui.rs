@@ -84,10 +84,10 @@ pub fn make_override(seq: &Sequence, card: Card, clips: &[ClipId], at: Time, kee
 
 impl PreviewOverride {
     /// Whether it no longer shows what a click would apply: the clips it
-    /// goes on are others now, or the playhead moved and `def` has a
+    /// goes on are others now, or the playhead moved and its recipe has a
     /// «Момент» (made at the old playhead, a punch would land there).
-    pub fn outdated(&self, def: &RecipeDef, targets: &[ClipId], playhead: Time) -> bool {
-        self.clips() != targets || (self.at != playhead && def.params.iter().any(|p| p.kind == ParamKind::Moment))
+    pub fn outdated(&self, targets: &[ClipId], playhead: Time) -> bool {
+        self.clips() != targets || (self.at != playhead && self.card.def.params.iter().any(|p| p.kind == ParamKind::Moment))
     }
 
     /// The effects put on a copy of the sequence (the preview's snapshot),
@@ -666,7 +666,7 @@ impl App {
         let gone = hover_gone(self.fx.hover.map(|(c, _)| c), &listed);
         let stale = self.fx.preview.as_ref().is_some_and(|o| {
             let playhead = if self.playing { o.at } else { self.playhead };
-            o.outdated(o.card.def, &targets(seq, sel, o.card.def), playhead)
+            o.outdated(&targets(seq, sel, o.card.def), playhead)
         });
         if gone {
             self.fx_clear_hover();
@@ -1186,12 +1186,17 @@ mod tests {
         let (ti, ci) = applied.locate_clip(v1).unwrap();
         applied.tracks[ti].clips[ci].put_effect(effect.clone());
         let id = applied.tracks[ti].clips[ci].effects[0].id;
+        // An effect after the Look: the replacement keeps the Look's place.
+        let hand = card("handheld").fresh(&applied.tracks[ti].clips[ci].clone(), Time::from_secs(1));
+        applied.tracks[ti].clips[ci].put_effect(hand.clone());
         let Some(EditCommand::Batch { commands, .. }) = apply_batch(&applied, card("look:dramatic"), &[v1], Time::from_secs(1)) else { panic!("a replacement") };
         let [EditCommand::AddEffect { effect: dramatic, .. }] = &commands[..] else { panic!("{commands:?}") };
         applied.tracks[ti].clips[ci].put_effect(dramatic.clone());
         let looks: Vec<&AppliedEffect> = applied.tracks[ti].clips[ci].effects.iter().filter(|e| e.recipe == "look").collect();
         assert_eq!(looks.len(), 1, "one Look per clip (spec §2)");
         assert_eq!((looks[0].id, &looks[0].params["preset"]), (id, &ParamValue::Choice("dramatic".into())), "replaced in place");
+        let order: Vec<(&str, EffectId)> = applied.tracks[ti].clips[ci].effects.iter().map(|e| (e.recipe.as_str(), e.id)).collect();
+        assert_eq!(order, [("look", id), ("handheld", hand.id)], "the Look stays first, with its id; Handheld after it");
         assert!(apply_batch(&applied, card("look:dramatic"), &[v1], Time::from_secs(1)).is_none(), "the same preset again: nothing to send");
     }
 
@@ -1302,9 +1307,9 @@ mod tests {
         let at = Time::from_secs;
         let punch = card("punch_in");
         let o = make_override(&s, punch, &[v1], at(1), None).unwrap();
-        assert!(!o.outdated(punch.def, &[v1], at(1)));
-        assert!(o.outdated(punch.def, &[v1], at(3)), "its moment is the frame at 1 s");
-        assert!(o.outdated(punch.def, &[], at(1)), "nothing selected any more");
+        assert!(!o.outdated(&[v1], at(1)));
+        assert!(o.outdated(&[v1], at(3)), "its moment is the frame at 1 s");
+        assert!(o.outdated(&[], at(1)), "nothing selected any more");
         let moved = make_override(&s, punch, &[v1], at(3), Some(&o)).unwrap();
         assert_eq!(moved.at, at(3));
         assert_eq!(moved.effects[0].1.id, o.effects[0].1.id, "the same instance");
@@ -1314,7 +1319,7 @@ mod tests {
 
         let hand = card("handheld");
         let h = make_override(&s, hand, &[v1], at(1), None).unwrap();
-        assert!(!h.outdated(hand.def, &[v1], at(3)), "no moment: the playhead changes nothing");
+        assert!(!h.outdated(&[v1], at(3)), "no moment: the playhead changes nothing");
         assert_eq!(make_override(&s, hand, &[v1], at(3), Some(&h)), Some(PreviewOverride { at: at(3), ..h.clone() }), "made again: the same shake");
         assert_ne!(make_override(&s, hand, &[v1], at(1), Some(&o)).unwrap().effects[0].1.id, o.effects[0].1.id, "another recipe's instance is not reused");
         assert!(make_override(&s, hand, &[], at(1), Some(&h)).is_none(), "on no clip: none");

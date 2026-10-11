@@ -115,13 +115,18 @@ export component EffectsPanel inherits Rectangle {
             current: 1;
             selected(i) => { root.tab-selected(i); }
         }
+        // Search and chips keep their own heights; the cards below take the
+        // rest. Nothing here may stretch: a LineEdit has no maximum height,
+        // so a block with any stretch would grow its search field.
         VerticalLayout {
+            vertical-stretch: 0;
             padding-left: 8px;
             padding-right: 8px;
             padding-top: 8px;
             padding-bottom: 4px;
             spacing: 8px;
             LineEdit {
+                vertical-stretch: 0;
                 placeholder-text: Tr.t("fx.search");
                 text <=> root.search;
                 edited(t) => {
@@ -133,9 +138,11 @@ export component EffectsPanel inherits Rectangle {
             // (D6): the Flickable takes a horizontal wheel or a touchpad
             // swipe; a vertical wheel, which it ignores when it cannot scroll
             // vertically, falls through to the TouchArea beneath it. A fade
-            // marks each side with more chips.
+            // marks each side with more chips. A Rectangle stretches by
+            // default (a fixed height does not change that): stretch 0.
             Rectangle {
                 height: 24px;
+                vertical-stretch: 0;
                 clip: true;
                 TouchArea {
                     scroll-event(e) => {
