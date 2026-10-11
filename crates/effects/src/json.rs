@@ -63,6 +63,22 @@ pub fn effect_json(clip: &Clip, e: &AppliedEffect) -> Value {
 /// Client parameters for `def` on `clip`, each checked like a command
 /// would; the error names the key and the reason.
 pub fn params_from_json(def: &RecipeDef, clip: &Clip, json: &Map<String, Value>) -> Result<BTreeMap<String, ParamValue>, String> {
+    params_from_json_in(def, clip, json, None, Time::ZERO)
+}
+
+/// [`params_from_json`] for a caller that knows more. `current` is the
+/// effect's stored values when updating: a moment echoed back from
+/// [`value_json`] (milliseconds are floored) resolves to the stored one,
+/// so it is not a change. `slack` widens the snap of a timeline `at_ms`
+/// just before the clip's first frame (the AI passes half a frame); it is
+/// at least one millisecond, the flooring of an echoed start.
+pub fn params_from_json_in(
+    def: &RecipeDef,
+    clip: &Clip,
+    json: &Map<String, Value>,
+    current: Option<&BTreeMap<String, ParamValue>>,
+    slack: Time,
+) -> Result<BTreeMap<String, ParamValue>, String> {
     let mut out = BTreeMap::new();
     for (k, v) in json {
         let d = def
@@ -76,7 +92,13 @@ pub fn params_from_json(def: &RecipeDef, clip: &Clip, json: &Map<String, Value>)
                 let get = |c: &str| o.get(c).and_then(Value::as_f64).ok_or_else(|| format!("{k} must be {{\"x\": 0..1, \"y\": 0..1}}"));
                 ParamValue::Point { x: get("x")?, y: get("y")? }
             }
-            ParamKind::Moment => ParamValue::Moment(moment_from_json(clip, k, v)?),
+            ParamKind::Moment => {
+                let stored = match current.and_then(|c| c.get(k.as_str())) {
+                    Some(ParamValue::Moment(m)) => Some(*m),
+                    _ => None,
+                };
+                ParamValue::Moment(moment_from_json(clip, k, v, stored, slack)?)
+            }
         };
         d.check(&value)?;
         out.insert(k.clone(), value);
@@ -84,29 +106,42 @@ pub fn params_from_json(def: &RecipeDef, clip: &Clip, json: &Map<String, Value>)
     Ok(out)
 }
 
-fn moment_from_json(clip: &Clip, k: &str, v: &Value) -> Result<SourceTime, String> {
+/// `{at_ms}` (timeline, inside the clip), `{source_ms}`, or what
+/// [`value_json`] writes, `{at_ms, source_ms, visible}` — then `source_ms`
+/// wins, it is the exact one.
+fn moment_from_json(clip: &Clip, k: &str, v: &Value, stored: Option<SourceTime>, slack: Time) -> Result<SourceTime, String> {
     let shape = || format!("{k} must be {{\"at_ms\": int}} (timeline, inside the clip) or {{\"source_ms\": int}}");
-    let o = v.as_object().filter(|o| o.len() == 1).ok_or_else(shape)?;
+    let o = v
+        .as_object()
+        .filter(|o| o.keys().all(|key| matches!(key.as_str(), "at_ms" | "source_ms" | "visible")))
+        .ok_or_else(shape)?;
     let ms = |key: &str| -> Result<Option<i64>, String> {
         o.get(key)
             .map(|x| x.as_i64().filter(|m| m.unsigned_abs() <= MAX_MS).ok_or_else(|| format!("{k}.{key} must be an integer within ±{MAX_MS}")))
             .transpose()
     };
-    if let Some(ms) = ms("at_ms")? {
-        let t = Time::from_millis(ms);
-        if t < clip.timeline_in || t >= clip.timeline_out {
-            return Err(format!(
-                "{k}.at_ms {ms} is outside the clip ({}..{} ms); use source_ms for a moment off the clip",
-                clip.timeline_in.as_millis(),
-                clip.timeline_out.as_millis()
-            ));
-        }
-        return Ok(SourceTime(clip.source_time_at(t)));
+    let (at, source) = (ms("at_ms")?, ms("source_ms")?);
+    if let Some(ms) = source {
+        // Milliseconds are floored when shown: the stored moment within that ms is the one named.
+        return Ok(stored.filter(|m| m.0.as_millis() == ms).unwrap_or(SourceTime(Time::from_millis(ms))));
     }
-    match ms("source_ms")? {
-        Some(ms) => Ok(SourceTime(Time::from_millis(ms))),
-        None => Err(shape()),
+    let ms = at.ok_or_else(shape)?;
+    let degenerate = clip.source_out == clip.source_in;
+    if let Some(m) = stored.filter(|m| !degenerate && clip.timeline_time_of(m.0).as_millis() == ms) {
+        return Ok(m);
     }
+    let mut t = Time::from_millis(ms);
+    if t < clip.timeline_in && clip.timeline_in - t < slack.max(Time::from_millis(1)) {
+        t = clip.timeline_in;
+    }
+    if t < clip.timeline_in || t >= clip.timeline_out {
+        return Err(format!(
+            "{k}.at_ms {ms} is outside the clip ({}..{} ms); use source_ms for a moment off the clip",
+            clip.timeline_in.as_millis(),
+            clip.timeline_out.as_millis()
+        ));
+    }
+    Ok(SourceTime(clip.source_time_at(t)))
 }
 
 #[cfg(test)]
@@ -176,5 +211,42 @@ mod tests {
         assert_eq!(j["params"]["moment"], json!({"at_ms": 25_000, "source_ms": 45_000, "visible": false}));
         assert_eq!(j["params"]["strength"], json!(0.6));
         assert_eq!(effect_json(&c, &AppliedEffect::new("glitch_v2", 1, BTreeMap::new()))["known"], false);
+    }
+
+    /// R11(a): what `value_json` writes is accepted back, `source_ms` wins,
+    /// and an echoed unchanged moment is that same moment (ms flooring).
+    #[test]
+    fn a_moment_echoed_from_get_state_is_accepted_and_unchanged() {
+        let c = clip();
+        let def = recipe("punch_in").unwrap();
+        let stored = ParamValue::Moment(SourceTime(Time::from_secs(35) + Time(1234)));
+        let cur = BTreeMap::from([("moment".to_string(), stored.clone())]);
+        let echo = value_json(&c, &stored);
+        let got = |j: Value, cur: Option<&BTreeMap<String, ParamValue>>| params_from_json_in(def, &c, &obj(json!({"moment": j})), cur, Time::ZERO).unwrap()["moment"].clone();
+        assert_eq!(got(echo.clone(), Some(&cur)), stored, "the whole echo");
+        assert_eq!(got(json!({"at_ms": echo["at_ms"]}), Some(&cur)), stored, "at_ms alone, floored");
+        assert_eq!(got(json!({"source_ms": echo["source_ms"]}), Some(&cur)), stored, "source_ms alone, floored");
+        assert_eq!(got(json!({"source_ms": 36_000}), Some(&cur)), ParamValue::Moment(SourceTime(Time::from_secs(36))), "a different moment is a change");
+        assert_eq!(got(json!({"at_ms": 11_000, "source_ms": 45_000, "visible": true}), None), ParamValue::Moment(SourceTime(Time::from_secs(45))), "source_ms is preferred");
+        let off = ParamValue::Moment(SourceTime(Time::from_secs(45) + Time(99)));
+        let cur_off = BTreeMap::from([("moment".to_string(), off.clone())]);
+        assert_eq!(got(value_json(&c, &off), Some(&cur_off)), off, "an off-clip moment echoes back too");
+        assert!(params_from_json(def, &c, &obj(json!({"moment": {"visible": true}}))).unwrap_err().contains("moment must be"));
+        assert!(params_from_json(def, &c, &obj(json!({"moment": {"at_ms": 12_000, "bogus": 1}}))).unwrap_err().contains("moment must be"));
+    }
+
+    /// R11(b): the floored millisecond of a clip that starts between two
+    /// milliseconds names its first frame, not a frame before the clip.
+    #[test]
+    fn at_ms_snaps_to_the_clips_frame_exact_start() {
+        let mut c = clip();
+        c.move_to(Time::from_secs(10) + Time(1000));
+        let def = recipe("punch_in").unwrap();
+        let at = |ms: i64| params_from_json(def, &c, &obj(json!({"moment": {"at_ms": ms}})));
+        assert_eq!(at(10_000).unwrap()["moment"], ParamValue::Moment(SourceTime(Time::from_secs(30))));
+        assert!(at(9_999).is_err());
+        // A caller-given slack (the AI's half frame) widens the snap.
+        let wide = params_from_json_in(def, &c, &obj(json!({"moment": {"at_ms": 9_990}})), None, Time::from_millis(16)).unwrap();
+        assert_eq!(wide["moment"], ParamValue::Moment(SourceTime(Time::from_secs(30))));
     }
 }

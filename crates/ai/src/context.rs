@@ -37,7 +37,15 @@ pub fn project_context(project: &Project, st: &EditorState) -> serde_json::Value
                         "selected": st.selection.contains(&c.id),
                     });
                     if !c.effects.is_empty() {
-                        j["effects"] = c.effects.iter().map(|e| kadr_effects::json::effect_json(c, e)).collect();
+                        // An effect this version cannot run: no raw parameters leave the machine.
+                        j["effects"] = c
+                            .effects
+                            .iter()
+                            .map(|e| match kadr_effects::definition(e) {
+                                Some(_) => kadr_effects::json::effect_json(c, e),
+                                None => json!({"id": e.id.to_string(), "recipe": e.recipe, "known": false, "enabled": e.enabled}),
+                            })
+                            .collect();
                     }
                     j
                 })

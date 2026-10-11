@@ -228,7 +228,21 @@ pub fn parse_commands(json: &str) -> Result<Vec<AiCommand>, ValidationError> {
 
 /// Validates against the current project state and translates into engine
 /// commands. All-or-nothing: one invalid command rejects the whole action.
+/// An effect command that would change nothing (the clip already has the
+/// effect with these settings) is dropped, not rejected: a plan with it
+/// still stands (ruling R10).
 pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> Result<Vec<EditCommand>, ValidationError> {
+    validate_with(cmds, project, perms, false)
+}
+
+/// [`validate`] for a client that sends one op and wants to know why
+/// nothing happens (MCP): an effect command that changes nothing is
+/// rejected with "no change".
+pub fn validate_strict(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> Result<Vec<EditCommand>, ValidationError> {
+    validate_with(cmds, project, perms, true)
+}
+
+fn validate_with(cmds: &[AiCommand], project: &Project, perms: &Permissions, strict: bool) -> Result<Vec<EditCommand>, ValidationError> {
     if cmds.len() > perms.max_commands {
         return Err(ValidationError::TooMany(cmds.len()));
     }
@@ -243,10 +257,17 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
         Ok(tt)
     };
     let clip = |index: usize, id: &str| -> Result<ClipId, ValidationError> {
-        ClipId::parse(id)
+        let c = ClipId::parse(id)
             .filter(|c| seq.clip(*c).is_some())
-            .ok_or_else(|| ValidationError::UnknownClip { index, id: id.to_string() })
+            .ok_or_else(|| ValidationError::UnknownClip { index, id: id.to_string() })?;
+        let (ti, _) = seq.locate_clip(c).unwrap();
+        if seq.tracks[ti].locked {
+            return Err(ValidationError::Range { index, msg: format!("clip {id} is on the locked track {}", seq.tracks[ti].name) });
+        }
+        Ok(c)
     };
+    // A millisecond bound within half a frame of a clip's first frame names it.
+    let half_frame = seq.frame_rate.frame_duration().div_ratio(1, 2);
     let destructive = |index: usize| -> Result<(), ValidationError> {
         if perms.allow_destructive { Ok(()) } else { Err(ValidationError::Permission { index, msg: "destructive edits are disabled for AI".into() }) }
     };
@@ -409,13 +430,26 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                 let def = kadr_effects::recipe(recipe).ok_or_else(|| range(format!("unknown effect {recipe:?} (one of {})", ids())))?;
                 let (ti, _) = seq.locate_clip(id).unwrap();
                 if !kadr_effects::fits(def.target, seq.tracks[ti].kind) {
-                    return Err(range(format!("{recipe} is for video clips")));
+                    let on = match def.target {
+                        kadr_effects::Target::Clip => "video clips",
+                        kadr_effects::Target::AudioClip => "audio clips",
+                        kadr_effects::Target::Cut => "cuts between clips",
+                    };
+                    return Err(range(format!("{recipe} is for {on}")));
                 }
-                let mut values = kadr_effects::json::params_from_json(def, c, params).map_err(range)?;
+                let current = c.effect_of(recipe).map(|e| &e.params);
+                let mut values = kadr_effects::json::params_from_json_in(def, c, params, current, half_frame).map_err(range)?;
                 kadr_effects::complete(def, &mut values, c, c.timeline_in + Time(c.duration().flicks() / 2));
                 let effect = AppliedEffect::new(def.id, def.version, values);
                 if !c.clone().put_effect(effect.clone()) {
-                    return Err(range(format!("no change: the clip already has {recipe} with these parameters")));
+                    if strict {
+                        return Err(range(format!("no change: the clip already has {recipe} with these parameters")));
+                    }
+                    continue;
+                }
+                // Replacing an instance drops its keyframes.
+                if c.effects.iter().any(|x| x.recipe == *recipe && c.animation.has_effect_tracks(x.id)) {
+                    destructive(i)?;
                 }
                 EditCommand::AddEffect { clip: id, effect }
             }
@@ -428,7 +462,7 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                 if params.is_empty() && enabled.is_none() {
                     return Err(range("give params and/or enabled".into()));
                 }
-                let values = kadr_effects::json::params_from_json(def, c, params).map_err(range)?;
+                let values = kadr_effects::json::params_from_json_in(def, c, params, Some(&e.params), half_frame).map_err(range)?;
                 // R24: a number with keyframes ignores its stored value.
                 if let Some(d) = def.params.iter().find(|d| values.contains_key(d.key) && c.animation.is_animated(TrackKey::fx(e.id, d.key))) {
                     return Err(ValidationError::Animated { index: i, param: d.key });
@@ -439,7 +473,10 @@ pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> R
                     probe.enabled = *on;
                 }
                 if probe == *e {
-                    return Err(range("no change: the effect already has these settings".into()));
+                    if strict {
+                        return Err(range("no change: the effect already has these settings".into()));
+                    }
+                    continue;
                 }
                 EditCommand::UpdateEffect { clip: id, id: e.id, params: values, enabled: *enabled }
             }
@@ -659,7 +696,9 @@ mod tests {
         let set = |params: serde_json::Value| cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": fid.to_string(), "params": params}));
         let ok = validate(&[set(json!({"direction": "out"}))], &p, &perms).unwrap();
         assert!(matches!(&ok[0], EditCommand::UpdateEffect { params, enabled: None, .. } if params["direction"] == ParamValue::Choice("out".into())));
-        assert!(validate(&[set(json!({"direction": "in"}))], &p, &perms).unwrap_err().to_string().contains("no change"));
+        // R10: a plan tolerates a command that changes nothing (it is dropped); one op asked alone says why.
+        assert_eq!(validate(&[set(json!({"direction": "in"}))], &p, &perms).unwrap(), vec![]);
+        assert!(validate_strict(&[set(json!({"direction": "in"}))], &p, &perms).unwrap_err().to_string().contains("no change"));
         p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(fid, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
         assert_eq!(validate(&[set(json!({"strength": 0.9}))], &p, &perms).unwrap_err(), ValidationError::Animated { index: 0, param: "strength" });
         assert!(validate(&[set(json!({"direction": "out"}))], &p, &perms).is_ok(), "only the given params count");
@@ -699,5 +738,97 @@ mod tests {
         let ctx = crate::context::project_context(&p, &Default::default());
         assert_eq!(ctx["tracks"][0]["clips"][0]["effects"][0]["recipe"], "handheld");
         assert!(ctx["tracks"][1]["clips"][0].get("effects").is_none(), "a clip without effects says nothing");
+    }
+
+    fn with_effect(p: &mut Project, recipe: &str) -> kadr_core::EffectId {
+        let c = &p.sequence().tracks[0].clips[0];
+        let e = kadr_effects::fresh(kadr_effects::recipe(recipe).unwrap(), c, Time::from_secs(12));
+        let id = e.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        id
+    }
+
+    /// R10: one no-op effect command must not lose the rest of a paid plan.
+    #[test]
+    fn a_plan_tolerates_no_op_effect_commands_but_one_op_alone_says_why() {
+        let (mut p, id) = fx_project();
+        with_effect(&mut p, "handheld");
+        let perms = Permissions::default();
+        let again = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld"}));
+        let marker = cmd(json!({"type": "add_marker", "at_ms": 1_000, "name": "m"}));
+        let zoom = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "smooth_zoom"}));
+        let out = validate(&[again.clone(), marker, zoom], &p, &perms).unwrap();
+        assert_eq!(out.len(), 2, "the no-op add is dropped: {out:?}");
+        assert!(matches!(out[0], EditCommand::AddMarker(_)) && matches!(out[1], EditCommand::AddEffect { .. }));
+        let msg = validate_strict(&[again], &p, &perms).unwrap_err().to_string();
+        assert!(msg.contains("no change") && msg.contains("handheld"), "{msg}");
+        // Still an error in a plan: a real mistake.
+        assert!(validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "params": {"strength": 5}}))], &p, &perms).is_err());
+    }
+
+    /// R11(a): what get_state shows is accepted back and is no change.
+    #[test]
+    fn echoing_an_unchanged_moment_is_no_change() {
+        let (mut p, id) = fx_project();
+        let fid = with_effect(&mut p, "punch_in");
+        p.sequence_mut().tracks[0].clips[0].effects[0].params.insert("moment".into(), ParamValue::Moment(SourceTime(Time::from_secs(32) + Time(1234))));
+        let c = &p.sequence().tracks[0].clips[0];
+        let echo = kadr_effects::json::value_json(c, &c.effects[0].params["moment"]);
+        let set = cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": fid.to_string(), "params": {"moment": echo}}));
+        assert_eq!(validate(&[set.clone()], &p, &Permissions::default()).unwrap(), vec![]);
+        assert!(validate_strict(&[set], &p, &Permissions::default()).unwrap_err().to_string().contains("no change"));
+    }
+
+    /// R11(b): a clip that starts between two milliseconds is addressed by the floored one.
+    #[test]
+    fn a_floored_clip_start_names_the_clips_first_frame() {
+        let (mut p, id) = fx_project();
+        p.sequence_mut().tracks[0].clips[0].move_to(Time::from_secs(10) + Time(1000));
+        let add = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "punch_in", "params": {"moment": {"at_ms": 10_000}}}));
+        let out = validate(&[add], &p, &Permissions::default()).unwrap();
+        let EditCommand::AddEffect { effect, .. } = &out[0] else { panic!() };
+        assert_eq!(effect.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(30))));
+    }
+
+    /// R11(e): replacing an effect drops its keyframes, which is destructive.
+    #[test]
+    fn replacing_an_animated_effect_needs_the_destructive_permission() {
+        let (mut p, id) = fx_project();
+        let fid = with_effect(&mut p, "handheld");
+        let add = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "params": {"strength": 0.9}}));
+        let no = Permissions { allow_destructive: false, max_commands: 10 };
+        assert!(validate(&[add.clone()], &p, &no).is_ok(), "no keyframes: nothing is lost");
+        p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(fid, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
+        assert!(matches!(validate(&[add.clone()], &p, &no), Err(ValidationError::Permission { .. })));
+        assert!(validate(&[add], &p, &Permissions::default()).is_ok());
+    }
+
+    /// R11(f): a locked track fails at validation, with a reason.
+    #[test]
+    fn a_clip_on_a_locked_track_is_refused_with_a_reason() {
+        let (mut p, id) = fx_project();
+        p.sequence_mut().tracks[0].locked = true;
+        let perms = Permissions::default();
+        for j in [
+            json!({"type": "add_effect", "clip_id": id, "recipe": "handheld"}),
+            json!({"type": "move_clip", "clip_id": id, "to_ms": 12_000}),
+            json!({"type": "change_speed", "clip_id": id, "speed": 2.0}),
+        ] {
+            let msg = validate(&[cmd(j)], &p, &perms).unwrap_err().to_string();
+            assert!(msg.contains("locked"), "{msg}");
+        }
+    }
+
+    /// R11(c): the cloud gets no raw data of an effect this version cannot run.
+    #[test]
+    fn the_context_tells_the_cloud_nothing_of_unknown_effects() {
+        let (mut p, _) = fx_project();
+        let mut future = AppliedEffect::new("glitch_v2", 1, Default::default());
+        future.params.insert("secret".into(), ParamValue::Unknown(json!({"blob": [1, 2, 3]})));
+        p.sequence_mut().tracks[0].clips[0].effects.push(future);
+        let ctx = crate::context::project_context(&p, &Default::default());
+        let e = &ctx["tracks"][0]["clips"][0]["effects"][0];
+        assert_eq!((e["recipe"].as_str(), e["known"].as_bool(), e["enabled"].as_bool()), (Some("glitch_v2"), Some(false), Some(true)));
+        assert!(e.get("params").is_none() && !ctx.to_string().contains("blob"), "{e}");
     }
 }

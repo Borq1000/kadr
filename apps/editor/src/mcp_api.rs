@@ -135,7 +135,7 @@ fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditComm
             let perms = kadr_ai::command::Permissions { allow_destructive: true, max_commands: 500 };
             // Validated one at a time, so the validator's own "command 0:"
             // prefix is meaningless; the caller adds the real op index.
-            kadr_ai::command::validate(&[cmd], project, &perms).map_err(|e| {
+            kadr_ai::command::validate_strict(&[cmd], project, &perms).map_err(|e| {
                 let s = e.to_string();
                 BridgeError::new("edit_rejected", s.strip_prefix("command 0: ").map(str::to_string).unwrap_or(s))
             })
@@ -576,6 +576,20 @@ mod tests {
         assert_eq!(e.code, "edit_rejected");
         let e = edit_commands(&p, &[], &serde_json::json!({"type": "split_clip"})).unwrap_err();
         assert_eq!(e.code, "bad_params", "ops must be an array");
+    }
+
+    /// R10: the AI plan drops a no-op effect command; one MCP op says why it does nothing.
+    #[test]
+    fn a_no_op_effect_op_is_rejected_with_a_reason() {
+        let (mut p, v, _) = project_with_pair();
+        let e = kadr_project::AppliedEffect::new("handheld", 1, [("strength".to_string(), kadr_project::ParamValue::Number(0.6))].into());
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let add = serde_json::json!({"type": "add_effect", "clip_id": v.to_string(), "recipe": "handheld"});
+        let e = edit_commands(&p, &[], &serde_json::json!([add])).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        assert!(e.message.starts_with("op #0: no change"), "{}", e.message);
+        let fresh = serde_json::json!({"type": "add_effect", "clip_id": v.to_string(), "recipe": "smooth_zoom"});
+        assert!(matches!(edit_commands(&p, &[], &serde_json::json!([fresh])).unwrap()[0], EditCommand::AddEffect { .. }));
     }
 
     #[test]

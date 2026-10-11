@@ -459,6 +459,12 @@ impl Animation {
         self.tracks.iter().filter(|(_, keys)| keys.binary_search_by_key(&at, |k| k.at).is_ok()).map(|(p, _)| p.clone()).collect()
     }
 
+    /// `effect` has parameter tracks (unreadable ones count).
+    pub fn has_effect_tracks(&self, effect: EffectId) -> bool {
+        let prefix = format!("fx:{effect}:");
+        self.tracks.keys().any(|k| k.as_fx().is_some_and(|f| f.effect == effect)) || self.unknown.keys().any(|k| k.starts_with(&prefix))
+    }
+
     /// Drops every track of `effect`'s parameters — unreadable ones kept
     /// verbatim too (removing an effect takes its tracks, effects spec §2).
     /// `true` when something went.
@@ -846,7 +852,9 @@ mod tests {
         a.set_key(TrackKey::fx(fx, "strength"), st(0), 0.5, None);
         a.set_key(TrackKey::fx(other, "strength"), st(0), 0.5, None);
         a.set_key(AnimParam::X, st(0), 1.0, None);
+        assert!(a.has_effect_tracks(fx) && a.has_effect_tracks(other));
         assert!(a.remove_effect(fx));
+        assert!(!a.has_effect_tracks(fx));
         assert_eq!(a.keys(), vec![TrackKey::Clip(AnimParam::X), TrackKey::fx(other, "strength")]);
         assert_eq!(a.unknown_len(), 0);
         assert!(!a.remove_effect(fx), "nothing left to remove");
