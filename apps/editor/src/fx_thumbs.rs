@@ -132,14 +132,16 @@ impl ThumbKey {
 
 /// The effect as a thumbnail shows it at `phase`: «Обычно», the progress
 /// held at `phase`, and every «Момент» placed so its motion is `phase` of
-/// the way through (just ahead at 0, done from ~0.75).
+/// the way through. The frame is `0.3·phase − 0.22` s of screen time past
+/// the moment: Punch In's 0.12 s snap, which ends at its moment (R17), runs
+/// from phase ≈ 0.33 to ≈ 0.73 — just ahead at 0, done well before 1.
 pub fn demo_effect(def: &RecipeDef, clip: &Clip, at: Time, phase: f64) -> AppliedEffect {
     let mut e = kadr_effects::fresh(def, clip, at);
     e.id = EffectId::parse(DEMO_EFFECT_ID).unwrap_or(e.id);
     e.progress = (phase, phase);
     let s = clip.source_time_at(at);
     for d in def.params.iter().filter(|d| matches!(d.kind, ParamKind::Moment)) {
-        let lead = Time::from_secs_f64((phase * 0.3 - 0.1) * clip.speed());
+        let lead = Time::from_secs_f64((phase * 0.3 - 0.22) * clip.speed());
         e.params.insert(d.key.to_string(), ParamValue::Moment(SourceTime(s - lead)));
     }
     e
@@ -495,9 +497,12 @@ mod tests {
         let def = kadr_effects::recipe("punch_in").unwrap();
         let e = demo_effect(def, &clip(), Time::from_secs(12), 0.0);
         assert_eq!(e.progress, (0.0, 0.0), "a constant progress: the frame shows the phase");
-        assert_eq!(e.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32) + Time::from_millis(100))), "phase 0: the punch is just ahead");
+        // The snap ends at the moment (R17): it runs from 0.12 s before it.
+        assert_eq!(e.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32) + Time::from_millis(220))), "phase 0: the punch is 0.1 s ahead");
+        let mid = demo_effect(def, &clip(), Time::from_secs(12), 0.5);
+        assert_eq!(mid.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32) + Time::from_millis(70))), "mid-loop: mid-punch");
         let done = demo_effect(def, &clip(), Time::from_secs(12), 1.0);
-        assert_eq!(done.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32) - Time::from_millis(200))), "phase 1: well past it");
+        assert_eq!(done.params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(32) - Time::from_millis(80))), "phase 1: past it");
         assert_eq!(done.params["strength"], ParamValue::Number(0.6), "«Обычно»");
         assert_eq!(done.id, e.id, "one id: Handheld's shake (seeded by it) is the same on every render and loop frame");
         assert_eq!(ThumbKey { phase: STILL, ..key(0) }.phase_f(), 0.85);

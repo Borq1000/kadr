@@ -57,10 +57,38 @@ pub struct FxDrag {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewOverride {
     pub recipe: &'static str,
+    /// The playhead the instances were made at (a «Момент» is its frame).
+    pub at: Time,
     pub effects: Vec<(ClipId, AppliedEffect)>,
 }
 
+/// `def` at «Обычно» on `clips`, made at `at` as a click there would make
+/// it; `None` on none. A clip `keep` shows the recipe on already keeps that
+/// instance's id: Handheld's shake is seeded by it, so the picture does not
+/// jump when the override is made again.
+pub fn make_override(seq: &Sequence, def: &'static RecipeDef, clips: &[ClipId], at: Time, keep: Option<&PreviewOverride>) -> Option<PreviewOverride> {
+    let kept = |id: ClipId| keep.filter(|o| o.recipe == def.id).and_then(|o| o.effects.iter().find(|(c, _)| *c == id)).map(|(_, e)| e.id);
+    let effects: Vec<(ClipId, AppliedEffect)> = clips
+        .iter()
+        .filter_map(|id| {
+            let mut e = kadr_effects::fresh(def, seq.clip(*id)?, at);
+            if let Some(same) = kept(*id) {
+                e.id = same;
+            }
+            Some((*id, e))
+        })
+        .collect();
+    (!effects.is_empty()).then_some(PreviewOverride { recipe: def.id, at, effects })
+}
+
 impl PreviewOverride {
+    /// Whether it no longer shows what a click would apply: the clips it
+    /// goes on are others now, or the playhead moved and `def` has a
+    /// «Момент» (made at the old playhead, a punch would land there).
+    pub fn outdated(&self, def: &RecipeDef, targets: &[ClipId], playhead: Time) -> bool {
+        self.clips() != targets || (self.at != playhead && def.params.iter().any(|p| p.kind == ParamKind::Moment))
+    }
+
     /// The effects put on a copy of the sequence (the preview's snapshot),
     /// as applying them would.
     pub fn apply(&self, seq: &mut Sequence) {
@@ -526,10 +554,10 @@ impl App {
         crate::util::sync_rows_by_key(ui.get_fx_cards(), cards, |c| c.id.clone(), |m| ui.set_fx_cards(m));
         ui.set_fx_hint(t(if sel.is_empty() { "fx.hint.select_clip" } else { "fx.hint.apply" }).into());
         // A hovered card filtered out (search, category) ends its hover; a
-        // shown preview follows the selection: the hovered card's effect on
-        // the clips it now fits, or none.
+        // shown preview follows the selection — the hovered card's effect on
+        // the clips it now fits, or none — and a moment the playhead.
         let gone = hover_gone(self.fx.hover.map(|(r, _)| r), &listed);
-        let stale = self.fx.preview.as_ref().is_some_and(|o| kadr_effects::recipe(o.recipe).is_none_or(|d| targets(seq, sel, d) != o.clips()));
+        let stale = self.fx.preview.as_ref().is_some_and(|o| kadr_effects::recipe(o.recipe).is_none_or(|d| o.outdated(d, &targets(seq, sel, d), self.playhead)));
         if gone {
             self.fx_clear_hover();
         } else if stale {
@@ -595,12 +623,11 @@ impl App {
     }
 
     /// `def` at «Обычно» on the selected clips it goes on, made at the
-    /// playhead as a click would; `None` when it goes on none.
+    /// playhead as a click would; `None` when it goes on none. The
+    /// instances shown already keep their ids ([`make_override`]).
     fn fx_override(&self, def: &'static RecipeDef) -> Option<PreviewOverride> {
         let seq = self.project.sequence();
-        let effects: Vec<(ClipId, AppliedEffect)> =
-            targets(seq, &self.tl.selection, def).into_iter().filter_map(|id| Some((id, kadr_effects::fresh(def, seq.clip(id)?, self.playhead)))).collect();
-        (!effects.is_empty()).then_some(PreviewOverride { recipe: def.id, effects })
+        make_override(seq, def, &targets(seq, &self.tl.selection, def), self.playhead, self.fx.preview.as_ref())
     }
 
     /// Shows `next` on the preview (a new snapshot) — when there is a
@@ -1042,9 +1069,37 @@ mod tests {
         let Some(EditCommand::Batch { commands, .. }) = batch_of(&s, def, vec![(v1, shown.clone())]) else { panic!("a batch") };
         assert_eq!(commands, vec![EditCommand::AddEffect { clip: v1, effect: shown.clone() }]);
         let mut applied = s.clone();
-        let o = PreviewOverride { recipe: def.id, effects: vec![(v1, shown)] };
+        let o = PreviewOverride { recipe: def.id, at: Time::from_secs(1), effects: vec![(v1, shown)] };
         o.apply(&mut applied);
         assert!(batch_of(&applied, def, o.effects.clone()).is_none(), "applied already: nothing to send");
+    }
+
+    /// A hover follows the playhead (M1): a punch's moment is made again at
+    /// the new playhead with the same instance, so a click applies the punch
+    /// the preview shows now; an effect without a moment is not made again,
+    /// and when it is (another selection) its id — Handheld's seed — stays.
+    #[test]
+    fn a_hover_follows_the_playhead_with_the_same_instances() {
+        let (s, [v1, _, _]) = seq();
+        let at = Time::from_secs;
+        let punch = kadr_effects::recipe("punch_in").unwrap();
+        let o = make_override(&s, punch, &[v1], at(1), None).unwrap();
+        assert!(!o.outdated(punch, &[v1], at(1)));
+        assert!(o.outdated(punch, &[v1], at(3)), "its moment is the frame at 1 s");
+        assert!(o.outdated(punch, &[], at(1)), "nothing selected any more");
+        let moved = make_override(&s, punch, &[v1], at(3), Some(&o)).unwrap();
+        assert_eq!(moved.at, at(3));
+        assert_eq!(moved.effects[0].1.id, o.effects[0].1.id, "the same instance");
+        assert_eq!(moved.effects[0].1.params["moment"], ParamValue::Moment(SourceTime(at(3))), "the punch lands at the new playhead");
+        let Some(EditCommand::Batch { commands, .. }) = batch_of(&s, punch, moved.effects.clone()) else { panic!("a batch") };
+        assert_eq!(commands, vec![EditCommand::AddEffect { clip: v1, effect: moved.effects[0].1.clone() }], "a click applies what is shown now");
+
+        let hand = kadr_effects::recipe("handheld").unwrap();
+        let h = make_override(&s, hand, &[v1], at(1), None).unwrap();
+        assert!(!h.outdated(hand, &[v1], at(3)), "no moment: the playhead changes nothing");
+        assert_eq!(make_override(&s, hand, &[v1], at(3), Some(&h)), Some(PreviewOverride { at: at(3), ..h.clone() }), "made again: the same shake");
+        assert_ne!(make_override(&s, hand, &[v1], at(1), Some(&o)).unwrap().effects[0].1.id, o.effects[0].1.id, "another recipe's instance is not reused");
+        assert!(make_override(&s, hand, &[], at(1), Some(&h)).is_none(), "on no clip: none");
     }
 
     fn project_with_clip() -> (Project, ClipId) {
@@ -1065,7 +1120,7 @@ mod tests {
         let (p, id) = project_with_clip();
         let before = p.clone();
         let def = kadr_effects::recipe("smooth_zoom").unwrap();
-        let o = PreviewOverride { recipe: def.id, effects: vec![(id, kadr_effects::fresh(def, p.sequence().clip(id).unwrap(), Time::ZERO))] };
+        let o = PreviewOverride { recipe: def.id, at: Time::ZERO, effects: vec![(id, kadr_effects::fresh(def, p.sequence().clip(id).unwrap(), Time::ZERO))] };
         let out = OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewFast);
         let hovered = crate::scene_source::ProjectScenes::new_with(&p, false, |seq| o.apply(seq));
         assert!(hovered.scene_at(Time::from_secs(4), &out).layers[0].placement.scale.x > 1.0, "the snapshot shows it");
