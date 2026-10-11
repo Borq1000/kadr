@@ -14,13 +14,20 @@ fn bad(msg: impl Into<String>) -> BridgeError {
     BridgeError::new("edit_rejected", msg.into())
 }
 
-/// `list_effects`: the registry, each recipe named in both languages.
+/// `list_effects`: the registry, each recipe named in both languages; a
+/// recipe with variants (the Look's presets) lists them with their names.
 pub fn list_effects() -> Value {
+    let names = |key: &str| json!({"ru": t_in(Lang::Ru, key), "en": t_in(Lang::En, key)});
     let all: Vec<Value> = kadr_effects::registry()
         .iter()
         .map(|d| {
             let mut v = kadr_effects::json::recipe_json(d);
-            v["name"] = json!({"ru": t_in(Lang::Ru, &d.name_key()), "en": t_in(Lang::En, &d.name_key())});
+            v["name"] = names(&d.name_key());
+            if let Some(key) = d.variants
+                && !d.variant_options().is_empty()
+            {
+                v["variants"] = Value::Array(d.variant_options().iter().map(|o| json!({"key": o, "name": names(&d.option_name_key(key, o))})).collect());
+            }
             v
         })
         .collect();
@@ -137,5 +144,20 @@ mod tests {
             let n = &e["name"];
             assert!(n["ru"].as_str().is_some_and(|s| !s.starts_with("fx.")) && n["en"].as_str().is_some_and(|s| !s.starts_with("fx.")), "{e}");
         }
+    }
+
+    /// Refinement 13: the Look's presets with their names, for MCP clients.
+    #[test]
+    fn list_effects_names_the_look_presets() {
+        let v = list_effects();
+        let all = v["effects"].as_array().unwrap();
+        let look = all.iter().find(|e| e["id"] == "look").unwrap();
+        assert_eq!(look["category"], "look");
+        assert_eq!(look["variants"].as_array().unwrap().len(), 6);
+        assert_eq!(look["variants"][0], json!({"key": "cinematic", "name": {"ru": "Кино", "en": "Cinematic"}}));
+        assert_eq!(look["variants"][2], json!({"key": "soft_film", "name": {"ru": "Мягкая плёнка", "en": "Soft Film"}}));
+        let vignette = all.iter().find(|e| e["id"] == "vignette").unwrap();
+        assert_eq!((vignette["category"].as_str(), vignette["name"]["ru"].as_str()), (Some("light"), Some("Виньетка")));
+        assert!(vignette.get("variants").is_none(), "one card, no variants");
     }
 }

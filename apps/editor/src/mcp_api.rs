@@ -628,6 +628,20 @@ mod tests {
         assert_eq!(e.code, "bad_params", "ops must be an array");
     }
 
+    /// D8: MCP's strict validation names a bad preset; another preset replaces the clip's Look.
+    #[test]
+    fn a_look_preset_is_checked_and_replaces_the_clip_s_look() {
+        let (mut p, v, _) = project_with_pair();
+        let add = |preset: &str| serde_json::json!([{"type": "add_effect", "clip_id": v.to_string(), "recipe": "look", "params": {"preset": preset}}]);
+        let e = edit_commands(&p, &[], &add("sepia")).unwrap_err();
+        assert_eq!(e.code, "edit_rejected");
+        assert!(e.message.starts_with("op #0: ") && e.message.contains("preset must be one of cinematic, warm, soft_film, dramatic, vintage, natural"), "{}", e.message);
+        let c = p.sequence().clip(v).unwrap().clone();
+        p.sequence_mut().tracks[0].clips[0].effects.push(kadr_effects::fresh(kadr_effects::recipe("look").unwrap(), &c, Time::ZERO));
+        assert!(matches!(&edit_commands(&p, &[], &add("warm")).unwrap()[..], [EditCommand::AddEffect { .. }]), "another preset replaces the Look");
+        assert!(edit_commands(&p, &[], &add("cinematic")).unwrap_err().message.contains("no change"), "the same Look again");
+    }
+
     /// R10: the AI plan drops a no-op effect command; one MCP op says why it does nothing.
     #[test]
     fn a_no_op_effect_op_is_rejected_with_a_reason() {

@@ -673,6 +673,21 @@ mod tests {
         serde_json::from_value(j).unwrap()
     }
 
+    /// D8: a Look is added by its preset; a preset this build lacks is
+    /// refused with the list; the Vignette takes its softness.
+    #[test]
+    fn a_look_is_added_by_preset_and_an_unknown_preset_is_refused() {
+        let (p, id) = fx_project();
+        let perms = Permissions::default();
+        let ok = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "look", "params": {"preset": "warm"}}))], &p, &perms).unwrap();
+        let EditCommand::AddEffect { effect, .. } = &ok[0] else { panic!("{ok:?}") };
+        assert_eq!((effect.recipe.as_str(), &effect.params["preset"], &effect.params["strength"]), ("look", &ParamValue::Choice("warm".into()), &ParamValue::Number(0.6)));
+        let err = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "look", "params": {"preset": "sepia"}}))], &p, &perms).unwrap_err().to_string();
+        assert!(err.contains("preset must be one of cinematic, warm, soft_film, dramatic, vintage, natural"), "{err}");
+        let v = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "vignette", "params": {"softness": 0.8}}))], &p, &perms).unwrap();
+        assert!(matches!(&v[0], EditCommand::AddEffect { effect, .. } if effect.params["softness"] == ParamValue::Number(0.8) && effect.params["strength"] == ParamValue::Number(0.6)));
+    }
+
     #[test]
     fn add_effect_is_checked_against_the_registry() {
         let (p, id) = fx_project();
