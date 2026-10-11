@@ -238,6 +238,7 @@ impl App {
             let outside = anim_ui::edit_time(c, self.playhead, frame).is_none();
             d.outside = outside;
             d.outside_hint = anim_ui::outside_hint(c, self.playhead, frame);
+            d.fx_outside_hint = crate::effects_ui::fx_outside_hint(c, self.playhead, frame);
             let keys: Vec<KeyState> = P::ALL
                 .iter()
                 .map(|p| {

@@ -15,7 +15,7 @@ use kadr_i18n::{t, t_in, tf, Lang};
 use kadr_project::{AppliedEffect, Clip, FadeEdge, ParamValue, Sequence, SourceTime, TrackKey, TrackKind};
 use kadr_scene::{Layer, LayerContent, LayerId, SizeU};
 use kadr_timeline::EditCommand;
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
@@ -321,6 +321,14 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
 /// action both use it, so an enabled button always does something (R14).
 fn moment_target(c: &Clip, playhead: Time, rate: FrameRate) -> Option<SourceTime> {
     anim_ui::edit_time(c, playhead, rate.frame_duration()).map(|tt| SourceTime(c.source_time_at(tt)))
+}
+
+/// Whether the effects section repeats «Поставьте плейхед на клип…» (M6):
+/// the playhead is off the clip and a number of one of its effects has
+/// keyframes — that row is locked there, as the Transform rows are.
+pub fn fx_outside_hint(c: &Clip, playhead: Time, frame: Time) -> bool {
+    anim_ui::edit_time(c, playhead, frame).is_none()
+        && c.effects.iter().any(|e| kadr_effects::definition(e).is_some_and(|d| d.params.iter().any(|p| c.animation.is_animated(TrackKey::fx(e.id, p.key)))))
 }
 
 /// Whether a block of `c` shows a moment: its «к плейхеду» depends on the
@@ -727,16 +735,23 @@ impl App {
                 (DropHit::Clip(id), at) => {
                     // «Момент» defaults to the frame dropped on (spec §5).
                     let at = self.project.sequence().frame_rate.snap(at);
-                    let applied = match apply_batch(self.project.sequence(), def, &[id], at) {
-                        Some(cmd) => self.execute(cmd),
+                    // (on the clip now, just applied)
+                    let (on, new) = match apply_batch(self.project.sequence(), def, &[id], at) {
+                        Some(cmd) => {
+                            let done = self.execute(cmd);
+                            (done, done)
+                        }
                         None => {
                             self.toast(tf("fx.already", &[("name", &t(&def.name_key()))]));
-                            true
+                            (true, false)
                         }
                     };
-                    if applied {
+                    if on {
                         self.tl.selection = vec![id];
                         self.refresh_inspector();
+                    }
+                    if new {
+                        self.fx_reveal(def);
                     }
                 }
                 (DropHit::Unfit, _) => self.toast_warn(t("fx.hint.unfit")),
@@ -763,10 +778,32 @@ impl App {
         };
         match cmd {
             Some(cmd) => {
-                self.execute(cmd);
+                if self.execute(cmd) && self.inspected().is_some_and(|id| clips.contains(&id)) {
+                    self.fx_reveal(def);
+                }
             }
             None => self.toast(tf("fx.already", &[("name", &t(&def.name_key()))])),
         }
+    }
+
+    /// `def` was just applied to the inspected clip (A3): its block takes
+    /// the focus — its point shows on the preview — and the inspector
+    /// scrolls to it, top first. The scroll waits a turn of the event loop:
+    /// by then a new block exists and is laid out (Slint instantiates it
+    /// right after the pointer event), so its `changed` handler runs.
+    fn fx_reveal(&mut self, def: &RecipeDef) {
+        let Some(id) = self.inspected() else { return };
+        let Some(e) = self.project.sequence().clip(id).and_then(|c| c.effects.iter().find(|e| e.recipe == def.id)).map(|e| e.id) else { return };
+        self.fx.focus = Some(e);
+        self.fx_update_marker();
+        let ui = self.ui();
+        ui.set_inspector_reveal_fx(e.to_string().into());
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_inspector_reveal_seq(ui.get_inspector_reveal_seq().wrapping_add(1));
+            }
+        });
     }
 
     /// The «Эффекты клипа» rows of `c` (spec §6.2, mockup A), updating the
@@ -1173,6 +1210,22 @@ mod tests {
         assert!(!has_moment(&c), "a newer Kadr's version shows no rows");
         c.effects.push(kadr_effects::fresh(kadr_effects::recipe("punch_in").unwrap(), &c, Time::from_secs(12)));
         assert!(has_moment(&c));
+    }
+
+    /// M6: off the clip the effects section says why its keyframed numbers
+    /// are locked — only when one is (Transform's own hint covers the rest).
+    #[test]
+    fn the_effects_section_repeats_the_outside_hint_when_its_rows_are_locked() {
+        let mut c = clip_10_20();
+        let frame = FrameRate::FPS_30.frame_duration();
+        let z = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &c, Time::from_secs(12));
+        c.effects.push(z.clone());
+        c.animation.set_key(kadr_project::AnimParam::Scale, SourceTime(Time::from_secs(31)), 0.5, None);
+        assert!(!fx_outside_hint(&c, Time::from_secs(25), frame), "only the scale has keyframes");
+        c.animation.set_key(TrackKey::fx(z.id, "strength"), SourceTime(Time::from_secs(31)), 0.3, None);
+        assert!(fx_outside_hint(&c, Time::from_secs(25), frame));
+        assert!(fx_outside_hint(&c, Time::from_secs(5), frame), "before the clip too");
+        assert!(!fx_outside_hint(&c, Time::from_secs(12), frame), "on the clip: the rows work");
     }
 
     /// Review focus 4: a moment the trim left outside the visible clip says so.

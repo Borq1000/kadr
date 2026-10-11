@@ -64,6 +64,9 @@ export struct InspectorData {
     outside: bool,
     // Off the clip *and* the clip has animation: explain why it is locked.
     outside-hint: bool,
+    // Off the clip and an effect's number has keyframes: the same hint in
+    // the effects section, whose locked rows may be far below Transform.
+    fx-outside-hint: bool,
     vfade-in: float,
     vfade-out: float,
     // Clip duration in seconds: fade-in + fade-out never exceed it.
@@ -90,6 +93,10 @@ export component Inspector inherits Rectangle {
     callback shot-clicked(int);
     callback key-action(string /* prop */, string /* prev | toggle | next | clear | ease:<key> */);
     callback fx-action(string /* effect id */, string /* action */);
+    // An effect just applied (its id): its block scrolls into view, top
+    // first, each time Rust bumps `reveal-seq` (once the block is laid out).
+    in property <string> reveal-fx;
+    in property <int> reveal-seq;
     background: Theme.bg1;
 
     VerticalLayout {
@@ -197,6 +204,7 @@ export component Inspector inherits Rectangle {
                 // Under the correction (effects spec §6.2, mockup A).
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.fx"); resettable: root.d.fx.length > 0; reset => { root.reset("effects"); } }
                 if root.d.has-video-props && root.d.fx.length == 0: Text { text: Tr.t("inspector.fx.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                if root.d.has-video-props && root.d.fx-outside-hint: Text { text: Tr.t("inspector.key.outside"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
                 for e in root.d.fx: FxBlock {
                     fx: e;
                     outside: root.d.outside;
@@ -204,6 +212,16 @@ export component Inspector inherits Rectangle {
                     live(p, v) => { root.live(p, v); }
                     commit(p, v) => { root.commit(p, v); }
                     key-action(p, a) => { root.key-action(p, a); }
+                    // Where the block is in the scroll area's visible part.
+                    property <length> top-in-view: self.absolute-position.y - sv2.absolute-position.y;
+                    property <int> reveal: root.reveal-seq;
+                    // The block just applied comes into view: scrolled by the
+                    // least that shows its bottom, but never past its top.
+                    changed reveal => {
+                        if (e.id == root.reveal-fx) {
+                            sv2.content-y = clamp(sv2.content-y - min(self.top-in-view, max(0px, self.top-in-view + self.height - sv2.visible-height)), min(0px, sv2.visible-height - sv2.content-height), 0px);
+                        }
+                    }
                 }
 
                 // Each fade is at most the clip minus the other fade (spec §6.1).

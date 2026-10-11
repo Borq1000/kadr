@@ -144,6 +144,9 @@ export component AppWindow inherits Window {
 
     // ---- Inspector
     in property <InspectorData> inspector;
+    // An effect just applied: its block scrolls into view on each bump.
+    in property <string> inspector-reveal-fx;
+    in property <int> inspector-reveal-seq;
 
     // ---- AI
     in-out property <bool> ai-open: true;
@@ -504,6 +507,8 @@ export component AppWindow inherits Window {
                     width: root.inspector-width;
                     max-height: 100000px;
                     d: root.inspector;
+                    reveal-fx: root.inspector-reveal-fx;
+                    reveal-seq: root.inspector-reveal-seq;
                     live(p, v) => { root.inspector-live(p, v); }
                     commit(p, v) => { root.inspector-commit(p, v); root.focus-editor(); }
                     toggle-enabled => { root.inspector-toggle-enabled(); }
