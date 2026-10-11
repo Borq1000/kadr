@@ -1,12 +1,13 @@
 //! Effects in the evaluator (effects spec §3): for each enabled, known
 //! effect of a clip in list order — progress (§1), the parameter values at
-//! the frame (`fx:` tracks over stored values), `compile`, and the motion
-//! delta composed over the clip's placement.
+//! the frame (`fx:` tracks over stored values), `compile` — the motion delta
+//! composed over the clip's placement and the colour primitives collected
+//! in order.
 
 use kadr_core::Time;
 use kadr_effects::{definition, CompileCtx, Params};
 use kadr_project::{AppliedEffect, Clip, SourceTime, Transform};
-use kadr_scene::{Placement, SizeU};
+use kadr_scene::{Effect, Placement, SizeU};
 
 /// Where `t` lies in the clip's visible length, `(t − timeline_in) /
 /// duration` — integer flicks into one f64; 0 for a clip of no length (never
@@ -40,32 +41,35 @@ pub fn crop_window(tr: &Transform) -> (f64, f64, f64, f64) {
 
 /// `base` — the clip's own placement at `t` — with the clip's motion
 /// effects applied in list order, in the crop window the clip has at `t`
-/// (its animated crop). Unknown recipes and newer versions are skipped;
-/// strength 0 compiles nothing (§3).
+/// (its animated crop). Unknown recipes, newer versions and unknown
+/// variants are skipped; strength 0 compiles nothing (§3).
 pub fn place_with_effects(clip: &Clip, t: Time, canvas: SizeU, base: Placement) -> Placement {
     if clip.effects.is_empty() || clip.duration() <= Time::ZERO {
         return base;
     }
     let window = crop_window(&crate::scene::clip_state_at(clip, t, Time::ZERO).transform);
-    place_in_window(clip, t, canvas, base, window)
+    apply_effects(clip, t, canvas, base, window).0
 }
 
-/// `place_with_effects` for a caller that has the clip's state at `t`
-/// already (`clip_layer`): `window` is `crop_window` of it.
-pub(crate) fn place_in_window(clip: &Clip, t: Time, canvas: SizeU, base: Placement, window: (f64, f64, f64, f64)) -> Placement {
+/// Every enabled, known effect of `clip` at `t`, in list order (spec §3,
+/// D3): its placement delta composed over `base` in the crop `window`
+/// (`crop_window` of the clip's state at `t`), its colour primitives
+/// collected — `clip_layer` puts them after the inspector's correction.
+pub(crate) fn apply_effects(clip: &Clip, t: Time, canvas: SizeU, base: Placement, window: (f64, f64, f64, f64)) -> (Placement, Vec<Effect>) {
     // A clip of no length shows nothing (and maps no source time).
     if clip.effects.is_empty() || clip.duration() <= Time::ZERO {
-        return base;
+        return (base, Vec::new());
     }
     let source_time = SourceTime(clip.source_time_at(t));
     let aspect = if base.size.y > 0.0 { base.size.x as f64 / base.size.y as f64 } else { 1.0 };
     let secs = clip.duration().as_secs_f64();
     let speed = Some(clip.speed()).filter(|s| s.is_finite() && *s > 0.0).unwrap_or(1.0);
     let mut placement = base;
+    let mut colour = Vec::new();
     for e in clip.effects.iter().filter(|e| e.enabled) {
-        // Unknown recipe or newer version: kept, never run (spec §2) — nor
-        // are its `fx:` tracks read. Only declared number parameters of the
-        // clip's own effects are looked up, so orphan tracks never count.
+        // Unknown recipe, newer version or variant: kept, never run (spec §2)
+        // — nor are its `fx:` tracks read. Only declared number parameters of
+        // the clip's own effects are looked up, so orphan tracks never count.
         let Some(def) = definition(e) else { continue };
         let params = Params::resolve(def.params, &e.params, |key| clip.animation.fx_value_at(e.id, key, source_time));
         if params.is_off() {
@@ -80,9 +84,11 @@ pub(crate) fn place_in_window(clip: &Clip, t: Time, canvas: SizeU, base: Placeme
             continue;
         }
         let ctx = CompileCtx { progress, clip_secs, source_time, speed, canvas, aspect, window, frame: t, seed: effect_seed(e) };
-        placement = (def.compile)(&params, &ctx).placement.apply(&placement);
+        let compiled = (def.compile)(&params, &ctx);
+        placement = compiled.placement.apply(&placement);
+        colour.extend(compiled.effects);
     }
-    placement
+    (placement, colour)
 }
 
 #[cfg(test)]

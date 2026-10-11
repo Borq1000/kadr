@@ -5,9 +5,11 @@
 
 use kadr_core::color::AlphaMode;
 use kadr_core::{ColorInfo, CpuFrame, FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
+use kadr_playback::SceneSource;
 use kadr_project::{AppliedEffect, Clip, MediaAsset, ParamValue, Project};
+use kadr_project_scenes::ProjectScenes;
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, PreparedFrame, RenderInputs, RenderTarget, Renderer};
-use kadr_scene::{LayerContent, OutputSpec, RenderQuality, SizeU};
+use kadr_scene::{FrameScene, LayerContent, OutputSpec, RenderQuality, SizeU};
 use kadr_timeline::ops::{split_clip, LinkRemap};
 use kadr_timeline::scene::evaluate;
 use std::collections::BTreeMap;
@@ -42,14 +44,20 @@ fn gradient() -> Arc<CpuFrame> {
     Arc::new(CpuFrame::from_rgba8(W, H, ColorInfo { alpha: AlphaMode::Opaque, ..ColorInfo::WORKING_SDR }, px))
 }
 
-fn render(p: &Project, t: Time) -> Vec<u8> {
-    let out = OutputSpec::new(SizeU::new(W, H), RenderQuality::Export);
-    let scene = evaluate(p, p.sequence(), t, &out);
+fn out() -> OutputSpec {
+    OutputSpec::new(SizeU::new(W, H), RenderQuality::Export)
+}
+
+fn render_scene(scene: &FrameScene) -> Vec<u8> {
     let g = gradient();
     let inputs = RenderInputs { layers: scene.layers.iter().map(|l| match l.content { LayerContent::Media { .. } => LayerInput::Cpu(g.clone()), _ => LayerInput::None }).collect() };
     let mut buf = vec![0u8; (W * H * 4) as usize];
-    CpuRenderer::new().render(&PreparedFrame { scene: &scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(W, H, &mut buf))).unwrap();
+    CpuRenderer::new().render(&PreparedFrame { scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(W, H, &mut buf))).unwrap();
     buf
+}
+
+fn render(p: &Project, t: Time) -> Vec<u8> {
+    render_scene(&evaluate(p, p.sequence(), t, &out()))
 }
 
 fn fx(recipe: &str, set: &[(&str, ParamValue)]) -> AppliedEffect {
@@ -100,4 +108,37 @@ fn smooth_zoom_magnifies_about_its_point() {
     let red = |buf: &[u8], x: u32, y: u32| buf[((y * W + x) * 4) as usize] as i32;
     assert!(red(&zoomed, 0, 18) > red(&plain, 0, 18) + 8, "the left edge shows content from further in: {} vs {}", red(&zoomed, 0, 18), red(&plain, 0, 18));
     assert!((red(&zoomed, 32, 18) - red(&plain, 32, 18)).abs() <= 2, "the centre (the point) stays");
+}
+
+/// Spec §9: every Look changes the picture; strength 0 and the «До» view do not.
+#[test]
+fn a_look_changes_the_picture_and_strength_zero_or_the_before_view_do_not() {
+    let t = Time::from_secs(2);
+    let plain = render(&project(vec![]), t);
+    for key in kadr_effects::look::preset_keys() {
+        assert_ne!(render(&project(vec![fx("look", &[("preset", ParamValue::Choice(key.to_string()))])]), t), plain, "{key} changes the picture");
+    }
+    assert_eq!(render(&project(vec![fx("look", &[("strength", ParamValue::Number(0.0))])]), t), plain, "strength 0");
+    let graded = project(vec![fx("look", &[]), fx("vignette", &[])]);
+    assert_ne!(render(&graded, t), plain);
+    assert_eq!(render_scene(&ProjectScenes::new(&graded, true).scene_at(t, &out())), plain, "«До» shows the clip without its Look");
+}
+
+/// Review focus 2 at the pixel level, with grain and a vignette.
+#[test]
+fn a_split_keeps_every_pixel_of_a_look() {
+    let whole = project(vec![fx("look", &[("preset", ParamValue::Choice("vintage".into())), ("strength", ParamValue::Number(1.0))]), fx("vignette", &[])]);
+    let mut split = whole.clone();
+    let c = split.sequence().tracks[0].clips[0].clone();
+    let (l, r) = split_clip(&c, FrameRate::FPS_30.frame_to_time(37), &mut LinkRemap::default());
+    split.sequence_mut().tracks[0].clips = vec![l, r];
+    let plain = project(vec![]);
+    let mut graded = 0;
+    for f in 30..45 {
+        let t = FrameRate::FPS_30.frame_to_time(f);
+        graded += (render(&whole, t) != render(&plain, t)) as u32;
+        let worst = render(&whole, t).iter().zip(render(&split, t)).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+        assert!(worst <= 1, "frame {f}: off by {worst}");
+    }
+    assert_eq!(graded, 15, "the Look shows on every frame");
 }

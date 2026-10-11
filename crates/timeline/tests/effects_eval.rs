@@ -2,7 +2,7 @@
 
 use kadr_core::{EffectId, FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
 use kadr_project::*;
-use kadr_scene::{Layer, OutputSpec, Placement, RenderQuality, SizeU};
+use kadr_scene::{Effect, Layer, OutputSpec, Placement, RenderQuality, SizeU};
 use kadr_timeline::ops::{split_clip, trim_start, LinkRemap};
 use kadr_timeline::scene::evaluate;
 use std::collections::BTreeMap;
@@ -356,4 +356,82 @@ fn degenerate_clips_and_ranges_stay_finite() {
     }
     let pl = kadr_timeline::fx::place_with_effects(&l, Time::from_secs(10), SizeU::new(1920, 1080), base);
     assert!([pl.position.x, pl.position.y, pl.scale.x, pl.rotation].iter().all(|v| v.is_finite()), "{pl:?}");
+}
+
+/// The colour primitives of a layer, by kind, in order.
+fn kinds(l: &Layer) -> Vec<&'static str> {
+    l.effects
+        .iter()
+        .map(|e| match e {
+            Effect::ColorAdjust(_) => "adjust",
+            Effect::ToneCurve(_) => "curve",
+            Effect::SplitTone(_) => "split",
+            Effect::Vignette(_) => "vignette",
+            Effect::Grain(_) => "grain",
+            _ => "other",
+        })
+        .collect()
+}
+
+fn look(preset: &str) -> AppliedEffect {
+    fx("look", &[("preset", ParamValue::Choice(preset.into()))])
+}
+
+/// Spec §3: correction first, then the Look, in D4's order.
+#[test]
+fn a_look_follows_the_inspector_correction_in_its_fixed_order() {
+    let (mut p, id) = project(vec![look("vintage")]);
+    clip_mut(&mut p, id).color.saturation = 0.5;
+    let l = layer(&p, Time::from_secs(15));
+    assert_eq!(kinds(&l), ["adjust", "adjust", "curve", "split", "vignette", "grain"]);
+    let Effect::ColorAdjust(first) = &l.effects[0] else { unreachable!() };
+    assert_eq!(first.saturation, 0.5, "the inspector's correction comes first");
+}
+
+#[test]
+fn colour_effects_follow_the_clip_s_list_order() {
+    let (p, _) = project(vec![fx("vignette", &[]), look("natural")]);
+    assert_eq!(kinds(&layer(&p, Time::from_secs(15))), ["vignette", "adjust", "curve"]);
+}
+
+/// Review focus 3 and 4: strength 0, a switched-off Look and a preset this
+/// build lacks change nothing — not one field of the layer.
+#[test]
+fn a_look_at_zero_switched_off_or_of_an_unknown_preset_adds_nothing() {
+    let t = Time::from_secs(15);
+    let mut off = look("warm");
+    off.enabled = false;
+    for e in [fx("look", &[("strength", ParamValue::Number(0.0))]), off, look("bleach_bypass"), fx("vignette", &[("strength", ParamValue::Number(0.0))])] {
+        let (p, id) = project(vec![e.clone()]);
+        assert_eq!(layer(&p, t), layer(&without_effects(&p, id), t), "{e:?}");
+    }
+}
+
+#[test]
+fn motion_and_a_look_both_apply() {
+    let (p, _) = project(vec![fx("smooth_zoom", &[("strength", ParamValue::Number(1.0))]), look("dramatic")]);
+    let l = layer(&p, Time::from_millis(19_900));
+    assert!(l.placement.scale.x > 1.1, "zoomed: {}", l.placement.scale.x);
+    assert_eq!(kinds(&l), ["adjust", "curve", "vignette"]);
+}
+
+/// Review focus 2: grain is new every frame, and a split or a start-trim
+/// never changes a frame's primitives (the seed is the effect id's and the frame's).
+#[test]
+fn grain_changes_every_frame_and_a_split_or_trim_keeps_it() {
+    let (p, id) = project(vec![look("soft_film")]);
+    let grain = |p: &Project, t: Time| layer(p, t).effects.iter().find_map(|e| if let Effect::Grain(g) = e { Some(*g) } else { None }).expect("Мягкая плёнка has grain");
+    let at = Time::from_secs(15);
+    assert_ne!(grain(&p, at).seed, grain(&p, at + F30).seed, "the next frame has new grain");
+    assert_eq!(grain(&p, at), grain(&p, at), "the same frame, the same grain");
+    let c = p.sequence().clip(id).unwrap().clone();
+    let (l, r) = split_clip(&c, Time::from_secs(14), &mut LinkRemap::default());
+    let mut split = p.clone();
+    split.sequence_mut().tracks[0].clips = vec![l, r];
+    let mut trimmed = p.clone();
+    trim_start(clip_mut(&mut trimmed, id), Time::from_secs(12));
+    for t in [Time::from_secs(13), Time::from_secs(14), Time::from_secs(14) + F30, Time::from_secs(18)] {
+        assert_eq!(layer(&split, t).effects, layer(&p, t).effects, "split, {t:?}");
+        assert_eq!(layer(&trimmed, t).effects, layer(&p, t).effects, "trimmed, {t:?}");
+    }
 }
