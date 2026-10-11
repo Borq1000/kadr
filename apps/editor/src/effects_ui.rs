@@ -575,9 +575,13 @@ impl App {
         ui.set_fx_hint(t(if sel.is_empty() { "fx.hint.select_clip" } else { "fx.hint.apply" }).into());
         // A hovered card filtered out (search, category) ends its hover; a
         // shown preview follows the selection — the hovered card's effect on
-        // the clips it now fits, or none — and a moment the playhead.
+        // the clips it now fits, or none — and, while paused, a moment the
+        // playhead (playing, the punch plays where it was shown).
         let gone = hover_gone(self.fx.hover.map(|(r, _)| r), &listed);
-        let stale = self.fx.preview.as_ref().is_some_and(|o| kadr_effects::recipe(o.recipe).is_none_or(|d| o.outdated(d, &targets(seq, sel, d), self.playhead)));
+        let stale = self.fx.preview.as_ref().is_some_and(|o| {
+            let playhead = if self.playing { o.at } else { self.playhead };
+            kadr_effects::recipe(o.recipe).is_none_or(|d| o.outdated(d, &targets(seq, sel, d), playhead))
+        });
         if gone {
             self.fx_clear_hover();
         } else if stale {
