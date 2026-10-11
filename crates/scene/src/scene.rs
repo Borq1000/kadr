@@ -97,8 +97,13 @@ pub enum Effect {
 }
 
 impl Effect {
-    /// Whether the primitive leaves every colour as it is: a chain of only
-    /// such is skipped, its clamp included.
+    /// Whether the primitive is neutral: an adjust equal to
+    /// [`ColorAdjust::NEUTRAL`], an identity curve ([`ToneCurve::is_neutral`]),
+    /// a split tone, vignette or grain whose amounts are 0. A neutral
+    /// primitive is skipped wherever it stands in a chain (an identity tone
+    /// curve does not clamp its input); a chain of only neutral primitives is
+    /// skipped entirely, its final clamp included (crate docs, "Point
+    /// operations").
     pub fn is_neutral(&self) -> bool {
         match self {
             Effect::ColorAdjust(a) => a.is_neutral(),

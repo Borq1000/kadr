@@ -1,8 +1,9 @@
 //! The colour primitives of effects E2 (effects spec §4; formulas: the
 //! effects system draft §3 «Примитивы цвета», exact rules in the crate docs,
-//! "Point operations"): plain data, plus the normative pure helpers every
-//! renderer uses — the CPU renderer now, a GPU one later (the tone table
-//! becomes its 1D texture, the grain hash its integer shader code).
+//! "Point operations"): plain data, plus pure helpers that are the
+//! normative formulas — the test reference calls them and the CPU renderer
+//! matches them within ±1 LSB (so will a GPU one: the tone table becomes its
+//! 1D texture, the grain hash its integer shader code).
 
 /// Rec.709 luma weights of non-linear R'G'B'.
 pub const LUMA709: [f64; 3] = [0.2126, 0.7152, 0.0722];
@@ -21,8 +22,10 @@ pub fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
 /// One tone curve for R', G' and B' (E2 has no per-channel curves, D11).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToneCurve {
-    /// 2–5 control points `(x, y)` in [0, 1], x strictly increasing, y
-    /// non-decreasing; anything else is cleaned up by [`ToneCurve::usable`].
+    /// Control points `(x, y)`: a recipe gives 2–5 in [0, 1], x strictly
+    /// increasing, y non-decreasing. Any list is accepted as given (more
+    /// than 5 points included); a renderer uses [`ToneCurve::usable`], which
+    /// cleans up the rest.
     pub points: Vec<(f32, f32)>,
 }
 
@@ -32,15 +35,17 @@ impl ToneCurve {
     }
 
     /// The points the curve uses (refinement 8): non-finite ones dropped,
-    /// the rest clamped into [0, 1] and sorted by x; of points sharing an x
-    /// the first given; each y at least the one before. Fewer than two left:
-    /// the identity's two.
+    /// the rest clamped into [0, 1] (−0 counts as 0) and sorted by x; of
+    /// points sharing an x the first given; each y at least the one before.
+    /// Fewer than two left: the identity's two.
     pub fn usable(&self) -> Vec<(f64, f64)> {
+        // `+ 0.0` turns −0 into +0, so the stable sort keeps ±0 in the given order.
+        let unit = |v: f32| (v as f64).clamp(0.0, 1.0) + 0.0;
         let mut p: Vec<(f64, f64)> = self
             .points
             .iter()
             .filter(|(x, y)| x.is_finite() && y.is_finite())
-            .map(|&(x, y)| ((x as f64).clamp(0.0, 1.0), (y as f64).clamp(0.0, 1.0)))
+            .map(|&(x, y)| (unit(x), unit(y)))
             .collect();
         p.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.dedup_by(|later, earlier| later.0 == earlier.0);
@@ -50,9 +55,13 @@ impl ToneCurve {
         if p.len() < 2 { vec![(0.0, 0.0), (1.0, 1.0)] } else { p }
     }
 
-    /// Whether the curve maps every value to itself: its usable points run
-    /// from (0, 0) to (1, 1) on the diagonal (the curve is constant beyond
-    /// its first and last points, so one that starts later is not).
+    /// Whether the curve is the identity on its domain [0, 1]: its usable
+    /// points run from (0, 0) to (1, 1) on the diagonal (the curve is
+    /// constant beyond its first and last points, so one that starts later is
+    /// not). A neutral curve is skipped wherever it stands in a chain, so it
+    /// does not clamp its input; a chain of only neutral primitives is
+    /// skipped entirely, its final clamp included (crate docs, "Point
+    /// operations").
     pub fn is_neutral(&self) -> bool {
         let p = self.usable();
         p.first() == Some(&(0.0, 0.0)) && p.last() == Some(&(1.0, 1.0)) && p.iter().all(|(x, y)| x == y)
@@ -109,8 +118,9 @@ impl ToneCurve {
 }
 
 /// One channel through a tone table: `v` clamped into [0, 1] — the
-/// curve's domain, the one clamp inside a chain — `× 255`, then linear
-/// between the two neighbouring entries. NaN reads as 0.
+/// curve's domain, the one clamp inside a chain, done by a non-neutral curve
+/// only (a neutral one is skipped) — `× 255`, then linear between the two
+/// neighbouring entries. NaN reads as 0.
 #[inline]
 pub fn tone_lookup(table: &[f32; 256], v: f32) -> f32 {
     let x = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } * 255.0;
@@ -281,6 +291,15 @@ mod tests {
         let f = |v: f32| v as f64;
         assert_eq!(messy.usable(), vec![(f(0.1), f(0.4)), (f(0.5), f(0.4)), (f(0.9), f(0.7)), (1.0, 1.0)], "finite, clamped, sorted, first of equal x, rising");
         assert_eq!(curve(&[(0.5, 0.5)]).usable(), vec![(0.0, 0.0), (1.0, 1.0)], "one point: the identity");
+        // −0 is 0: of (0, …) and (−0, …) the first given wins, whichever sign comes first.
+        for (first, second) in [(0.0f32, -0.0f32), (-0.0, 0.0)] {
+            let p = curve(&[(first, 0.3), (second, 0.1), (1.0, 1.0)]).usable();
+            assert_eq!(p, vec![(0.0, f(0.3)), (1.0, 1.0)], "{first} then {second}");
+            assert!(p[0].0.is_sign_positive(), "{first} then {second}");
+        }
+        let seven: Vec<(f32, f32)> = (0..7).map(|i| (i as f32 / 6.0, i as f32 / 6.0)).collect();
+        assert_eq!(curve(&seven).usable().len(), 7, "more than 5 points are used as given");
+        assert!(curve(&seven).is_neutral());
     }
 
     #[test]
@@ -300,6 +319,11 @@ mod tests {
         let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
         assert!(close(hue_offset(0.0), [0.7874, -0.2126, -0.2126]));
         assert!(close(hue_offset(200.0), [-0.549, 0.117_666_666_666_666_7, 0.451]));
+        let near = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4);
+        assert!(near(hue_offset(90.0), [-0.3215, 0.1785, -0.8215]), "sector 1");
+        assert!(near(hue_offset(150.0), [-0.7513, 0.2487, -0.2513]), "sector 2");
+        assert!(near(hue_offset(270.0), [0.3215, -0.1785, 0.8215]), "sector 4");
+        assert!(near(hue_offset(330.0), [0.7513, -0.2487, 0.2513]), "sector 5");
         assert!(close(hue_offset(-60.0), hue_offset(300.0)) && close(hue_offset(725.0), hue_offset(5.0)), "taken mod 360");
         assert!(SplitTone::NEUTRAL.is_neutral());
         assert!(!SplitTone { highlight_amount: 0.1, ..SplitTone::NEUTRAL }.is_neutral());
@@ -314,6 +338,7 @@ mod tests {
         assert_eq!(v.gain(0.1), 1.0);
         assert!((v.gain(0.205) - 0.75).abs() < 1e-6, "a zero feather is 0.01 wide");
         assert_eq!(v.gain(0.5), 0.5);
+        assert_eq!(smoothstep(0.0, 1.0, 0.25), 0.15625);
         assert!(Vignette { amount: 0.0, midpoint: 0.3, feather: 0.4 }.is_neutral());
     }
 
@@ -330,7 +355,9 @@ mod tests {
             assert_eq!(Grain { size: bad, ..g }.cell_size(), 1.0, "{bad}");
         }
         assert_eq!(Grain::cell_index(1.0, 3.5, 2.5), (2 << 32) | 3);
+        assert_eq!(Grain::cell_index(1.0, -0.5, 0.0), 0xFFFF_FFFF, "left of the canvas: cell −1, taken as 32 bits");
         assert_eq!([grain_weight(0.5), grain_weight(0.0), grain_weight(1.0), grain_weight(1.7), grain_weight(-1.0)], [1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(grain_weight(0.25), 0.75);
         assert!(!g.is_neutral() && Grain { amount: 0.0, ..g }.is_neutral());
     }
 

@@ -9,6 +9,7 @@ pub const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// murmur3's `fmix64` finaliser: a bijection on `u64` that avalanches every
 /// input bit into every output bit (0 is its fixed point).
+#[inline]
 pub fn fmix64(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
@@ -26,16 +27,19 @@ pub fn fmix64(mut x: u64) -> u64 {
 ///    `rotr32(((state >> 18) ^ state) >> 27 truncated to 32 bits, state >> 59)`.
 ///
 /// Different seeds give unrelated sequences, never shifted copies.
+#[inline]
 pub fn pcg32_hash(seed: u64, i: u64) -> u32 {
     pcg32_at(pcg32_stream(seed), i)
 }
 
 /// Step 1 of [`pcg32_hash`], once per seed (a renderer hashing every pixel of a layer).
+#[inline]
 pub fn pcg32_stream(seed: u64) -> u64 {
     fmix64(seed.wrapping_add(GOLDEN))
 }
 
 /// Steps 2 and 3 of [`pcg32_hash`] on a [`pcg32_stream`].
+#[inline]
 pub fn pcg32_at(stream: u64, i: u64) -> u32 {
     let state = fmix64(stream ^ i.wrapping_mul(GOLDEN));
     let xorshifted = (((state >> 18) ^ state) >> 27) as u32;
