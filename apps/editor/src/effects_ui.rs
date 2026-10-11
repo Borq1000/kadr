@@ -180,10 +180,16 @@ pub fn cards_of(def: &'static RecipeDef) -> Vec<Card> {
     }
 }
 
-/// The UI name of an effect: its recipe's name, or the raw recipe id of an
-/// effect from a newer Kadr.
+/// The UI name of an effect: its recipe's name — with its variant for a
+/// recipe that has them, «Look · Кино» (D7, refinement 4) — or the raw
+/// recipe id of an effect from a newer Kadr.
 pub fn fx_name(e: &AppliedEffect) -> String {
-    kadr_effects::recipe(&e.recipe).map_or_else(|| e.recipe.clone(), |d| t(&d.name_key()))
+    let Some(d) = kadr_effects::recipe(&e.recipe) else { return e.recipe.clone() };
+    let name = t(&d.name_key());
+    match (d.variants, d.variant_of(&e.params)) {
+        (Some(key), Some(v)) => tf("fx.variant_named", &[("name", &name), ("variant", &t(&d.option_name_key(key, v)))]),
+        _ => name,
+    }
 }
 
 /// Width of the `fx N` badge in a clip's name bar (timeline.slint draws it this wide).
@@ -355,16 +361,25 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
             let ease = anim_ui::key_here(c, &key, playhead, frame).map_or("", |k| anim_ui::ease_key(&k.ease));
             row.k = KeyState { state: info.state, prev: info.prev.is_some(), next: info.next.is_some(), enabled: on_clip, ease: ease.into() };
             row.strength = p.key == "strength";
+            // A 0..1 number reads as 0–100 % (Мягкость, refinement 9).
+            row.percent = min == 0.0 && max == 1.0;
         }
-        ParamKind::Choice { options, .. } => {
-            row.kind = 1;
+        ParamKind::Choice { options, default } => {
+            let def = kadr_effects::recipe(&e.recipe);
+            // The recipe's variants (a Look's presets) are a named list,
+            // other choices icon segments (D7).
+            row.kind = if def.is_some_and(|d| d.variants == Some(p.key)) { 4 } else { 1 };
+            // A missing value is the default, as the recipe reads it (and
+            // the block's title names it, refinement 3).
             let current = match e.params.get(p.key) {
                 Some(ParamValue::Choice(v)) => v.as_str(),
+                None => default,
                 _ => "",
             };
             row.current = options.iter().position(|o| *o == current).map_or(-1, |i| i as i32);
             row.options = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(*o)).collect::<Vec<_>>()));
-            row.tips = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(t(&format!("fx.choice.{o}")))).collect::<Vec<_>>()));
+            let name_key = |o: &str| def.map_or_else(|| format!("fx.choice.{o}"), |d| d.option_name_key(p.key, o));
+            row.tips = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(t(&name_key(o)))).collect::<Vec<_>>()));
         }
         ParamKind::Point => {
             row.kind = 2;
@@ -423,9 +438,17 @@ pub fn has_moment(c: &Clip) -> bool {
 /// «Сбросить» of one effect: its settings back to the defaults and no
 /// keyframes on its numbers — `None` when it is so already. Every moment
 /// stays where it was put (ruling R13: a reset never re-times a punch); one
-/// the effect lacks gets its default (the frame at `at`).
+/// the effect lacks gets its default (the frame at `at`). A variant — a
+/// Look's preset — stays too (refinement 5).
 pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) -> Option<Vec<EditCommand>> {
     let mut defaults = kadr_effects::fresh(def, c, at).params;
+    // A Look's preset is what the effect is (its card): a reset keeps it, as
+    // it keeps a moment (refinement 5).
+    if let Some(key) = def.variants
+        && let Some(v @ ParamValue::Choice(_)) = e.params.get(key)
+    {
+        defaults.insert(key.to_string(), v.clone());
+    }
     for p in def.params.iter().filter(|p| p.kind == ParamKind::Moment) {
         if let Some(m @ ParamValue::Moment(_)) = e.params.get(p.key) {
             defaults.insert(p.key.to_string(), m.clone());
@@ -1393,6 +1416,46 @@ mod tests {
         assert_eq!(d.options.iter().collect::<Vec<_>>(), vec![slint::SharedString::from("in"), slint::SharedString::from("out")]);
     }
 
+    /// D7: the preset is a list of names; the block's title says which.
+    #[test]
+    fn a_look_s_preset_is_a_named_list_and_its_block_says_which() {
+        let mut c = clip_10_20();
+        let look = kadr_effects::recipe("look").unwrap();
+        let e = card("look:soft_film").fresh(&c, Time::from_secs(12));
+        c.effects.push(e.clone());
+        let row = param_row(&c, &e, look.param("preset").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false);
+        assert_eq!((row.kind, row.current), (4, 2), "a dropdown, «Мягкая плёнка» chosen");
+        let names: Vec<String> = row.tips.iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, kadr_effects::look::preset_keys().iter().map(|k| t(&format!("fx.look.{k}"))).collect::<Vec<_>>());
+        assert_eq!(fx_name(&e), tf("fx.variant_named", &[("name", &t("fx.look")), ("variant", &t("fx.look.soft_film"))]));
+        // A pick from the list changes the preset only, in one entry.
+        let (label, cmds) = action_commands(&c, e.id, "choice:preset:3", Time::from_secs(12), FrameRate::FPS_30).unwrap();
+        assert_eq!(label, tf("cmd.update_effect_named", &[("name", &fx_name(&e))]));
+        assert_eq!(cmds, vec![EditCommand::UpdateEffect { clip: c.id, id: e.id, params: BTreeMap::from([("preset".to_string(), ParamValue::Choice("dramatic".into()))]), enabled: None }]);
+        assert!(action_commands(&c, e.id, "choice:preset:2", Time::from_secs(12), FrameRate::FPS_30).is_none(), "already that preset");
+        // Refinement 3: a Look without a preset is Кино — in the list as in its title.
+        let mut bare = e.clone();
+        bare.params.remove("preset");
+        assert_eq!(param_row(&c, &bare, look.param("preset").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false).current, 0);
+        assert_eq!(fx_name(&bare), tf("fx.variant_named", &[("name", &t("fx.look")), ("variant", &t("fx.look.cinematic"))]));
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        let z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
+        assert_eq!(param_row(&c, &z, zoom.param("direction").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false).kind, 1, "icon choices stay segments");
+    }
+
+    #[test]
+    fn the_vignette_shows_strength_and_softness_in_percent() {
+        let mut c = clip_10_20();
+        let vig = kadr_effects::recipe("vignette").unwrap();
+        let e = kadr_effects::fresh(vig, &c, Time::from_secs(12));
+        c.effects.push(e.clone());
+        let rows: Vec<FxParamRow> = vig.params.iter().map(|p| param_row(&c, &e, p, Time::from_secs(12), FrameRate::FPS_30, false)).collect();
+        let shape: Vec<(String, i32, bool, bool)> = rows.iter().map(|r| (r.key.to_string(), r.kind, r.strength, r.percent)).collect();
+        assert_eq!(shape, [("strength".to_string(), 0, true, true), ("softness".to_string(), 0, false, true)]);
+        assert_eq!(rows[1].value, 0.5);
+        assert_eq!(fx_name(&e), t("fx.vignette"), "no variant, no suffix");
+    }
+
     /// «К плейхеду» is enabled only off the moment's frame: a playhead move
     /// must refresh the block even on a clip without keyframes.
     #[test]
@@ -1466,6 +1529,21 @@ mod tests {
         assert_eq!(params["strength"], ParamValue::Number(0.6), "the settings go back");
         assert_eq!(params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(37))), "the moment stays");
         assert_eq!(params["point"], ParamValue::Point { x: 0.5, y: 0.5 });
+    }
+
+    /// Refinement 5: a Look's «Сбросить» brings «Обычно» back but keeps its preset.
+    #[test]
+    fn resetting_a_look_keeps_its_preset() {
+        let mut c = clip_10_20();
+        let look = kadr_effects::recipe("look").unwrap();
+        let mut e = card("look:warm").fresh(&c, Time::from_secs(12));
+        c.effects.push(e.clone());
+        assert!(reset_commands(&c, &e, look, Time::from_secs(12)).is_none(), "Тёплый at «Обычно»: nothing to reset");
+        e.params.insert("strength".into(), ParamValue::Number(0.9));
+        c.effects[0] = e.clone();
+        let cmds = reset_commands(&c, &e, look, Time::from_secs(12));
+        let Some([EditCommand::UpdateEffect { params, .. }]) = cmds.as_deref() else { panic!("one UpdateEffect: {cmds:?}") };
+        assert_eq!((&params["strength"], &params["preset"]), (&ParamValue::Number(0.6), &ParamValue::Choice("warm".into())));
     }
 
     /// R14: «Сбросить» in the ⋯ menu is greyed out exactly when it would do nothing.

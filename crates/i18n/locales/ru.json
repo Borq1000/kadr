@@ -841,5 +841,6 @@
   "fx.look.natural": "Естественный",
   "fx.vignette": "Виньетка",
   "fx.param.preset": "Пресет",
-  "fx.param.softness": "Мягкость"
+  "fx.param.softness": "Мягкость",
+  "fx.variant_named": "{name} · {variant}"
 }

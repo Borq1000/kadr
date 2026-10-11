@@ -812,5 +812,6 @@
   "fx.look.natural": "Natural",
   "fx.vignette": "Vignette",
   "fx.param.preset": "Preset",
-  "fx.param.softness": "Softness"
+  "fx.param.softness": "Softness",
+  "fx.variant_named": "{name} · {variant}"
 }

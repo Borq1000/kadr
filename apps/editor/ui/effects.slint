@@ -254,7 +254,7 @@ export struct FxParamRow {
     key: string,
     // "fx:<effect-id>:<key>": a number row's live / commit / key actions.
     prop: string,
-    kind: int, // 0 number, 1 choice, 2 point, 3 moment
+    kind: int, // 0 number, 1 choice (icon segments), 2 point, 3 moment, 4 named list (dropdown)
     label: string,
     value: float,
     minimum: float,
@@ -263,7 +263,9 @@ export struct FxParamRow {
     k: KeyState,
     // Strength: 0–100 % with marks at 30 / 60 / 90 % and snapping.
     strength: bool,
-    // A choice's option keys (the icons follow from them) and their names.
+    // A 0..1 number shown as 0–100 % (Мягкость).
+    percent: bool,
+    // A choice's option keys (icons follow from them) and their names (tooltips, or the list's entries).
     options: [string],
     tips: [string],
     current: int,
@@ -321,6 +323,86 @@ component ChoiceSegments inherits Rectangle {
                 }
             }
             if sa.has-hover && i < root.tips.length: Tooltip { text: root.tips[i]; x: (parent.width - self.width) / 2; y: -self.height - 4px; }
+        }
+    }
+}
+
+// A choice named by text (a Look's presets, D7): the current name and a
+// chevron; a click opens the app's own list (MenuButton's styling, the
+// current entry checked). Paths, not glyphs. A PopupWindow is drawn in
+// window coordinates: the inspector's scroll area does not clip it, and
+// Slint keeps it inside the window (near the bottom it moves up).
+component ChoiceList inherits Rectangle {
+    in property <[string]> names;
+    in property <int> current;
+    callback selected(int);
+    height: 26px;
+    border-radius: 5px;
+    background: ta.pressed ? Theme.bg4 : ta.has-hover ? Theme.bg3 : Theme.bg2;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.border-strong : Theme.border;
+    accessible-role: combobox;
+    accessible-value: root.current >= 0 && root.current < root.names.length ? root.names[root.current] : "";
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 6px;
+        Text {
+            text: root.current >= 0 && root.current < root.names.length ? root.names[root.current] : "—";
+            font-size: Theme.font-sm;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            Icon { icon: Icons.chevron-down; width: 12px; height: 12px; color: Theme.text-dim; }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 2px;
+        width: max(root.width, 160px);
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.bg2;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #000000a0;
+            VerticalLayout {
+                padding: 4px;
+                for n[i] in root.names: Rectangle {
+                    height: 26px;
+                    border-radius: 4px;
+                    background: ra.has-hover ? Theme.bg3 : transparent;
+                    accessible-role: list-item;
+                    accessible-label: n;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        Rectangle {
+                            width: 14px;
+                            if i == root.current: Icon { icon: Icons.check; width: 12px; height: 12px; color: Theme.accent; }
+                        }
+                        Text { text: n; font-size: Theme.font-sm; color: Theme.text; vertical-alignment: center; overflow: elide; }
+                    }
+                    ra := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            popup.close();
+                            if (i != root.current) { root.selected(i); }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -425,6 +507,7 @@ export component FxBlock inherits VerticalLayout {
         if p.kind == 0 && !p.strength: AnimRow {
             prop: p.prop; k: p.k; outside: root.outside; label: p.label; value: p.value;
             minimum: p.minimum; maximum: p.maximum; default-value: p.default-value;
+            display-scale: p.percent ? 100 : 1; decimals: p.percent ? 0 : 2; unit: p.percent ? "%" : "";
             live(a, v) => { root.live(a, v); }
             commit(a, v) => { root.commit(a, v); }
             key-action(a, b) => { root.key-action(a, b); }
@@ -435,6 +518,16 @@ export component FxBlock inherits VerticalLayout {
             Text { width: 84px; text: p.label; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
             VerticalLayout { alignment: center; ChoiceSegments { options: p.options; tips: p.tips; current: p.current; selected(i) => { root.action(root.fx.id, "choice:" + p.key + ":" + i); } } }
             Rectangle { horizontal-stretch: 1; }
+        }
+        if p.kind == 4: HorizontalLayout {
+            height: 30px;
+            spacing: 8px;
+            Text { width: 84px; text: p.label; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                ChoiceList { names: p.tips; current: p.current; selected(i) => { root.action(root.fx.id, "choice:" + p.key + ":" + i); } }
+            }
         }
         if p.kind == 2: HorizontalLayout {
             height: 28px;
