@@ -3,6 +3,7 @@
 //! CPU frames today and GPU textures later without the scene changing.
 
 use crate::geom::{Placement, RectF, SizeU};
+use crate::primitives::{Grain, SplitTone, ToneCurve, Vignette};
 use kadr_core::{AssetId, ClipId, ColorInfo, Time, TransitionId};
 
 /// Stable identity of a layer (from a clip or transition id): the key for
@@ -83,11 +84,35 @@ impl ColorAdjust {
     }
 }
 
-/// Render primitives only — never a recipe or a CPU filter object.
+/// Render primitives only — never a recipe or a CPU filter object. Exact
+/// formulas: crate docs, "Point operations".
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Effect {
     ColorAdjust(ColorAdjust),
+    ToneCurve(ToneCurve),
+    SplitTone(SplitTone),
+    Vignette(Vignette),
+    Grain(Grain),
+}
+
+impl Effect {
+    /// Whether the primitive leaves every colour as it is: a chain of only
+    /// such is skipped, its clamp included.
+    pub fn is_neutral(&self) -> bool {
+        match self {
+            Effect::ColorAdjust(a) => a.is_neutral(),
+            Effect::ToneCurve(c) => c.is_neutral(),
+            Effect::SplitTone(s) => s.is_neutral(),
+            Effect::Vignette(v) => v.is_neutral(),
+            Effect::Grain(g) => g.is_neutral(),
+        }
+    }
+
+    /// Whether the primitive reads the pixel's canvas position.
+    pub fn is_spatial(&self) -> bool {
+        matches!(self, Effect::Vignette(_) | Effect::Grain(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

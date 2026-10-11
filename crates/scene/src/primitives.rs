@@ -1,0 +1,350 @@
+//! The colour primitives of effects E2 (effects spec §4; formulas: the
+//! effects system draft §3 «Примитивы цвета», exact rules in the crate docs,
+//! "Point operations"): plain data, plus the normative pure helpers every
+//! renderer uses — the CPU renderer now, a GPU one later (the tone table
+//! becomes its 1D texture, the grain hash its integer shader code).
+
+/// Rec.709 luma weights of non-linear R'G'B'.
+pub const LUMA709: [f64; 3] = [0.2126, 0.7152, 0.0722];
+
+/// `Y(c)`: the Rec.709 luma of non-linear R'G'B'.
+pub fn luma709(c: [f64; 3]) -> f64 {
+    LUMA709[0] * c[0] + LUMA709[1] * c[1] + LUMA709[2] * c[2]
+}
+
+/// `t²·(3 − 2t)` with `t = clamp((x − e0) / (e1 − e0), 0, 1)`; `e1 > e0`.
+pub fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// One tone curve for R', G' and B' (E2 has no per-channel curves, D11).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneCurve {
+    /// 2–5 control points `(x, y)` in [0, 1], x strictly increasing, y
+    /// non-decreasing; anything else is cleaned up by [`ToneCurve::usable`].
+    pub points: Vec<(f32, f32)>,
+}
+
+impl ToneCurve {
+    pub fn identity() -> ToneCurve {
+        ToneCurve { points: vec![(0.0, 0.0), (1.0, 1.0)] }
+    }
+
+    /// The points the curve uses (refinement 8): non-finite ones dropped,
+    /// the rest clamped into [0, 1] and sorted by x; of points sharing an x
+    /// the first given; each y at least the one before. Fewer than two left:
+    /// the identity's two.
+    pub fn usable(&self) -> Vec<(f64, f64)> {
+        let mut p: Vec<(f64, f64)> = self
+            .points
+            .iter()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|&(x, y)| ((x as f64).clamp(0.0, 1.0), (y as f64).clamp(0.0, 1.0)))
+            .collect();
+        p.sort_by(|a, b| a.0.total_cmp(&b.0));
+        p.dedup_by(|later, earlier| later.0 == earlier.0);
+        for i in 1..p.len() {
+            p[i].1 = p[i].1.max(p[i - 1].1);
+        }
+        if p.len() < 2 { vec![(0.0, 0.0), (1.0, 1.0)] } else { p }
+    }
+
+    /// Whether the curve maps every value to itself: its usable points run
+    /// from (0, 0) to (1, 1) on the diagonal (the curve is constant beyond
+    /// its first and last points, so one that starts later is not).
+    pub fn is_neutral(&self) -> bool {
+        let p = self.usable();
+        p.first() == Some(&(0.0, 0.0)) && p.last() == Some(&(1.0, 1.0)) && p.iter().all(|(x, y)| x == y)
+    }
+
+    /// The normative 256-entry table: the monotone cubic Hermite spline of
+    /// Fritsch and Carlson through [`ToneCurve::usable`], evaluated in f64 at
+    /// `x = i/255` and stored as f32. Secants `d_k`; tangents `m_0 = d_0`,
+    /// `m_{n−1} = d_{n−2}`, inside `m_k = 0` where `d_{k−1}·d_k ≤ 0`, else
+    /// `(d_{k−1} + d_k)/2`; then for `k = 0 … n−2` in order: `d_k = 0` sets
+    /// `m_k = m_{k+1} = 0`, else with `α = m_k/d_k`, `β = m_{k+1}/d_k`,
+    /// `α² + β² > 9` scales both by `3/√(α² + β²)`. Below the first point the
+    /// curve is its y, above the last point the last y.
+    pub fn table(&self) -> [f32; 256] {
+        let p = self.usable();
+        let n = p.len();
+        let d: Vec<f64> = (0..n - 1).map(|k| (p[k + 1].1 - p[k].1) / (p[k + 1].0 - p[k].0)).collect();
+        let mut m = vec![0.0; n];
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for k in 1..n - 1 {
+            m[k] = if d[k - 1] * d[k] <= 0.0 { 0.0 } else { (d[k - 1] + d[k]) / 2.0 };
+        }
+        for k in 0..n - 1 {
+            if d[k] == 0.0 {
+                m[k] = 0.0;
+                m[k + 1] = 0.0;
+            } else {
+                let (a, b) = (m[k] / d[k], m[k + 1] / d[k]);
+                let s = a * a + b * b;
+                if s > 9.0 {
+                    let tau = 3.0 / s.sqrt();
+                    m[k] = tau * a * d[k];
+                    m[k + 1] = tau * b * d[k];
+                }
+            }
+        }
+        std::array::from_fn(|i| {
+            let x = i as f64 / 255.0;
+            let v = if x <= p[0].0 {
+                p[0].1
+            } else if x >= p[n - 1].0 {
+                p[n - 1].1
+            } else {
+                let k = (0..n - 1).find(|&k| x < p[k + 1].0).unwrap_or(n - 2);
+                let h = p[k + 1].0 - p[k].0;
+                let t = (x - p[k].0) / h;
+                let (t2, t3) = (t * t, t * t * t);
+                (2.0 * t3 - 3.0 * t2 + 1.0) * p[k].1 + (t3 - 2.0 * t2 + t) * h * m[k] + (-2.0 * t3 + 3.0 * t2) * p[k + 1].1 + (t3 - t2) * h * m[k + 1]
+            };
+            v.clamp(0.0, 1.0) as f32
+        })
+    }
+}
+
+/// One channel through a tone table: `v` clamped into [0, 1] — the
+/// curve's domain, the one clamp inside a chain — `× 255`, then linear
+/// between the two neighbouring entries. NaN reads as 0.
+#[inline]
+pub fn tone_lookup(table: &[f32; 256], v: f32) -> f32 {
+    let x = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } * 255.0;
+    let i = (x as usize).min(254);
+    table[i] + (table[i + 1] - table[i]) * (x - i as f32)
+}
+
+/// Tints the shadows and the highlights by two hues without changing luma.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitTone {
+    /// Degrees, any value (taken mod 360).
+    pub shadow_hue_deg: f32,
+    /// 0..1; 0 = no tint.
+    pub shadow_amount: f32,
+    pub highlight_hue_deg: f32,
+    pub highlight_amount: f32,
+    /// −1..1: positive gives more of the picture to the highlights' tint.
+    pub balance: f32,
+}
+
+impl SplitTone {
+    pub const NEUTRAL: SplitTone = SplitTone { shadow_hue_deg: 0.0, shadow_amount: 0.0, highlight_hue_deg: 0.0, highlight_amount: 0.0, balance: 0.0 };
+
+    pub fn is_neutral(&self) -> bool {
+        self.shadow_amount == 0.0 && self.highlight_amount == 0.0
+    }
+}
+
+/// `d(h)` of the split tone: the hue `h` (degrees, taken mod 360) at full
+/// saturation and value, `hsv(h, 1, 1)`, minus its own Rec.709 luma — a
+/// pure chroma shift.
+pub fn hue_offset(hue_deg: f64) -> [f64; 3] {
+    let h = hue_deg.rem_euclid(360.0) / 60.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    let rgb = match h as u32 {
+        0 => [1.0, x, 0.0],
+        1 => [x, 1.0, 0.0],
+        2 => [0.0, 1.0, x],
+        3 => [0.0, x, 1.0],
+        4 => [x, 0.0, 1.0],
+        _ => [1.0, 0.0, x],
+    };
+    let y = luma709(rgb);
+    rgb.map(|v| v - y)
+}
+
+/// Darkens towards the canvas corners: a circle in canvas pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vignette {
+    /// 0..1: the darkening at full distance.
+    pub amount: f32,
+    /// Where the darkening starts, as a [`Vignette::distance`].
+    pub midpoint: f32,
+    /// Width of the soft edge in distance units (at least 0.01).
+    pub feather: f32,
+}
+
+impl Vignette {
+    pub fn is_neutral(&self) -> bool {
+        self.amount == 0.0
+    }
+
+    /// `d` of canvas point `(x, y)`: its distance from the canvas centre ÷
+    /// half the canvas diagonal — 0 in the centre, 1 in the corners.
+    pub fn distance(canvas_w: f64, canvas_h: f64, x: f64, y: f64) -> f64 {
+        let (dx, dy) = (x - canvas_w / 2.0, y - canvas_h / 2.0);
+        (dx * dx + dy * dy).sqrt() / ((canvas_w * canvas_w + canvas_h * canvas_h).sqrt() / 2.0)
+    }
+
+    /// `v = 1 − amount · smoothstep(midpoint, midpoint + max(feather, 0.01), d)`.
+    pub fn gain(&self, d: f64) -> f64 {
+        let e0 = self.midpoint as f64;
+        1.0 - self.amount as f64 * smoothstep(e0, e0 + (self.feather as f64).max(0.01), d)
+    }
+}
+
+/// Monochrome film grain on canvas-pixel cells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grain {
+    /// Peak-to-peak strength at mid-grey (0.05 is visible film grain).
+    pub amount: f32,
+    /// Side of a grain cell in canvas pixels.
+    pub size: f32,
+    /// The recipe varies it per frame.
+    pub seed: u64,
+}
+
+impl Grain {
+    pub fn is_neutral(&self) -> bool {
+        self.amount == 0.0
+    }
+
+    /// The cell side in canvas pixels: `size`, but at least 1 (a size below
+    /// 1 or not finite counts as 1).
+    pub fn cell_size(&self) -> f64 {
+        let s = self.size as f64;
+        if s.is_finite() && s >= 1.0 { s } else { 1.0 }
+    }
+
+    /// The hash index of the cell of side `size` holding canvas point
+    /// `(x, y)`: `floor(y/size) << 32 | floor(x/size)`, each taken as 32 bits.
+    #[inline]
+    pub fn cell_index(size: f64, x: f64, y: f64) -> u64 {
+        // Truncation is floor for q ≥ 0 — the whole canvas — and needs no libm call.
+        let cell = |v: f64| {
+            let q = v / size;
+            (if q >= 0.0 { q as i64 } else { q.floor() as i64 }) as u32 as u64
+        };
+        (cell(y) << 32) | cell(x)
+    }
+
+    /// `h` of canvas point `(x, y)`: `pcg32_hash(seed, cell index) / (2³² − 1)`, in [0, 1].
+    pub fn noise(&self, x: f64, y: f64) -> f64 {
+        kadr_core::hash::pcg32_hash(self.seed, Self::cell_index(self.cell_size(), x, y)) as f64 / u32::MAX as f64
+    }
+}
+
+/// The grain's weight `4·Y·(1 − Y)` with `Y` clamped into [0, 1]: no grain
+/// in pure black or white.
+pub fn grain_weight(y: f64) -> f64 {
+    let y = y.clamp(0.0, 1.0);
+    4.0 * y * (1.0 - y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ColorAdjust, Effect};
+
+    fn curve(points: &[(f32, f32)]) -> ToneCurve {
+        ToneCurve { points: points.to_vec() }
+    }
+
+    #[test]
+    fn an_identity_curve_is_neutral_and_its_table_is_the_diagonal() {
+        for c in [ToneCurve::identity(), curve(&[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)]), curve(&[(0.4, 0.9)]), curve(&[])] {
+            assert!(c.is_neutral(), "{c:?}");
+            let t = c.table();
+            assert!(t.iter().enumerate().all(|(i, v)| (v - i as f32 / 255.0).abs() < 1e-6), "{c:?}");
+        }
+        assert!(!curve(&[(0.2, 0.2), (0.8, 0.8)]).is_neutral(), "constant beyond its points: not the identity");
+        assert!(!curve(&[(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)]).is_neutral());
+    }
+
+    /// The normative table: a GPU's 1D texture of this curve holds these numbers.
+    #[test]
+    fn the_tone_table_is_pinned() {
+        let t = curve(&[(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)]).table();
+        for (i, want) in [(0, 0.0), (32, 0.062_745_3), (64, 0.150_982_7), (128, 0.503_137_2), (191, 0.849_017_3), (255, 1.0)] {
+            assert!((t[i] - want).abs() < 1e-6, "T[{i}] = {} (want {want})", t[i]);
+        }
+    }
+
+    /// Fritsch–Carlson: monotone and without overshoot, even through a near-step.
+    #[test]
+    fn the_spline_never_overshoots() {
+        let step = curve(&[(0.0, 0.0), (0.45, 0.05), (0.55, 0.95), (1.0, 1.0)]).table();
+        assert!(step.windows(2).all(|w| w[0] <= w[1]), "monotone");
+        assert!(step[..115].iter().all(|&v| v <= 0.05 + 1e-6), "below the step: within its two points");
+        assert!(step[141..].iter().all(|&v| v >= 0.95 - 1e-6), "above the step: within its two points");
+        let flat = curve(&[(0.0, 0.2), (1.0, 0.2)]).table();
+        assert!(flat.iter().all(|&v| v == 0.2), "a flat curve stays flat");
+    }
+
+    #[test]
+    fn unusable_points_are_cleaned_up() {
+        let messy = curve(&[(0.9, 0.7), (f32::NAN, 0.5), (0.1, 0.4), (0.1, 0.0), (1.3, 1.2), (0.5, 0.2)]);
+        let f = |v: f32| v as f64;
+        assert_eq!(messy.usable(), vec![(f(0.1), f(0.4)), (f(0.5), f(0.4)), (f(0.9), f(0.7)), (1.0, 1.0)], "finite, clamped, sorted, first of equal x, rising");
+        assert_eq!(curve(&[(0.5, 0.5)]).usable(), vec![(0.0, 0.0), (1.0, 1.0)], "one point: the identity");
+    }
+
+    #[test]
+    fn lookup_clamps_its_input_and_interpolates() {
+        let t = curve(&[(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)]).table();
+        assert_eq!(tone_lookup(&t, -3.0), t[0]);
+        assert_eq!(tone_lookup(&t, 7.0), t[255]);
+        assert_eq!(tone_lookup(&t, f32::NAN), t[0]);
+        assert!((tone_lookup(&t, 64.5 / 255.0) - (t[64] + t[65]) / 2.0).abs() < 1e-6, "half way between two entries");
+    }
+
+    #[test]
+    fn split_tone_offsets_are_pure_chroma() {
+        for h in [0.0, 30.0, 35.0, 120.0, 200.0, 300.0, -60.0, 725.0] {
+            assert!(luma709(hue_offset(h)).abs() < 1e-12, "{h}: luma stays");
+        }
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
+        assert!(close(hue_offset(0.0), [0.7874, -0.2126, -0.2126]));
+        assert!(close(hue_offset(200.0), [-0.549, 0.117_666_666_666_666_7, 0.451]));
+        assert!(close(hue_offset(-60.0), hue_offset(300.0)) && close(hue_offset(725.0), hue_offset(5.0)), "taken mod 360");
+        assert!(SplitTone::NEUTRAL.is_neutral());
+        assert!(!SplitTone { highlight_amount: 0.1, ..SplitTone::NEUTRAL }.is_neutral());
+    }
+
+    #[test]
+    fn the_vignette_is_a_circle_in_canvas_pixels() {
+        assert_eq!(Vignette::distance(1920.0, 1080.0, 960.0, 540.0), 0.0);
+        assert!((Vignette::distance(1920.0, 1080.0, 0.0, 0.0) - 1.0).abs() < 1e-12, "the corners are 1");
+        assert!((Vignette::distance(1920.0, 1080.0, 0.0, 540.0) - 1920.0 / 1920f64.hypot(1080.0)).abs() < 1e-12, "a side's middle is nearer than a corner");
+        let v = Vignette { amount: 0.5, midpoint: 0.2, feather: 0.0 };
+        assert_eq!(v.gain(0.1), 1.0);
+        assert!((v.gain(0.205) - 0.75).abs() < 1e-6, "a zero feather is 0.01 wide");
+        assert_eq!(v.gain(0.5), 0.5);
+        assert!(Vignette { amount: 0.0, midpoint: 0.3, feather: 0.4 }.is_neutral());
+    }
+
+    #[test]
+    fn grain_is_pinned_per_canvas_cell() {
+        let g = Grain { amount: 1.0, size: 1.0, seed: 7 };
+        assert_eq!(g.noise(0.5, 0.5), 1_630_685_630.0 / u32::MAX as f64, "cell (0, 0): index 0");
+        assert_eq!(g.noise(1.5, 0.5), 1_910_406_292.0 / u32::MAX as f64, "cell (1, 0): index 1");
+        assert_eq!(g.noise(0.5, 1.5), 4_255_874_242.0 / u32::MAX as f64, "cell (0, 1): index 2³²");
+        let big = Grain { size: 2.0, ..g };
+        assert_eq!(big.noise(0.5, 0.5), big.noise(1.9, 1.9), "one 2 × 2 cell");
+        assert_ne!(big.noise(0.5, 0.5), big.noise(2.1, 0.5));
+        for bad in [0.3, 0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(Grain { size: bad, ..g }.cell_size(), 1.0, "{bad}");
+        }
+        assert_eq!(Grain::cell_index(1.0, 3.5, 2.5), (2 << 32) | 3);
+        assert_eq!([grain_weight(0.5), grain_weight(0.0), grain_weight(1.0), grain_weight(1.7), grain_weight(-1.0)], [1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(!g.is_neutral() && Grain { amount: 0.0, ..g }.is_neutral());
+    }
+
+    #[test]
+    fn effects_know_whether_they_change_anything_or_read_a_position() {
+        let none = [
+            Effect::ColorAdjust(ColorAdjust::NEUTRAL),
+            Effect::ToneCurve(ToneCurve::identity()),
+            Effect::SplitTone(SplitTone::NEUTRAL),
+            Effect::Vignette(Vignette { amount: 0.0, midpoint: 0.5, feather: 0.5 }),
+            Effect::Grain(Grain { amount: 0.0, size: 2.0, seed: 1 }),
+        ];
+        assert!(none.iter().all(Effect::is_neutral));
+        assert_eq!(none.iter().map(Effect::is_spatial).collect::<Vec<_>>(), [false, false, false, true, true]);
+        assert!(!Effect::Vignette(Vignette { amount: 0.3, midpoint: 0.5, feather: 0.5 }).is_neutral());
+    }
+}

@@ -1,7 +1,11 @@
 //! `Noise1D` (effects spec §3): smooth value noise for natural motion
-//! (Handheld). Lattice values come from an integer hash of (seed, lattice
-//! index) ending in one PCG32 (XSH-RR) output step — integer-exact, so a
-//! GPU shader reproduces them bit for bit.
+//! (Handheld). Lattice values come from `kadr_core::hash::pcg32_hash` of
+//! (seed, lattice index), an integer hash ending in one PCG32 (XSH-RR)
+//! output step — integer-exact, so a GPU shader reproduces them bit for bit.
+
+/// The lattice hash: `kadr_core::hash::pcg32_hash` (saved semantics, shared
+/// with the renderer's grain).
+pub use kadr_core::hash::pcg32_hash;
 
 /// Value noise in `[−amplitude, amplitude]`: a lattice value every
 /// `1 / frequency` seconds, smoothstep-blended in between.
@@ -26,38 +30,6 @@ impl Noise1D {
         let s = f * f * (3.0 - 2.0 * f);
         self.amplitude * (a + (b - a) * s)
     }
-}
-
-/// Odd 64-bit golden-ratio constant (splitmix64's increment).
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// murmur3's `fmix64` finaliser: a bijection on `u64` that avalanches every
-/// input bit into every output bit.
-fn fmix64(mut x: u64) -> u64 {
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-    x ^ (x >> 33)
-}
-
-/// The hash of lattice point `i` on stream `seed` — saved project
-/// semantics, so the algorithm is fixed (u64 wrapping operations only; a GPU
-/// port reproduces it bit for bit):
-///
-/// 1. `stream = fmix64(seed + 0x9E3779B97F4A7C15 mod 2⁶⁴)` — all 64 seed
-///    bits, every one avalanched (the offset keeps seed 0 off `fmix64`'s
-///    fixed point 0);
-/// 2. `state = fmix64(stream ^ (i · 0x9E3779B97F4A7C15 mod 2⁶⁴))`;
-/// 3. the PCG32 XSH-RR output of `state`:
-///    `rotr32(((state >> 18) ^ state) >> 27 truncated to 32 bits, state >> 59)`.
-///
-/// Different seeds therefore give unrelated sequences (never shifted copies
-/// of one another).
-pub fn pcg32_hash(seed: u64, i: u64) -> u32 {
-    let state = fmix64(fmix64(seed.wrapping_add(GOLDEN)) ^ i.wrapping_mul(GOLDEN));
-    let xorshifted = (((state >> 18) ^ state) >> 27) as u32;
-    xorshifted.rotate_right((state >> 59) as u32)
 }
 
 /// The lattice value of point `i`, in `[−1, 1]`.

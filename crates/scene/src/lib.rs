@@ -77,21 +77,64 @@
 //! layer of [`Rgba::MISSING`] with the same placement, crop, opacity, blend
 //! and effects; the scene itself never changes because of it.
 //!
-//! Effects (point operations, formulas in the effects spec «Примитивы цвета»)
-//! apply to that sample in `effects` order, on unpremultiplied colour:
-//! `rgb / a` → the effect chain (clamped to [0, 1] once, at its end) →
-//! `× a`; a sample with `a = 0` stays as it is (the chain is skipped), and
-//! so does every sample when the chain holds only neutral adjusts
-//! ([`ColorAdjust::is_neutral`]: no-ops, the clamp included — which matters
-//! for premultiplied texels brighter than their alpha). This
-//! happens before opacity and coverage. For `c ≥ 0` exposure equals
-//! `c · 2^(ev/2.4)`; a negative intermediate value (only possible between
-//! chained adjusts) uses that same form, so the whole `ColorAdjust` is
-//! affine in `c` and may be applied as one 3×4 matrix.
+//! Effects apply to that sample: "Point operations (effects)" below.
 //!
 //! A layer draws nothing when its crop is empty (`RectF::is_empty`), its
 //! `placement.size` has a non-positive side, or its transform has no
 //! inverse.
+//!
+//! ## Point operations (effects)
+//!
+//! A layer's `effects` are point operations on its sample (formulas: the
+//! effects spec «Примитивы цвета»; the exact rules are these). They apply in
+//! list order to unpremultiplied colour, before opacity and coverage:
+//! `c = rgb / a` → each primitive → `clamp(c, 0, 1)` **once, at the end** →
+//! `× a`. A sample with `a = 0` stays as it is (the chain is skipped), and
+//! so does every sample when every primitive is neutral
+//! ([`Effect::is_neutral`]: no-ops, the final clamp included — which matters
+//! for premultiplied texels brighter than their alpha). Between primitives
+//! values may leave [0, 1]. `Y(c) = 0.2126·r + 0.7152·g + 0.0722·b` is the
+//! Rec.709 luma of non-linear R'G'B' ([`luma709`]). For the spatial
+//! primitives `p` is the canvas position of the output pixel centre
+//! `(x, y)`: `p = ((x − o.x) / k, (y − o.y) / k)` (see Coordinates),
+//! computed in f64 exactly so.
+//!
+//! - **ColorAdjust**, steps in this order: exposure `c · 2^(ev/2.4)` (equal
+//!   to `(c^2.4 · 2^ev)^(1/2.4)` for `c ≥ 0`; a negative intermediate value
+//!   uses the same form), contrast `(c − 0.5)·k + 0.5`, temperature / tint
+//!   `R·(1 + 0.1t)`, `G·(1 − 0.05u)`, `B·(1 − 0.1t)`, saturation
+//!   `Y + (c − Y)·s`. Each adjust is affine in `c`, so consecutive adjusts
+//!   may be applied as one 3×4 matrix.
+//! - **ToneCurve**, one curve for R', G' and B': the 256 entries
+//!   `T` = [`ToneCurve::table`] (a Fritsch–Carlson monotone cubic through
+//!   the usable points, constant beyond the first and the last); each
+//!   channel `v` becomes [`tone_lookup`]`(T, v)`: `x = clamp(v, 0, 1)·255`,
+//!   `i = min(floor(x), 254)`, `T[i] + (T[i+1] − T[i])·(x − i)`. Clamping
+//!   the input to the curve's domain is the one clamp inside a chain.
+//! - **SplitTone**: `Yb = clamp(Y(c) + 0.25·balance, 0, 1)`,
+//!   `c' = c + shadow_amount·(1 − Yb)²·d(shadow_hue) + highlight_amount·Yb²·d(highlight_hue)`
+//!   with `d` = [`hue_offset`] (the hue at full saturation minus its own
+//!   luma: luma stays).
+//! - **Vignette**: `d` = [`Vignette::distance`] of `p` (from the canvas
+//!   centre ÷ half the canvas diagonal: a circle in canvas pixels, 1 in the
+//!   corners); `c' = c · (1 − amount · smoothstep(midpoint, midpoint +
+//!   max(feather, 0.01), d))` ([`Vignette::gain`]). It belongs to the
+//!   canvas, not to the layer: on a picture-in-picture layer the darkening
+//!   is where it would be on a full-frame one.
+//! - **Grain**: `h` = [`Grain::noise`] of `p` — `pcg32_hash(seed,
+//!   ⌊p.y/s⌋ << 32 | ⌊p.x/s⌋) / (2³² − 1)` with cells of side `s` =
+//!   [`Grain::cell_size`] canvas pixels (at least 1), each cell index taken
+//!   as 32 bits (`kadr_core::hash`); `c' = c + (h − 0.5) · amount ·
+//!   4·Yc·(1 − Yc)` on all three channels with `Yc = clamp(Y(c), 0, 1)`
+//!   ([`grain_weight`]: monochrome, none in pure black or white). A recipe
+//!   varies `seed` per frame.
+//!
+//! A renderer runs the whole chain inside the layer's one sampling pass
+//! (sample → chain → opacity and coverage → composite), never through a
+//! buffer, and needs `p` only for a chain with a spatial primitive
+//! ([`Effect::is_spatial`]). Parameters are finite (the evaluator's domain);
+//! out-of-range ones simply follow the formulas (an amount above 1 darkens
+//! past black, which the final clamp catches).
 //!
 //! ## Value domain
 //!
@@ -176,7 +219,9 @@
 //!   opaque.
 
 pub mod geom;
+pub mod primitives;
 pub mod scene;
 
 pub use geom::*;
+pub use primitives::*;
 pub use scene::*;
