@@ -2,7 +2,7 @@
 //! (`kadr-scene` crate docs). It exists only so the optimized `CpuRenderer`
 //! can be compared against something written separately from it: f64
 //! everywhere, single-threaded, every layer evaluated at every output pixel —
-//! no bounding boxes, no fast paths, no LUTs. Each rule is written the way the
+//! no bounding boxes, no fast paths, no LUTs but the normative tone table. Each rule is written the way the
 //! contract states it, not the way it would be made fast.
 //!
 //! Interpretation notes (where the contract text leaves room):
@@ -307,9 +307,10 @@ fn apply_effects(effects: &[Effect], s: Px, pos: (f64, f64), canvas: (f64, f64))
         return s;
     }
     let a = s[3];
-    // "A sample with a = 0 stays as it is (the chain is skipped)."
+    // "When a chain runs, a sample with a = 0 becomes transparent black (0, 0, 0, 0) — the limit
+    // of clamp(·)·a as a → 0⁺" (E2-R3).
     if a == 0.0 {
-        return s;
+        return [0.0; 4];
     }
     let mut c = [s[0] / a, s[1] / a, s[2] / a];
     // "A neutral primitive is skipped wherever it stands in a chain (an identity tone curve does

@@ -751,6 +751,8 @@ fn cpu_renderer_matches_the_reference_on_spatial_and_clamped_chains() {
         vec![adjust(-1.0, 2.5), grain(0.5, 3.0, 8)],
         vec![split(-0.8)],
         vec![split(0.9)],
+        // E2-R1: an identity curve between a strong exposure and a contrast is skipped, not a clamp.
+        vec![adjust(3.0, 1.0), Effect::ToneCurve(ToneCurve::identity()), adjust(0.0, 0.5)],
     ];
     // Canvas 48 × 27 into: itself, ½ (letterboxed), 2×, a 4:3 window, a pillarbox, a portrait window, an up-scaled pillarbox.
     let outputs = [(48, 27), (24, 14), (96, 54), (40, 30), (64, 27), (33, 50), (100, 41)];
@@ -782,7 +784,7 @@ fn cpu_renderer_matches_the_reference_on_spatial_and_clamped_chains() {
 fn generator_is_deterministic_and_varied() {
     let a = Gen::new(scene_seed(BASE_SEED, 7)).scene().0;
     let b = Gen::new(scene_seed(BASE_SEED, 7)).scene().0;
-    let shape = |s: &FrameScene| (s.canvas, s.output.size, s.background, s.layers.iter().map(|l| (l.placement, l.crop, l.opacity, l.blend)).collect::<Vec<_>>());
+    let shape = |s: &FrameScene| (s.canvas, s.output.size, s.background, s.layers.iter().map(|l| (l.placement, l.crop, l.opacity, l.blend, l.effects.clone())).collect::<Vec<_>>());
     assert_eq!(shape(&a), shape(&b));
 
     let (mut transitions, mut media, mut missing, mut solids, mut crops_beyond, mut letterbox, mut full_frame) = (0, 0, 0, 0, 0, 0, 0);

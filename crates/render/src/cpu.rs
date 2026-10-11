@@ -409,12 +409,14 @@ impl PointFx {
     }
 
     /// On a premultiplied sample whose output pixel centre lies at canvas
-    /// position `pos`: unpremultiply, the ops, clamp once, premultiply.
+    /// position `pos`: unpremultiply, the ops, clamp once, premultiply. A
+    /// sample with `a = 0` becomes transparent black — the limit of
+    /// `clamp(·)·a` as `a → 0⁺` (contract, ruling E2-R3).
     #[inline(always)]
     fn apply(&self, s: [f32; 4], pos: (f64, f64)) -> [f32; 4] {
         let a = s[3];
         if a == 0.0 {
-            return s;
+            return [0.0; 4];
         }
         let mut c = [s[0] / a, s[1] / a, s[2] / a];
         for op in &self.ops {
@@ -1009,6 +1011,24 @@ mod tests {
         assert_eq!(with, without);
         // (1.6 − 0.5)·0.3 + 0.5 = 0.83; a clamped 1 would give 0.65 (166).
         assert!(near(px(&with, 2, 0, 0), [212, 212, 212, 255]), "{:?}", px(&with, 2, 0, 0));
+    }
+
+    /// Ruling E2-R3: under a running chain, an "additive" texel (colour, no
+    /// alpha) adds nothing — the limit of `clamp(·)·a` as `a → 0⁺` — so
+    /// renderers that differ only in a ~1e-16 bilinear alpha agree. With no
+    /// chain (or an all-neutral one) the texel still adds its colour.
+    #[test]
+    fn a_running_chain_turns_a_zero_alpha_sample_transparent() {
+        let canvas = (4, 4);
+        let glow = frame(4, 4, AlphaMode::Premultiplied, |_, _| [200, 0, 0, 0]);
+        let graded = |effects: Vec<Effect>| {
+            let mut l = media(Placement::fill(SizeU::new(4, 4)));
+            l.effects = effects;
+            render(&scene(canvas, canvas, Rgba::BLACK, vec![l]), vec![LayerInput::Cpu(glow.clone())])
+        };
+        assert_eq!(px(&graded(vec![Effect::ColorAdjust(ColorAdjust { exposure: 1.0, ..ColorAdjust::NEUTRAL })]), 4, 1, 1), [0, 0, 0, 255], "a running chain");
+        assert_eq!(px(&graded(vec![]), 4, 1, 1), [200, 0, 0, 255], "no chain: the glow adds");
+        assert_eq!(px(&graded(vec![Effect::ToneCurve(ToneCurve::identity())]), 4, 1, 1), [200, 0, 0, 255], "an all-neutral chain is skipped");
     }
 
     #[test]

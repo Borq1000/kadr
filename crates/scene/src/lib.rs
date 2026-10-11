@@ -89,7 +89,13 @@
 //! effects spec «Примитивы цвета»; the exact rules are these). They apply in
 //! list order to unpremultiplied colour, before opacity and coverage:
 //! `c = rgb / a` → each primitive → `clamp(c, 0, 1)` **once, at the end** →
-//! `× a`. A sample with `a = 0` stays as it is (the chain is skipped). A
+//! `× a`. When a chain runs (some primitive is not neutral), a sample with
+//! `a = 0` becomes transparent black `(0, 0, 0, 0)` — the limit of
+//! `clamp(·)·a` as `a → 0⁺`, so a renderer whose bilinear weights give
+//! `a ≈ 1e-16` instead of an exact 0 agrees with one that gets 0;
+//! well-formed premultiplied input (`rgb ≤ a`) is not changed by this, only
+//! "additive" texels with colour and no alpha lose their glow under a
+//! running chain (as they do at any `a > 0`). A
 //! neutral primitive ([`Effect::is_neutral`]) is skipped wherever it stands
 //! in a chain (an identity tone curve does **not** clamp its input); a chain
 //! of only neutral primitives is skipped entirely, its final clamp included
