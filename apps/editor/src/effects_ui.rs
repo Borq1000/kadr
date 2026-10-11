@@ -562,9 +562,6 @@ fn same_list(old: ModelRc<SharedString>, new: ModelRc<SharedString>) -> ModelRc<
     crate::util::reuse_rows(Some(old), new.iter().collect())
 }
 
-/// `rows` into the model on screen, each row keeping its nested option
-/// lists (a fresh `ModelRc` would make every row look changed and rebuild
-/// its elements on each refresh).
 /// The block of the clip's `i`-th effect (spec §6.2): its name, state and
 /// parameter rows — none for an effect this build cannot run, shown
 /// «Недоступен» (`known: false`). `old`: the block's parameter model on
@@ -585,6 +582,9 @@ pub fn fx_row(c: &Clip, i: usize, playhead: Time, rate: FrameRate, picking: impl
     }
 }
 
+/// `rows` into the model on screen, each row keeping its nested option
+/// lists (a fresh `ModelRc` would make every row look changed and rebuild
+/// its elements on each refresh).
 fn reuse_param_rows(old: Option<ModelRc<FxParamRow>>, mut rows: Vec<FxParamRow>) -> ModelRc<FxParamRow> {
     if let Some(old) = &old {
         for (i, r) in rows.iter_mut().enumerate() {
