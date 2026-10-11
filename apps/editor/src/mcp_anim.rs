@@ -193,15 +193,12 @@ fn default_of(c: &Clip, k: &TrackKey) -> f64 {
     }
 }
 
-/// An effect number's static value must lie in its range: the engine would
-/// clamp it silently (a file from elsewhere may hold keyframes outside it),
-/// so the client is told instead. Clip properties are written as they are.
-/// `why(lo, hi)` words the refusal.
-fn static_in_range(c: &Clip, k: &TrackKey, v: f64, why: impl FnOnce(f64, f64) -> String) -> Result<(), BridgeError> {
-    match effect_number(c, k) {
-        Some((lo, hi, _)) if !(lo..=hi).contains(&v) => Err(bad(why(lo, hi))),
-        _ => Ok(()),
-    }
+/// A static value derived from keyframes (`clear_animation` `keep_ms`): an
+/// effect number is kept in its range — what the picture showed, as the
+/// engine writes it (ruling R12; a file from elsewhere may hold keyframes
+/// outside the range). Clip properties are written as they are.
+fn static_of(c: &Clip, k: &TrackKey, v: f64) -> f64 {
+    effect_number(c, k).map_or(v, |(lo, hi, _)| v.clamp(lo, hi))
 }
 
 fn set_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
@@ -228,13 +225,8 @@ fn set_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<Edit
 fn remove_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
     let p = param(c, op)?;
     let at = existing(seq, c, Some(&p), op, "at_ms", "source_ms")?;
-    // The last keyframe's value stays as the static value.
-    if let [k] = c.animation.track(&p) {
-        let v = k.value;
-        static_in_range(c, &p, v, |lo, hi| {
-            format!("removing the last keyframe would keep {v} as the static value of {}, out of range {lo}..{hi}; set the keyframe in range first, or use clear_animation", p.key_string())
-        })?;
-    }
+    // The last keyframe's value stays as the static value; the engine keeps
+    // an effect number's in its range (ruling R12).
     Ok(EditCommand::RemoveKeyframe { clip: id, param: p, at, keep: None })
 }
 
@@ -266,16 +258,12 @@ fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<E
         .into_iter()
         .map(|k| {
             let v = match keep {
-                Some(t) => {
-                    let v = c.track_value(&k, t).unwrap_or_else(|| default_of(c, &k));
-                    static_in_range(c, &k, v, |lo, hi| format!("{} would be {v} at keep_ms, out of range {lo}..{hi}; omit keep_ms for its default", k.key_string()))?;
-                    v
-                }
+                Some(t) => static_of(c, &k, c.track_value(&k, t).unwrap_or_else(|| default_of(c, &k))),
                 None => default_of(c, &k),
             };
-            Ok((k, v))
+            (k, v)
         })
-        .collect::<Result<Vec<_>, BridgeError>>()?;
+        .collect();
     Ok(EditCommand::ClearAnimation { clip: id, statics })
 }
 
@@ -774,10 +762,12 @@ mod tests {
         assert_eq!(c.animation.track(&k).len(), 1, "the newer effect's keyframe stayed");
     }
 
-    /// The engine keeps an effect's static number in range by clamping it;
-    /// MCP refuses instead, naming the value and the range.
+    /// Ruling R12: a static derived from keyframes is kept in the effect
+    /// number's range like the engine keeps it — what the picture showed —
+    /// so an out-of-range key from elsewhere can be cleared or removed in
+    /// one op. Only a value the client gives is refused when out of range.
     #[test]
-    fn an_out_of_range_static_for_an_effect_number_is_refused() {
+    fn an_out_of_range_static_for_an_effect_number_is_kept_in_its_range() {
         let (mut p, id, fid) = fx_only();
         let k = TrackKey::fx(fid, "strength");
         // A file from elsewhere: a keyframe beyond the parameter's range.
@@ -785,18 +775,27 @@ mod tests {
         let late = c.animation.track(&k)[1].at;
         c.animation.set_key(&k, late, 1.5, None);
         let at = c.timeline_time_of(late.0).as_millis();
-        let e = run(&mut p.clone(), json!({"type": "clear_animation", "clip_id": id, "keep_ms": at})).unwrap_err().message;
-        assert!(e.contains(&k.key_string()) && e.contains("1.5") && e.contains("out of range 0..1"), "{e}");
-        // Without keep_ms the default is used: fine.
-        run(&mut p.clone(), json!({"type": "clear_animation", "clip_id": id})).unwrap();
-        // Removing the last keyframe would keep its value as the static one.
+        let cmds = anim_op(&p, p.sequence(), &json!({"type": "clear_animation", "clip_id": id, "keep_ms": at})).unwrap().unwrap();
+        assert!(matches!(&cmds[..], [EditCommand::ClearAnimation { statics, .. }] if statics[..] == [(k.clone(), 1.0)]), "the command carries the clamped value: {cmds:?}");
+        let mut cleared = p.clone();
+        run(&mut cleared, json!({"type": "clear_animation", "clip_id": id, "keep_ms": at})).unwrap();
+        let c = &cleared.sequence().tracks[0].clips[0];
+        assert!(c.animation.is_empty());
+        assert_eq!(c.effect(fid).unwrap().number("strength"), Some(1.0), "the picture at keep_ms: clamped to 1");
+        // Removing the last keyframe keeps its value, clamped, as the static one.
         let early = p.sequence().tracks[0].clips[0].animation.track(&k)[0].at;
-        let c = &mut p.sequence_mut().tracks[0].clips[0];
-        c.animation.remove_key(&k, early);
-        let e = run(&mut p.clone(), json!({"type": "remove_keyframe", "clip_id": id, "param": k.key_string(), "at_ms": at})).unwrap_err().message;
-        assert!(e.contains("1.5") && e.contains("out of range 0..1"), "{e}");
+        let mut last = p.clone();
+        last.sequence_mut().tracks[0].clips[0].animation.remove_key(&k, early);
+        run(&mut last, json!({"type": "remove_keyframe", "clip_id": id, "param": k.key_string(), "at_ms": at})).unwrap();
+        let c = &last.sequence().tracks[0].clips[0];
+        assert!(c.animation.is_empty());
+        assert_eq!(c.effect(fid).unwrap().number("strength"), Some(1.0));
+        // A value the client gives out of range is still refused.
+        let e = run(&mut p.clone(), json!({"type": "set_keyframe", "clip_id": id, "param": k.key_string(), "value": 1.5, "at_ms": at})).unwrap_err().message;
+        assert!(e.contains("out of range 0..1"), "{e}");
         // An in-range last keyframe goes, its value staying.
         let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.animation.remove_key(&k, early);
         c.animation.set_key(&k, late, 0.8, None);
         run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": k.key_string(), "at_ms": at})).unwrap();
         let c = &p.sequence().tracks[0].clips[0];
