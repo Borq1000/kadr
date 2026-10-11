@@ -1,7 +1,8 @@
 // The «Эффекты» tab (effects spec §6.1): search, filter chips, a grid of
-// cards, a hint line. Rust builds the rows (stable models, keyed by recipe
-// id) and does hover delays, click and drag; Slint only draws and reports
-// the pointer. Also the inspector's effect blocks (§6.2, `FxBlock`).
+// cards, a hint line. Rust builds the rows (stable models, keyed by card id:
+// a recipe, or `look:<preset>`) and does hover delays, click and drag; Slint
+// only draws and reports the pointer. Also the inspector's effect blocks
+// (§6.2, `FxBlock`).
 
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
@@ -51,7 +52,7 @@ component FxCard inherits Rectangle {
             background: #000000;
             clip: true;
             if root.c.has-thumb: Image { width: parent.width; height: parent.height; source: root.c.thumb; image-fit: cover; }
-            if !root.c.has-thumb: Icon { icon: root.c.category == "motion" ? Icons.motion : Icons.sparkle; width: 22px; height: 22px; color: Theme.text-faint; }
+            if !root.c.has-thumb: Icon { icon: root.c.category == "motion" ? Icons.motion : root.c.category == "look" ? Icons.look : root.c.category == "light" ? Icons.light : Icons.sparkle; width: 22px; height: 22px; color: Theme.text-faint; }
         }
         // Two lines: a long name wraps in a narrow panel instead of eliding.
         Text {
@@ -128,26 +129,58 @@ export component EffectsPanel inherits Rectangle {
                     root.search-changed(t);
                 }
             }
-            HorizontalLayout {
-                spacing: 4px;
-                alignment: start;
-                for cat in root.categories: Rectangle {
-                    width: ct.preferred-width + 20px;
-                    height: 24px;
-                    border-radius: 12px;
-                    background: root.category == cat.key ? Theme.bg4 : cta.has-hover ? Theme.bg3 : Theme.bg2;
-                    border-width: 1px;
-                    border-color: root.category == cat.key ? Theme.border-strong : Theme.border;
-                    accessible-role: button;
-                    accessible-label: cat.label;
-                    ct := Text { text: cat.label; font-size: Theme.font-sm; color: root.category == cat.key ? Theme.text : Theme.text-dim; }
-                    cta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.tip-index = -1;
-                            root.category-selected(cat.key);
+            // The chips scroll sideways when the panel is too narrow for them
+            // (D6): the Flickable takes a horizontal wheel or a touchpad
+            // swipe; a vertical wheel, which it ignores when it cannot scroll
+            // vertically, falls through to the TouchArea beneath it. A fade
+            // marks each side with more chips.
+            Rectangle {
+                height: 24px;
+                clip: true;
+                TouchArea {
+                    scroll-event(e) => {
+                        if (e.delta-y == 0px || chips.content-width <= chips.width) {
+                            return reject;
+                        }
+                        chips.content-x = max(chips.width - chips.content-width, min(0px, chips.content-x + e.delta-y));
+                        return accept;
+                    }
+                }
+                chips := Flickable {
+                    content-width: max(self.width, row.preferred-width);
+                    content-height: self.height;
+                    row := HorizontalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        for cat in root.categories: Rectangle {
+                            width: ct.preferred-width + 20px;
+                            height: 24px;
+                            border-radius: 12px;
+                            background: root.category == cat.key ? Theme.bg4 : cta.has-hover ? Theme.bg3 : Theme.bg2;
+                            border-width: 1px;
+                            border-color: root.category == cat.key ? Theme.border-strong : Theme.border;
+                            accessible-role: button;
+                            accessible-label: cat.label;
+                            ct := Text { text: cat.label; font-size: Theme.font-sm; color: root.category == cat.key ? Theme.text : Theme.text-dim; }
+                            cta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.tip-index = -1;
+                                    root.category-selected(cat.key);
+                                }
+                            }
                         }
                     }
+                }
+                if chips.content-x < -0.5px: Rectangle {
+                    x: 0;
+                    width: 20px;
+                    background: @linear-gradient(90deg, Theme.bg1 0%, Theme.bg1.with-alpha(0) 100%);
+                }
+                if chips.content-x + chips.content-width > chips.width + 0.5px: Rectangle {
+                    x: parent.width - self.width;
+                    width: 20px;
+                    background: @linear-gradient(90deg, Theme.bg1.with-alpha(0) 0%, Theme.bg1 100%);
                 }
             }
         }

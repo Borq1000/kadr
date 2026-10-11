@@ -31,7 +31,7 @@ pub struct FxUi {
     pub search: String,
     /// The card under the pointer and the generation of that hover: a newer
     /// hover makes an older delayed preview stale.
-    pub hover: Option<(&'static str, u64)>,
+    pub hover: Option<(Card, u64)>,
     hover_gen: u64,
     /// The hovered card's effect on the selected clips — app state only.
     pub preview: Option<PreviewOverride>,
@@ -48,7 +48,7 @@ pub struct FxUi {
 }
 
 pub struct FxDrag {
-    recipe: &'static str,
+    card: Card,
     start: (f64, f64),
     active: bool,
 }
@@ -56,29 +56,30 @@ pub struct FxDrag {
 /// An effect shown on clips by the preview only (spec §6.1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewOverride {
-    pub recipe: &'static str,
+    pub card: Card,
     /// The playhead the instances were made at (a «Момент» is its frame).
     pub at: Time,
     pub effects: Vec<(ClipId, AppliedEffect)>,
 }
 
-/// `def` at «Обычно» on `clips`, made at `at` as a click there would make
-/// it; `None` on none. A clip `keep` shows the recipe on already keeps that
-/// instance's id: Handheld's shake is seeded by it, so the picture does not
-/// jump when the override is made again.
-pub fn make_override(seq: &Sequence, def: &'static RecipeDef, clips: &[ClipId], at: Time, keep: Option<&PreviewOverride>) -> Option<PreviewOverride> {
-    let kept = |id: ClipId| keep.filter(|o| o.recipe == def.id).and_then(|o| o.effects.iter().find(|(c, _)| *c == id)).map(|(_, e)| e.id);
+/// `card`'s effect at «Обычно» on `clips`, made at `at` as a click there
+/// would make it; `None` on none. A clip `keep` shows the card on already
+/// keeps that instance's id: Handheld's shake and a Look's grain are seeded
+/// by it, so the picture does not jump when the override is made again.
+/// Over a clip's Look a Look card shows the replacement ([`PreviewOverride::apply`]).
+pub fn make_override(seq: &Sequence, card: Card, clips: &[ClipId], at: Time, keep: Option<&PreviewOverride>) -> Option<PreviewOverride> {
+    let kept = |id: ClipId| keep.filter(|o| o.card == card).and_then(|o| o.effects.iter().find(|(c, _)| *c == id)).map(|(_, e)| e.id);
     let effects: Vec<(ClipId, AppliedEffect)> = clips
         .iter()
         .filter_map(|id| {
-            let mut e = kadr_effects::fresh(def, seq.clip(*id)?, at);
+            let mut e = card.fresh(seq.clip(*id)?, at);
             if let Some(same) = kept(*id) {
                 e.id = same;
             }
             Some((*id, e))
         })
         .collect();
-    (!effects.is_empty()).then_some(PreviewOverride { recipe: def.id, at, effects })
+    (!effects.is_empty()).then_some(PreviewOverride { card, at, effects })
 }
 
 impl PreviewOverride {
@@ -90,7 +91,8 @@ impl PreviewOverride {
     }
 
     /// The effects put on a copy of the sequence (the preview's snapshot),
-    /// as applying them would.
+    /// as applying them would: a recipe the clip has is replaced in place
+    /// (`put_effect`) — a Look card over a Look shows the new Look only.
     pub fn apply(&self, seq: &mut Sequence) {
         for (id, e) in &self.effects {
             if let Some((ti, ci)) = seq.locate_clip(*id) {
@@ -101,6 +103,80 @@ impl PreviewOverride {
 
     pub fn clips(&self) -> Vec<ClipId> {
         self.effects.iter().map(|(c, _)| *c).collect()
+    }
+}
+
+/// One card of the tab (spec §6.1, D5): a recipe, or one of its variants —
+/// a Look preset — with its own id (`look:warm`), name, picture and apply.
+/// Built only from the registry (`cards_of`, `Card::parse`).
+#[derive(Clone, Copy)]
+pub struct Card {
+    pub def: &'static RecipeDef,
+    pub variant: Option<&'static str>,
+}
+
+impl PartialEq for Card {
+    fn eq(&self, o: &Card) -> bool {
+        self.def.id == o.def.id && self.variant == o.variant
+    }
+}
+
+impl Eq for Card {}
+
+impl std::hash::Hash for Card {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::hash::Hash::hash(&(self.def.id, self.variant), h);
+    }
+}
+
+impl std::fmt::Debug for Card {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Card({})", self.id())
+    }
+}
+
+impl Card {
+    /// `smooth_zoom`, or `look:warm` for a variant.
+    pub fn id(&self) -> String {
+        match self.variant {
+            Some(v) => format!("{}:{v}", self.def.id),
+            None => self.def.id.to_string(),
+        }
+    }
+
+    /// The card an id from the tab names; `None` for one this build lacks.
+    pub fn parse(id: &str) -> Option<Card> {
+        let (recipe, variant) = match id.split_once(':') {
+            Some((r, v)) => (r, Some(v)),
+            None => (id, None),
+        };
+        cards_of(kadr_effects::recipe(recipe)?).into_iter().find(|c| c.variant == variant)
+    }
+
+    /// i18n key of the card's name: the variant's (`fx.look.warm`) or the recipe's.
+    pub fn name_key(&self) -> String {
+        match (self.def.variants, self.variant) {
+            (Some(key), Some(v)) => self.def.option_name_key(key, v),
+            _ => self.def.name_key(),
+        }
+    }
+
+    /// What the card applies to `clip` at timeline time `at`: the recipe at
+    /// «Обычно» with the card's variant.
+    pub fn fresh(&self, clip: &Clip, at: Time) -> AppliedEffect {
+        let mut e = kadr_effects::fresh(self.def, clip, at);
+        if let (Some(key), Some(v)) = (self.def.variants, self.variant) {
+            e.params.insert(key.to_string(), ParamValue::Choice(v.to_string()));
+        }
+        e
+    }
+}
+
+/// A recipe's cards: one per variant, else the recipe's own.
+pub fn cards_of(def: &'static RecipeDef) -> Vec<Card> {
+    match def.variant_options() {
+        [] => vec![Card { def, variant: None }],
+        variants => variants.iter().map(|v| Card { def, variant: Some(*v) }).collect(),
     }
 }
 
@@ -177,22 +253,25 @@ pub fn categories() -> Vec<Category> {
     Category::ALL.into_iter().filter(|c| kadr_effects::registry().iter().any(|d| d.category == *c)).collect()
 }
 
-/// Recipes listed for `category` (`""` = all) whose Russian or English name
-/// contains `query`, any case (spec §6.1: search by name, RU/EN).
-pub fn visible_recipes(category: &str, query: &str) -> Vec<&'static RecipeDef> {
+/// The cards listed for `category` (`""` = all) whose name — the card's or
+/// its recipe's («Look» finds every preset), Russian or English — contains
+/// `query`, any case (spec §6.1).
+pub fn visible_cards(category: &str, query: &str) -> Vec<Card> {
     let q = query.trim().to_lowercase();
+    let named = |key: &str| Lang::ALL.iter().any(|l| t_in(*l, key).to_lowercase().contains(&q));
     kadr_effects::registry()
         .iter()
         .filter(|d| category.is_empty() || d.category.key() == category)
-        .filter(|d| q.is_empty() || Lang::ALL.iter().any(|l| t_in(*l, &d.name_key()).to_lowercase().contains(&q)))
+        .flat_map(cards_of)
+        .filter(|c| q.is_empty() || named(&c.name_key()) || named(&c.def.name_key()))
         .collect()
 }
 
-/// Whether the hovered card (`hover`, a recipe id) is not among the
-/// `listed` cards any more: a card filtered out under a resting pointer is
-/// destroyed without a pointer leave, so its hover must end without one.
-pub fn hover_gone(hover: Option<&str>, listed: &[&RecipeDef]) -> bool {
-    hover.is_some_and(|r| !listed.iter().any(|d| d.id == r))
+/// Whether the hovered card is not among the `listed` cards any more: a
+/// card filtered out under a resting pointer is destroyed without a pointer
+/// leave, so its hover must end without one.
+pub fn hover_gone(hover: Option<Card>, listed: &[Card]) -> bool {
+    hover.is_some_and(|h| !listed.contains(&h))
 }
 
 /// The selected clips an effect of `def` goes on: those it fits, on unlocked tracks.
@@ -239,23 +318,24 @@ pub fn drop_hit(seq: &Sequence, rows: &[Row], t: Time, y: f64, def: &RecipeDef) 
     }
 }
 
-/// The edit applying `def` at «Обычно» to `clips` (spec §6.1: one undo entry
-/// «Эффект: …»), applied at timeline time `at`; only clips it changes —
-/// `None` when it changes none.
-pub fn apply_batch(seq: &Sequence, def: &RecipeDef, clips: &[ClipId], at: Time) -> Option<EditCommand> {
-    let effects = clips.iter().filter_map(|id| Some((*id, kadr_effects::fresh(def, seq.clip(*id)?, at)))).collect();
-    batch_of(seq, def, effects)
+/// The edit applying `card` at «Обычно» to `clips` (spec §6.1: one undo
+/// entry «Эффект: Кино», named by the card), applied at timeline time `at`;
+/// only clips it changes — `None` when it changes none. A Look card over a
+/// clip's Look replaces it in place (`put_effect`).
+pub fn apply_batch(seq: &Sequence, card: Card, clips: &[ClipId], at: Time) -> Option<EditCommand> {
+    let effects = clips.iter().filter_map(|id| Some((*id, card.fresh(seq.clip(*id)?, at)))).collect();
+    batch_of(seq, card, effects)
 }
 
 /// [`apply_batch`] with the effects given — the hovered preview's, so what
-/// was shown is what is applied (Handheld's noise is seeded by the id).
-fn batch_of(seq: &Sequence, def: &RecipeDef, effects: Vec<(ClipId, AppliedEffect)>) -> Option<EditCommand> {
+/// was shown is what is applied (Handheld's noise and the grain are seeded by the id).
+fn batch_of(seq: &Sequence, card: Card, effects: Vec<(ClipId, AppliedEffect)>) -> Option<EditCommand> {
     let commands: Vec<EditCommand> = effects
         .into_iter()
         .filter(|(id, effect)| seq.clip(*id).is_some_and(|c| c.clone().put_effect(effect.clone())))
         .map(|(clip, effect)| EditCommand::AddEffect { clip, effect })
         .collect();
-    (!commands.is_empty()).then(|| EditCommand::Batch { label: tf("cmd.effect_named", &[("name", &t(&def.name_key()))]), commands })
+    (!commands.is_empty()).then(|| EditCommand::Batch { label: tf("cmd.effect_named", &[("name", &t(&card.name_key()))]), commands })
 }
 
 /// One parameter row of an effect block at the playhead (spec §6.2): a
@@ -544,15 +624,15 @@ impl App {
         if ui.get_left_tab() != 1 {
             return;
         }
-        let listed = visible_recipes(&self.fx.category, &self.fx.search);
+        let listed = visible_cards(&self.fx.category, &self.fx.search);
         // The selected clip's frame under the playhead, or the sample; a
         // card whose new picture is not rendered yet keeps its last one.
         let base = crate::fx_thumbs::thumb_base(&self.project, self.inspected(), self.playhead);
         let thumbs: Vec<Option<slint::Image>> = listed
             .iter()
-            .map(|d| {
-                let now = self.fx_thumb(d, &base);
-                self.fx.thumbs.shown(d.id, now)
+            .map(|c| {
+                let now = self.fx_thumb(*c, &base);
+                self.fx.thumbs.shown(*c, now)
             })
             .collect();
         let seq = self.project.sequence();
@@ -564,12 +644,12 @@ impl App {
         let cards: Vec<FxCardView> = listed
             .iter()
             .zip(thumbs)
-            .map(|(d, thumb)| {
-                let hint = card_hint(seq, sel, d);
+            .map(|(c, thumb)| {
+                let hint = card_hint(seq, sel, c.def);
                 FxCardView {
-                    id: d.id.into(),
-                    name: t(&d.name_key()).into(),
-                    category: d.category.key().into(),
+                    id: c.id().into(),
+                    name: t(&c.name_key()).into(),
+                    category: c.def.category.key().into(),
                     has_thumb: thumb.is_some(),
                     thumb: thumb.unwrap_or_default(),
                     enabled: hint.is_none(),
@@ -583,15 +663,15 @@ impl App {
         // shown preview follows the selection — the hovered card's effect on
         // the clips it now fits, or none — and, while paused, a moment follows
         // the playhead (playing, the punch plays where it was shown).
-        let gone = hover_gone(self.fx.hover.map(|(r, _)| r), &listed);
+        let gone = hover_gone(self.fx.hover.map(|(c, _)| c), &listed);
         let stale = self.fx.preview.as_ref().is_some_and(|o| {
             let playhead = if self.playing { o.at } else { self.playhead };
-            kadr_effects::recipe(o.recipe).is_none_or(|d| o.outdated(d, &targets(seq, sel, d), playhead))
+            o.outdated(o.card.def, &targets(seq, sel, o.card.def), playhead)
         });
         if gone {
             self.fx_clear_hover();
         } else if stale {
-            let next = self.fx.hover.and_then(|(r, _)| kadr_effects::recipe(r)).and_then(|d| self.fx_override(d));
+            let next = self.fx.hover.and_then(|(c, _)| self.fx_override(c));
             self.fx_set_preview(next);
         }
         self.fx_request_thumbs(base);
@@ -610,17 +690,17 @@ impl App {
     /// The pointer entered or left a card. Entering starts the 150 ms delay;
     /// leaving restores the preview at once.
     pub fn fx_card_hover(&mut self, id: &str, on: bool) {
-        let Some(def) = kadr_effects::recipe(id) else { return };
+        let Some(card) = Card::parse(id) else { return };
         if on {
             // Straight from another card (no gap crossed, or its leave
             // reported after this enter): that preview ends now, not when
             // this card's delay is over — this card may show none at all.
-            if self.fx.preview.as_ref().is_some_and(|o| o.recipe != def.id) {
+            if self.fx.preview.as_ref().is_some_and(|o| o.card != card) {
                 self.fx_clear_preview();
             }
             self.fx.hover_gen += 1;
             let generation = self.fx.hover_gen;
-            self.fx.hover = Some((def.id, generation));
+            self.fx.hover = Some((card, generation));
             slint::Timer::single_shot(HOVER_DELAY, move || {
                 crate::app::with_app(|app| app.fx_hover_fire(generation));
             });
@@ -628,7 +708,7 @@ impl App {
             if self.fx.thumbs.stop_loop() {
                 self.refresh_effects();
             }
-        } else if self.fx.hover.is_some_and(|(r, _)| r == def.id) {
+        } else if self.fx.hover.is_some_and(|(c, _)| c == card) {
             self.fx_clear_hover();
         }
     }
@@ -638,27 +718,27 @@ impl App {
     /// of its motion — started here, not on entering: a pointer crossing
     /// cards renders no loops (M4).
     fn fx_hover_fire(&mut self, generation: u64) {
-        let Some((recipe, g)) = self.fx.hover else { return };
+        let Some((card, g)) = self.fx.hover else { return };
         if g != generation || self.fx.drag.as_ref().is_some_and(|d| d.active) {
             return;
         }
-        let Some(def) = kadr_effects::recipe(recipe) else { return };
-        let next = self.fx_override(def);
+        let next = self.fx_override(card);
         self.fx_set_preview(next);
-        if def.category == Category::Motion {
-            self.fx.thumbs.start_loop(def.id, || {
+        if card.def.category == Category::Motion {
+            self.fx.thumbs.start_loop(card, || {
                 crate::app::with_app(|app| app.fx_loop_tick());
             });
             self.refresh_effects();
         }
     }
 
-    /// `def` at «Обычно» on the selected clips it goes on, made at the
-    /// playhead as a click would; `None` when it goes on none. The
-    /// instances shown already keep their ids ([`make_override`]).
-    fn fx_override(&self, def: &'static RecipeDef) -> Option<PreviewOverride> {
+    /// `card`'s effect at «Обычно» on the selected clips it goes on, made at
+    /// the playhead as a click would; `None` when it goes on none. The
+    /// instances shown already keep their ids ([`make_override`]); over a
+    /// clip's Look a Look card shows the replacement.
+    fn fx_override(&self, card: Card) -> Option<PreviewOverride> {
         let seq = self.project.sequence();
-        make_override(seq, def, &targets(seq, &self.tl.selection, def), self.playhead, self.fx.preview.as_ref())
+        make_override(seq, card, &targets(seq, &self.tl.selection, card.def), self.playhead, self.fx.preview.as_ref())
     }
 
     /// Shows `next` on the preview (a new snapshot) — when there is a
@@ -687,8 +767,8 @@ impl App {
     }
 
     pub fn fx_card_pressed(&mut self, id: &str, x: f32, y: f32) {
-        let Some(def) = kadr_effects::recipe(id) else { return };
-        self.fx.drag = Some(FxDrag { recipe: def.id, start: (x as f64, y as f64), active: false });
+        let Some(card) = Card::parse(id) else { return };
+        self.fx.drag = Some(FxDrag { card, start: (x as f64, y as f64), active: false });
     }
 
     /// What a drop at window point (`wx`, `wy`) hits, and the timeline time there.
@@ -714,11 +794,11 @@ impl App {
         if !d.active {
             return;
         }
-        let Some(def) = kadr_effects::recipe(d.recipe) else { return };
+        let card = d.card;
         self.fx_clear_preview();
-        let name = t(&def.name_key());
+        let name = t(&card.name_key());
         let seq = self.project.sequence();
-        let (hit, _) = self.fx_drop_at(x, y, def);
+        let (hit, _) = self.fx_drop_at(x, y, card.def);
         let (label, ghost) = match hit {
             DropHit::Clip(id) => match (seq.clip(id), seq.locate_clip(id)) {
                 (Some(c), Some((ti, _))) => {
@@ -751,20 +831,21 @@ impl App {
         ui.set_drag_refused(false);
         self.tl.ghost = None;
         let Some(d) = self.fx.drag.take() else { return };
-        let Some(def) = kadr_effects::recipe(d.recipe) else { return };
+        let card = d.card;
+        let name = t(&card.name_key());
         if d.active {
-            match self.fx_drop_at(x as f64, y as f64, def) {
+            match self.fx_drop_at(x as f64, y as f64, card.def) {
                 (DropHit::Clip(id), at) => {
                     // «Момент» defaults to the frame dropped on (spec §5).
                     let at = self.project.sequence().frame_rate.snap(at);
                     // (on the clip now, just applied)
-                    let (on, new) = match apply_batch(self.project.sequence(), def, &[id], at) {
+                    let (on, new) = match apply_batch(self.project.sequence(), card, &[id], at) {
                         Some(cmd) => {
                             let done = self.execute(cmd);
                             (done, done)
                         }
                         None => {
-                            self.toast(tf("fx.already", &[("name", &t(&def.name_key()))]));
+                            self.toast(tf("fx.already", &[("name", &name)]));
                             (true, false)
                         }
                     };
@@ -773,7 +854,7 @@ impl App {
                         self.refresh_inspector();
                     }
                     if new {
-                        self.fx_reveal(def);
+                        self.fx_reveal(card.def);
                     }
                 }
                 (DropHit::Unfit, _) => self.toast_warn(t("fx.hint.unfit")),
@@ -787,34 +868,35 @@ impl App {
         if self.tl.selection.is_empty() {
             return self.toast(t("fx.hint.select_clip"));
         }
-        let clips = targets(seq, &self.tl.selection, def);
+        let clips = targets(seq, &self.tl.selection, card.def);
         if clips.is_empty() {
-            let why = card_hint(seq, &self.tl.selection, def).unwrap_or("fx.hint.unfit");
+            let why = card_hint(seq, &self.tl.selection, card.def).unwrap_or("fx.hint.unfit");
             return self.toast_warn(t(why));
         }
         // The previewed instances when the hover showed this card on these
         // clips: what was shown is what is applied.
         let cmd = match &self.fx.preview {
-            Some(o) if o.recipe == def.id && o.clips() == clips => batch_of(seq, def, o.effects.clone()),
-            _ => apply_batch(seq, def, &clips, self.playhead),
+            Some(o) if o.card == card && o.clips() == clips => batch_of(seq, card, o.effects.clone()),
+            _ => apply_batch(seq, card, &clips, self.playhead),
         };
         match cmd {
             Some(cmd) => {
                 if self.execute(cmd) && self.inspected().is_some_and(|id| clips.contains(&id)) {
-                    self.fx_reveal(def);
+                    self.fx_reveal(card.def);
                 }
             }
-            None => self.toast(tf("fx.already", &[("name", &t(&def.name_key()))])),
+            None => self.toast(tf("fx.already", &[("name", &name)])),
         }
     }
 
-    /// `def` was just applied to the inspected clip (A3): its block takes
-    /// the focus — its point shows on the preview — and the inspector
-    /// scrolls to it, top first. The scroll waits a turn of the event loop:
-    /// a `changed` handler never fires for the value its element was created
-    /// with, so a new block must exist before `reveal-seq` moves — it does,
-    /// because the repaint (and the layout that creates the block) runs
-    /// before the zero-delay timer fires on the next turn.
+    /// `def` was just applied to the inspected clip (A3; any Look card: the
+    /// clip's one Look): its block takes the focus — its point shows on the
+    /// preview — and the inspector scrolls to it, top first. The scroll
+    /// waits a turn of the event loop: a `changed` handler never fires for
+    /// the value its element was created with, so a new block must exist
+    /// before `reveal-seq` moves — it does, because the repaint (and the
+    /// layout that creates the block) runs before the zero-delay timer fires
+    /// on the next turn.
     fn fx_reveal(&mut self, def: &RecipeDef) {
         let Some(id) = self.inspected() else { return };
         let Some(e) = self.project.sequence().clip(id).and_then(|c| c.effects.iter().find(|e| e.recipe == def.id)).map(|e| e.id) else { return };
@@ -1073,26 +1155,88 @@ mod tests {
         (s, ids)
     }
 
+    fn card(id: &str) -> Card {
+        Card::parse(id).unwrap_or_else(|| panic!("no card {id}"))
+    }
+
+    #[test]
+    fn cards_name_a_recipe_or_one_of_its_presets() {
+        assert_eq!(card("look:warm").id(), "look:warm");
+        assert_eq!((card("look:warm").def.id, card("look:warm").variant), ("look", Some("warm")));
+        assert_eq!(card("handheld").variant, None);
+        for bad in ["look", "look:sepia", "handheld:x", "glitch", ""] {
+            assert!(Card::parse(bad).is_none(), "{bad}");
+        }
+        assert_eq!(card("look:soft_film").name_key(), "fx.look.soft_film");
+        assert_eq!(card("vignette").name_key(), "fx.vignette");
+        let c = clip_10_20();
+        assert_eq!(card("look:vintage").fresh(&c, Time::from_secs(12)).params["preset"], ParamValue::Choice("vintage".into()));
+    }
+
+    /// Review focus 1: a Look card applies its preset in one entry named by
+    /// the card; another Look card replaces it in place; the same again sends nothing.
+    #[test]
+    fn a_look_card_applies_its_preset_and_another_one_replaces_it() {
+        let (s, [v1, _, _]) = seq();
+        let Some(EditCommand::Batch { label, commands }) = apply_batch(&s, card("look:warm"), &[v1], Time::from_secs(1)) else { panic!("a batch") };
+        assert_eq!(label, tf("cmd.effect_named", &[("name", &t("fx.look.warm"))]), "«Эффект: Тёплый»");
+        let [EditCommand::AddEffect { effect, .. }] = &commands[..] else { panic!("{commands:?}") };
+        assert_eq!((effect.recipe.as_str(), &effect.params["preset"]), ("look", &ParamValue::Choice("warm".into())));
+        let mut applied = s.clone();
+        let (ti, ci) = applied.locate_clip(v1).unwrap();
+        applied.tracks[ti].clips[ci].put_effect(effect.clone());
+        let id = applied.tracks[ti].clips[ci].effects[0].id;
+        let Some(EditCommand::Batch { commands, .. }) = apply_batch(&applied, card("look:dramatic"), &[v1], Time::from_secs(1)) else { panic!("a replacement") };
+        let [EditCommand::AddEffect { effect: dramatic, .. }] = &commands[..] else { panic!("{commands:?}") };
+        applied.tracks[ti].clips[ci].put_effect(dramatic.clone());
+        let looks: Vec<&AppliedEffect> = applied.tracks[ti].clips[ci].effects.iter().filter(|e| e.recipe == "look").collect();
+        assert_eq!(looks.len(), 1, "one Look per clip (spec §2)");
+        assert_eq!((looks[0].id, &looks[0].params["preset"]), (id, &ParamValue::Choice("dramatic".into())), "replaced in place");
+        assert!(apply_batch(&applied, card("look:dramatic"), &[v1], Time::from_secs(1)).is_none(), "the same preset again: nothing to send");
+    }
+
+    /// Review focus 1: hovering a Look card over a clip with a Look shows the
+    /// replacement — never both — and only in the preview's snapshot.
+    #[test]
+    fn hovering_a_look_card_over_a_look_shows_the_replacement_only_in_the_snapshot() {
+        let (mut p, id) = project_with_clip();
+        let c = p.sequence().clip(id).unwrap().clone();
+        p.sequence_mut().tracks[0].clips[0].put_effect(card("look:cinematic").fresh(&c, Time::ZERO));
+        let before = p.clone();
+        let o = PreviewOverride { card: card("look:vintage"), at: Time::ZERO, effects: vec![(id, card("look:vintage").fresh(&c, Time::ZERO))] };
+        let mut snapshot = p.sequence().clone();
+        o.apply(&mut snapshot);
+        let looks: Vec<&AppliedEffect> = snapshot.clip(id).unwrap().effects.iter().filter(|e| e.recipe == "look").collect();
+        assert_eq!(looks.len(), 1);
+        assert_eq!(looks[0].params["preset"], ParamValue::Choice("vintage".into()));
+        assert_eq!(p, before, "the project is untouched");
+    }
+
     #[test]
     fn categories_hide_empty_ones_and_search_matches_either_language() {
         assert_eq!(categories(), vec![Category::Motion, Category::Look, Category::Light], "E2: motion, Looks, light");
-        assert_eq!(visible_recipes("", "").len(), 7);
-        assert!(visible_recipes("transition", "").is_empty());
-        let ids = |v: Vec<&'static RecipeDef>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
-        assert_eq!(ids(visible_recipes("look", "")), ["look"]);
-        assert_eq!(ids(visible_recipes("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
-        assert_eq!(ids(visible_recipes("motion", "HAND")), ["handheld"], "English name, any case");
-        assert_eq!(ids(visible_recipes("", "  Ручная ")), ["handheld"], "trimmed");
+        let ids = |v: Vec<Card>| v.into_iter().map(|c| c.id()).collect::<Vec<_>>();
+        assert_eq!(visible_cards("", "").len(), 12, "5 motion, 6 Looks, the Vignette");
+        assert_eq!(ids(visible_cards("look", "")), ["look:cinematic", "look:warm", "look:soft_film", "look:dramatic", "look:vintage", "look:natural"]);
+        assert_eq!(ids(visible_cards("light", "")), ["vignette"]);
+        assert!(visible_cards("transition", "").is_empty());
+        assert_eq!(ids(visible_cards("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
+        assert_eq!(ids(visible_cards("motion", "HAND")), ["handheld"], "English name, any case");
+        assert_eq!(ids(visible_cards("", "  Ручная ")), ["handheld"], "trimmed");
+        assert_eq!(ids(visible_cards("", "кино")), ["cinematic_push", "look:cinematic"], "a preset by its own name");
+        assert_eq!(visible_cards("", "LOOK").len(), 6, "the recipe's name finds every preset");
+        assert_eq!(ids(visible_cards("", "vintage")), ["look:vintage"]);
     }
 
     /// Review focus 1: a card filtered out under a resting pointer is
     /// destroyed without a pointer leave — its hover (and preview) ends here.
     #[test]
     fn a_hovered_card_filtered_out_ends_its_hover() {
-        let listed = visible_recipes("", "наезд");
-        assert!(!hover_gone(Some("smooth_zoom"), &listed));
-        assert!(hover_gone(Some("handheld"), &listed), "searched away");
-        assert!(hover_gone(Some("handheld"), &[]), "no cards at all");
+        let listed = visible_cards("", "наезд");
+        assert!(!hover_gone(Some(card("smooth_zoom")), &listed));
+        assert!(hover_gone(Some(card("handheld")), &listed), "searched away");
+        assert!(hover_gone(Some(card("look:warm")), &visible_cards("look", "драма")), "another preset of the same recipe");
+        assert!(hover_gone(Some(card("handheld")), &[]), "no cards at all");
         assert!(!hover_gone(None, &[]), "nothing hovered");
     }
 
@@ -1119,14 +1263,14 @@ mod tests {
         assert_eq!(targets(&s, &[v1, v2, a1], def), vec![v1], "V2 is locked, A1 is sound");
         assert_eq!(card_hint(&s, &[a1], def), Some("fx.hint.unfit"));
         assert_eq!(card_hint(&s, &[], def), None, "nothing selected: the card stays usable (drag)");
-        let Some(EditCommand::Batch { label, commands }) = apply_batch(&s, def, &[v1], Time::from_secs(1)) else { panic!("a batch") };
+        let Some(EditCommand::Batch { label, commands }) = apply_batch(&s, card("handheld"), &[v1], Time::from_secs(1)) else { panic!("a batch") };
         assert_eq!(commands.len(), 1);
         assert_eq!(label, tf("cmd.effect_named", &[("name", &t("fx.handheld"))]));
         let mut applied = s.clone();
         let (ti, ci) = applied.locate_clip(v1).unwrap();
         let c = applied.tracks[ti].clips[ci].clone();
         applied.tracks[ti].clips[ci].put_effect(kadr_effects::fresh(def, &c, Time::from_secs(1)));
-        assert!(apply_batch(&applied, def, &[v1], Time::from_secs(1)).is_none(), "already there: no command, no empty history entry");
+        assert!(apply_batch(&applied, card("handheld"), &[v1], Time::from_secs(1)).is_none(), "already there: no command, no empty history entry");
     }
 
     /// A card over a selection on a locked track says why it is inactive
@@ -1140,12 +1284,12 @@ mod tests {
         assert_eq!(card_hint(&s, &[v2, a1], def), Some("fx.drop.locked"), "the video clip it fits is locked");
         assert_eq!(card_hint(&s, &[v1, a1], def), None, "V1 takes it");
         let shown = kadr_effects::fresh(def, s.clip(v1).unwrap(), Time::from_secs(1));
-        let Some(EditCommand::Batch { commands, .. }) = batch_of(&s, def, vec![(v1, shown.clone())]) else { panic!("a batch") };
+        let Some(EditCommand::Batch { commands, .. }) = batch_of(&s, card("handheld"), vec![(v1, shown.clone())]) else { panic!("a batch") };
         assert_eq!(commands, vec![EditCommand::AddEffect { clip: v1, effect: shown.clone() }]);
         let mut applied = s.clone();
-        let o = PreviewOverride { recipe: def.id, at: Time::from_secs(1), effects: vec![(v1, shown)] };
+        let o = PreviewOverride { card: card("handheld"), at: Time::from_secs(1), effects: vec![(v1, shown)] };
         o.apply(&mut applied);
-        assert!(batch_of(&applied, def, o.effects.clone()).is_none(), "applied already: nothing to send");
+        assert!(batch_of(&applied, card("handheld"), o.effects.clone()).is_none(), "applied already: nothing to send");
     }
 
     /// A hover follows the playhead (M1): a punch's moment is made again at
@@ -1156,11 +1300,11 @@ mod tests {
     fn a_hover_follows_the_playhead_with_the_same_instances() {
         let (s, [v1, _, _]) = seq();
         let at = Time::from_secs;
-        let punch = kadr_effects::recipe("punch_in").unwrap();
+        let punch = card("punch_in");
         let o = make_override(&s, punch, &[v1], at(1), None).unwrap();
-        assert!(!o.outdated(punch, &[v1], at(1)));
-        assert!(o.outdated(punch, &[v1], at(3)), "its moment is the frame at 1 s");
-        assert!(o.outdated(punch, &[], at(1)), "nothing selected any more");
+        assert!(!o.outdated(punch.def, &[v1], at(1)));
+        assert!(o.outdated(punch.def, &[v1], at(3)), "its moment is the frame at 1 s");
+        assert!(o.outdated(punch.def, &[], at(1)), "nothing selected any more");
         let moved = make_override(&s, punch, &[v1], at(3), Some(&o)).unwrap();
         assert_eq!(moved.at, at(3));
         assert_eq!(moved.effects[0].1.id, o.effects[0].1.id, "the same instance");
@@ -1168,12 +1312,21 @@ mod tests {
         let Some(EditCommand::Batch { commands, .. }) = batch_of(&s, punch, moved.effects.clone()) else { panic!("a batch") };
         assert_eq!(commands, vec![EditCommand::AddEffect { clip: v1, effect: moved.effects[0].1.clone() }], "a click applies what is shown now");
 
-        let hand = kadr_effects::recipe("handheld").unwrap();
+        let hand = card("handheld");
         let h = make_override(&s, hand, &[v1], at(1), None).unwrap();
-        assert!(!h.outdated(hand, &[v1], at(3)), "no moment: the playhead changes nothing");
+        assert!(!h.outdated(hand.def, &[v1], at(3)), "no moment: the playhead changes nothing");
         assert_eq!(make_override(&s, hand, &[v1], at(3), Some(&h)), Some(PreviewOverride { at: at(3), ..h.clone() }), "made again: the same shake");
         assert_ne!(make_override(&s, hand, &[v1], at(1), Some(&o)).unwrap().effects[0].1.id, o.effects[0].1.id, "another recipe's instance is not reused");
         assert!(make_override(&s, hand, &[], at(1), Some(&h)).is_none(), "on no clip: none");
+
+        // A Look card's override carries its preset; made again it keeps its
+        // instance (the grain is seeded by the id); another preset's is not reused.
+        let warm = make_override(&s, card("look:warm"), &[v1], at(1), None).unwrap();
+        assert_eq!(warm.effects[0].1.params["preset"], ParamValue::Choice("warm".into()));
+        assert_eq!(make_override(&s, card("look:warm"), &[v1], at(3), Some(&warm)).unwrap().effects[0].1.id, warm.effects[0].1.id);
+        let vintage = make_override(&s, card("look:vintage"), &[v1], at(1), Some(&warm)).unwrap();
+        assert_ne!(vintage.effects[0].1.id, warm.effects[0].1.id, "another card's instance is not reused");
+        assert_eq!(vintage.effects[0].1.params["preset"], ParamValue::Choice("vintage".into()));
     }
 
     fn project_with_clip() -> (Project, ClipId) {
@@ -1194,7 +1347,7 @@ mod tests {
         let (p, id) = project_with_clip();
         let before = p.clone();
         let def = kadr_effects::recipe("smooth_zoom").unwrap();
-        let o = PreviewOverride { recipe: def.id, at: Time::ZERO, effects: vec![(id, kadr_effects::fresh(def, p.sequence().clip(id).unwrap(), Time::ZERO))] };
+        let o = PreviewOverride { card: card("smooth_zoom"), at: Time::ZERO, effects: vec![(id, kadr_effects::fresh(def, p.sequence().clip(id).unwrap(), Time::ZERO))] };
         let out = OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewFast);
         let hovered = crate::scene_source::ProjectScenes::new_with(&p, false, |seq| o.apply(seq));
         assert!(hovered.scene_at(Time::from_secs(4), &out).layers[0].placement.scale.x > 1.0, "the snapshot shows it");

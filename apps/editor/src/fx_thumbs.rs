@@ -1,9 +1,10 @@
 //! Card thumbnails of the «Эффекты» tab (effects spec §6.1): the inspected
-//! clip's frame at the playhead with the card's effect at «Обычно»,
+//! clip's frame at the playhead with the card's effect at «Обычно» — a
+//! recipe, or one of its variants (each Look preset is its own card) —
 //! rendered in the background at 160 × 90 and cached by (clip, source frame,
-//! the clip's look, recipe, version, phase); a new batch cancels the
-//! previous one, leaving the tab cancels it; a hovered motion card plays a
-//! short loop of its motion. Without a clip a built-in sample picture
+//! the clip's look, recipe and preset, version, phase); a new batch cancels
+//! the previous one, leaving the tab cancels it; a hovered motion card plays
+//! a short loop of its motion. Without a clip a built-in sample picture
 //! stands in (no decoding).
 //!
 //! One thread renders, one thumbnail at a time, from small one-clip copies
@@ -13,11 +14,11 @@
 //! preview and playback are not slowed or superseded by it.
 
 use crate::app::App;
-use crate::effects_ui::visible_recipes;
+use crate::effects_ui::{visible_cards, Card};
 use crate::scene_source::ProjectScenes;
 use kadr_core::color::AlphaMode;
 use kadr_core::{CancelToken, ClipId, ColorInfo, CpuFrame, EffectId, FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
-use kadr_effects::{ParamKind, RecipeDef};
+use kadr_effects::ParamKind;
 use kadr_playback::{Mode, Resolver, SceneSource};
 use kadr_project::{AnimParam, AppliedEffect, Clip, EdgeFades, MediaAsset, ParamValue, Project, SourceTime, Track, TrackKey, TrackKind, Transform};
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, PreparedFrame, RenderInputs, RenderTarget, Renderer};
@@ -119,15 +120,16 @@ pub struct ThumbKey {
     pub frame: Time,
     /// [`ThumbBase::state`]: an edit of the clip renders its cards again.
     pub state: u64,
-    pub recipe: &'static str,
+    /// The recipe and its preset (spec §6.1's key: «рецепт, пресет»).
+    pub card: Card,
     pub version: u16,
     /// `STILL`, or a loop frame `0..LOOP_FRAMES`.
     pub phase: u8,
 }
 
 impl ThumbKey {
-    pub fn new(base: &ThumbBase, d: &RecipeDef, phase: u8) -> ThumbKey {
-        ThumbKey { clip: base.clip, frame: base.frame, state: base.state, recipe: d.id, version: d.version, phase }
+    pub fn new(base: &ThumbBase, card: Card, phase: u8) -> ThumbKey {
+        ThumbKey { clip: base.clip, frame: base.frame, state: base.state, card, version: card.def.version, phase }
     }
 
     /// The motion phase 0..1 this thumbnail shows.
@@ -141,24 +143,25 @@ impl ThumbKey {
     }
 }
 
-/// The effect as a thumbnail shows it at `phase`: «Обычно», the progress
-/// held at `phase`, and every «Момент» placed so its motion is `phase` of
-/// the way through. The frame is `0.3·phase − 0.22` s of screen time past
-/// the moment: Punch In's 0.12 s snap, which ends at its moment (R17), runs
-/// from phase ≈ 0.33 to ≈ 0.73 — just ahead at 0, done well before 1.
+/// The card's effect as a thumbnail shows it at `phase`: «Обычно» with
+/// the card's preset, the progress held at `phase`, and every «Момент»
+/// placed so its motion is `phase` of the way through. The frame is
+/// `0.3·phase − 0.22` s of screen time past the moment: Punch In's 0.12 s
+/// snap, which ends at its moment (R17), runs from phase ≈ 0.33 to ≈ 0.73
+/// — just ahead at 0, done well before 1.
 ///
 /// An effect on its own clock (Handheld's noise runs at `progress ×
 /// clip_secs`) gets a real-time demo clock instead: loop frame to loop
 /// frame is one [`LOOP_TICK`] of it, so the card sways as the clip will —
 /// not a jitter of samples ~1/11 of the clip apart (I6).
-pub fn demo_effect(def: &RecipeDef, clip: &Clip, at: Time, phase: f64) -> AppliedEffect {
-    let mut e = kadr_effects::fresh(def, clip, at);
+pub fn demo_effect(card: Card, clip: &Clip, at: Time, phase: f64) -> AppliedEffect {
+    let mut e = card.fresh(clip, at);
     e.id = EffectId::parse(DEMO_EFFECT_ID).unwrap_or(e.id);
     let secs = clip.duration().as_secs_f64();
-    let p = if ON_ITS_CLOCK.contains(&def.id) && secs > 0.0 { phase * LOOP_SECS / secs } else { phase };
+    let p = if ON_ITS_CLOCK.contains(&card.def.id) && secs > 0.0 { phase * LOOP_SECS / secs } else { phase };
     e.progress = (p, p);
     let s = clip.source_time_at(at);
-    for d in def.params.iter().filter(|d| matches!(d.kind, ParamKind::Moment)) {
+    for d in card.def.params.iter().filter(|d| matches!(d.kind, ParamKind::Moment)) {
         let lead = Time::from_secs_f64((phase * 0.3 - 0.22) * clip.speed());
         e.params.insert(d.key.to_string(), ParamValue::Moment(SourceTime(s - lead)));
     }
@@ -221,12 +224,12 @@ pub fn sample_frame() -> Arc<CpuFrame> {
     Arc::new(CpuFrame::from_rgba8(SAMPLE_W, SAMPLE_H, ColorInfo { alpha: AlphaMode::Opaque, ..ColorInfo::WORKING_SDR }, px))
 }
 
-/// The sample as a 10 s clip on a 16:9 sequence, with `def` at `phase`.
-pub fn sample_project(def: &RecipeDef, phase: f64) -> Project {
+/// The sample as a 10 s clip on a 16:9 sequence, with `card`'s effect at `phase`.
+pub fn sample_project(card: Card, phase: f64) -> Project {
     let video = VideoInfo { width: SAMPLE_W, height: SAMPLE_H, frame_rate: Some(FrameRate::FPS_30), variable_frame_rate: false, codec: "sample".into(), pixel_format: "rgba".into(), rotation: 0, sar: (1, 1), color: None };
     let a = MediaAsset::new("kadr-sample", MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(10), container: "sample".into(), size_bytes: 0, video: Some(video), audio: None, timecode: None });
     let mut c = Clip::new(a.id, "sample", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::ZERO);
-    c.effects = vec![demo_effect(def, &c, SAMPLE_AT, phase)];
+    c.effects = vec![demo_effect(card, &c, SAMPLE_AT, phase)];
     let mut p = Project::new("sample");
     p.sequence_mut().tracks[0].clips.push(c);
     p.assets.push(a);
@@ -377,14 +380,14 @@ pub struct Thumbs {
     cancel: Option<CancelToken>,
     sample: Option<Arc<CpuFrame>>,
     /// The picture each card showed last: it stays while the new one renders.
-    last: HashMap<&'static str, slint::Image>,
+    last: HashMap<Card, slint::Image>,
     /// The thumbnail thread's inbox and the thread (started on first use).
     worker: Option<(Arc<Inbox<Batch>>, JoinHandle<()>)>,
     /// The app is closing: nothing starts the thread again.
     closed: bool,
     /// The card whose loop plays (the hovered motion card, once its hover
     /// delay is over) and its frame.
-    looping: Option<&'static str>,
+    looping: Option<Card>,
     pub loop_frame: u8,
     /// Advances `loop_frame` while the loop plays (dropping it stops it).
     timer: Option<slint::Timer>,
@@ -409,26 +412,26 @@ impl Thumbs {
         self.images.len()
     }
 
-    /// What `d`'s card shows of `base`: while its loop plays, its loop frame
+    /// What `card` shows of `base`: while its loop plays, its loop frame
     /// once the whole loop is rendered (no flicker between the still and the
     /// frames as they arrive); else its still.
-    pub fn card(&self, d: &RecipeDef, base: &ThumbBase) -> Option<slint::Image> {
-        let looping = self.looping == Some(d.id) && (0..LOOP_FRAMES).all(|i| self.images.contains_key(&ThumbKey::new(base, d, i)));
-        looping.then(|| self.get(&ThumbKey::new(base, d, self.loop_frame))).flatten().or_else(|| self.get(&ThumbKey::new(base, d, STILL)))
+    pub fn card(&self, card: Card, base: &ThumbBase) -> Option<slint::Image> {
+        let looping = self.looping == Some(card) && (0..LOOP_FRAMES).all(|i| self.images.contains_key(&ThumbKey::new(base, card, i)));
+        looping.then(|| self.get(&ThumbKey::new(base, card, self.loop_frame))).flatten().or_else(|| self.get(&ThumbKey::new(base, card, STILL)))
     }
 
     /// The card whose loop plays.
-    pub fn looping(&self) -> Option<&'static str> {
+    pub fn looping(&self) -> Option<Card> {
         self.looping
     }
 
-    /// `recipe`'s card starts its loop, from its first frame; `tick`
-    /// advances it every [`LOOP_TICK`].
-    pub fn start_loop(&mut self, recipe: &'static str, tick: impl FnMut() + 'static) {
+    /// `card` starts its loop, from its first frame; `tick` advances it
+    /// every [`LOOP_TICK`].
+    pub fn start_loop(&mut self, card: Card, tick: impl FnMut() + 'static) {
         let timer = slint::Timer::default();
         timer.start(slint::TimerMode::Repeated, LOOP_TICK, tick);
         self.timer = Some(timer);
-        self.looping = Some(recipe);
+        self.looping = Some(card);
         self.loop_frame = 0;
     }
 
@@ -471,21 +474,21 @@ impl Thumbs {
         self.images.insert(k, img);
     }
 
-    /// What `recipe`'s card shows: `now` (remembered), or while it is not
-    /// rendered yet the picture the card showed last.
-    pub fn shown(&mut self, recipe: &'static str, now: Option<slint::Image>) -> Option<slint::Image> {
+    /// What `card` shows: `now` (remembered), or while it is not rendered
+    /// yet the picture the card showed last.
+    pub fn shown(&mut self, card: Card, now: Option<slint::Image>) -> Option<slint::Image> {
         match now {
             Some(img) => {
-                self.last.insert(recipe, img.clone());
+                self.last.insert(card, img.clone());
                 Some(img)
             }
-            None => self.last.get(recipe).cloned(),
+            None => self.last.get(&card).cloned(),
         }
     }
 
-    /// `recipe`'s card has no picture now (its clip's file is missing).
-    pub fn forget_shown(&mut self, recipe: &str) {
-        self.last.remove(recipe);
+    /// `card` has no picture now (its clip's file is missing).
+    pub fn forget_shown(&mut self, card: Card) {
+        self.last.remove(&card);
     }
 
     /// Stops the batch in flight (the tab was left, the frame changed).
@@ -550,9 +553,9 @@ impl Thumbs {
 }
 
 impl App {
-    /// What a card shows for `d`: its loop frame while its loop plays, else its still.
-    pub fn fx_thumb(&self, d: &RecipeDef, base: &ThumbBase) -> Option<slint::Image> {
-        self.fx.thumbs.card(d, base)
+    /// What `card` shows: its loop frame while its loop plays, else its still.
+    pub fn fx_thumb(&self, card: Card, base: &ThumbBase) -> Option<slint::Image> {
+        self.fx.thumbs.card(card, base)
     }
 
     /// Starts rendering what the tab needs and lacks: stills of the listed
@@ -563,20 +566,20 @@ impl App {
         if self.playing {
             return;
         }
-        let mut wanted: Vec<(ThumbKey, &'static RecipeDef)> = visible_recipes(&self.fx.category, &self.fx.search).into_iter().map(|d| (ThumbKey::new(&base, d, STILL), d)).collect();
-        if let Some(d) = self.fx.thumbs.looping().and_then(kadr_effects::recipe) {
-            wanted.extend((0..LOOP_FRAMES).map(|i| (ThumbKey::new(&base, d, i), d)));
+        let mut wanted: Vec<ThumbKey> = visible_cards(&self.fx.category, &self.fx.search).into_iter().map(|c| ThumbKey::new(&base, c, STILL)).collect();
+        if let Some(card) = self.fx.thumbs.looping() {
+            wanted.extend((0..LOOP_FRAMES).map(|i| ThumbKey::new(&base, card, i)));
         }
-        let Some(need) = self.fx.thumbs.plan(wanted.iter().map(|(k, _)| *k)) else { return };
+        let Some(need) = self.fx.thumbs.plan(wanted.iter().copied()) else { return };
         let jobs: Vec<Job> = wanted
             .into_iter()
-            .filter(|(k, _)| need.contains(k))
-            .filter_map(|(key, d)| match base.clip {
+            .filter(|k| need.contains(k))
+            .filter_map(|key| match base.clip {
                 Some(id) => {
                     let c = self.project.sequence().clip(id)?;
-                    Some(Job { key, project: thumb_project(&self.project, c, demo_effect(d, c, base.at, key.phase_f())), at: base.at })
+                    Some(Job { key, project: thumb_project(&self.project, c, demo_effect(key.card, c, base.at, key.phase_f())), at: base.at })
                 }
-                None => Some(Job { key, project: sample_project(d, key.phase_f()), at: SAMPLE_AT }),
+                None => Some(Job { key, project: sample_project(key.card, key.phase_f()), at: SAMPLE_AT }),
             })
             .collect();
         let resolver = if base.clip.is_some() { self.preview.mcp_resolver() } else { None };
@@ -600,7 +603,7 @@ impl App {
     /// The key stays pending, so it is not tried again until the next batch.
     pub fn fx_thumb_failed(&mut self, key: ThumbKey) {
         if self.fx.thumbs.wants(&key) && key.phase == STILL {
-            self.fx.thumbs.forget_shown(key.recipe);
+            self.fx.thumbs.forget_shown(key.card);
             self.refresh_effects();
         }
     }
@@ -619,7 +622,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects_ui::Card;
     use kadr_core::AssetId;
+
+    fn zoom() -> Card {
+        Card::parse("smooth_zoom").unwrap()
+    }
 
     /// Timeline 10..20 s showing source 30..40 s.
     fn clip() -> Clip {
@@ -632,12 +640,12 @@ mod tests {
     }
 
     fn key(phase: u8) -> ThumbKey {
-        ThumbKey { clip: None, frame: SAMPLE_AT, state: 0, recipe: "smooth_zoom", version: 1, phase }
+        ThumbKey { clip: None, frame: SAMPLE_AT, state: 0, card: zoom(), version: 1, phase }
     }
 
     #[test]
     fn demo_effects_hold_a_phase_and_place_the_moment_around_it() {
-        let def = kadr_effects::recipe("punch_in").unwrap();
+        let def = Card::parse("punch_in").unwrap();
         let e = demo_effect(def, &clip(), Time::from_secs(12), 0.0);
         assert_eq!(e.progress, (0.0, 0.0), "a constant progress: the frame shows the phase");
         // The snap ends at the moment (R17): it runs from 0.12 s before it.
@@ -658,7 +666,7 @@ mod tests {
     /// progress, still goes through its whole motion.
     #[test]
     fn a_clock_driven_card_loops_in_real_time() {
-        let hand = kadr_effects::recipe("handheld").unwrap();
+        let hand = Card::parse("handheld").unwrap();
         let long = Clip::new(AssetId::new(), "l", TimeRange::new(Time::ZERO, Time::from_secs(120)), Time::ZERO);
         for c in [clip(), long] {
             let clock = |i: u8| {
@@ -672,8 +680,7 @@ mod tests {
                 assert!((step - LOOP_TICK.as_secs_f64()).abs() < 1e-9, "{}: {step}", c.name);
             }
         }
-        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
-        assert_eq!(demo_effect(zoom, &clip(), Time::from_secs(12), 1.0).progress, (1.0, 1.0));
+        assert_eq!(demo_effect(zoom(), &clip(), Time::from_secs(12), 1.0).progress, (1.0, 1.0));
     }
 
     #[test]
@@ -702,13 +709,27 @@ mod tests {
     #[test]
     fn the_sample_renders_and_a_zoom_changes_it() {
         let sample = sample_frame();
-        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let def = zoom();
         let start = render(&sample_project(def, 0.0), SAMPLE_AT, None, Some(&sample)).unwrap();
         let end = render(&sample_project(def, 1.0), SAMPLE_AT, None, Some(&sample)).unwrap();
         assert_eq!(start.len(), (THUMB_W * THUMB_H * 4) as usize);
         assert!(start.chunks(4).any(|p| p[0] > 40), "not a black frame");
         assert_ne!(start, end, "phase 1 is zoomed in");
         assert!(render(&sample_project(def, 0.0), SAMPLE_AT, None, None).is_none(), "no decoder and no sample: nothing");
+    }
+
+    /// D5: each Look preset is its own card with its own picture and cache key.
+    #[test]
+    fn look_cards_render_their_own_presets() {
+        let sample = sample_frame();
+        let look = |k: &str| Card::parse(&format!("look:{k}")).unwrap();
+        let pic = |k: &str| render(&sample_project(look(k), STILL_PHASE), SAMPLE_AT, None, Some(&sample)).unwrap();
+        let (warm, dramatic) = (pic("warm"), pic("dramatic"));
+        assert_ne!(warm, dramatic);
+        assert_ne!(warm, pic("vintage"));
+        let base = ThumbBase { clip: None, at: SAMPLE_AT, frame: SAMPLE_AT, state: 0 };
+        assert_ne!(ThumbKey::new(&base, look("warm"), STILL), ThumbKey::new(&base, look("dramatic"), STILL), "cached apart");
+        assert_eq!(sample_project(look("vintage"), STILL_PHASE).sequence().tracks[0].clips[0].effects[0].params["preset"], ParamValue::Choice("vintage".into()));
     }
 
     /// A clip's frame comes through the resolver (export mode: it waits);
@@ -721,7 +742,7 @@ mod tests {
         let decoders = Arc::new(FakeDecoders::new(Duration::ZERO, Duration::ZERO));
         decoders.add(&path, FakeMedia { tag: 220, frames: None, fail: false });
         let resolver = Resolver::new(decoders, kadr_playback::ResolverConfig::default());
-        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let def = zoom();
         let thumb = |a: &MediaAsset| {
             let mut p = Project::new("t");
             let c = Clip::new(a.id, "c", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::ZERO);
@@ -766,7 +787,7 @@ mod tests {
         let id = c.id;
         p.assets.push(a);
         p.sequence_mut().tracks[0].clips.push(c);
-        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let def = zoom();
         let key_at = |p: &Project, playhead: i64| ThumbKey::new(&thumb_base(p, Some(id), Time::from_secs(playhead)), def, STILL);
         let edited = |p: &Project, f: &dyn Fn(&mut Clip)| {
             let mut q = p.clone();
@@ -843,9 +864,9 @@ mod tests {
         th.cancel();
         assert!(!th.wants(&key(STILL)), "cancelled: its late result is dropped");
         th.insert(key(0), slint::Image::default());
-        assert_eq!(th.shown("smooth_zoom", th.get(&key(0))).map(|_| ()), Some(()));
+        assert_eq!(th.shown(zoom(), th.get(&key(0))).map(|_| ()), Some(()));
         th.clear();
-        assert!(th.get(&key(0)).is_none() && th.shown("smooth_zoom", None).is_none(), "a new project: nothing kept");
+        assert!(th.get(&key(0)).is_none() && th.shown(zoom(), None).is_none(), "a new project: nothing kept");
     }
 
     /// While a card's new picture renders it keeps the one it showed (no
@@ -853,13 +874,13 @@ mod tests {
     #[test]
     fn a_card_keeps_its_last_picture_until_the_new_one_arrives() {
         let mut th = Thumbs::default();
-        assert!(th.shown("smooth_zoom", None).is_none(), "nothing yet: the icon");
+        assert!(th.shown(zoom(), None).is_none(), "nothing yet: the icon");
         let img = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(2, 2));
-        assert!(th.shown("smooth_zoom", Some(img.clone())).is_some());
-        assert_eq!(th.shown("smooth_zoom", None), Some(img), "the next frame is not there yet");
-        assert!(th.shown("punch_in", None).is_none(), "per card");
-        th.forget_shown("smooth_zoom");
-        assert!(th.shown("smooth_zoom", None).is_none());
+        assert!(th.shown(zoom(), Some(img.clone())).is_some());
+        assert_eq!(th.shown(zoom(), None), Some(img), "the next frame is not there yet");
+        assert!(th.shown(Card::parse("punch_in").unwrap(), None).is_none(), "per card");
+        th.forget_shown(zoom());
+        assert!(th.shown(zoom(), None).is_none());
     }
 
     /// A card loops only while its loop plays (a hovered motion card, once
@@ -867,7 +888,7 @@ mod tests {
     /// until then, and otherwise, it shows its still.
     #[test]
     fn a_hovered_card_loops_once_its_whole_loop_is_rendered() {
-        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let def = zoom();
         let base = ThumbBase { clip: None, at: SAMPLE_AT, frame: SAMPLE_AT, state: 0 };
         // Slint compares pictures by their buffer: each is its own.
         let img = || slint::Image::from_rgba8(slint::SharedPixelBuffer::new(1, 1));
@@ -879,15 +900,15 @@ mod tests {
         }
         th.insert(ThumbKey::new(&base, def, LOOP_FRAMES - 1), frames[LOOP_FRAMES as usize - 1].clone());
         assert_eq!(th.card(def, &base), Some(still.clone()), "no loop plays: the still");
-        th.looping = Some(def.id);
+        th.looping = Some(def);
         th.loop_frame = 3;
         assert_eq!(th.card(def, &base), Some(frames[3].clone()), "the loop plays");
         th.images.remove(&ThumbKey::new(&base, def, 5));
         assert_eq!(th.card(def, &base), Some(still.clone()), "one frame missing: the still");
         th.insert(ThumbKey::new(&base, def, 5), frames[5].clone());
-        th.looping = Some("handheld");
+        th.looping = Some(Card::parse("handheld").unwrap());
         assert_eq!(th.card(def, &base), Some(still.clone()), "another card's loop");
-        th.looping = Some(def.id);
+        th.looping = Some(def);
         assert!(th.stop_loop(), "it played");
         assert_eq!((th.card(def, &base), th.looping(), th.loop_frame), (Some(still), None, 0), "stopped: the still, from the first frame next time");
         assert!(!th.stop_loop(), "nothing plays");
