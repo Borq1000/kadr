@@ -148,6 +148,9 @@ pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> R
 
 /// One `edit` op; `edit_commands` prefixes errors with its index.
 fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditCommand>, BridgeError> {
+    if !op.is_object() {
+        return Err(BridgeError::new("edit_rejected", format!("an op must be an object with a `type`, got {op}")));
+    }
     if let Some(r) = crate::mcp_anim::anim_op(project, seq, op) {
         return r;
     }
@@ -714,6 +717,25 @@ mod tests {
         // A refused type keeps its own reason.
         let e = edit_commands(&p, &[], &json!([{"type": "add_caption", "start_ms": 0, "end_ms": 1_000, "text": "hi"}])).unwrap_err().message;
         assert!(e.contains("caption") && !e.contains("unknown op type"), "{e}");
+        // An op that is not an object says so.
+        for op in [json!("split_clip"), json!(7)] {
+            let e = edit_commands(&p, &[], &json!([op])).unwrap_err().message;
+            assert!(e.starts_with("op #0: an op must be an object"), "{e}");
+        }
+    }
+
+    /// Every AI command reaches `edit` (listed or refused with its own
+    /// reason): a new `AiCommand` variant missing from `EDIT_OPS` would be
+    /// refused as an unknown type over MCP. Serde's own "expected one of"
+    /// list names every variant.
+    #[test]
+    fn every_ai_command_is_an_edit_op_or_refused() {
+        let e = serde_json::from_value::<kadr_ai::command::AiCommand>(json!({"type": "?"})).unwrap_err().to_string();
+        let names: Vec<&str> = e.split("expected one of").nth(1).expect(&e).split(',').map(|n| n.trim().trim_matches('`')).filter(|n| !n.is_empty()).collect();
+        assert!(names.len() >= 10, "{e}");
+        for n in names {
+            assert!(EDIT_OPS.contains(&n) || REFUSED_OPS.contains(&n), "AiCommand `{n}` is neither in EDIT_OPS nor in REFUSED_OPS");
+        }
     }
 
     /// kadr-mcp's `edit` description (what Claude reads) documents exactly

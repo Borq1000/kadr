@@ -407,8 +407,14 @@ pub fn unseen_key(c: Option<&Clip>, playhead: Time, frame: Time) -> &'static str
 /// The point of `layer`'s picture under a click at canvas fraction (`fx`,
 /// `fy`) — through the placement as shown (zoomed, panned, turned) — as
 /// fractions of the picture (the content rectangle before crop,
-/// refinement 6); `None` off its visible part (review focus 4).
+/// refinement 6); `None` off its visible part (review focus 4) and off
+/// the frame — a layer zoomed past the canvas has hidden picture under the
+/// margin round the frame, and a click there is a miss too (M5).
 pub fn pick_point(layer: &Layer, canvas: SizeU, fx: f64, fy: f64) -> Option<(f64, f64)> {
+    // NaN fails both: no frame position, no point.
+    if !((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)) {
+        return None;
+    }
     let inv = layer.placement.to_canvas().inverse()?;
     let (x, y) = inv.apply(fx * canvas.w as f64, fy * canvas.h as f64);
     let c = layer.crop;
@@ -575,8 +581,8 @@ impl App {
         ui.set_fx_hint(t(if sel.is_empty() { "fx.hint.select_clip" } else { "fx.hint.apply" }).into());
         // A hovered card filtered out (search, category) ends its hover; a
         // shown preview follows the selection — the hovered card's effect on
-        // the clips it now fits, or none — and, while paused, a moment the
-        // playhead (playing, the punch plays where it was shown).
+        // the clips it now fits, or none — and, while paused, a moment follows
+        // the playhead (playing, the punch plays where it was shown).
         let gone = hover_gone(self.fx.hover.map(|(r, _)| r), &listed);
         let stale = self.fx.preview.as_ref().is_some_and(|o| {
             let playhead = if self.playing { o.at } else { self.playhead };
@@ -805,8 +811,10 @@ impl App {
     /// `def` was just applied to the inspected clip (A3): its block takes
     /// the focus — its point shows on the preview — and the inspector
     /// scrolls to it, top first. The scroll waits a turn of the event loop:
-    /// by then a new block exists and is laid out (Slint instantiates it
-    /// right after the pointer event), so its `changed` handler runs.
+    /// a `changed` handler never fires for the value its element was created
+    /// with, so a new block must exist before `reveal-seq` moves — it does,
+    /// because the repaint (and the layout that creates the block) runs
+    /// before the zero-delay timer fires on the next turn.
     fn fx_reveal(&mut self, def: &RecipeDef) {
         let Some(id) = self.inspected() else { return };
         let Some(e) = self.project.sequence().clip(id).and_then(|c| c.effects.iter().find(|e| e.recipe == def.id)).map(|e| e.id) else { return };
@@ -1480,6 +1488,13 @@ mod tests {
         let full = layer_with(Placement::fill(canvas), None);
         for (x, y) in [(-0.02, 0.5), (1.03, 0.5), (0.5, -0.1), (0.5, 1.2), (f64::NAN, 0.5)] {
             assert!(pick_point(&full, canvas, x, y).is_none(), "{x} {y}");
+        }
+        // A clip zoomed past the frame (a zoom effect, scale > 100 %) has
+        // picture hidden under the margin: a click there is still a miss.
+        let zoomed = layer_with(Placement { scale: Vec2::new(1.3, 1.3), ..Placement::fill(canvas) }, None);
+        assert!(pick_point(&zoomed, canvas, 0.5, 0.5).is_some());
+        for (x, y) in [(-0.05, 0.5), (1.05, 0.5), (0.5, -0.05), (0.5, 1.05)] {
+            assert!(pick_point(&zoomed, canvas, x, y).is_none(), "zoomed {x} {y}");
         }
     }
 
