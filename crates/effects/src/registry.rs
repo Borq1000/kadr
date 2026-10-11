@@ -77,12 +77,23 @@ pub struct CompileCtx {
     /// Source seconds per timeline second.
     pub speed: f64,
     pub canvas: SizeU,
-    /// The clip picture's width / height.
+    /// The clip picture's width / height (the whole picture, before crop).
     pub aspect: f64,
+    /// The visible crop window: its edges `(x0, y0, x1, y1)` as fractions of
+    /// the picture (left, top, right, bottom) = `(crop_left, crop_top,
+    /// 1 − crop_right, 1 − crop_bottom)` at this frame; `UNCROPPED` when the
+    /// clip has no crop. Motion recipes keep this window covering its own
+    /// on-screen footprint (ruling R6).
+    pub window: (f64, f64, f64, f64),
     /// Timeline time of the frame.
     pub frame: Time,
     /// From the effect's id (noise).
     pub seed: u64,
+}
+
+impl CompileCtx {
+    /// The window of a clip without crop: the whole picture.
+    pub const UNCROPPED: (f64, f64, f64, f64) = (0.0, 0.0, 1.0, 1.0);
 }
 
 /// What one effect adds to a frame. E1 recipes only move the picture;
