@@ -511,6 +511,37 @@ fn switch_angle_shifts_keyframes_by_the_sync_difference() {
     assert_eq!(c.timeline_time_of(s(10)), s(2), "same place on the timeline");
 }
 
+/// Effect Moments are source-bound like keys: a Punch In keeps its timeline
+/// time across an angle switch — of the whole clip, a live cut, and
+/// SetAngleRange (the AI's select_camera) — and undo restores it.
+#[test]
+fn switch_angle_keeps_an_effect_moment_on_its_timeline_time() {
+    let (mut p, mut e, clip, _) = multicam_project(10, 20);
+    // CAM1 source 15 s = group 15 s = timeline 5 s.
+    let punch = AppliedEffect::new("punch_in", 1, [("moment".to_string(), ParamValue::Moment(SourceTime(s(15))))].into());
+    p.sequence_mut().tracks[0].clips[0].effects.push(punch);
+    let before = p.sequence().clone();
+    let punch_at = |p: &Project| -> Vec<Time> {
+        let moment = |c: &Clip| match c.effects.first()?.params.get("moment")? {
+            ParamValue::Moment(m) => Some(c.timeline_time_of(m.0)),
+            _ => None,
+        };
+        p.sequence().tracks[0].clips.iter().filter_map(moment).collect()
+    };
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: None }).unwrap();
+    assert_eq!(p.sequence().clip(clip).unwrap().effects[0].params["moment"], ParamValue::Moment(SourceTime(s(13))), "group 15 s is CAM2 source 13 s");
+    assert_eq!(punch_at(&p), vec![s(5)]);
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence(), &before, "undo restores the moment");
+    e.execute(&mut p, EditCommand::SwitchAngle { clip, angle: 1, at: Some(s(4)) }).unwrap();
+    assert_eq!(punch_at(&p), vec![s(5), s(5)], "a live cut: both halves name the same frame");
+    e.undo(&mut p).unwrap();
+    e.execute(&mut p, EditCommand::SetAngleRange { range: TimeRange::new(s(3), s(6)), angle: 1 }).unwrap();
+    assert_eq!(punch_at(&p), vec![s(5), s(5), s(5)]);
+    e.undo(&mut p).unwrap();
+    assert_eq!(p.sequence(), &before);
+}
+
 /// The length a speed gives (shared by the engine and the inspector's
 /// no-change check): whole frames, at least one.
 #[test]

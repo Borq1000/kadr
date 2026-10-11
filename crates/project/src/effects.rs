@@ -182,6 +182,24 @@ impl Clip {
         self.effects.iter().find(|e| e.recipe == recipe)
     }
 
+    /// Moves everything bound to the source media by `delta` — every
+    /// keyframe and every effect «Момент» — for a clip that starts showing
+    /// other media at that offset (a multicam angle switch: the sync-offset
+    /// difference), so each stays on its content frame and its timeline
+    /// time. A moment saturates within ±`MAX_KEY_FLICKS`, the range a saved
+    /// moment is read back in (and keys run in).
+    pub fn shift_source_bound(&mut self, delta: Time) {
+        self.animation.shift_all(delta);
+        let limit = MAX_KEY_FLICKS as i64;
+        for e in &mut self.effects {
+            for v in e.params.values_mut() {
+                if let ParamValue::Moment(m) = v {
+                    *m = SourceTime(Time(m.0.flicks().saturating_add(delta.flicks()).clamp(-limit, limit)));
+                }
+            }
+        }
+    }
+
     /// Applies `e`, one instance per recipe (spec §2): a new recipe is
     /// appended; one the clip has is replaced in place — its id and position
     /// stay, its `fx:` tracks go. When a lenient load left the clip two of
@@ -350,6 +368,29 @@ mod tests {
         c.effect_mut(id).unwrap().enabled = false;
         assert!(!c.effects[0].enabled);
         assert!(c.effect(EffectId::new()).is_none() && c.effect_of("smooth_zoom").is_none());
+    }
+
+    /// A multicam angle switch moves keys and Moments alike; a moment near
+    /// the end of the readable range saturates there instead of overflowing.
+    #[test]
+    fn shift_source_bound_moves_keys_and_moments_together() {
+        let mut c = crate::Clip::new(kadr_core::AssetId::new(), "c", kadr_core::TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let moment = |s: i64| ParamValue::Moment(SourceTime(Time::from_secs(s)));
+        let punch = AppliedEffect::new("punch_in", 1, BTreeMap::from([("moment".to_string(), moment(3)), ("strength".to_string(), ParamValue::Number(0.6))]));
+        let pid = punch.id;
+        let mut far = AppliedEffect::new("future", 1, BTreeMap::from([("at".to_string(), ParamValue::Moment(SourceTime(Time(MAX_KEY_FLICKS as i64 - 5))))]));
+        far.params.insert("blob".into(), ParamValue::Unknown(json!({"moment": 7})));
+        c.effects = vec![punch, far];
+        c.animation.set_key(crate::TrackKey::fx(pid, "strength"), SourceTime(Time::from_secs(1)), 0.2, None);
+        c.shift_source_bound(Time::from_secs(-2));
+        assert_eq!(c.effects[0].params["moment"], moment(1));
+        assert_eq!(c.effects[0].params["strength"], ParamValue::Number(0.6), "only moments move");
+        assert_eq!(c.animation.times(), vec![SourceTime(Time::from_secs(-1))]);
+        c.shift_source_bound(Time::from_secs(4));
+        assert_eq!(c.effects[1].params["at"], ParamValue::Moment(SourceTime(Time(MAX_KEY_FLICKS as i64))), "saturates at the readable range");
+        assert_eq!(c.effects[1].params["blob"], ParamValue::Unknown(json!({"moment": 7})), "unknown data stays verbatim");
+        let saved = serde_json::to_value(&c.effects[1].params["at"]).unwrap();
+        assert_eq!(serde_json::from_value::<ParamValue>(saved).unwrap(), c.effects[1].params["at"], "still a moment after a save");
     }
 
     #[test]

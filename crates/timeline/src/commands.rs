@@ -492,9 +492,11 @@ impl EditCommand {
                 let (asset, src) = crate::multicam::angle_source(group, *angle, c, ctx.assets)?;
                 let label = group.angles[*angle as usize].label.clone();
                 let c = &mut seq.tracks[ti].clips[ci];
-                // Keyframes are source-bound: follow the sync-offset difference.
+                // Keyframes and effect Moments are source-bound: follow the
+                // sync-offset difference (SetAngleRange and the AI's
+                // select_camera come through here too).
                 let shift = src.start - c.source_in;
-                c.animation.shift_all(shift);
+                c.shift_source_bound(shift);
                 c.asset = asset;
                 c.source_in = src.start;
                 c.source_out = src.end;
