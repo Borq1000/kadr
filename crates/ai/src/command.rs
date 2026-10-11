@@ -726,7 +726,7 @@ mod tests {
         let fid = e.id;
         p.sequence_mut().tracks[0].clips[0].effects.push(e);
         let rm = cmd(json!({"type": "remove_effect", "clip_id": id, "effect_id": fid.to_string()}));
-        assert_eq!(validate(&[rm.clone()], &p, &Permissions::default()).unwrap(), vec![EditCommand::RemoveEffect { clip: cid, id: fid }]);
+        assert_eq!(validate(std::slice::from_ref(&rm), &p, &Permissions::default()).unwrap(), vec![EditCommand::RemoveEffect { clip: cid, id: fid }]);
         let no = Permissions { allow_destructive: false, max_commands: 10 };
         assert!(matches!(validate(&[rm], &p, &no), Err(ValidationError::Permission { .. })));
         let gone = cmd(json!({"type": "remove_effect", "clip_id": id, "effect_id": kadr_core::EffectId::new().to_string()}));
@@ -785,7 +785,7 @@ mod tests {
         let c = &p.sequence().tracks[0].clips[0];
         let echo = kadr_effects::json::value_json(c, &c.effects[0].params["moment"]);
         let set = cmd(json!({"type": "set_effect", "clip_id": id, "effect_id": fid.to_string(), "params": {"moment": echo}}));
-        assert_eq!(validate(&[set.clone()], &p, &Permissions::default()).unwrap(), vec![]);
+        assert_eq!(validate(std::slice::from_ref(&set), &p, &Permissions::default()).unwrap(), vec![]);
         assert!(validate_strict(&[set], &p, &Permissions::default()).unwrap_err().to_string().contains("no change"));
     }
 
@@ -807,9 +807,9 @@ mod tests {
         let fid = with_effect(&mut p, "handheld");
         let add = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld", "params": {"strength": 0.9}}));
         let no = Permissions { allow_destructive: false, max_commands: 10 };
-        assert!(validate(&[add.clone()], &p, &no).is_ok(), "no keyframes: nothing is lost");
+        assert!(validate(std::slice::from_ref(&add), &p, &no).is_ok(), "no keyframes: nothing is lost");
         p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(fid, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
-        assert!(matches!(validate(&[add.clone()], &p, &no), Err(ValidationError::Permission { .. })));
+        assert!(matches!(validate(std::slice::from_ref(&add), &p, &no), Err(ValidationError::Permission { .. })));
         assert!(validate(&[add], &p, &Permissions::default()).is_ok());
     }
 

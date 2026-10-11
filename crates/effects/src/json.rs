@@ -1,10 +1,10 @@
 //! JSON forms of effects for MCP and the AI assistant (effects spec §7):
-//! the registry, an effect as `get_state` shows it, and parameters as
-//! clients write them — numbers, choice strings, `{x, y}` points and
+//! a recipe as `list_effects` shows it, an effect as `get_state` shows it,
+//! and parameters as clients write them — numbers, choice strings, `{x, y}` points and
 //! `{at_ms}` / `{source_ms}` moments (`at_ms` is timeline time inside the clip).
 
 use crate::params::{ParamDef, ParamKind};
-use crate::registry::{definition, registry, RecipeDef};
+use crate::registry::{definition, RecipeDef};
 use kadr_core::Time;
 use kadr_project::{AppliedEffect, Clip, ParamValue, SourceTime};
 use serde_json::{json, Map, Value};
@@ -27,11 +27,6 @@ pub fn recipe_json(d: &RecipeDef) -> Value {
         "id": d.id, "category": d.category.key(), "target": d.target.key(), "version": d.version,
         "params": d.params.iter().map(param_schema).collect::<Vec<_>>(),
     })
-}
-
-/// `list_effects`: every recipe in card order.
-pub fn registry_json() -> Value {
-    Value::Array(registry().iter().map(recipe_json).collect())
 }
 
 /// A stored value as clients read it; a moment in both time domains.
@@ -61,12 +56,7 @@ pub fn effect_json(clip: &Clip, e: &AppliedEffect) -> Value {
 }
 
 /// Client parameters for `def` on `clip`, each checked like a command
-/// would; the error names the key and the reason.
-pub fn params_from_json(def: &RecipeDef, clip: &Clip, json: &Map<String, Value>) -> Result<BTreeMap<String, ParamValue>, String> {
-    params_from_json_in(def, clip, json, None, Time::ZERO)
-}
-
-/// [`params_from_json`] for a caller that knows more. `current` is the
+/// would; the error names the key and the reason. `current` is the
 /// effect's stored values when updating: a moment echoed back from
 /// [`value_json`] (milliseconds are floored) resolves to the stored one,
 /// so it is not a change. `slack` widens the snap of a timeline `at_ms`
@@ -159,9 +149,14 @@ fn moment_from_json(clip: &Clip, k: &str, v: &Value, stored: Option<SourceTime>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::recipe;
+    use crate::registry::{recipe, registry};
     use kadr_core::{AssetId, TimeRange};
     use serde_json::json;
+
+    /// [`params_from_json_in`] for a new effect: no stored values, no slack.
+    fn params_from_json(def: &RecipeDef, clip: &Clip, json: &Map<String, Value>) -> Result<BTreeMap<String, ParamValue>, String> {
+        params_from_json_in(def, clip, json, None, Time::ZERO)
+    }
 
     /// Timeline 10..20 s showing source 30..40 s.
     fn clip() -> Clip {
@@ -174,8 +169,8 @@ mod tests {
 
     #[test]
     fn the_registry_describes_types_ranges_options_and_defaults() {
-        let all = registry_json();
-        assert_eq!(all.as_array().unwrap().len(), 5);
+        let all: Vec<Value> = registry().iter().map(recipe_json).collect();
+        assert_eq!(all.len(), 5);
         let zoom = &all[0];
         assert_eq!((zoom["id"].as_str(), zoom["category"].as_str(), zoom["target"].as_str()), (Some("smooth_zoom"), Some("motion"), Some("clip")));
         assert_eq!(zoom["params"][0], json!({"key": "direction", "type": "choice", "options": ["in", "out"], "default": "in"}));
