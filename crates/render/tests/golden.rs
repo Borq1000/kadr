@@ -28,6 +28,28 @@ fn video() -> Arc<CpuFrame> {
     })
 }
 
+/// "Footage" for the colour goldens: the video's gradient with its bar, a
+/// skin-tone patch, and a grey ramp 0 → 1 along the bottom fifth (curves show on it).
+fn photo() -> Arc<CpuFrame> {
+    frame(320, 180, AlphaMode::Opaque, |x, y| {
+        if y > 0.8 {
+            return [x, x, x, 1.0];
+        }
+        if (0.62..0.78).contains(&x) && (0.15..0.45).contains(&y) {
+            return [0.86, 0.64, 0.52, 1.0];
+        }
+        let bar = if (0.45..0.55).contains(&y) { 0.35 } else { 0.0 };
+        [0.9 - 0.7 * x + bar, 0.2 + 0.5 * y + bar, 0.2 + 0.7 * x * (1.0 - y) + bar, 1.0]
+    })
+}
+
+/// The photo full frame with `effects`.
+fn graded(effects: Vec<Effect>) -> (FrameScene, Vec<LayerInput>) {
+    let mut l = full(AlphaMode::Opaque);
+    l.effects = effects;
+    (scene(OUT, vec![l]), vec![LayerInput::Cpu(photo())])
+}
+
 /// 8×8-cell checkerboard, green and white, with a red top-left cell to show orientation.
 fn checker(w: u32, h: u32) -> Arc<CpuFrame> {
     frame(w, h, AlphaMode::Opaque, |x, y| {
@@ -222,4 +244,32 @@ fn missing_media() {
     // The picture-in-picture clip is offline: a dark red rectangle in its place.
     let pip = media(placement((320.0, 180.0), (220.0, 120.0), 0.4, 0.0), AlphaMode::Opaque);
     check("missing_media", scene(OUT, vec![full(AlphaMode::Opaque), pip]), vec![LayerInput::Cpu(video()), LayerInput::Missing(MissingReason::Offline)]);
+}
+
+#[test]
+fn tone_curve() {
+    // A strong S: deeper shadows, brighter highlights (the ramp shows the shape).
+    let (s, i) = graded(vec![Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.0), (0.25, 0.12), (0.75, 0.88), (1.0, 1.0)] })]);
+    check("tone_curve", s, i);
+}
+
+#[test]
+fn split_tone() {
+    // Teal shadows, orange highlights, exaggerated so the review sees them.
+    let (s, i) = graded(vec![Effect::SplitTone(SplitTone { shadow_hue_deg: 200.0, shadow_amount: 0.6, highlight_hue_deg: 35.0, highlight_amount: 0.5, balance: 0.0 })]);
+    check("split_tone", s, i);
+}
+
+#[test]
+fn vignette() {
+    // A strong vignette: dark corners, the centre untouched.
+    let (s, i) = graded(vec![Effect::Vignette(Vignette { amount: 0.8, midpoint: 0.3, feather: 0.6 })]);
+    check("vignette", s, i);
+}
+
+#[test]
+fn grain() {
+    // Coarse, strong grain (3-pixel cells): visible in the mids, none on the ramp's black and white ends.
+    let (s, i) = graded(vec![Effect::Grain(Grain { amount: 0.4, size: 3.0, seed: 7 })]);
+    check("grain", s, i);
 }

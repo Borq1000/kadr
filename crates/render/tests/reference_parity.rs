@@ -131,6 +131,32 @@ fn sanity_exposure_contrast_temperature_formulas() {
     assert_eq!(px(&reference_of(&scene((2, 2), (2, 2), Rgba::BLACK, vec![l])), 2, 0, 0), [140, 121, 115, 255]);
 }
 
+/// Hand-computed values of the E2 primitives on solids (canvas = output, k = 1).
+#[test]
+fn sanity_tone_curve_split_tone_vignette_and_grain() {
+    let grade = |cv: (u32, u32), colour: Rgba, e: Effect| {
+        let mut l = solid(cv, colour);
+        l.effects = vec![e];
+        reference_of(&scene(cv, cv, Rgba::BLACK, vec![l]))
+    };
+    let grey = |v: f32| rgba(v, v, v, 1.0);
+    // A flat curve at 0.2: 51 whatever the colour.
+    let flat = Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.2), (1.0, 0.2)] });
+    assert_eq!(px(&grade((2, 2), rgba(0.9, 0.1, 0.5, 1.0), flat), 2, 0, 0), [51, 51, 51, 255]);
+    // Grey 0.5 with red shadows at 1: 0.5 + 0.25·(0.7874, −0.2126, −0.2126).
+    let red = Effect::SplitTone(SplitTone { shadow_hue_deg: 0.0, shadow_amount: 1.0, ..SplitTone::NEUTRAL });
+    assert_eq!(px(&grade((2, 2), grey(0.5), red), 2, 0, 0), [178, 114, 114, 255]);
+    // Grey 0.8 with orange highlights at 0.5: 0.8 + 0.32·(0.4298, −0.0702, −0.5702).
+    let orange = Effect::SplitTone(SplitTone { highlight_hue_deg: 30.0, highlight_amount: 0.5, ..SplitTone::NEUTRAL });
+    assert_eq!(px(&grade((2, 2), grey(0.8), orange), 2, 0, 0), [239, 198, 157, 255]);
+    // White 10 × 10, vignette 1 / 0 / 1: corner d = 0.9 → 0.028, centre-ish d = 0.1 → 0.972, side d ≈ 0.640 → 0.295.
+    let vig = grade((10, 10), grey(1.0), Effect::Vignette(Vignette { amount: 1.0, midpoint: 0.0, feather: 1.0 }));
+    assert_eq!([px(&vig, 10, 0, 0)[0], px(&vig, 10, 4, 4)[0], px(&vig, 10, 0, 4)[0]], [7, 248, 75]);
+    // Grain on grey 0.5 (weight 1): the pixel is pcg32_hash(7, cell) / (2³² − 1).
+    let grain = grade((4, 4), grey(0.5), Effect::Grain(Grain { amount: 1.0, size: 1.0, seed: 7 }));
+    assert_eq!([px(&grain, 4, 0, 0)[0], px(&grain, 4, 1, 0)[0], px(&grain, 4, 0, 1)[0]], [97, 113, 253]);
+}
+
 #[test]
 fn sanity_dissolve_at_zero_is_from_and_at_one_is_to() {
     let cv = (8, 8);
@@ -405,18 +431,47 @@ impl Gen {
         }
     }
 
+    /// A chain of one to four primitives of any kind now and then (D2).
     fn effects(&mut self) -> Vec<Effect> {
-        if !self.rng.chance(0.3) {
+        if !self.rng.chance(0.4) {
             return vec![];
         }
-        let mut param = |neutral: f64, lo: f64, hi: f64| if self.rng.chance(0.4) { neutral as f32 } else { self.rng.range(lo, hi) as f32 };
-        vec![Effect::ColorAdjust(ColorAdjust {
-            exposure: param(0.0, -3.0, 3.0),
-            contrast: param(1.0, 0.0, 2.0),
-            saturation: param(1.0, 0.0, 2.0),
-            temperature: param(0.0, -1.0, 1.0),
-            tint: param(0.0, -1.0, 1.0),
-        })]
+        let n = self.rng.int(1, 4);
+        (0..n).map(|_| self.effect()).collect()
+    }
+
+    /// One primitive, neutral now and then; tone curves include messy point
+    /// lists (unsorted, out of range, repeated x, falling y, a single point).
+    fn effect(&mut self) -> Effect {
+        let r = &mut self.rng;
+        let neutral = r.chance(0.15);
+        let amount = |r: &mut Rng, hi: f64| if neutral { 0.0 } else { r.range(0.0, hi) as f32 };
+        match r.int(0, 4) {
+            0 => {
+                let mut param = |neutral_value: f64, lo: f64, hi: f64| if r.chance(0.4) { neutral_value as f32 } else { r.range(lo, hi) as f32 };
+                Effect::ColorAdjust(ColorAdjust {
+                    exposure: param(0.0, -3.0, 3.0),
+                    contrast: param(1.0, 0.0, 2.0),
+                    saturation: param(1.0, 0.0, 2.0),
+                    temperature: param(0.0, -1.0, 1.0),
+                    tint: param(0.0, -1.0, 1.0),
+                })
+            }
+            1 if neutral => Effect::ToneCurve(ToneCurve::identity()),
+            1 => {
+                let n = r.int(1, 5);
+                Effect::ToneCurve(ToneCurve { points: (0..n).map(|_| (r.range(-0.2, 1.2) as f32, r.range(-0.2, 1.2) as f32)).collect() })
+            }
+            2 => Effect::SplitTone(SplitTone {
+                shadow_hue_deg: r.range(-90.0, 450.0) as f32,
+                shadow_amount: amount(r, 1.0),
+                highlight_hue_deg: r.range(0.0, 360.0) as f32,
+                highlight_amount: amount(r, 1.0),
+                balance: r.range(-1.0, 1.0) as f32,
+            }),
+            3 => Effect::Vignette(Vignette { amount: amount(r, 1.0), midpoint: r.range(0.0, 1.0) as f32, feather: if r.chance(0.2) { 0.0 } else { r.range(0.0, 1.0) as f32 } }),
+            _ => Effect::Grain(Grain { amount: amount(r, 0.5), size: [0.5, 1.0, 1.7, 3.0][r.int(0, 3) as usize], seed: r.next() }),
+        }
     }
 
     fn placement(&mut self) -> Placement {
@@ -676,6 +731,52 @@ fn cpu_renderer_matches_the_reference_on_random_scenes() {
     assert_eq!(failing, 0, "{failing} of {rendered} scenes differ from the reference beyond tolerance (max diff {max_diff}); first ones above");
 }
 
+/// What the random scenes reach only now and then, made sure of: vignette and grain on down- and
+/// up-scaled, letterboxed and pillarboxed outputs (the canvas position `(x − o) / k`), on a
+/// full-frame and on a turned picture-in-picture layer; split-tone balance away from 0; grain after
+/// a strong exposure or contrast (its weight reads luma clamped into [0, 1]).
+#[test]
+fn cpu_renderer_matches_the_reference_on_spatial_and_clamped_chains() {
+    let canvas = SizeU::new(48, 27);
+    let (w, h) = (canvas.w, canvas.h);
+    let ramp: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x * 255 / (w - 1)) as u8, (y * 255 / (h - 1)) as u8, (255 - (x * y * 255 / ((w - 1) * (h - 1)))) as u8, 255])).collect();
+    let frame = Arc::new(CpuFrame::from_rgba8(w, h, ColorInfo { alpha: AlphaMode::Opaque, ..ColorInfo::WORKING_SDR }, ramp));
+    let grain = |amount: f32, size: f32, seed: u64| Effect::Grain(Grain { amount, size, seed });
+    let adjust = |exposure: f32, contrast: f32| Effect::ColorAdjust(ColorAdjust { exposure, contrast, ..ColorAdjust::NEUTRAL });
+    let split = |balance: f32| Effect::SplitTone(SplitTone { shadow_hue_deg: 200.0, shadow_amount: 0.8, highlight_hue_deg: 35.0, highlight_amount: 0.7, balance });
+    let chains = [
+        vec![Effect::Vignette(Vignette { amount: 0.9, midpoint: 0.2, feather: 0.5 }), grain(0.5, 1.7, 11)],
+        vec![adjust(3.0, 1.0), grain(0.5, 1.0, 5)],
+        vec![adjust(2.0, 2.5), grain(0.5, 1.0, 6)],
+        vec![adjust(-1.0, 2.5), grain(0.5, 3.0, 8)],
+        vec![split(-0.8)],
+        vec![split(0.9)],
+    ];
+    // Canvas 48 × 27 into: itself, ½ (letterboxed), 2×, a 4:3 window, a pillarbox, a portrait window, an up-scaled pillarbox.
+    let outputs = [(48, 27), (24, 14), (96, 54), (40, 30), (64, 27), (33, 50), (100, 41)];
+    let mut renderer = CpuRenderer::new();
+    for (c, chain) in chains.iter().enumerate() {
+        for &(ow, oh) in &outputs {
+            let out = SizeU::new(ow, oh);
+            assert!(!has_boundary_tie(canvas, out), "{ow}x{oh}");
+            let media = |placement: Placement| {
+                let m = MediaRef { media: AssetId::new(), stream: 0, kind: SourceKind::Video, display_size: canvas, color: frame.color };
+                Layer { id: LayerId(1), content: LayerContent::Media { media: m, source_time: Time::ZERO }, crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: chain.clone() }
+            };
+            let pip = Placement { size: Vec2::new(48.0, 27.0), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(34.0, 9.0), scale: Vec2::new(0.45, 0.45), rotation: 0.3 };
+            let scene = FrameScene { time: Time::ZERO, canvas, output: OutputSpec::new(out, RenderQuality::Export), background: Rgba::BLACK, layers: vec![media(Placement::fill(canvas)), media(pip)] };
+            let inputs = RenderInputs { layers: vec![LayerInput::Cpu(frame.clone()), LayerInput::Cpu(frame.clone())] };
+            let (expected, ties) = render_reference_with_ties(&scene, &inputs);
+            let mut actual = vec![0xAAu8; ow as usize * oh as usize * 4];
+            renderer.render(&PreparedFrame { scene: &scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(ow, oh, &mut actual))).unwrap();
+            for (at, (e, a)) in expected.iter().zip(&actual).enumerate() {
+                let pix = at / 4;
+                assert!(e.abs_diff(*a) <= 1 + ties[pix].min(1), "chain {c}, output {ow}x{oh}: pixel ({}, {}) channel {}: reference {e}, renderer {a}", pix % ow as usize, pix / ow as usize, at % 4);
+            }
+        }
+    }
+}
+
 /// The generator itself is deterministic and covers what the parity test claims to cover.
 #[test]
 fn generator_is_deterministic_and_varied() {
@@ -685,6 +786,7 @@ fn generator_is_deterministic_and_varied() {
     assert_eq!(shape(&a), shape(&b));
 
     let (mut transitions, mut media, mut missing, mut solids, mut crops_beyond, mut letterbox, mut full_frame) = (0, 0, 0, 0, 0, 0, 0);
+    let (mut curves, mut spatial) = (0usize, 0usize);
     for i in 0..400 {
         let (s, inputs) = Gen::new(scene_seed(BASE_SEED, i)).scene();
         let k = (s.output.size.w as f64 / s.canvas.w as f64).min(s.output.size.h as f64 / s.canvas.h as f64);
@@ -707,8 +809,12 @@ fn generator_is_deterministic_and_varied() {
             if l.crop.x0 < 0.0 || l.crop.x1 > l.placement.size.x {
                 crops_beyond += 1;
             }
+            curves += l.effects.iter().filter(|e| matches!(e, Effect::ToneCurve(_))).count();
+            spatial += l.effects.iter().filter(|e| e.is_spatial()).count();
         }
     }
-    println!("generator over 400 scenes: {media} media, {solids} solid, {missing} missing, {transitions} transitions, {crops_beyond} crops beyond content, {letterbox} scenes with margins, {full_frame} full-frame layers");
-    assert!(transitions > 100 && media > 300 && missing > 20 && solids > 50 && crops_beyond > 10 && letterbox > 50 && full_frame > 20);
+    println!(
+        "generator over 400 scenes: {media} media, {solids} solid, {missing} missing, {transitions} transitions, {crops_beyond} crops beyond content, {letterbox} scenes with margins, {full_frame} full-frame layers, {curves} tone curves, {spatial} spatial primitives"
+    );
+    assert!(transitions > 100 && media > 300 && missing > 20 && solids > 50 && crops_beyond > 10 && letterbox > 50 && full_frame > 20 && curves > 30 && spatial > 30);
 }

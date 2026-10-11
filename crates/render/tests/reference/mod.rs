@@ -18,13 +18,27 @@
 //!   the later `s + d·(1 − s.a)` blends, so parity allows one extra LSB at such a pixel.
 //! - Missing / mismatching inputs: `Media` without a `Cpu` input is drawn as
 //!   `Rgba::MISSING`; a `Transition` without matching inputs gets no inputs.
+//! - Point operations are written out from the contract in f64, each on its
+//!   own, but every formula `kadr-scene` states as a normative helper is that
+//!   helper, called rather than re-derived (ruling E2-R2), so parity ties the
+//!   CPU's f32 code to the normative formulas: the tone table
+//!   `ToneCurve::table` (a GPU shares it as a 1D texture) read through
+//!   `tone_lookup`, `hue_offset`, `luma709`, `Vignette::{distance, gain}`,
+//!   `Grain::noise` (its `cell_size`, `cell_index` and the hash
+//!   `kadr_core::hash::pcg32_hash`) and `grain_weight` — the grain cell from
+//!   the canvas position computed exactly as the contract says, so a cell
+//!   never flips between the two renderers. Only the colour adjust, which
+//!   has no helper, is written out here.
+//! - A neutral primitive is skipped wherever it stands in a chain (an
+//!   identity curve does not clamp its input); a chain of only neutral
+//!   primitives is skipped entirely, its final clamp included (ruling E2-R1).
 
 #![allow(dead_code)]
 
 use kadr_core::CpuFrame;
 use kadr_core::color::AlphaMode;
 use kadr_render::{LayerInput, RenderInputs};
-use kadr_scene::{BlendMode, Effect, FrameScene, Layer, LayerContent, Rgba, TransitionOp};
+use kadr_scene::{BlendMode, Effect, FrameScene, Layer, LayerContent, Rgba, TransitionOp, Vignette, grain_weight, hue_offset, luma709, tone_lookup};
 use std::cell::RefCell;
 
 /// Premultiplied RGBA, components in [0, 1].
@@ -220,7 +234,7 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
                 Source::Solid(p) => *p,
                 Source::Texels(f) => bilinear(f, layer, lx, ly),
             };
-            sample = apply_effects(&layer.effects, sample);
+            sample = apply_effects(&layer.effects, sample, (cx, cy), (g.cw, g.ch));
             let s = sample.map(|v| v * unit(layer.opacity) * coverage);
             let n = j * g.ow + i;
             buf[n] = g.store4(n, blend(layer.blend, s, load4(buf[n])));
@@ -284,10 +298,12 @@ fn bilinear(f: &CpuFrame, layer: &Layer, lx: f64, ly: f64) -> Px {
     [0, 1, 2, 3].map(|c| t00[c] * (1.0 - fx) * (1.0 - fy) + t10[c] * fx * (1.0 - fy) + t01[c] * (1.0 - fx) * fy + t11[c] * fx * fy)
 }
 
-/// Effects on unpremultiplied colour: `rgb / a` → chain → clamp once → `× a`.
-fn apply_effects(effects: &[Effect], s: Px) -> Px {
-    // "Neutral adjusts are no-ops: a chain with nothing else is skipped, clamp included."
-    if effects.iter().all(|e| matches!(e, Effect::ColorAdjust(a) if a.is_neutral())) {
+/// Effects on unpremultiplied colour, in list order: `rgb / a` → chain →
+/// clamp once → `× a`. `pos`: the canvas position of the output pixel
+/// centre; `canvas`: the canvas size.
+fn apply_effects(effects: &[Effect], s: Px, pos: (f64, f64), canvas: (f64, f64)) -> Px {
+    // "A chain of only neutral primitives is skipped entirely, its final clamp included."
+    if effects.iter().all(Effect::is_neutral) {
         return s;
     }
     let a = s[3];
@@ -296,28 +312,63 @@ fn apply_effects(effects: &[Effect], s: Px) -> Px {
         return s;
     }
     let mut c = [s[0] / a, s[1] / a, s[2] / a];
-    for e in effects {
-        let Effect::ColorAdjust(adj) = e else { continue };
-        // Exposure: linear light with a pure 2.4 power (odd extension for negatives, only
-        // reachable in a chain of several adjusts, before the single final clamp).
-        let gain = 2f64.powf(adj.exposure as f64);
-        for v in c.iter_mut() {
-            let m = v.abs().powf(2.4) * gain;
-            *v = if *v < 0.0 { -m.powf(1.0 / 2.4) } else { m.powf(1.0 / 2.4) };
-        }
-        // Contrast about 0.5.
-        for v in c.iter_mut() {
-            *v = (*v - 0.5) * adj.contrast as f64 + 0.5;
-        }
-        // Temperature and tint.
-        let (t, u) = (adj.temperature as f64, adj.tint as f64);
-        c[0] *= 1.0 + 0.1 * t;
-        c[2] *= 1.0 - 0.1 * t;
-        c[1] *= 1.0 - 0.05 * u;
-        // Saturation about Rec.709 luma.
-        let y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-        for v in c.iter_mut() {
-            *v = y + (*v - y) * adj.saturation as f64;
+    // "A neutral primitive is skipped wherever it stands in a chain (an identity tone curve does
+    // not clamp its input)" (E2-R1).
+    for e in effects.iter().filter(|e| !e.is_neutral()) {
+        match e {
+            Effect::ColorAdjust(adj) => {
+                // Exposure: linear light with a pure 2.4 power (odd extension for negatives, only
+                // reachable in a chain, before the single final clamp).
+                let gain = 2f64.powf(adj.exposure as f64);
+                for v in c.iter_mut() {
+                    let m = v.abs().powf(2.4) * gain;
+                    *v = if *v < 0.0 { -m.powf(1.0 / 2.4) } else { m.powf(1.0 / 2.4) };
+                }
+                // Contrast about 0.5.
+                for v in c.iter_mut() {
+                    *v = (*v - 0.5) * adj.contrast as f64 + 0.5;
+                }
+                // Temperature and tint.
+                let (t, u) = (adj.temperature as f64, adj.tint as f64);
+                c[0] *= 1.0 + 0.1 * t;
+                c[2] *= 1.0 - 0.1 * t;
+                c[1] *= 1.0 - 0.05 * u;
+                // Saturation about Rec.709 luma.
+                let y = luma709(c);
+                for v in c.iter_mut() {
+                    *v = y + (*v - y) * adj.saturation as f64;
+                }
+            }
+            Effect::ToneCurve(curve) => {
+                // The normative table and lookup. `tone_lookup` is f32: called anyway (E2-R2), as
+                // its error — the input rounded to f32 (≤ 3e-8) times the steepest possible
+                // lookup slope (255, a full step inside one entry), plus f32 interpolation — stays
+                // below 0.01 LSB, far inside the parity budget.
+                let table = curve.table();
+                c = c.map(|v| tone_lookup(&table, v as f32) as f64);
+            }
+            Effect::SplitTone(st) => {
+                let yb = (luma709(c) + 0.25 * st.balance as f64).clamp(0.0, 1.0);
+                let (ws, wh) = ((1.0 - yb) * (1.0 - yb), yb * yb);
+                let (ds, dh) = (hue_offset(st.shadow_hue_deg as f64), hue_offset(st.highlight_hue_deg as f64));
+                for k in 0..3 {
+                    c[k] += st.shadow_amount as f64 * ws * ds[k] + st.highlight_amount as f64 * wh * dh[k];
+                }
+            }
+            Effect::Vignette(v) => {
+                let gain = v.gain(Vignette::distance(canvas.0, canvas.1, pos.0, pos.1));
+                for x in c.iter_mut() {
+                    *x *= gain;
+                }
+            }
+            Effect::Grain(g) => {
+                // `noise`: the cell of side `cell_size` holding `pos`, its `cell_index`, `pcg32_hash`.
+                let n = (g.noise(pos.0, pos.1) - 0.5) * g.amount as f64 * grain_weight(luma709(c));
+                for x in c.iter_mut() {
+                    *x += n;
+                }
+            }
+            _ => {}
         }
     }
     [c[0].clamp(0.0, 1.0) * a, c[1].clamp(0.0, 1.0) * a, c[2].clamp(0.0, 1.0) * a, a]
