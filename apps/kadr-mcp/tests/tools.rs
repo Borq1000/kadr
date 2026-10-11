@@ -45,6 +45,7 @@ fn edit_description_documents_every_op() {
     ] {
         assert!(d.contains(&format!("\"{op}\"")), "edit docs lack op {op}");
     }
+    assert!(d.contains("Keyframe, fade and effect ops are resolved against the project as it was before the call"), "the before-the-call rule");
     for field in [
         "at_ms", "clip_id", "start_ms", "end_ms", "edge", "to_ms", "speed", "gain_db", "rotation_deg", "cross_dissolve", "angle", "part", "source_ms",
         "from_source_ms", "param", "params", "keep_ms", "fade_in_ms", "fade_out_ms", "recipe", "effect_id", "enabled", "fx:<effect-id>:<key>", "list_effects",
@@ -57,7 +58,7 @@ fn edit_description_documents_every_op() {
 fn list_effects_is_a_tool() {
     let t = tool("list_effects");
     let d = t["description"].as_str().unwrap();
-    for word in ["add_effect", "fx:<effect-id>:<key>", "category", "default"] {
+    for word in ["add_effect", "fx:<effect-id>:<key>", "category", "default", "version", "animatable", "{\"effects\": ["] {
         assert!(d.contains(word), "list_effects description lacks {word}: {d}");
     }
 }

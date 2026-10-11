@@ -249,7 +249,7 @@ fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<E
     if animated.is_empty() {
         return Err(bad(match listed {
             Some(_) => "clip has no animation on the listed params",
-            None if !c.animation.is_empty() => "the clip's keyframes belong to an effect this version cannot edit",
+            None if !c.animation.is_empty() => "the clip's keyframes are read-only: they belong to an effect this version cannot edit (from a newer Kadr) or to no effect on the clip",
             None => "clip has no animation",
         }));
     }
@@ -333,7 +333,7 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                 // track (a newer Kadr's effect) keeps its keyframe (ruling R8).
                 let params: Vec<TrackKey> = p.map_or_else(|| kadr_timeline::editable_keys_at(c, from), |p| vec![p]);
                 if params.is_empty() {
-                    return Err(bad("the keyframes at this moment belong to an effect this version cannot edit"));
+                    return Err(bad("the keyframes at this moment are read-only: they belong to an effect this version cannot edit (from a newer Kadr) or to no effect on the clip"));
                 }
                 if let Some(q) = params.iter().find(|q| c.animation.track(*q).iter().any(|k| k.at == to)) {
                     return Err(bad(format!("{} already has a keyframe at {to_ms} ms; move or remove it first", q.key_string())));
@@ -822,5 +822,23 @@ mod tests {
         assert_eq!(c.animation.track(&newer).iter().map(|k| k.at).collect::<Vec<_>>(), [at], "the newer effect's key stayed");
         let e = run(&mut p, json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 9_000})).unwrap_err().message;
         assert!(e.contains("belong to an effect this version cannot edit"), "{e}");
+    }
+
+    /// An orphan `fx:` track (its effect is not on the clip; only a file
+    /// from elsewhere has one) is read-only too, and the refusal does not
+    /// claim an effect exists.
+    #[test]
+    fn an_orphan_effect_track_is_read_only_and_named_so() {
+        let (mut p, id) = project();
+        let orphan = TrackKey::fx(kadr_core::EffectId::new(), "strength");
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        let at = SourceTime(c.source_time_at(Time::from_secs(6)));
+        c.animation.set_key(&orphan, at, 0.5, None);
+        for op in [json!({"type": "clear_animation", "clip_id": id}), json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 8_000})] {
+            let e = run(&mut p.clone(), op.clone()).unwrap_err().message;
+            assert!(e.contains("read-only") && e.contains("no effect on the clip"), "{op}: {e}");
+        }
+        let e = run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": orphan.key_string(), "at_ms": 6_000})).unwrap_err().message;
+        assert!(e.contains("no effect"), "{e}");
     }
 }
