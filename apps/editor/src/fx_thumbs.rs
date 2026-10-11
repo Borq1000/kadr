@@ -7,9 +7,10 @@
 //! stands in (no decoding).
 //!
 //! One thread renders, one thumbnail at a time, from small one-clip copies
-//! (the project is never touched); it decodes through the export-mode
-//! resolver MCP `get_frame` uses, never the preview's, so the preview and
-//! playback are not slowed or superseded by it.
+//! (the project is never touched) — the latest batch, after a short quiet
+//! spell (a batch it has not started is replaced). It decodes through the
+//! export-mode resolver MCP `get_frame` uses, never the preview's, so the
+//! preview and playback are not slowed or superseded by it.
 
 use crate::app::App;
 use crate::effects_ui::visible_recipes;
