@@ -23,6 +23,7 @@ kadr-analysis = { path = "../../crates/analysis" }
 kadr-jobs = { path = "../../crates/jobs" }
 kadr-cache = { path = "../../crates/cache" }
 kadr-ai = { path = "../../crates/ai" }
+kadr-effects = { path = "../../crates/effects" }
 kadr-i18n = { path = "../../crates/i18n" }
 kadr-mcp-bridge = { path = "../../crates/mcp-bridge" }
 png = "0.17"

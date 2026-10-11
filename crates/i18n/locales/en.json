@@ -739,5 +739,11 @@
   "cmd.move_effect": "Reorder effects",
   "err.edit.unknown_recipe": "This effect is not available in this version of Kadr",
   "err.edit.effect_target": "This effect does not fit this clip",
-  "err.edit.invalid_param": "Invalid effect setting"
+  "err.edit.invalid_param": "Invalid effect setting",
+  "fx.title": "EFFECTS",
+  "fx.smooth_zoom": "Smooth Zoom",
+  "fx.cinematic_push": "Cinematic Push",
+  "fx.punch_in": "Punch In",
+  "fx.smooth_pan": "Smooth Pan",
+  "fx.handheld": "Handheld"
 }

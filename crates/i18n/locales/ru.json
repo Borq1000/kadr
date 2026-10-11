@@ -767,5 +767,11 @@
   "cmd.move_effect": "Порядок эффектов",
   "err.edit.unknown_recipe": "Этот эффект недоступен в этой версии Kadr",
   "err.edit.effect_target": "Этот эффект не подходит для такого клипа",
-  "err.edit.invalid_param": "Недопустимое значение параметра эффекта"
+  "err.edit.invalid_param": "Недопустимое значение параметра эффекта",
+  "fx.title": "ЭФФЕКТЫ",
+  "fx.smooth_zoom": "Плавный наезд",
+  "fx.cinematic_push": "Кино-наезд",
+  "fx.punch_in": "Резкий наезд",
+  "fx.smooth_pan": "Плавная панорама",
+  "fx.handheld": "Ручная камера"
 }

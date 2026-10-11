@@ -19,6 +19,7 @@ mod mcp_input;
 mod perf_view;
 mod mcp_state;
 mod mcp_anim;
+mod mcp_fx;
 mod mcp_api;
 mod multicam_ui;
 mod persistence;

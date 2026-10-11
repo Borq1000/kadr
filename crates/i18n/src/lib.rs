@@ -75,6 +75,14 @@ pub fn t(key: &str) -> String {
     raw(key).map(str::to_string).unwrap_or_else(|| key.to_string())
 }
 
+/// `key` in language `l`, whatever the UI language (search by either name,
+/// MCP names); English, then the key itself, when missing.
+pub fn t_in(l: Lang, key: &str) -> String {
+    let (en, ru) = catalogs();
+    let c = if l == Lang::Ru { ru } else { en };
+    c.get(key).or_else(|| en.get(key)).cloned().unwrap_or_else(|| key.to_string())
+}
+
 pub fn tf(key: &str, args: &[(&str, &str)]) -> String {
     fill(t(key), args)
 }
@@ -242,6 +250,14 @@ mod tests {
         assert_eq!([f(1), f(2), f(5), f(11), f(21), f(22), f(25), f(112)], ["one", "few", "many", "many", "one", "few", "many", "many"]);
         assert_eq!(plural_form(Lang::En, 1), "one");
         assert_eq!(plural_form(Lang::En, 0), "other");
+    }
+
+    #[test]
+    fn t_in_reads_a_language_regardless_of_the_current_one() {
+        set_lang(Lang::En);
+        assert_eq!(t_in(Lang::Ru, "fx.title"), "ЭФФЕКТЫ");
+        assert_eq!(t_in(Lang::En, "fx.title"), "EFFECTS");
+        assert_eq!(t_in(Lang::Ru, "no.such.key"), "no.such.key");
     }
 
     #[test]

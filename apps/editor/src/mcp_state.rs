@@ -77,6 +77,7 @@ pub fn timeline_json(seq: &Sequence, selection: &[ClipId], playhead: Time) -> Va
                     let tl = c.timeline_time_of(k.at.0);
                     json!({"at_ms": ms(tl), "source_ms": ms(k.at.0), "value": k.value, "ease": k.ease.key().unwrap_or("unknown"), "visible": tl >= c.timeline_in && tl < c.timeline_out})
                 }).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
+                "effects": c.effects.iter().map(|e| kadr_effects::json::effect_json(c, e)).collect::<Vec<_>>(),
                 "link": c.link.map(|l| l.to_string()),
                 "multicam": c.multicam.as_ref().map(|m| json!({"group": m.group.to_string(), "angle": m.angle})),
             })).collect::<Vec<_>>(),
@@ -138,6 +139,17 @@ mod tests {
         p.sequence_mut().tracks[0].clips.push(c);
         let v = timeline_json(p.sequence(), &[], Time::ZERO);
         assert_eq!(v["tracks"][0]["clips"][0]["animation"][k.key_string()][0]["value"], 0.3);
+    }
+
+    #[test]
+    fn clips_report_their_effects() {
+        let mut p = Project::new("t");
+        let mut c = Clip::new(kadr_core::AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::ZERO);
+        c.effects.push(kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), &c.clone(), Time::ZERO));
+        p.sequence_mut().tracks[0].clips.push(c);
+        let v = timeline_json(p.sequence(), &[], Time::ZERO);
+        let fx = &v["tracks"][0]["clips"][0]["effects"][0];
+        assert_eq!((fx["recipe"].as_str(), fx["known"].as_bool(), fx["params"]["strength"].as_f64()), (Some("handheld"), Some(true), Some(0.6)));
     }
 
     #[test]

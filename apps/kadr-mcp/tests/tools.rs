@@ -41,12 +41,24 @@ fn edit_description_documents_every_op() {
     for op in [
         "split_clip", "delete_range", "delete_clip", "trim_clip", "move_clip", "set_transform", "change_speed", "set_audio_gain", "add_marker",
         "add_transition", "select_camera", "add_caption", "unlink", "link", "delete_part", "set_keyframe", "remove_keyframe", "set_keyframe_ease",
-        "move_keyframes", "clear_animation", "set_video_fade",
+        "move_keyframes", "clear_animation", "set_video_fade", "add_effect", "set_effect", "remove_effect", "move_effect",
     ] {
         assert!(d.contains(&format!("\"{op}\"")), "edit docs lack op {op}");
     }
-    for field in ["at_ms", "clip_id", "start_ms", "end_ms", "edge", "to_ms", "speed", "gain_db", "rotation_deg", "cross_dissolve", "angle", "part", "source_ms", "from_source_ms", "param", "params", "keep_ms", "fade_in_ms", "fade_out_ms"] {
+    for field in [
+        "at_ms", "clip_id", "start_ms", "end_ms", "edge", "to_ms", "speed", "gain_db", "rotation_deg", "cross_dissolve", "angle", "part", "source_ms",
+        "from_source_ms", "param", "params", "keep_ms", "fade_in_ms", "fade_out_ms", "recipe", "effect_id", "enabled", "fx:<effect-id>:<key>", "list_effects",
+    ] {
         assert!(d.contains(field), "edit docs lack field {field}");
+    }
+}
+
+#[test]
+fn list_effects_is_a_tool() {
+    let t = tool("list_effects");
+    let d = t["description"].as_str().unwrap();
+    for word in ["add_effect", "fx:<effect-id>:<key>", "category", "default"] {
+        assert!(d.contains(word), "list_effects description lacks {word}: {d}");
     }
 }
 

@@ -18,6 +18,7 @@ pub fn handle(app: &mut App, method: &str, p: Value) -> Reply {
     match method {
         "ping" => Reply::Now(Ok(json!({"pid": std::process::id()}))),
         "get_state" => Reply::Now(Ok(app.mcp_state())),
+        "list_effects" => Reply::Now(Ok(crate::mcp_fx::list_effects())),
         "get_log" => {
             let n = p.get("lines").and_then(Value::as_u64).unwrap_or(50) as usize;
             match log_level(&p) {
@@ -113,6 +114,9 @@ pub fn edit_commands(project: &Project, _selection: &[ClipId], ops: &Value) -> R
 /// One `edit` op; `edit_commands` prefixes errors with its index.
 fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditCommand>, BridgeError> {
     if let Some(r) = crate::mcp_anim::anim_op(project, seq, op) {
+        return r;
+    }
+    if let Some(r) = crate::mcp_fx::fx_op(project, seq, op) {
         return r;
     }
     match op.get("type").and_then(Value::as_str) {
@@ -590,6 +594,61 @@ mod tests {
         assert!(e.message.starts_with("op #0: no change"), "{}", e.message);
         let fresh = serde_json::json!({"type": "add_effect", "clip_id": v.to_string(), "recipe": "smooth_zoom"});
         assert!(matches!(edit_commands(&p, &[], &serde_json::json!([fresh])).unwrap()[0], EditCommand::AddEffect { .. }));
+    }
+
+    #[test]
+    fn edit_routes_effect_ops() {
+        let (p, v, _) = project_with_pair(); // v: the video clip on V1
+        let cmds = edit_commands(&p, &[], &json!([{"type": "add_effect", "clip_id": v.to_string(), "recipe": "handheld"}])).unwrap();
+        assert!(matches!(&cmds[..], [EditCommand::AddEffect { .. }]));
+        let e = edit_commands(&p, &[], &json!([{"type": "add_effect", "clip_id": v.to_string(), "recipe": "nope"}])).unwrap_err();
+        assert!(e.message.starts_with("op #0: ") && e.message.contains("unknown effect"), "{}", e.message);
+    }
+
+    /// Every effect op of `edit`: the AI commands through the fallback, `move_effect` in mcp_fx.
+    #[test]
+    fn edit_routes_set_remove_and_move_effect() {
+        let (mut p, v, _) = project_with_pair();
+        let c = p.sequence().clip(v).unwrap().clone();
+        let (zoom, shake) = (kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &c, Time::ZERO), kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), &c, Time::ZERO));
+        let (z, h) = (zoom.id.to_string(), shake.id.to_string());
+        p.sequence_mut().tracks[0].clips[0].effects.extend([zoom, shake]);
+        let one = |op: Value| edit_commands(&p, &[], &json!([op]));
+        assert!(matches!(&one(json!({"type": "set_effect", "clip_id": v.to_string(), "effect_id": z, "params": {"strength": 0.9}})).unwrap()[..], [EditCommand::UpdateEffect { .. }]));
+        assert!(matches!(&one(json!({"type": "set_effect", "clip_id": v.to_string(), "effect_id": z, "enabled": false})).unwrap()[..], [EditCommand::UpdateEffect { enabled: Some(false), .. }]));
+        assert!(matches!(&one(json!({"type": "remove_effect", "clip_id": v.to_string(), "effect_id": h})).unwrap()[..], [EditCommand::RemoveEffect { .. }]));
+        assert!(matches!(&one(json!({"type": "move_effect", "clip_id": v.to_string(), "effect_id": h, "to": 0})).unwrap()[..], [EditCommand::MoveEffect { to: 0, .. }]));
+        let msg = |op: Value| one(op).unwrap_err().message;
+        assert!(msg(json!({"type": "set_effect", "clip_id": v.to_string(), "effect_id": z, "params": {"strength": 0.6}})).contains("no change"));
+        assert!(msg(json!({"type": "set_effect", "clip_id": v.to_string(), "effect_id": z, "params": {"strength": 1.2}})).contains("strength must be 0..1"));
+        assert!(msg(json!({"type": "set_effect", "clip_id": v.to_string(), "effect_id": z, "colour": 1})).contains("unknown field"));
+        assert!(msg(json!({"type": "move_effect", "clip_id": v.to_string(), "effect_id": z, "to": 0})).starts_with("op #0: no change"));
+    }
+
+    /// A moment echoed back from `get_state` (milliseconds floored, both time
+    /// domains) names the stored moment: sending it unchanged is no change.
+    #[test]
+    fn an_echoed_moment_in_set_effect_is_no_change() {
+        let (mut p, v, _) = project_with_pair();
+        p.sequence_mut().frame_rate = kadr_core::FrameRate::FPS_29_97;
+        // A moment that is not a whole millisecond in either time domain.
+        let at = p.sequence().frame_rate.snap(Time::from_millis(4_321));
+        let c = p.sequence().clip(v).unwrap().clone();
+        let punch = kadr_effects::fresh(kadr_effects::recipe("punch_in").unwrap(), &c, at);
+        let kadr_project::ParamValue::Moment(m) = punch.params["moment"] else { panic!() };
+        assert_ne!(Time::from_millis(m.0.as_millis()), m.0, "the echo must be a rounded value");
+        let pid = punch.id.to_string();
+        p.sequence_mut().tracks[0].clips[0].effects.push(punch);
+        let state = mcp_state::timeline_json(p.sequence(), &[], Time::ZERO);
+        let echoed = state["tracks"][0]["clips"][0]["effects"][0]["params"]["moment"].clone();
+        assert!(echoed["visible"].as_bool().unwrap(), "{echoed}");
+        let set = |moment: Value| edit_commands(&p, &[], &json!([{"type": "set_effect", "clip_id": v.to_string(), "effect_id": pid, "params": {"moment": moment}}]));
+        for moment in [echoed.clone(), json!({"at_ms": echoed["at_ms"]}), json!({"source_ms": echoed["source_ms"]})] {
+            let e = set(moment.clone()).unwrap_err();
+            assert!(e.message.starts_with("op #0: no change"), "{moment}: {}", e.message);
+        }
+        // A different moment is a change.
+        assert!(set(json!({"at_ms": 6_000})).is_ok());
     }
 
     #[test]

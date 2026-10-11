@@ -1,6 +1,8 @@
 //! MCP `edit` ops for keyframes and clip fades (keyframes spec §7). Times
 //! arrive as milliseconds and are turned into exact `Time`/`SourceTime`
-//! at once; nothing below this module sees milliseconds.
+//! at once; nothing below this module sees milliseconds. A keyframe op's
+//! `param` is a clip property or `fx:<effect-id>:<key>`, a number of an
+//! effect on the clip (effects spec §7).
 //!
 //! Like every `edit` op these are resolved against the project as it was
 //! before the call, so a later op in the same batch does not see keyframes
@@ -8,9 +10,10 @@
 
 use crate::anim_ui;
 use kadr_core::{ClipId, Time};
+use kadr_effects::ParamKind;
 use kadr_mcp_bridge::BridgeError;
 use kadr_project::{AnimParam, Clip, EdgeFades, Ease, Project, Sequence, SourceTime, TrackKey, TrackKind};
-use kadr_timeline::{ClipProperty, EditCommand};
+use kadr_timeline::{ClipProperty, EditCommand, EditError};
 use serde_json::Value;
 
 /// Largest accepted |milliseconds| (about 116 days): far beyond any
@@ -50,12 +53,30 @@ fn clip<'a>(seq: &'a Sequence, op: &Value) -> Result<(ClipId, &'a Clip), BridgeE
     Ok((id, seq.clip(id).ok_or_else(|| bad(format!("unknown clip {id}")))?))
 }
 
-fn param_named(k: &str) -> Result<AnimParam, BridgeError> {
-    AnimParam::from_key(k).ok_or_else(|| bad(format!("unknown param {k:?} (one of {})", AnimParam::ALL.map(|p| p.key()).join(", "))))
+/// A keyframe op's `param`: a clip property, or `fx:<effect-id>:<key>` — a
+/// number of an effect on this clip that this version runs (the engine's
+/// `track_def` rule, ruling R4), each refusal with its reason.
+fn param_named(c: &Clip, k: &str) -> Result<TrackKey, BridgeError> {
+    if k.starts_with("fx:") {
+        let Some(key @ TrackKey::Fx(_)) = TrackKey::parse(k) else {
+            return Err(bad(format!("malformed effect param {k:?} (fx:<effect-id>:<key>, the effect id as get_state shows it)")));
+        };
+        let effect = key.as_fx().map(|f| f.effect).expect("an fx key");
+        return match kadr_timeline::track_def(c, &key) {
+            Ok(_) => Ok(key),
+            Err(EditError::EffectNotFound) => Err(bad(format!("the clip has no effect {effect}"))),
+            Err(EditError::UnknownRecipe(r)) => Err(bad(format!("effect {effect} ({r}) was made by a newer Kadr and cannot be animated"))),
+            Err(EditError::InvalidParam(m)) => Err(bad(m)),
+            Err(e) => Err(bad(e.to_string())),
+        };
+    }
+    AnimParam::from_key(k)
+        .map(TrackKey::Clip)
+        .ok_or_else(|| bad(format!("unknown param {k:?} (one of {}, or fx:<effect-id>:<key>)", AnimParam::ALL.map(|p| p.key()).join(", "))))
 }
 
-fn param(op: &Value) -> Result<AnimParam, BridgeError> {
-    param_named(op.get("param").and_then(Value::as_str).unwrap_or_default())
+fn param(c: &Clip, op: &Value) -> Result<TrackKey, BridgeError> {
+    param_named(c, op.get("param").and_then(Value::as_str).unwrap_or_default())
 }
 
 fn ease(op: &Value) -> Result<Option<Ease>, BridgeError> {
@@ -109,7 +130,7 @@ fn new_time(seq: &Sequence, c: &Clip, op: &Value, at: &str, src: &str) -> Result
 /// milliseconds) or addressing an off-frame key still hits it. With `at_ms`
 /// only keys inside the clip count — the inspector's "keyframe here" rule
 /// (`anim_ui::visible_key_near`); hidden ones are `source_ms` business.
-fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<Option<SourceTime>, BridgeError> {
+fn find(seq: &Sequence, c: &Clip, p: Option<&TrackKey>, op: &Value, at: &str, src: &str) -> Result<Option<SourceTime>, BridgeError> {
     let frame = seq.frame_rate.frame_duration();
     let h = anim_ui::half_frame(frame);
     Ok(match when(op, at, src)? {
@@ -120,73 +141,141 @@ fn find(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, sr
             if t < c.timeline_in - h || t >= c.timeline_out + h {
                 return Err(outside(c, ms));
             }
-            anim_ui::visible_key_near(c, p.map(TrackKey::from), t, frame)
+            anim_ui::visible_key_near(c, p.cloned(), t, frame)
         }
         When::Source(ms) => {
             let s = Time::from_millis(ms);
-            c.animation.times().into_iter().filter(|a| p.is_none_or(|q| c.animation.keys_at(*a).contains(&TrackKey::from(q)))).filter(|a| (a.0 - s).abs() < h).min_by_key(|a| (a.0 - s).abs())
+            c.animation.times().into_iter().filter(|a| p.is_none_or(|q| c.animation.keys_at(*a).contains(q))).filter(|a| (a.0 - s).abs() < h).min_by_key(|a| (a.0 - s).abs())
         }
     })
 }
 
 /// Like `find`, but a missing keyframe is an error.
-fn existing(seq: &Sequence, c: &Clip, p: Option<AnimParam>, op: &Value, at: &str, src: &str) -> Result<SourceTime, BridgeError> {
+fn existing(seq: &Sequence, c: &Clip, p: Option<&TrackKey>, op: &Value, at: &str, src: &str) -> Result<SourceTime, BridgeError> {
     find(seq, c, p, op, at, src)?.ok_or_else(|| {
         bad("no keyframe there (looked within half a frame of the given time; keyframes made by an earlier op of the same call are not visible yet)")
     })
 }
 
-/// The accepted `value` range of a property (same limits as `set_transform`
-/// for the transform params; fractions of the frame for crops).
-fn value_range(p: AnimParam) -> (f64, f64) {
-    match p {
-        AnimParam::X | AnimParam::Y => (-20_000.0, 20_000.0),
-        AnimParam::Scale => (0.01, 16.0),
-        AnimParam::Rotation => (-3600.0, 3600.0),
-        AnimParam::Opacity | AnimParam::CropLeft | AnimParam::CropRight | AnimParam::CropTop | AnimParam::CropBottom => (0.0, 1.0),
-        AnimParam::Exposure => (-2.0, 2.0),
-        AnimParam::Contrast | AnimParam::Saturation => (0.0, 2.0),
-        AnimParam::Temperature => (-1.0, 1.0),
+/// An effect number's `(min, max, default)` from the registry; `None` for a
+/// clip property (and for a track keyframe ops may not edit, which `param`
+/// has already refused).
+fn effect_number(c: &Clip, k: &TrackKey) -> Option<(f64, f64, f64)> {
+    match kadr_timeline::track_def(c, k).ok()??.kind {
+        ParamKind::Number { min, max, default } => Some((min, max, default)),
+        _ => None,
+    }
+}
+
+/// The accepted `value` range (same limits as `set_transform` for the
+/// transform params; fractions of the frame for crops; the registry's for
+/// effect numbers).
+fn value_range(c: &Clip, k: &TrackKey) -> (f64, f64) {
+    match k {
+        TrackKey::Clip(p) => match p {
+            AnimParam::X | AnimParam::Y => (-20_000.0, 20_000.0),
+            AnimParam::Scale => (0.01, 16.0),
+            AnimParam::Rotation => (-3600.0, 3600.0),
+            AnimParam::Opacity | AnimParam::CropLeft | AnimParam::CropRight | AnimParam::CropTop | AnimParam::CropBottom => (0.0, 1.0),
+            AnimParam::Exposure => (-2.0, 2.0),
+            AnimParam::Contrast | AnimParam::Saturation => (0.0, 2.0),
+            AnimParam::Temperature => (-1.0, 1.0),
+        },
+        TrackKey::Fx(_) => effect_number(c, k).map_or((0.0, 0.0), |(lo, hi, _)| (lo, hi)),
+    }
+}
+
+/// A track's static value after `clear_animation` without `keep_ms`.
+fn default_of(c: &Clip, k: &TrackKey) -> f64 {
+    match k {
+        TrackKey::Clip(p) => p.default_value(),
+        TrackKey::Fx(_) => effect_number(c, k).map_or(0.0, |(_, _, d)| d),
+    }
+}
+
+/// An effect number's static value must lie in its range: the engine would
+/// clamp it silently (a file from elsewhere may hold keyframes outside it),
+/// so the client is told instead. Clip properties are written as they are.
+/// `why(lo, hi)` words the refusal.
+fn static_in_range(c: &Clip, k: &TrackKey, v: f64, why: impl FnOnce(f64, f64) -> String) -> Result<(), BridgeError> {
+    match effect_number(c, k) {
+        Some((lo, hi, _)) if !(lo..=hi).contains(&v) => Err(bad(why(lo, hi))),
+        _ => Ok(()),
     }
 }
 
 fn set_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
-    let p = param(op)?;
+    let p = param(c, op)?;
     let value = op.get("value").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("value missing or not a number"))?;
-    let (lo, hi) = value_range(p);
+    let (lo, hi) = value_range(c, &p);
     if !(lo..=hi).contains(&value) {
-        return Err(bad(format!("{} out of range {lo}..{hi} (got {value})", p.key())));
+        return Err(bad(format!("{} out of range {lo}..{hi} (got {value})", p.key_string())));
     }
     let ease = ease(op)?;
     // A key within half a frame is updated, not shadowed by a near-duplicate.
-    let at = match find(seq, c, Some(p), op, "at_ms", "source_ms")? {
+    let at = match find(seq, c, Some(&p), op, "at_ms", "source_ms")? {
         Some(at) => {
-            if c.animation.track(p).iter().any(|k| k.at == at && k.value == value && ease.as_ref().is_none_or(|e| *e == k.ease)) {
+            if c.animation.track(&p).iter().any(|k| k.at == at && k.value == value && ease.as_ref().is_none_or(|e| *e == k.ease)) {
                 return Err(bad("no change: that keyframe already has this value and ease"));
             }
             at
         }
         None => new_time(seq, c, op, "at_ms", "source_ms")?,
     };
-    Ok(EditCommand::SetKeyframe { clip: id, param: p.into(), at, value, ease })
+    Ok(EditCommand::SetKeyframe { clip: id, param: p, at, value, ease })
+}
+
+fn remove_keyframe(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
+    let p = param(c, op)?;
+    let at = existing(seq, c, Some(&p), op, "at_ms", "source_ms")?;
+    // The last keyframe's value stays as the static value.
+    if let [k] = c.animation.track(&p) {
+        let v = k.value;
+        static_in_range(c, &p, v, |lo, hi| {
+            format!("removing the last keyframe would keep {v} as the static value of {}, out of range {lo}..{hi}; set the keyframe in range first, or use clear_animation", p.key_string())
+        })?;
+    }
+    Ok(EditCommand::RemoveKeyframe { clip: id, param: p, at, keep: None })
 }
 
 fn clear_animation(seq: &Sequence, id: ClipId, c: &Clip, op: &Value) -> Result<EditCommand, BridgeError> {
     let listed = match op.get("params").filter(|v| !v.is_null()) {
         None => None,
-        Some(Value::Array(a)) => Some(a.iter().map(|v| param_named(v.as_str().unwrap_or_default())).collect::<Result<Vec<_>, _>>()?),
+        Some(Value::Array(a)) => Some(a.iter().map(|v| param_named(c, v.as_str().unwrap_or_default())).collect::<Result<Vec<_>, _>>()?),
         Some(_) => return Err(bad("`params` must be an array of param names")),
     };
-    // Only animated properties are reset; a static value is not the animation's business.
-    let animated: Vec<AnimParam> = match &listed {
-        None => c.animation.params(),
-        Some(l) => c.animation.params().into_iter().filter(|p| l.contains(p)).collect(),
-    };
+    // Only animated tracks are reset (a static value is not the animation's
+    // business), and only those keyframe commands may edit: a newer Kadr's
+    // effect keeps its keyframes (ruling R8).
+    let animated: Vec<TrackKey> = c
+        .animation
+        .keys()
+        .into_iter()
+        .filter(|k| kadr_timeline::track_def(c, k).is_ok())
+        .filter(|k| listed.as_ref().is_none_or(|l| l.contains(k)))
+        .collect();
     if animated.is_empty() {
-        return Err(bad(if listed.is_some() { "clip has no animation on the listed params" } else { "clip has no animation" }));
+        return Err(bad(match listed {
+            Some(_) => "clip has no animation on the listed params",
+            None if !c.animation.is_empty() => "the clip's keyframes belong to an effect this version cannot edit",
+            None => "clip has no animation",
+        }));
     }
     let keep = ms_arg(op, "keep_ms")?.map(|ms| seq.frame_rate.snap(Time::from_millis(ms)));
-    let statics = animated.into_iter().map(|p| (p.into(), keep.map_or(p.default_value(), |t| c.anim_value(p, t)))).collect();
+    let statics = animated
+        .into_iter()
+        .map(|k| {
+            let v = match keep {
+                Some(t) => {
+                    let v = c.track_value(&k, t).unwrap_or_else(|| default_of(c, &k));
+                    static_in_range(c, &k, v, |lo, hi| format!("{} would be {v} at keep_ms, out of range {lo}..{hi}; omit keep_ms for its default", k.key_string()))?;
+                    v
+                }
+                None => default_of(c, &k),
+            };
+            Ok((k, v))
+        })
+        .collect::<Result<Vec<_>, BridgeError>>()?;
     Ok(EditCommand::ClearAnimation { clip: id, statics })
 }
 
@@ -234,23 +323,19 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
         }
         Ok(vec![match ty {
             "set_keyframe" => set_keyframe(seq, id, c, op)?,
-            "remove_keyframe" => {
-                let p = param(op)?;
-                let at = existing(seq, c, Some(p), op, "at_ms", "source_ms")?;
-                EditCommand::RemoveKeyframe { clip: id, param: p.into(), at, keep: None }
-            }
+            "remove_keyframe" => remove_keyframe(seq, id, c, op)?,
             "set_keyframe_ease" => {
-                let p = param(op)?;
+                let p = param(c, op)?;
                 let ease = ease(op)?.ok_or_else(|| bad("ease missing"))?;
-                let at = existing(seq, c, Some(p), op, "at_ms", "source_ms")?;
-                if c.animation.track(p).iter().any(|k| k.at == at && k.ease == ease) {
+                let at = existing(seq, c, Some(&p), op, "at_ms", "source_ms")?;
+                if c.animation.track(&p).iter().any(|k| k.at == at && k.ease == ease) {
                     return Err(bad("no change: that keyframe already has this ease"));
                 }
-                EditCommand::SetKeyframeEase { clip: id, param: p.into(), at, ease }
+                EditCommand::SetKeyframeEase { clip: id, param: p, at, ease }
             }
             "move_keyframes" => {
-                let p = op.get("param").filter(|v| !v.is_null()).map(|_| param(op)).transpose()?;
-                let from = existing(seq, c, p, op, "from_ms", "from_source_ms")?;
+                let p = op.get("param").filter(|v| !v.is_null()).map(|_| param(c, op)).transpose()?;
+                let from = existing(seq, c, p.as_ref(), op, "from_ms", "from_source_ms")?;
                 let to_ms = ms_arg(op, "to_ms")?.ok_or_else(|| bad("to_ms missing"))?;
                 let to = SourceTime(c.source_time_at(at_timeline(seq, c, to_ms)?));
                 if to == from {
@@ -258,7 +343,7 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                 }
                 // Every track of the moment: the editable ones; a read-only
                 // track (a newer Kadr's effect) keeps its keyframe (ruling R8).
-                let params: Vec<TrackKey> = p.map_or_else(|| kadr_timeline::editable_keys_at(c, from), |p| vec![p.into()]);
+                let params: Vec<TrackKey> = p.map_or_else(|| kadr_timeline::editable_keys_at(c, from), |p| vec![p]);
                 if params.is_empty() {
                     return Err(bad("the keyframes at this moment belong to an effect this version cannot edit"));
                 }
@@ -603,6 +688,120 @@ mod tests {
         assert!(msg(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000})).contains("no keyframe"));
         assert!(msg(&mut p, json!({"type": "set_video_fade", "clip_id": id})).contains("fade_in_ms"));
         assert!(msg(&mut p, json!({"type": "set_video_fade", "clip_id": id, "fade_in_ms": -5})).contains("negative"));
+    }
+
+    #[test]
+    fn effect_numbers_animate_through_the_keyframe_ops() {
+        let (mut p, id) = project();
+        let cid = ClipId::parse(&id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), p.sequence().clip(cid).unwrap(), Time::from_secs(6));
+        let fid = e.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let strength = format!("fx:{fid}:strength");
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": strength, "value": 0.9, "at_ms": 6_000})).unwrap();
+        assert!(p.sequence().tracks[0].clips[0].animation.is_animated(TrackKey::fx(fid, "strength")));
+        let err = |p: &Project, op: Value| run(&mut p.clone(), op).unwrap_err().message;
+        assert!(err(&p, json!({"type": "set_keyframe", "clip_id": id, "param": strength, "value": 1.5, "at_ms": 7_000})).contains("out of range 0..1"));
+        assert!(err(&p, json!({"type": "set_keyframe", "clip_id": id, "param": format!("fx:{fid}:direction"), "value": 1.0, "at_ms": 7_000})).contains("only numbers"));
+        assert!(err(&p, json!({"type": "set_keyframe", "clip_id": id, "param": format!("fx:{}:strength", kadr_core::EffectId::new()), "value": 0.5, "at_ms": 7_000})).contains("no effect"));
+        assert!(err(&p, json!({"type": "set_keyframe", "clip_id": id, "param": "fx:junk", "value": 0.5, "at_ms": 7_000})).contains("malformed"));
+        run(&mut p, json!({"type": "clear_animation", "clip_id": id, "params": [strength]})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert!(c.animation.is_empty());
+        assert_eq!(c.effect(fid).unwrap().number("strength"), Some(0.6), "the effect's default");
+    }
+
+    /// A clip with a smooth zoom whose strength is keyframed at 6 s and 8 s (and nothing else).
+    fn fx_only() -> (Project, String, kadr_core::EffectId) {
+        let (mut p, id) = project();
+        let cid = ClipId::parse(&id).unwrap();
+        let e = kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), p.sequence().clip(cid).unwrap(), Time::from_secs(6));
+        let fid = e.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(e);
+        let strength = format!("fx:{fid}:strength");
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": strength, "value": 0.2, "at_ms": 6_000})).unwrap();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": strength, "value": 1.0, "at_ms": 8_000, "ease": "linear"})).unwrap();
+        (p, id, fid)
+    }
+
+    /// Task 2 review: `clear_animation` without `params` resets effect tracks too.
+    #[test]
+    fn clear_animation_resets_a_clip_animated_only_through_an_effect() {
+        let (mut p, id, fid) = fx_only();
+        p.sequence_mut().tracks[0].clips[0].effects[0].params.insert("strength".into(), kadr_project::ParamValue::Number(0.3));
+        run(&mut p, json!({"type": "clear_animation", "clip_id": id})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert!(c.animation.is_empty());
+        assert_eq!(c.effect(fid).unwrap().number("strength"), Some(0.6), "the registry's default, not the old static");
+        // keep_ms freezes the effect number at that time.
+        let (mut p, id, fid) = fx_only();
+        let c = &p.sequence().tracks[0].clips[0];
+        let at = c.timeline_time_of(c.animation.track(TrackKey::fx(fid, "strength"))[1].at.0).as_millis();
+        run(&mut p, json!({"type": "clear_animation", "clip_id": id, "keep_ms": at})).unwrap();
+        assert_eq!(p.sequence().tracks[0].clips[0].effect(fid).unwrap().number("strength"), Some(1.0));
+    }
+
+    /// A newer Kadr's effect is read-only (spec §2): every keyframe op that
+    /// names one of its numbers says so instead of the engine's bare error.
+    #[test]
+    fn keyframe_ops_on_a_newer_kadrs_effect_say_why_not() {
+        let (mut p, id) = project();
+        let future = kadr_project::AppliedEffect::new("smooth_zoom", 9, [("strength".to_string(), kadr_project::ParamValue::Number(0.5))].into());
+        let k = TrackKey::fx(future.id, "strength");
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        let at = SourceTime(c.source_time_at(Time::from_secs(6)));
+        c.effects.push(future);
+        c.animation.set_key(&k, at, 0.5, None);
+        let key = k.key_string();
+        for op in [
+            json!({"type": "set_keyframe", "clip_id": id, "param": key, "value": 0.4, "at_ms": 7_000}),
+            json!({"type": "remove_keyframe", "clip_id": id, "param": key, "at_ms": 6_000}),
+            json!({"type": "set_keyframe_ease", "clip_id": id, "param": key, "at_ms": 6_000, "ease": "hold"}),
+            json!({"type": "move_keyframes", "clip_id": id, "param": key, "from_ms": 6_000, "to_ms": 7_000}),
+            json!({"type": "clear_animation", "clip_id": id, "params": [key]}),
+        ] {
+            let e = run(&mut p.clone(), op.clone()).unwrap_err().message;
+            assert!(e.contains("newer Kadr") && e.contains("smooth_zoom"), "{op}: {e}");
+        }
+        // Without params: its track alone is no animation this version can clear…
+        let e = run(&mut p.clone(), json!({"type": "clear_animation", "clip_id": id})).unwrap_err().message;
+        assert!(e.contains("cannot edit"), "{e}");
+        // …and next to a clip property it stays as it is.
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000, "value": 4.0})).unwrap();
+        run(&mut p, json!({"type": "clear_animation", "clip_id": id})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert!(!c.animation.is_animated(AnimParam::X));
+        assert_eq!(c.animation.track(&k).len(), 1, "the newer effect's keyframe stayed");
+    }
+
+    /// The engine keeps an effect's static number in range by clamping it;
+    /// MCP refuses instead, naming the value and the range.
+    #[test]
+    fn an_out_of_range_static_for_an_effect_number_is_refused() {
+        let (mut p, id, fid) = fx_only();
+        let k = TrackKey::fx(fid, "strength");
+        // A file from elsewhere: a keyframe beyond the parameter's range.
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        let late = c.animation.track(&k)[1].at;
+        c.animation.set_key(&k, late, 1.5, None);
+        let at = c.timeline_time_of(late.0).as_millis();
+        let e = run(&mut p.clone(), json!({"type": "clear_animation", "clip_id": id, "keep_ms": at})).unwrap_err().message;
+        assert!(e.contains(&k.key_string()) && e.contains("1.5") && e.contains("out of range 0..1"), "{e}");
+        // Without keep_ms the default is used: fine.
+        run(&mut p.clone(), json!({"type": "clear_animation", "clip_id": id})).unwrap();
+        // Removing the last keyframe would keep its value as the static one.
+        let early = p.sequence().tracks[0].clips[0].animation.track(&k)[0].at;
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.animation.remove_key(&k, early);
+        let e = run(&mut p.clone(), json!({"type": "remove_keyframe", "clip_id": id, "param": k.key_string(), "at_ms": at})).unwrap_err().message;
+        assert!(e.contains("1.5") && e.contains("out of range 0..1"), "{e}");
+        // An in-range last keyframe goes, its value staying.
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        c.animation.set_key(&k, late, 0.8, None);
+        run(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": k.key_string(), "at_ms": at})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert!(c.animation.is_empty());
+        assert_eq!(c.effect(fid).unwrap().number("strength"), Some(0.8));
     }
 
     /// Ruling R8: moving every keyframe of a moment moves the editable ones

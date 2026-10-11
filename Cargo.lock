@@ -2925,6 +2925,7 @@ dependencies = [
  "kadr-audio",
  "kadr-cache",
  "kadr-core",
+ "kadr-effects",
  "kadr-i18n",
  "kadr-jobs",
  "kadr-mcp-bridge",
