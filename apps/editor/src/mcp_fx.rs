@@ -153,7 +153,7 @@ mod tests {
         let all = v["effects"].as_array().unwrap();
         let look = all.iter().find(|e| e["id"] == "look").unwrap();
         assert_eq!(look["category"], "look");
-        assert_eq!(look["variants"].as_array().unwrap().len(), 6);
+        assert_eq!(look["variants"].as_array().unwrap().len(), kadr_effects::look::preset_keys().len());
         assert_eq!(look["variants"][0], json!({"key": "cinematic", "name": {"ru": "Кино", "en": "Cinematic"}}));
         assert_eq!(look["variants"][2], json!({"key": "soft_film", "name": {"ru": "Мягкая плёнка", "en": "Soft Film"}}));
         let vignette = all.iter().find(|e| e["id"] == "vignette").unwrap();

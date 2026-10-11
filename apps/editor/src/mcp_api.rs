@@ -628,7 +628,9 @@ mod tests {
         assert_eq!(e.code, "bad_params", "ops must be an array");
     }
 
-    /// D8: MCP's strict validation names a bad preset; another preset replaces the clip's Look.
+    /// D8: MCP's strict validation names a bad preset; another preset
+    /// replaces the clip's Look in place — the same effect id, its `fx:`
+    /// keyframes dropped — and `get_state` shows the new preset.
     #[test]
     fn a_look_preset_is_checked_and_replaces_the_clip_s_look() {
         let (mut p, v, _) = project_with_pair();
@@ -637,9 +639,23 @@ mod tests {
         assert_eq!(e.code, "edit_rejected");
         assert!(e.message.starts_with("op #0: ") && e.message.contains(&format!("preset must be one of {}", kadr_effects::look::preset_keys().join(", "))), "{}", e.message);
         let c = p.sequence().clip(v).unwrap().clone();
-        p.sequence_mut().tracks[0].clips[0].effects.push(kadr_effects::fresh(kadr_effects::recipe("look").unwrap(), &c, Time::ZERO));
-        assert!(matches!(&edit_commands(&p, &[], &add("warm")).unwrap()[..], [EditCommand::AddEffect { .. }]), "another preset replaces the Look");
+        let look = kadr_effects::fresh(kadr_effects::recipe("look").unwrap(), &c, Time::ZERO);
+        let id = look.id;
+        p.sequence_mut().tracks[0].clips[0].effects.push(look);
         assert!(edit_commands(&p, &[], &add("cinematic")).unwrap_err().message.contains("no change"), "the same Look again");
+        let strength = kadr_project::TrackKey::fx(id, "strength");
+        p.sequence_mut().tracks[0].clips[0].animation.set_key(strength, kadr_project::SourceTime(Time::from_secs(1)), 0.3, None);
+        let cmds = edit_commands(&p, &[], &add("warm")).unwrap();
+        assert!(matches!(&cmds[..], [EditCommand::AddEffect { .. }]), "another preset replaces the Look");
+        let mut engine = kadr_timeline::EditEngine::new();
+        for c in cmds {
+            engine.execute(&mut p, c).unwrap();
+        }
+        let c = p.sequence().clip(v).unwrap();
+        assert_eq!(c.effects.iter().map(|e| e.id).collect::<Vec<_>>(), [id], "one Look, the same effect");
+        assert!(!c.animation.has_effect_tracks(id), "its fx: keyframes went with the old preset");
+        let state = crate::mcp_state::timeline_json(p.sequence(), &[], Time::ZERO);
+        assert_eq!(state["tracks"][0]["clips"][0]["effects"][0]["params"]["preset"], "warm", "get_state shows the preset");
     }
 
     /// R10: the AI plan drops a no-op effect command; one MCP op says why it does nothing.

@@ -523,6 +523,10 @@ pub fn schema_for_prompt() -> String {
                 .iter()
                 .map(|p| match p.kind {
                     kadr_effects::ParamKind::Number { min, max, default } => format!("{} {min}..{max} (default {default})", p.key),
+                    // A Look's presets are alternatives, not settings to combine.
+                    kadr_effects::ParamKind::Choice { options, default } if d.variants == Some(p.key) => {
+                        format!("{} {} (alternatives: one {} per clip, adding another replaces it; default {default})", p.key, options.join("|"), d.id)
+                    }
                     kadr_effects::ParamKind::Choice { options, .. } => format!("{} {}", p.key, options.join("|")),
                     kadr_effects::ParamKind::Point => format!("{} {{\"x\":0..1,\"y\":0..1}}", p.key),
                     kadr_effects::ParamKind::Moment => format!("{} {{\"at_ms\":int}} (inside the clip; the effect is fully in at this frame)", p.key),
@@ -757,6 +761,9 @@ mod tests {
         }
         assert!(s.contains("\"add_effect\"") && s.contains("\"set_effect\"") && s.contains("\"remove_effect\""));
         assert!(s.contains("punch_in: ") && s.contains("fully in at this frame"), "ruling R17: the moment is where the punch is in");
+        let presets = kadr_effects::look::preset_keys().join("|");
+        assert!(s.contains(&format!("look: preset {presets} (alternatives: one look per clip, adding another replaces it; default cinematic)")), "{s}");
+        assert!(s.contains("vignette: strength 0..1 (default 0.6), softness 0..1 (default 0.5)"), "{s}");
         let (mut p, id) = fx_project();
         let cid = kadr_core::ClipId::parse(&id).unwrap();
         let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
@@ -764,6 +771,13 @@ mod tests {
         let ctx = crate::context::project_context(&p, &Default::default());
         assert_eq!(ctx["tracks"][0]["clips"][0]["effects"][0]["recipe"], "handheld");
         assert!(ctx["tracks"][1]["clips"][0].get("effects").is_none(), "a clip without effects says nothing");
+        // A Look's preset is what it is: the model sees it.
+        let mut look = kadr_effects::fresh(kadr_effects::recipe("look").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
+        look.params.insert("preset".into(), ParamValue::Choice("warm".into()));
+        p.sequence_mut().tracks[0].clips[0].effects.push(look);
+        let ctx = crate::context::project_context(&p, &Default::default());
+        let e = &ctx["tracks"][0]["clips"][0]["effects"][1];
+        assert_eq!((e["recipe"].as_str(), e["params"]["preset"].as_str()), (Some("look"), Some("warm")), "{e}");
     }
 
     /// An effect's numbers with keyframes are marked, so the model does not
