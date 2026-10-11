@@ -615,7 +615,12 @@ export component MenuButton inherits Rectangle {
                 padding: 5px;
                 for e in root.entries: MenuRow {
                     e: e;
-                    activated => { popup.close(); root.activated(e.id); }
+                    // Report first: closing the popup destroys this row,
+                    // and its `e` would be gone afterwards.
+                    activated => {
+                        root.activated(e.id);
+                        popup.close();
+                    }
                 }
             }
         }
