@@ -70,8 +70,10 @@ pub struct AdjustSpec {
 }
 
 impl Default for AdjustSpec {
+    /// `ColorAdjust::NEUTRAL`: an absent field changes nothing.
     fn default() -> Self {
-        AdjustSpec { exposure: 0.0, contrast: 1.0, saturation: 1.0, temperature: 0.0, tint: 0.0 }
+        let n = ColorAdjust::NEUTRAL;
+        AdjustSpec { exposure: n.exposure as f64, contrast: n.contrast as f64, saturation: n.saturation as f64, temperature: n.temperature as f64, tint: n.tint as f64 }
     }
 }
 
@@ -117,17 +119,18 @@ pub fn grain_cell(canvas: SizeU) -> f64 {
 /// `preset` at intensity `k` (D4): its correction, curve, split tone,
 /// vignette and grain, in that order, each moved from neutral by `k` — the
 /// curve's y to `x + k·(y − x)`, clamped into [0, 1] and kept rising; the
-/// correction from `ColorAdjust::NEUTRAL`; amounts × k — neutral ones dropped.
+/// correction from `ColorAdjust::NEUTRAL`; amounts × k, at most 1 — neutral
+/// ones dropped.
 pub fn look_effects(preset: &LookPreset, k: f64, ctx: &CompileCtx) -> Vec<Effect> {
     let lerp = |neutral: f64, v: f64| neutral + k * (v - neutral);
     let mut out = Vec::new();
-    let a = &preset.adjust;
+    let (a, n) = (&preset.adjust, AdjustSpec::default());
     let adjust = ColorAdjust {
-        exposure: lerp(0.0, a.exposure) as f32,
-        contrast: lerp(1.0, a.contrast).max(0.0) as f32,
-        saturation: lerp(1.0, a.saturation).max(0.0) as f32,
-        temperature: lerp(0.0, a.temperature).clamp(-1.0, 1.0) as f32,
-        tint: lerp(0.0, a.tint).clamp(-1.0, 1.0) as f32,
+        exposure: lerp(n.exposure, a.exposure) as f32,
+        contrast: lerp(n.contrast, a.contrast).max(0.0) as f32,
+        saturation: lerp(n.saturation, a.saturation).max(0.0) as f32,
+        temperature: lerp(n.temperature, a.temperature).clamp(-1.0, 1.0) as f32,
+        tint: lerp(n.tint, a.tint).clamp(-1.0, 1.0) as f32,
     };
     if !adjust.is_neutral() {
         out.push(Effect::ColorAdjust(adjust));
@@ -145,9 +148,9 @@ pub fn look_effects(preset: &LookPreset, k: f64, ctx: &CompileCtx) -> Vec<Effect
     if let Some(s) = preset.split_tone {
         let split = SplitTone {
             shadow_hue_deg: s.shadow_hue as f32,
-            shadow_amount: (s.shadow_amount * k) as f32,
+            shadow_amount: (s.shadow_amount * k).min(1.0) as f32,
             highlight_hue_deg: s.highlight_hue as f32,
-            highlight_amount: (s.highlight_amount * k) as f32,
+            highlight_amount: (s.highlight_amount * k).min(1.0) as f32,
             balance: s.balance as f32,
         };
         if !split.is_neutral() {
@@ -166,7 +169,11 @@ pub fn look_effects(preset: &LookPreset, k: f64, ctx: &CompileCtx) -> Vec<Effect
 }
 
 /// The `look` recipe (spec §5): its preset at the strength's intensity. A
-/// preset this build lacks never gets here (`definition` skips the effect).
+/// preset this build lacks never gets here (`definition` skips the effect),
+/// and `Params::resolve` against the Look's own parameters always yields one
+/// of its keys; the empty result stays only for `Params` resolved for
+/// another recipe (a caller's mistake) — nothing drawn rather than a panic
+/// in the middle of a render.
 pub fn look(p: &Params, ctx: &CompileCtx) -> Compiled {
     let effects = preset(p.choice("preset")).map_or_else(Vec::new, |found| look_effects(found, intensity(p.number("strength")), ctx));
     Compiled::colour(effects)
@@ -198,9 +205,12 @@ mod tests {
     #[test]
     fn looks_json_is_valid() {
         let keys: Vec<&str> = presets().iter().map(|p| p.key.as_str()).collect();
+        // The one pin of the six keys: other tests compare with `preset_keys()`.
         assert_eq!(keys, ["cinematic", "warm", "soft_film", "dramatic", "vintage", "natural"], "spec §5's six, in card order");
         assert!(keys.contains(&DEFAULT_PRESET));
         assert_eq!(preset_keys(), keys);
+        let unique: std::collections::BTreeSet<&str> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len(), "every key once: a card id, a choice option");
         for p in presets() {
             let k = &p.key;
             assert!(!k.is_empty() && k.chars().all(|c| c.is_ascii_lowercase() || c == '_'), "{k}: a key fit for a card id and i18n");
@@ -265,8 +275,10 @@ mod tests {
 
     #[test]
     fn strength_moves_every_value_from_neutral() {
+        for p in presets() {
+            assert!(look_effects(p, 0.0, &hd()).is_empty(), "{}: k = 0, nothing at all", p.key);
+        }
         let p = preset("cinematic").unwrap();
-        assert!(look_effects(p, 0.0, &hd()).is_empty(), "k = 0: nothing at all");
         let half = look_effects(p, 0.5, &hd());
         let Effect::ColorAdjust(a) = &half[0] else { panic!("{half:?}") };
         assert!((a.saturation - 0.95).abs() < 1e-6);
@@ -276,6 +288,12 @@ mod tests {
         assert!((v.amount - 0.125).abs() < 1e-6);
         let Some(Effect::SplitTone(s)) = half.iter().find(|e| matches!(e, Effect::SplitTone(_))) else { panic!("{half:?}") };
         assert!((s.shadow_amount - 0.1).abs() < 1e-6 && (s.highlight_amount - 0.075).abs() < 1e-6);
+        let film = look_effects(preset("soft_film").unwrap(), 0.5, &hd());
+        let Some(Effect::Grain(g)) = film.iter().find(|e| matches!(e, Effect::Grain(_))) else { panic!("{film:?}") };
+        assert!((g.amount - 0.02).abs() < 1e-6, "Мягкая плёнка: half its grain, {}", g.amount);
+        let warm = look_effects(preset("warm").unwrap(), 0.5, &hd());
+        let Effect::ColorAdjust(w) = &warm[0] else { panic!("{warm:?}") };
+        assert!((w.temperature - 0.35).abs() < 1e-6 && (w.tint - 0.04).abs() < 1e-6, "Тёплый: half its temperature and tint, {w:?}");
         let order: Vec<&str> = look_effects(preset("vintage").unwrap(), 1.0, &hd())
             .iter()
             .map(|e| match e {
@@ -303,6 +321,30 @@ mod tests {
                 }
             }
         }
+        // Amounts stay within 1 however strong a preset is pushed.
+        let mut bold = preset("cinematic").unwrap().clone();
+        bold.split_tone = Some(SplitToneSpec { shadow_hue: 200.0, shadow_amount: 0.9, highlight_hue: 35.0, highlight_amount: 0.8, balance: 0.0 });
+        bold.vignette = 0.9;
+        let fx = look_effects(&bold, intensity(1.0), &hd());
+        let Some(Effect::SplitTone(s)) = fx.iter().find(|e| matches!(e, Effect::SplitTone(_))) else { panic!("{fx:?}") };
+        assert_eq!((s.shadow_amount, s.highlight_amount), (1.0, 1.0));
+    }
+
+    /// Refinement 7: a Look's vignette has the Vignette effect's shape at
+    /// Мягкость 0.5 — only its amount is the preset's.
+    #[test]
+    fn a_look_s_vignette_is_the_vignette_effect_s_shape_at_softness_half() {
+        let def = recipe("vignette").unwrap();
+        let stored = [("softness".to_string(), ParamValue::Number(0.5))].into_iter().collect();
+        let [Effect::Vignette(v)] = (def.compile)(&Params::resolve(def.params, &stored, |_| None), &hd()).effects[..] else { panic!("one vignette") };
+        let mut with_one = 0;
+        for p in presets() {
+            if let Some(l) = look_effects(p, 1.0, &hd()).into_iter().find_map(|e| if let Effect::Vignette(l) = e { Some(l) } else { None }) {
+                assert_eq!((l.midpoint, l.feather), (v.midpoint, v.feather), "{}", p.key);
+                with_one += 1;
+            }
+        }
+        assert!(with_one >= 3, "Кино, Драма, Винтаж");
     }
 
     #[test]
