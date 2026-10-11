@@ -153,8 +153,9 @@ impl App {
         if let Some(cpu) = &self.preview.cpu {
             cpu.player().show(t);
         }
-        // The focused effect's point in this frame (its zoom, crop, the playhead).
-        self.fx_update_marker();
+        // The focused effect's point in this frame (its zoom, crop, the
+        // playhead) — in the scene just evaluated, not evaluated again.
+        self.fx_update_marker_in(Some(&scene));
     }
 
     /// The snapshot the preview shows (taken now if the project changed),

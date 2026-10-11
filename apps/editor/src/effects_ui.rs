@@ -13,7 +13,7 @@ use kadr_core::{ClipId, EffectId, FrameRate, Time, Timecode};
 use kadr_effects::{Category, ParamDef, ParamKind, RecipeDef};
 use kadr_i18n::{t, t_in, tf, Lang};
 use kadr_project::{AppliedEffect, Clip, FadeEdge, ParamValue, Sequence, SourceTime, TrackKey, TrackKind};
-use kadr_scene::{Layer, LayerContent, LayerId, SizeU};
+use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, SizeU};
 use kadr_timeline::EditCommand;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::{BTreeMap, HashMap};
@@ -142,10 +142,11 @@ pub fn fx_tip(c: &Clip) -> String {
 }
 
 /// Where the badge is in a clip `width` px wide (clip x range): right-aligned
-/// in the name bar, left of a fade-out handle that stays on screen
-/// (`pinned_out`).
-pub fn badge_span(width: f64, fade_out_px: f64, pinned_out: bool) -> (f64, f64) {
-    let pad = if pinned_out { (width - anim_ui::handle_x(0.0, width, fade_out_px, FadeEdge::Out) + 7.0).max(6.0) } else { 6.0 };
+/// in the name bar, left of the fade-out handle wherever that handle can
+/// appear (`out_can_appear`: also on a mere hover, ruling R16 — so the badge
+/// never slides).
+pub fn badge_span(width: f64, fade_out_px: f64, out_can_appear: bool) -> (f64, f64) {
+    let pad = if out_can_appear { (width - anim_ui::handle_x(0.0, width, fade_out_px, FadeEdge::Out) + 7.0).max(6.0) } else { 6.0 };
     (width - pad - BADGE_W, width - pad)
 }
 
@@ -291,7 +292,8 @@ pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate
                 Some(ParamValue::Point { x, y }) => (*x, *y),
                 _ => (0.5, 0.5),
             };
-            row.text = format!("{:.0} %, {:.0} %", x * 100.0, y * 100.0).into();
+            // As the sliders write a percentage: no space before the sign.
+            row.text = format!("{:.0}%, {:.0}%", x * 100.0, y * 100.0).into();
             row.can_act = on_clip;
             row.active = picking;
             row.hint = if picking { t("fx.pick.hint") } else if on_clip { String::new() } else { t("fx.pick.off_clip") }.into();
@@ -960,8 +962,17 @@ impl App {
     /// The point marker on the preview (spec §6.2, ruling R15): where the
     /// focused effect's zoom holds still in the frame shown — while paused.
     pub fn fx_update_marker(&mut self) {
+        self.fx_update_marker_in(None);
+    }
+
+    /// [`Self::fx_update_marker`] given the frame shown when the caller has
+    /// evaluated it already (`request_frame`): a paused frame is evaluated once.
+    pub fn fx_update_marker_in(&mut self, frame: Option<&FrameScene>) {
         let shown = match self.fx_marker_target() {
-            Some((clip, point)) if !self.playing => self.fx_shown_layer(clip).map(|(l, canvas)| marker_on_canvas(&l, canvas, point)),
+            Some((clip, point)) if !self.playing => match frame {
+                Some(scene) => layer_of(&scene.layers, clip).map(|l| marker_on_canvas(l, scene.canvas, point)),
+                None => self.fx_shown_layer(clip).map(|(l, canvas)| marker_on_canvas(&l, canvas, point)),
+            },
             _ => None,
         };
         let ui = self.ui();
@@ -1202,7 +1213,7 @@ mod tests {
         assert!(row("moment", 15).can_act);
         assert!(!row("moment", 25).can_act, "off the clip");
         let p = row("point", 12);
-        assert_eq!((p.kind, p.text.as_str(), p.can_act, p.active), (2, "50 %, 50 %", true, false));
+        assert_eq!((p.kind, p.text.as_str(), p.can_act, p.active), (2, "50%, 50%", true, false), "written as the sliders write a percentage");
         assert!(!row("point", 25).can_act);
         let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
         let z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
@@ -1557,10 +1568,11 @@ mod tests {
         assert_eq!(fx_tip(&c), tf("fx.tip", &[("list", &tf("fx.tip.unavailable", &[("name", &t("fx.smooth_zoom"))]))]));
     }
 
-    /// The tooltip zone is where timeline.slint draws the badge: right-aligned
-    /// in the name bar, left of a fade-out handle that stays on screen.
+    /// The badge's span — where Rust draws it (`ClipView.fx-x`) and where its
+    /// tooltip answers (R16): right-aligned in the name bar, left of the
+    /// fade-out handle when that handle can appear.
     #[test]
-    fn the_badge_sits_left_of_a_pinned_fade_out_handle() {
+    fn the_badge_sits_left_of_the_fade_out_handle_where_it_can_appear() {
         assert_eq!(badge_span(200.0, 0.0, false), (164.0, 194.0));
         let handle = anim_ui::handle_x(0.0, 200.0, 50.0, kadr_project::FadeEdge::Out);
         let (a, b) = badge_span(200.0, 50.0, true);

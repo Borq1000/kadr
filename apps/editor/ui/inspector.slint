@@ -107,16 +107,24 @@ export component Inspector inherits Rectangle {
                 padding: 12px;
                 spacing: 4px;
                 alignment: start;
+                // The text wraps in a box that grows with it (a fixed-height
+                // box left it one clipped line wider than the panel).
                 if root.d.multi-count > 1: Rectangle {
-                    height: 44px;
+                    min-height: 44px;
                     border-radius: 6px;
                     background: Theme.bg2;
-                    Text {
-                        text: Tr.t1("inspector.multi", root.d.multi-count);
-                        font-size: Theme.font-sm;
-                        color: Theme.text-dim;
-                        wrap: word-wrap;
-                        horizontal-alignment: center;
+                    VerticalLayout {
+                        padding: 8px;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+                        Text {
+                            text: Tr.t1("inspector.multi", root.d.multi-count);
+                            font-size: Theme.font-sm;
+                            color: Theme.text-dim;
+                            wrap: word-wrap;
+                            horizontal-alignment: center;
+                        }
                     }
                 }
                 SectionTitle { text: Tr.t("inspector.sequence"); }
