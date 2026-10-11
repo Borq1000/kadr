@@ -269,7 +269,9 @@ impl App {
         // dialog pumping events), it retries instead of never starting the audio.
         slint::Timer::single_shot(PREROLL_FALLBACK, move || post(move |app| app.start_pending_audio(generation)));
         self.playing = true;
-        // The point marker shows on a still frame only.
+        // A point is picked on a still frame: pick mode ends (a click would
+        // commit a point at the moving playhead), and the marker hides.
+        self.fx_cancel_pick();
         self.fx_update_marker();
         let ui = self.ui();
         ui.set_playing(true);

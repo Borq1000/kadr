@@ -392,6 +392,16 @@ pub fn layer_of(layers: &[Layer], clip: ClipId) -> Option<&Layer> {
     })
 }
 
+/// Why a pick finds no picture of clip `c` in the frame shown (an i18n
+/// key): the playhead is off the clip, or it is on it and the clip is not
+/// seen there — under a full-frame opaque layer, or switched off (M2).
+pub fn unseen_key(c: Option<&Clip>, playhead: Time, frame: Time) -> &'static str {
+    match c {
+        Some(c) if anim_ui::edit_time(c, playhead, frame).is_some() => "fx.pick.hidden",
+        _ => "fx.pick.off_clip",
+    }
+}
+
 /// The point of `layer`'s picture under a click at canvas fraction (`fx`,
 /// `fy`) — through the placement as shown (zoomed, panned, turned) — as
 /// fractions of the picture (the content rectangle before crop,
@@ -887,7 +897,8 @@ impl App {
         self.refresh_inspector();
     }
 
-    /// Pick mode ends without a pick (Esc, the button again, another tab).
+    /// Pick mode ends without a pick (Esc, the button again, another tab,
+    /// playback).
     pub fn fx_cancel_pick(&mut self) {
         if self.fx.picking.take().is_some() {
             self.refresh_inspector();
@@ -911,7 +922,9 @@ impl App {
     pub fn fx_point_picked(&mut self, fx: f32, fy: f32) {
         let Some(pick) = self.fx.picking.clone() else { return };
         let Some((layer, canvas)) = self.fx_shown_layer(pick.clip) else {
-            return self.toast_warn(t("fx.pick.off_clip"));
+            let seq = self.project.sequence();
+            let why = unseen_key(seq.clip(pick.clip), self.playhead, seq.frame_rate.frame_duration());
+            return self.toast_warn(t(why));
         };
         let Some((x, y)) = pick_point(&layer, canvas, fx as f64, fy as f64) else {
             return self.toast_warn(t("fx.pick.miss"));
@@ -1447,6 +1460,31 @@ mod tests {
         let left_cropped = RectF::new(303.75, 0.0, 607.5, 1080.0);
         assert!(pick_point(&layer_with(p, Some(left_cropped)), canvas, 0.45, 0.5).is_none(), "a cropped-away part");
         assert!(pick_point(&layer_with(p, Some(left_cropped)), canvas, 0.55, 0.5).is_some());
+        // M5: the whole viewport takes the click; the margin round the frame
+        // comes as fractions outside 0..1 — a miss, even for a full-frame clip.
+        let full = layer_with(Placement::fill(canvas), None);
+        for (x, y) in [(-0.02, 0.5), (1.03, 0.5), (0.5, -0.1), (0.5, 1.2), (f64::NAN, 0.5)] {
+            assert!(pick_point(&full, canvas, x, y).is_none(), "{x} {y}");
+        }
+    }
+
+    /// M2: a pick that finds no picture of its clip says why — the playhead
+    /// is off the clip, or the clip is not seen in this frame (under a
+    /// full-frame opaque layer, switched off).
+    #[test]
+    fn a_pick_without_the_clips_picture_says_why() {
+        let c = clip_10_20();
+        let frame = FrameRate::FPS_30.frame_duration();
+        assert_eq!(unseen_key(Some(&c), Time::from_secs(12), frame), "fx.pick.hidden");
+        assert_eq!(unseen_key(Some(&c), Time::from_secs(25), frame), "fx.pick.off_clip");
+        assert_eq!(unseen_key(Some(&c), Time::from_secs(20), frame), "fx.pick.off_clip", "its out point is past its last frame");
+        assert_eq!(unseen_key(None, Time::from_secs(12), frame), "fx.pick.off_clip", "the clip is gone");
+        for lang in Lang::ALL {
+            let keys = kadr_i18n::all_keys(lang);
+            for key in ["fx.pick.hidden", "fx.pick.off_clip", "fx.pick.miss"] {
+                assert!(keys.contains(&key), "{lang:?} lacks {key}");
+            }
+        }
     }
 
     #[test]

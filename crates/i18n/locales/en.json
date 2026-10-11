@@ -799,6 +799,7 @@
   "dlg.clear_effects.body.other": "{n} effects will be removed. You can undo it.",
   "dlg.clear_effects.ok": "Remove",
   "fx.pick.miss": "Click inside the clip's picture",
+  "fx.pick.hidden": "The clip is not visible in this frame",
   "fx.tip": "Effects: {list}",
   "fx.tip.off": "{name} (off)",
   "fx.tip.unavailable": "{name} (unavailable)"

@@ -73,7 +73,7 @@ export component Preview inherits Rectangle {
             property <length> fit-w: min(self.width - 24px, (self.height - 24px) * root.frame-aspect);
             property <length> fit-h: self.fit-w / root.frame-aspect;
             property <float> zf: root.zoom == 0 ? 1 : root.zoom == 1 ? 1.5 : 2.5;
-            Rectangle {
+            canvas := Rectangle {
                 width: viewport.fit-w * viewport.zf;
                 height: viewport.fit-h * viewport.zf;
                 x: (viewport.width - self.width) / 2;
@@ -134,10 +134,13 @@ export component Preview inherits Rectangle {
                     drop-shadow-color: #000000a0;
                     Rectangle { width: 4px; height: 4px; border-radius: 2px; background: #ffffff; }
                 }
-                if root.picking: TouchArea {
-                    mouse-cursor: crosshair;
-                    clicked => { root.point-picked(self.mouse-x / self.width, self.mouse-y / self.height); }
-                }
+            }
+            // Pick mode: the whole viewport takes the click — one in the
+            // margin round the frame is a miss, and says so — reported as
+            // fractions of the canvas (outside 0..1 off it).
+            if root.picking: TouchArea {
+                mouse-cursor: crosshair;
+                clicked => { root.point-picked((self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height); }
             }
             if root.clip-name != "" && root.empty-kind == 0: Rectangle {
                 x: 10px; y: 10px;
