@@ -123,7 +123,18 @@ fn moment_from_json(clip: &Clip, k: &str, v: &Value, stored: Option<SourceTime>,
     let (at, source) = (ms("at_ms")?, ms("source_ms")?);
     if let Some(ms) = source {
         // Milliseconds are floored when shown: the stored moment within that ms is the one named.
-        return Ok(stored.filter(|m| m.0.as_millis() == ms).unwrap_or(SourceTime(Time::from_millis(ms))));
+        let m = stored.filter(|m| m.0.as_millis() == ms).unwrap_or(SourceTime(Time::from_millis(ms)));
+        // Both given (an echoed moment with an edited at_ms): they must name the same frame.
+        if let Some(at) = at.filter(|_| clip.source_out != clip.source_in) {
+            let shown = clip.timeline_time_of(m.0);
+            if (Time::from_millis(at) - shown).abs() >= slack.max(Time::from_millis(1)) {
+                return Err(format!(
+                    "{k}: at_ms {at} and source_ms {ms} name different frames (source_ms is at {} ms on the timeline); give only one of them",
+                    shown.as_millis()
+                ));
+            }
+        }
+        return Ok(m);
     }
     let ms = at.ok_or_else(shape)?;
     let degenerate = clip.source_out == clip.source_in;
@@ -227,7 +238,7 @@ mod tests {
         assert_eq!(got(json!({"at_ms": echo["at_ms"]}), Some(&cur)), stored, "at_ms alone, floored");
         assert_eq!(got(json!({"source_ms": echo["source_ms"]}), Some(&cur)), stored, "source_ms alone, floored");
         assert_eq!(got(json!({"source_ms": 36_000}), Some(&cur)), ParamValue::Moment(SourceTime(Time::from_secs(36))), "a different moment is a change");
-        assert_eq!(got(json!({"at_ms": 11_000, "source_ms": 45_000, "visible": true}), None), ParamValue::Moment(SourceTime(Time::from_secs(45))), "source_ms is preferred");
+        assert_eq!(got(json!({"at_ms": 25_000, "source_ms": 45_000, "visible": false}), None), ParamValue::Moment(SourceTime(Time::from_secs(45))), "the whole echo of an off-clip moment, source_ms exact");
         let off = ParamValue::Moment(SourceTime(Time::from_secs(45) + Time(99)));
         let cur_off = BTreeMap::from([("moment".to_string(), off.clone())]);
         assert_eq!(got(value_json(&c, &off), Some(&cur_off)), off, "an off-clip moment echoes back too");
@@ -248,5 +259,16 @@ mod tests {
         // A caller-given slack (the AI's half frame) widens the snap.
         let wide = params_from_json_in(def, &c, &obj(json!({"moment": {"at_ms": 9_990}})), None, Time::from_millis(16)).unwrap();
         assert_eq!(wide["moment"], ParamValue::Moment(SourceTime(Time::from_secs(30))));
+    }
+
+    /// An echoed moment whose `at_ms` was edited names two frames: refuse, don't pick one.
+    #[test]
+    fn a_moment_whose_at_ms_and_source_ms_disagree_is_refused() {
+        let c = clip();
+        let def = recipe("punch_in").unwrap();
+        let both = |at: i64, src: i64| params_from_json(def, &c, &obj(json!({"moment": {"at_ms": at, "source_ms": src, "visible": true}})));
+        assert!(both(12_000, 32_000).is_ok(), "the same frame");
+        let msg = both(15_000, 32_000).unwrap_err();
+        assert!(msg.contains("different frames") && msg.contains("12000"), "{msg}");
     }
 }

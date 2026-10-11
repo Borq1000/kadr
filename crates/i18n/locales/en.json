@@ -311,6 +311,7 @@
   "ai.msg.undone": "Undone.",
   "ai.msg.redone": "Redone.",
   "ai.msg.plan_stale": "This plan no longer fits the current timeline: {error}",
+  "ai.msg.nothing_to_change": "Nothing to change: the timeline already looks like that",
   "ai.msg.applied": "Done. New duration: {d}. To revert, press «Undo AI edit» or Ctrl+Z.",
   "ai.msg.local_only_help": "OK, local only. Available locally: «remove pauses longer than N seconds», «split here», «delete the last/first N seconds», «add marker …», «undo».",
   "ai.msg.error": "AI error: {error}",

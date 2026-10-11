@@ -205,6 +205,14 @@ impl App {
                 return;
             }
         };
+        // The timeline changed since the plan was made and every enabled
+        // command would now change nothing: say so and close the plan.
+        if cmds.is_empty() && plan.enabled_count() > 0 {
+            self.ai.say(1, t("ai.msg.nothing_to_change"));
+            self.ai.plans[i].state = 2;
+            self.log_action(i, AIActionStatus::Rejected);
+            return;
+        }
         let batch = EditCommand::Batch { label: tf("cmd.ai_prefix", &[("what", &plan.title)]), commands: cmds };
         if self.execute_as(batch, EditSource::Ai, Some(plan.id)) {
             self.ai.plans[i].state = 1;

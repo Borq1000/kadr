@@ -303,13 +303,18 @@ pub fn plan_from_llm(
     let confidence = v["confidence"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0) as f32;
     let cmds = command::parse_commands(&v["commands"].to_string()).map_err(|e| AiError::BadResponse(e.to_string()))?;
     // Validate now so the user never reviews an impossible plan.
-    command::validate(&cmds, project, perms).map_err(|e| {
+    let kept = command::kept(&cmds, project, perms).map_err(|e| {
         tracing::warn!(error = %e, "LLM proposed invalid EditCommands");
         AiError::BadResponse(format!("invalid edit command: {e}"))
     })?;
+    // A command that changes nothing (the clip already has that effect) is
+    // not an operation of the plan; a plan of only those is a message.
+    let nothing_to_change = !cmds.is_empty() && !kept.contains(&true);
     let items: Vec<PlanItem> = cmds
         .iter()
-        .map(|c| {
+        .zip(&kept)
+        .filter(|(_, kept)| **kept)
+        .map(|(c, _)| {
             let (s, e) = match c {
                 AiCommand::DeleteRange { start_ms, end_ms, .. } => (*start_ms, *end_ms),
                 AiCommand::SplitClip { at_ms, .. } | AiCommand::AddMarker { at_ms, .. } | AiCommand::AddTransition { at_ms, .. } => {
@@ -331,7 +336,7 @@ pub fn plan_from_llm(
         id: ActionId::new(),
         prompt: offer.prompt.clone(),
         title: tf("ai.plan.cloud_title", &[("tier", offer.tier.label())]),
-        findings: vec![summary.clone()],
+        findings: vec![if nothing_to_change { t("ai.msg.nothing_to_change") } else { summary.clone() }],
         proposal: tn("ai.plan.operations", items.len() as i64, &[]),
         items,
         tier: offer.tier,

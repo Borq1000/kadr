@@ -232,17 +232,24 @@ pub fn parse_commands(json: &str) -> Result<Vec<AiCommand>, ValidationError> {
 /// effect with these settings) is dropped, not rejected: a plan with it
 /// still stands (ruling R10).
 pub fn validate(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> Result<Vec<EditCommand>, ValidationError> {
-    validate_with(cmds, project, perms, false)
+    Ok(validate_each(cmds, project, perms, false)?.into_iter().flatten().collect())
+}
+
+/// Which of `cmds` [`validate`] keeps (one flag per command): `false` for an
+/// effect command that changes nothing. Errors as [`validate`].
+pub fn kept(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> Result<Vec<bool>, ValidationError> {
+    Ok(validate_each(cmds, project, perms, false)?.iter().map(Option::is_some).collect())
 }
 
 /// [`validate`] for a client that sends one op and wants to know why
 /// nothing happens (MCP): an effect command that changes nothing is
 /// rejected with "no change".
 pub fn validate_strict(cmds: &[AiCommand], project: &Project, perms: &Permissions) -> Result<Vec<EditCommand>, ValidationError> {
-    validate_with(cmds, project, perms, true)
+    Ok(validate_each(cmds, project, perms, true)?.into_iter().flatten().collect())
 }
 
-fn validate_with(cmds: &[AiCommand], project: &Project, perms: &Permissions, strict: bool) -> Result<Vec<EditCommand>, ValidationError> {
+/// One entry per command: its engine command, or `None` when it changes nothing.
+fn validate_each(cmds: &[AiCommand], project: &Project, perms: &Permissions, strict: bool) -> Result<Vec<Option<EditCommand>>, ValidationError> {
     if cmds.len() > perms.max_commands {
         return Err(ValidationError::TooMany(cmds.len()));
     }
@@ -445,6 +452,7 @@ fn validate_with(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
                     if strict {
                         return Err(range(format!("no change: the clip already has {recipe} with these parameters")));
                     }
+                    out.push(None);
                     continue;
                 }
                 // Replacing an instance drops its keyframes.
@@ -476,6 +484,7 @@ fn validate_with(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
                     if strict {
                         return Err(range("no change: the effect already has these settings".into()));
                     }
+                    out.push(None);
                     continue;
                 }
                 EditCommand::UpdateEffect { clip: id, id: e.id, params: values, enabled: *enabled }
@@ -490,7 +499,7 @@ fn validate_with(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
             }
             AiCommand::AddCaption { .. } => return Err(ValidationError::Unsupported { index: i, what: "captions" }),
         };
-        out.push(cmd);
+        out.push(Some(cmd));
     }
     Ok(out)
 }

@@ -158,3 +158,48 @@ fn llm_commands_are_strictly_validated() {
     let c = command::parse_commands(r#"[{"type":"add_caption","start_ms":0,"end_ms":10,"text":"hi"}]"#).unwrap();
     assert!(matches!(command::validate(&c, &p, &perms), Err(ValidationError::Unsupported { .. })));
 }
+
+/// An offer to feed `plan_from_llm` (never run: local-only mode blocks it).
+fn blocked_offer(p: &Project) -> CloudOffer {
+    let ai = Assistant::new(AiSettings::default());
+    let Reply::CloudOffer(offer) = ai.handle("Оставь только лучшие моменты", p, &EditorState::default()) else { panic!() };
+    offer
+}
+
+/// The first video clip, already carrying Handheld.
+fn project_with_handheld() -> (Project, String) {
+    let mut p = project();
+    let c = &p.sequence().tracks[0].clips[0];
+    let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), c, Time::ZERO);
+    let id = c.id.to_string();
+    p.sequence_mut().tracks[0].clips[0].effects.push(e);
+    (p, id)
+}
+
+fn answer(commands: serde_json::Value) -> String {
+    serde_json::json!({"summary": "ok", "confidence": 0.9, "commands": commands}).to_string()
+}
+
+#[test]
+fn a_plan_of_only_no_op_effect_commands_is_a_message_not_a_plan() {
+    let (p, id) = project_with_handheld();
+    let text = answer(serde_json::json!([{"type": "add_effect", "clip_id": id, "recipe": "handheld"}]));
+    let (plan, _) = kadr_ai::assistant::plan_from_llm(&text, &p, &blocked_offer(&p), 0.01, 10, 10, &Permissions::default()).unwrap();
+    assert!(plan.is_empty(), "nothing to review");
+    assert_eq!(plan.findings, vec![kadr_i18n::t("ai.msg.nothing_to_change")]);
+}
+
+#[test]
+fn a_mixed_plan_lists_and_counts_only_what_changes_something() {
+    let (p, id) = project_with_handheld();
+    let text = answer(serde_json::json!([
+        {"type": "add_effect", "clip_id": id, "recipe": "handheld", "reason": "already there"},
+        {"type": "add_marker", "at_ms": 1000, "name": "m", "reason": "mark"},
+    ]));
+    let (plan, action) = kadr_ai::assistant::plan_from_llm(&text, &p, &blocked_offer(&p), 0.01, 10, 10, &Permissions::default()).unwrap();
+    assert_eq!(plan.items.len(), 1);
+    assert!(plan.items[0].label.starts_with("add_marker"), "{}", plan.items[0].label);
+    assert_eq!(plan.proposal, kadr_i18n::tn("ai.plan.operations", 1, &[]));
+    assert_eq!(plan.findings, vec!["ok".to_string()], "the model's own summary stands");
+    assert_eq!(action.commands.as_array().map(Vec::len), Some(2), "the action keeps what the model proposed");
+}
