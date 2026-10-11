@@ -63,6 +63,23 @@ fn effect_ops(e: &Effect, _quality: RenderQuality) -> f64 {
     }
 }
 
+/// Per-pixel operations of a layer's effect chain. The renderer folds a run
+/// of corrections (neutral primitives between them skipped) into one affine
+/// op, so the run costs one correction.
+fn chain_ops(effects: &[Effect], quality: RenderQuality) -> f64 {
+    let mut after_adjust = false;
+    effects
+        .iter()
+        .filter(|e| !e.is_neutral())
+        .map(|e| {
+            let adjust = matches!(e, Effect::ColorAdjust(_));
+            let folded = adjust && after_adjust;
+            after_adjust = adjust;
+            if folded { 0.0 } else { effect_ops(e, quality) }
+        })
+        .sum()
+}
+
 /// Output pixels a layer's bounding box touches, clamped to the output.
 fn covered_pixels(scene: &FrameScene, layer: &Layer) -> f64 {
     let (cw, ch) = (scene.canvas.w as f32, scene.canvas.h as f32);
@@ -78,7 +95,7 @@ fn covered_pixels(scene: &FrameScene, layer: &Layer) -> f64 {
 pub fn layer_cost(scene: &FrameScene, layer: &Layer) -> Cost {
     let out_px = scene.output.size.w as u64 * scene.output.size.h as u64;
     let px = covered_pixels(scene, layer);
-    let per_px = 1.0 + layer.effects.iter().map(|e| effect_ops(e, scene.output.quality)).sum::<f64>();
+    let per_px = 1.0 + chain_ops(&layer.effects, scene.output.quality);
     let own = match &layer.content {
         LayerContent::Transition(t) => {
             let inner: f64 = t.from.iter().chain(&t.to).map(|l| layer_cost(scene, l).ops).sum();
@@ -157,6 +174,32 @@ mod tests {
         look.effects = live.to_vec();
         look.effects.insert(0, Effect::ColorAdjust(ColorAdjust { saturation: 0.9, ..ColorAdjust::NEUTRAL }));
         assert_eq!(layer_cost(&scene, &look).class, CostClass::Medium);
+    }
+
+    /// The renderer folds consecutive corrections — the inspector's and a
+    /// Look's, with neutral primitives between them skipped — into one
+    /// affine op: the run costs one correction; a live primitive between
+    /// two corrections splits the run.
+    #[test]
+    fn a_run_of_corrections_costs_one() {
+        let canvas = SizeU::new(1920, 1080);
+        let scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewHigh));
+        let with = |effects: Vec<Effect>| {
+            let mut l = solid(canvas, 1.0);
+            l.effects = effects;
+            layer_cost(&scene, &l).ops
+        };
+        let adjust = |saturation: f32| Effect::ColorAdjust(ColorAdjust { saturation, ..ColorAdjust::NEUTRAL });
+        let curve = Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.1), (1.0, 0.9)] });
+        let one = with(vec![adjust(0.5)]);
+        assert!(one > with(vec![]));
+        assert_eq!(with(vec![adjust(0.5), adjust(0.9)]), one, "two corrections: one affine op");
+        assert_eq!(with(vec![adjust(0.5), Effect::ToneCurve(ToneCurve::identity()), adjust(0.9)]), one, "a neutral curve between them is skipped");
+        assert_eq!(with(vec![adjust(0.5), adjust(1.0), adjust(0.9)]), one);
+        let split = with(vec![adjust(0.5), curve.clone(), adjust(0.9)]);
+        let two = with(vec![adjust(0.5), curve.clone()]) + (one - with(vec![]));
+        assert!((split - two).abs() < 1e-6 * two, "a live curve between them: two ops, {split} vs {two}");
+        assert_eq!(with(vec![adjust(0.5), adjust(0.9), curve.clone()]), with(vec![adjust(0.5), curve]));
     }
 
     /// The E2 bench (release, Винтаж's primitives each alone on a
