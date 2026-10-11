@@ -126,7 +126,10 @@ General)».
 `place_media`, `project` (`new`/`open`/`save`/`save_as`), `export`
 (`preset` 0–2, `resolution` 0–3 — целые индексы, см. схему), `ui`
 (`menu` — id пункта меню), `assistant`. Грамматика операций `edit` (все типы
-и поля) — в описании инструмента, которое видит Claude.
+и поля) — в описании инструмента, которое видит Claude. Неизвестный или
+пропущенный `type` — отказ «unknown op type `X`; one of: …» со списком всех
+операций (`EDIT_OPS` в `apps/editor/src/mcp_api.rs`; тест сверяет его с
+описанием инструмента).
 
 `add_transition` (`EditCommand::AddTransition`): `at_ms` привязывается к стыку
 (`timeline_out` одного клипа == `timeline_in` следующего на той же дорожке),

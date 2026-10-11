@@ -97,6 +97,41 @@ fn clip_ids(p: &Project, v: &Value) -> Result<Vec<ClipId>, BridgeError> {
         .collect()
 }
 
+/// Every `type` an `edit` op may have: the AI commands (`kadr_ai::command::
+/// AiCommand`) but `add_caption`, the link ops below, the keyframe and fade
+/// ops of `mcp_anim` and `move_effect` of `mcp_fx`. kadr-mcp's tool
+/// description documents the same list (tested).
+const EDIT_OPS: &[&str] = &[
+    "split_clip",
+    "delete_range",
+    "delete_clip",
+    "trim_clip",
+    "move_clip",
+    "set_transform",
+    "change_speed",
+    "set_audio_gain",
+    "add_marker",
+    "add_transition",
+    "select_camera",
+    "add_effect",
+    "set_effect",
+    "remove_effect",
+    "move_effect",
+    "unlink",
+    "link",
+    "delete_part",
+    "set_keyframe",
+    "remove_keyframe",
+    "set_keyframe_ease",
+    "move_keyframes",
+    "clear_animation",
+    "set_video_fade",
+];
+
+/// Op types that are known but refused, each with its own reason (the AI
+/// validator's): not offered in the unknown-type list.
+const REFUSED_OPS: &[&str] = &["add_caption"];
+
 /// Turns MCP `edit` ops (a mix of `AiCommand` JSON and the extra
 /// link/unlink/delete_part ops) into engine `EditCommand`s. Pure and tested
 /// without a window.
@@ -133,9 +168,17 @@ fn edit_op(project: &Project, seq: &Sequence, op: &Value) -> Result<Vec<EditComm
             };
             commands::delete_part(seq, &clip_ids(project, op)?, kind).ok_or_else(|| BridgeError::new("edit_rejected", "no clip of that kind in the selection"))
         }
-        _ => {
+        ty => {
+            if !ty.is_some_and(|t| EDIT_OPS.contains(&t) || REFUSED_OPS.contains(&t)) {
+                let named = match op.get("type") {
+                    None => "missing".to_string(),
+                    Some(Value::String(t)) => format!("`{t}`"),
+                    Some(v) => format!("{v} (not a string)"),
+                };
+                return Err(BridgeError::new("edit_rejected", format!("unknown op type {named}; one of: {}", EDIT_OPS.join(", "))));
+            }
             let cmd: kadr_ai::command::AiCommand =
-                serde_json::from_value(op.clone()).map_err(|e| BridgeError::new("edit_rejected", format!("unknown or malformed op: {e}")))?;
+                serde_json::from_value(op.clone()).map_err(|e| BridgeError::new("edit_rejected", format!("malformed op: {e}")))?;
             let perms = kadr_ai::command::Permissions { allow_destructive: true, max_commands: 500 };
             // Validated one at a time, so the validator's own "command 0:"
             // prefix is meaningless; the caller adds the real op index.
@@ -649,6 +692,44 @@ mod tests {
         }
         // A different moment is a change.
         assert!(set(json!({"at_ms": 6_000})).is_ok());
+    }
+
+    /// An unknown or missing `type` names every op `edit` takes.
+    #[test]
+    fn an_unknown_op_type_lists_every_op() {
+        let (p, _, _) = project_with_pair();
+        for (op, named) in [(json!({"type": "teleport"}), "`teleport`"), (json!({"at_ms": 1}), "missing"), (json!({"type": 7}), "7 (not a string)")] {
+            let e = edit_commands(&p, &[], &json!([op])).unwrap_err();
+            assert_eq!(e.code, "edit_rejected");
+            assert!(e.message.starts_with(&format!("op #0: unknown op type {named}; one of: split_clip, ")), "{}", e.message);
+            for ty in EDIT_OPS {
+                assert!(e.message.contains(ty), "{ty} missing from: {}", e.message);
+            }
+        }
+        // Each listed type is routed somewhere (a missing field, not an unknown type).
+        for ty in EDIT_OPS {
+            let e = edit_commands(&p, &[], &json!([{"type": ty}])).unwrap_err().message;
+            assert!(!e.contains("unknown op type") && !e.contains("unknown variant"), "{ty}: {e}");
+        }
+        // A refused type keeps its own reason.
+        let e = edit_commands(&p, &[], &json!([{"type": "add_caption", "start_ms": 0, "end_ms": 1_000, "text": "hi"}])).unwrap_err().message;
+        assert!(e.contains("caption") && !e.contains("unknown op type"), "{e}");
+    }
+
+    /// kadr-mcp's `edit` description (what Claude reads) documents exactly
+    /// the ops `edit` takes, plus the refused ones.
+    #[test]
+    fn edit_ops_match_the_kadr_mcp_description() {
+        let src = include_str!("../../kadr-mcp/src/tools.rs");
+        let start = src.find("const EDIT_DESCRIPTION").expect("EDIT_DESCRIPTION in kadr-mcp");
+        // Its lines up to the one that closes the string; an op's line starts `- \"<type>\"`.
+        let documented: std::collections::BTreeSet<&str> = src[start..]
+            .lines()
+            .take_while(|l| !l.ends_with("\";"))
+            .filter_map(|l| l.strip_prefix("- \\\"")?.split("\\\"").next())
+            .collect();
+        let offered: std::collections::BTreeSet<&str> = EDIT_OPS.iter().chain(REFUSED_OPS).copied().collect();
+        assert_eq!(documented, offered);
     }
 
     #[test]
