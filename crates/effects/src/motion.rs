@@ -194,7 +194,7 @@ mod tests {
     fn run(id: &str, set: &[(&str, ParamValue)], c: &CompileCtx) -> PlacementDelta {
         let def = recipe(id).unwrap();
         let stored = set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-        (def.compile)(&Params::resolve(def.params, &stored, |_| None), c).placement
+        def.compile_clip(&Params::resolve(def.params, &stored, |_| None), c).placement
     }
 
     fn close(a: f64, b: f64) -> bool {
@@ -358,7 +358,7 @@ mod tests {
             let shakes: Vec<PlacementDelta> = (0..=SECS * RATE)
                 .map(|i| {
                     c.progress = i as f64 / (SECS * RATE) as f64;
-                    (def.compile)(&p, &c).placement
+                    def.compile_clip(&p, &c).placement
                 })
                 .collect();
             for axis in ["x", "y", "turn"] {

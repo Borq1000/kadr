@@ -88,7 +88,7 @@ pub(crate) fn apply_effects(clip: &Clip, t: Time, canvas: SizeU, base: Placement
             continue;
         }
         let ctx = CompileCtx { progress, clip_secs, source_time, speed, canvas, aspect, window, frame: t, seed: effect_seed(e) };
-        let compiled = (def.compile)(&params, &ctx);
+        let compiled = def.compile_clip(&params, &ctx);
         placement = compiled.placement.apply(&placement);
         colour.extend(compiled.effects);
     }

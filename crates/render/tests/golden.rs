@@ -332,3 +332,23 @@ fn looks() {
         check(&format!("look_{key}"), s, i);
     }
 }
+
+/// Засветка in each colour at «Обычно», a third of the way through its
+/// clip, over the photo: the overlays the recipe compiles, on the picture's
+/// layer as the evaluator puts them (refinement 7).
+#[test]
+fn light_leaks() {
+    let def = kadr_effects::recipe("light_leak").expect("E3 recipe");
+    for colour in ["warm", "pink", "cold"] {
+        let stored = [("color".to_string(), kadr_project::ParamValue::Choice(colour.into()))].into_iter().collect();
+        let params = kadr_effects::Params::resolve(def.params, &stored, |_| None);
+        let ctx = kadr_effects::CompileCtx { progress: 0.3, ..kadr_effects::CompileCtx::still(CANVAS, Time::ZERO, 7) };
+        let base = full(AlphaMode::Opaque);
+        let mut layers = vec![base.clone()];
+        for o in def.compile_clip(&params, &ctx).overlays {
+            layers.push(Layer { content: LayerContent::Generator(o.generator), opacity: o.opacity * base.opacity, blend: o.blend, effects: vec![], ..base.clone() });
+        }
+        let inputs = std::iter::once(LayerInput::Cpu(photo())).chain(std::iter::repeat_n(LayerInput::None, layers.len() - 1)).collect();
+        check(&format!("light_leak_{colour}"), scene(OUT, layers), inputs);
+    }
+}

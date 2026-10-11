@@ -338,7 +338,7 @@ mod tests {
     fn a_look_s_vignette_is_the_vignette_effect_s_shape_at_softness_half() {
         let def = recipe("vignette").unwrap();
         let stored = [("softness".to_string(), ParamValue::Number(0.5))].into_iter().collect();
-        let [Effect::Vignette(v)] = (def.compile)(&Params::resolve(def.params, &stored, |_| None), &hd()).effects[..] else { panic!("one vignette") };
+        let [Effect::Vignette(v)] = def.compile_clip(&Params::resolve(def.params, &stored, |_| None), &hd()).effects[..] else { panic!("one vignette") };
         let mut with_one = 0;
         for p in presets() {
             if let Some(l) = look_effects(p, 1.0, &hd()).into_iter().find_map(|e| if let Effect::Vignette(l) = e { Some(l) } else { None }) {
@@ -384,7 +384,7 @@ mod tests {
         let run = |id: &str, set: &[(&str, ParamValue)]| {
             let def = recipe(id).unwrap();
             let stored = set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-            (def.compile)(&Params::resolve(def.params, &stored, |_| None), &ctx)
+            def.compile_clip(&Params::resolve(def.params, &stored, |_| None), &ctx)
         };
         let warm = run("look", &[("preset", ParamValue::Choice("warm".into()))]);
         assert!(warm.placement.is_identity(), "a Look never moves the picture");

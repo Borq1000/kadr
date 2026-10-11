@@ -1298,12 +1298,13 @@ mod tests {
 
     #[test]
     fn categories_hide_empty_ones_and_search_matches_either_language() {
-        assert_eq!(categories(), vec![Category::Motion, Category::Look, Category::Light], "E2: motion, Looks, light");
+        assert_eq!(categories(), vec![Category::Motion, Category::Look, Category::Light, Category::Transition], "E3: motion, Looks, light, transitions");
         let ids = |v: Vec<Card>| v.into_iter().map(|c| c.id()).collect::<Vec<_>>();
-        assert_eq!(visible_cards("", "").len(), 12, "5 motion, 6 Looks, the Vignette");
+        assert_eq!(visible_cards("", "").len(), 18, "5 motion, 6 Looks, 2 lights, 5 transitions");
         assert_eq!(ids(visible_cards("look", "")), kadr_effects::look::preset_keys().iter().map(|k| format!("look:{k}")).collect::<Vec<_>>(), "a card per preset, in looks.json's order");
-        assert_eq!(ids(visible_cards("light", "")), ["vignette"]);
-        assert!(visible_cards("transition", "").is_empty());
+        assert_eq!(ids(visible_cards("light", "")), ["vignette", "light_leak"]);
+        assert_eq!(ids(visible_cards("transition", "")), ["clean_fade", "fade_through_color", "smooth_push", "light_sweep", "wipe"]);
+        assert_eq!(ids(visible_cards("", "шторк")), ["wipe"], "a transition by its Russian name");
         assert_eq!(ids(visible_cards("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
         assert_eq!(ids(visible_cards("motion", "HAND")), ["handheld"], "English name, any case");
         assert_eq!(ids(visible_cards("", "  Ручная ")), ["handheld"], "trimmed");

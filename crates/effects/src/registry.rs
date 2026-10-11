@@ -1,7 +1,9 @@
 //! The recipe registry (effects spec §3) and what a new effect starts with.
 
+use crate::leak;
 use crate::look;
 use crate::motion;
+use crate::transition::{self, TransitionBuild, TransitionCtx};
 use crate::params::{default_value, ParamDef, ParamKind, Params, NORMAL};
 use crate::PlacementDelta;
 use kadr_core::Time;
@@ -103,26 +105,72 @@ impl CompileCtx {
     pub fn still(canvas: SizeU, frame: Time, seed: u64) -> CompileCtx {
         CompileCtx { progress: 0.0, clip_secs: 1.0, source_time: SourceTime(Time::ZERO), speed: 1.0, canvas, aspect: canvas.w as f64 / canvas.h.max(1) as f64, window: Self::UNCROPPED, frame, seed }
     }
+
+    /// The clip's picture in canvas pixels at its scale 1 — its placement's
+    /// size: the picture of aspect `aspect` fitted into the canvas (a
+    /// non-finite or non-positive aspect counts as the canvas's). An
+    /// overlay's geometry is in these local pixels.
+    pub fn picture(&self) -> (f64, f64) {
+        let (cw, ch) = (self.canvas.w as f64, self.canvas.h.max(1) as f64);
+        let a = if self.aspect.is_finite() && self.aspect > 0.0 { self.aspect } else { cw / ch };
+        if cw / ch > a { (ch * a, ch) } else { (cw, cw / a) }
+    }
 }
 
-/// What one effect adds to a frame: motion recipes move the picture, colour
-/// recipes (Look, Vignette) add primitives after the clip's correction;
-/// overlays and transition builds (E3) and audio operations (E4) join here.
+/// What one effect adds to a frame of its clip: motion recipes move the
+/// picture, colour recipes (Look, Vignette) add primitives after the clip's
+/// correction, light recipes (Light Leak) add generator layers over the
+/// picture; audio operations (E4) join here. A transition's frame is a
+/// [`TransitionBuild`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Compiled {
     pub placement: PlacementDelta,
     pub effects: Vec<kadr_scene::Effect>,
+    /// Generator layers over the clip's picture, in order (D7): the
+    /// evaluator puts each on the clip layer's placement and crop, directly
+    /// above it.
+    pub overlays: Vec<Overlay>,
+}
+
+impl Default for Compiled {
+    /// Nothing: the picture stays where it is, unchanged.
+    fn default() -> Self {
+        Compiled { placement: PlacementDelta::IDENTITY, effects: vec![], overlays: vec![] }
+    }
 }
 
 impl Compiled {
     pub fn motion(placement: PlacementDelta) -> Compiled {
-        Compiled { placement, effects: vec![] }
+        Compiled { placement, ..Compiled::default() }
     }
 
     /// A colour effect's frame: primitives only, the picture stays where it is.
     pub fn colour(effects: Vec<kadr_scene::Effect>) -> Compiled {
-        Compiled { placement: PlacementDelta::IDENTITY, effects }
+        Compiled { effects, ..Compiled::default() }
     }
+
+    /// A light effect's frame: generator layers over the picture.
+    pub fn overlays(overlays: Vec<Overlay>) -> Compiled {
+        Compiled { overlays, ..Compiled::default() }
+    }
+}
+
+/// A generator layer an effect draws over a picture (D7, refinement 6):
+/// its geometry in the picture's local pixels (`CompileCtx::picture`), its
+/// blend, and its opacity before the picture layer's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Overlay {
+    pub generator: kadr_scene::Generator,
+    pub blend: kadr_scene::BlendMode,
+    pub opacity: f32,
+}
+
+/// How a recipe compiles (refinement 6): a clip effect's frame, or a
+/// transition's on a cut.
+#[derive(Clone, Copy)]
+pub enum Compile {
+    Clip(fn(&Params, &CompileCtx) -> Compiled),
+    Cut(fn(&Params, &TransitionCtx) -> TransitionBuild),
 }
 
 pub struct RecipeDef {
@@ -138,13 +186,29 @@ pub struct RecipeDef {
     /// inspector (the Look's `preset`, refinement 1); `None`: one card.
     pub variants: Option<&'static str>,
     pub cost: CostClass,
-    pub compile: fn(&Params, &CompileCtx) -> Compiled,
+    pub compile: Compile,
 }
 
 impl RecipeDef {
     /// i18n key of the effect's name: `fx.<id>`.
     pub fn name_key(&self) -> String {
         format!("fx.{}", self.id)
+    }
+
+    /// A clip effect's frame; nothing for a transition recipe.
+    pub fn compile_clip(&self, p: &Params, ctx: &CompileCtx) -> Compiled {
+        match self.compile {
+            Compile::Clip(f) => f(p, ctx),
+            Compile::Cut(_) => Compiled::default(),
+        }
+    }
+
+    /// A transition's frame; `None` for a clip recipe.
+    pub fn compile_cut(&self, p: &Params, ctx: &TransitionCtx) -> Option<TransitionBuild> {
+        match self.compile {
+            Compile::Cut(f) => Some(f(p, ctx)),
+            Compile::Clip(_) => None,
+        }
     }
 
     pub fn param(&self, key: &str) -> Option<&'static ParamDef> {
@@ -187,21 +251,35 @@ const ZOOM_DIRECTION: ParamDef = ParamDef { key: "direction", kind: ParamKind::C
 const PAN_DIRECTION: ParamDef = ParamDef { key: "direction", kind: ParamKind::Choice { options: &["left", "right", "up", "down"], default: "right" } };
 
 const SOFTNESS: ParamDef = ParamDef { key: "softness", kind: ParamKind::Number { min: 0.0, max: 1.0, default: 0.5 } };
+const LEAK_COLOR: ParamDef = ParamDef { key: "color", kind: ParamKind::Choice { options: &["warm", "pink", "cold"], default: "warm" } };
+const LEAK_VARIANT: ParamDef = ParamDef { key: "variant", kind: ParamKind::Choice { options: &["1", "2", "3"], default: "1" } };
+const FADE_STYLE: ParamDef = ParamDef { key: "style", kind: ParamKind::Choice { options: &["clean", "film"], default: "clean" } };
+const DIP_COLOR: ParamDef = ParamDef { key: "color", kind: ParamKind::Choice { options: &["black", "white"], default: "black" } };
+const CUT_DIRECTION: ParamDef = ParamDef { key: "direction", kind: ParamKind::Choice { options: &["left", "right", "up", "down"], default: "left" } };
+const SWEEP_COLOR: ParamDef = ParamDef { key: "color", kind: ParamKind::Choice { options: &["warm", "white", "cold"], default: "warm" } };
+const WIPE_SOFTNESS: ParamDef = ParamDef { key: "softness", kind: ParamKind::Number { min: 0.0, max: 1.0, default: 0.25 } };
 
 /// The Look's parameters: its `preset` options are `looks.json`'s keys
 /// (refinement 2), known only at run time.
 static LOOK_PARAMS: LazyLock<[ParamDef; 2]> =
     LazyLock::new(|| [ParamDef { key: "preset", kind: ParamKind::Choice { options: look::preset_keys(), default: look::DEFAULT_PRESET } }, STRENGTH]);
 
-static REGISTRY: LazyLock<[RecipeDef; 7]> = LazyLock::new(|| {
+static REGISTRY: LazyLock<[RecipeDef; 13]> = LazyLock::new(|| {
+    use Compile::{Clip, Cut};
     [
-        RecipeDef { id: "smooth_zoom", category: Category::Motion, target: Target::Clip, version: 1, params: &[ZOOM_DIRECTION, STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: motion::smooth_zoom },
-        RecipeDef { id: "cinematic_push", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: motion::cinematic_push },
-        RecipeDef { id: "punch_in", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, MOMENT, POINT], variants: None, cost: CostClass::Cheap, compile: motion::punch_in },
-        RecipeDef { id: "smooth_pan", category: Category::Motion, target: Target::Clip, version: 1, params: &[PAN_DIRECTION, STRENGTH], variants: None, cost: CostClass::Cheap, compile: motion::smooth_pan },
-        RecipeDef { id: "handheld", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH], variants: None, cost: CostClass::Cheap, compile: motion::handheld },
-        RecipeDef { id: "look", category: Category::Look, target: Target::Clip, version: 1, params: &*LOOK_PARAMS, variants: Some("preset"), cost: CostClass::Medium, compile: look::look },
-        RecipeDef { id: "vignette", category: Category::Light, target: Target::Clip, version: 1, params: &[STRENGTH, SOFTNESS], variants: None, cost: CostClass::Cheap, compile: look::vignette },
+        RecipeDef { id: "smooth_zoom", category: Category::Motion, target: Target::Clip, version: 1, params: &[ZOOM_DIRECTION, STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: Clip(motion::smooth_zoom) },
+        RecipeDef { id: "cinematic_push", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, POINT], variants: None, cost: CostClass::Cheap, compile: Clip(motion::cinematic_push) },
+        RecipeDef { id: "punch_in", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH, MOMENT, POINT], variants: None, cost: CostClass::Cheap, compile: Clip(motion::punch_in) },
+        RecipeDef { id: "smooth_pan", category: Category::Motion, target: Target::Clip, version: 1, params: &[PAN_DIRECTION, STRENGTH], variants: None, cost: CostClass::Cheap, compile: Clip(motion::smooth_pan) },
+        RecipeDef { id: "handheld", category: Category::Motion, target: Target::Clip, version: 1, params: &[STRENGTH], variants: None, cost: CostClass::Cheap, compile: Clip(motion::handheld) },
+        RecipeDef { id: "look", category: Category::Look, target: Target::Clip, version: 1, params: &*LOOK_PARAMS, variants: Some("preset"), cost: CostClass::Medium, compile: Clip(look::look) },
+        RecipeDef { id: "vignette", category: Category::Light, target: Target::Clip, version: 1, params: &[STRENGTH, SOFTNESS], variants: None, cost: CostClass::Cheap, compile: Clip(look::vignette) },
+        RecipeDef { id: "light_leak", category: Category::Light, target: Target::Clip, version: 1, params: &[STRENGTH, LEAK_COLOR, LEAK_VARIANT], variants: None, cost: CostClass::Medium, compile: Clip(leak::light_leak) },
+        RecipeDef { id: "clean_fade", category: Category::Transition, target: Target::Cut, version: 1, params: &[FADE_STYLE], variants: None, cost: CostClass::Cheap, compile: Cut(transition::clean_fade) },
+        RecipeDef { id: "fade_through_color", category: Category::Transition, target: Target::Cut, version: 1, params: &[DIP_COLOR], variants: None, cost: CostClass::Cheap, compile: Cut(transition::fade_through_color) },
+        RecipeDef { id: "smooth_push", category: Category::Transition, target: Target::Cut, version: 1, params: &[CUT_DIRECTION], variants: None, cost: CostClass::Cheap, compile: Cut(transition::smooth_push) },
+        RecipeDef { id: "light_sweep", category: Category::Transition, target: Target::Cut, version: 1, params: &[CUT_DIRECTION, SWEEP_COLOR], variants: None, cost: CostClass::Medium, compile: Cut(transition::light_sweep) },
+        RecipeDef { id: "wipe", category: Category::Transition, target: Target::Cut, version: 1, params: &[CUT_DIRECTION, WIPE_SOFTNESS], variants: None, cost: CostClass::Cheap, compile: Cut(transition::wipe) },
     ]
 });
 
@@ -256,21 +334,29 @@ mod tests {
     use kadr_core::{AssetId, TimeRange};
 
     #[test]
-    fn the_registry_holds_motion_then_looks_and_light_in_card_order() {
+    fn the_registry_holds_motion_looks_light_then_transitions_in_card_order() {
         let ids: Vec<&str> = registry().iter().map(|d| d.id).collect();
-        assert_eq!(ids, ["smooth_zoom", "cinematic_push", "punch_in", "smooth_pan", "handheld", "look", "vignette"]);
+        assert_eq!(ids, ["smooth_zoom", "cinematic_push", "punch_in", "smooth_pan", "handheld", "look", "vignette", "light_leak", "clean_fade", "fade_through_color", "smooth_push", "light_sweep", "wipe"]);
         for d in registry() {
-            assert_eq!((d.target, d.version), (Target::Clip, 1), "{}", d.id);
+            assert_eq!(d.version, 1, "{}", d.id);
             assert!(!d.params.is_empty() && d.params.len() <= 5, "{}: 1–5 parameters", d.id);
-            assert!(d.param("strength").is_some(), "{} has a strength", d.id);
             assert_eq!(d.name_key(), format!("fx.{}", d.id));
+            if d.category == Category::Transition {
+                assert_eq!((d.target, d.variants), (Target::Cut, None), "{}", d.id);
+                assert!(matches!(d.compile, Compile::Cut(_)) && d.param("strength").is_none(), "{}: a transition has a length, not a strength", d.id);
+                assert!(d.params.iter().all(|p| matches!(p.kind, ParamKind::Number { .. } | ParamKind::Choice { .. })), "{}: no point or moment on a cut", d.id);
+            } else {
+                assert_eq!(d.target, Target::Clip, "{}", d.id);
+                assert!(matches!(d.compile, Compile::Clip(_)) && d.param("strength").is_some(), "{} has a strength", d.id);
+            }
         }
         for d in &registry()[..5] {
             assert_eq!((d.category, d.cost, d.variants), (Category::Motion, CostClass::Cheap, None), "{}", d.id);
         }
-        let (look, vignette) = (recipe("look").unwrap(), recipe("vignette").unwrap());
+        let (look, vignette, leak) = (recipe("look").unwrap(), recipe("vignette").unwrap(), recipe("light_leak").unwrap());
         assert_eq!((look.category, look.cost, look.variants), (Category::Look, CostClass::Medium, Some("preset")));
         assert_eq!((vignette.category, vignette.cost, vignette.variants), (Category::Light, CostClass::Cheap, None));
+        assert_eq!((leak.category, leak.cost, leak.variants), (Category::Light, CostClass::Medium, None), "one card: its variant is a plain choice");
         let keys = |id: &str| recipe(id).unwrap().params.iter().map(|p| p.key).collect::<Vec<_>>();
         assert_eq!(keys("smooth_zoom"), ["direction", "strength", "point"], "spec §5 order");
         assert_eq!(keys("punch_in"), ["strength", "moment", "point"]);
@@ -278,10 +364,19 @@ mod tests {
         assert_eq!(keys("handheld"), ["strength"]);
         assert_eq!(keys("look"), ["preset", "strength"]);
         assert_eq!(keys("vignette"), ["strength", "softness"]);
+        assert_eq!(keys("light_leak"), ["strength", "color", "variant"]);
+        assert_eq!(keys("clean_fade"), ["style"]);
+        assert_eq!(keys("fade_through_color"), ["color"]);
+        assert_eq!(keys("smooth_push"), ["direction"]);
+        assert_eq!(keys("light_sweep"), ["direction", "color"]);
+        assert_eq!(keys("wipe"), ["direction", "softness"]);
         let c = Clip::new(AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
         let e = fresh(look, &c, Time::ZERO);
         assert_eq!((e.params["preset"].clone(), e.params["strength"].clone()), (ParamValue::Choice("cinematic".into()), ParamValue::Number(0.6)));
         assert_eq!(fresh(vignette, &c, Time::ZERO).params["softness"], ParamValue::Number(0.5));
+        assert_eq!(fresh(leak, &c, Time::ZERO).params["variant"], ParamValue::Choice("1".into()));
+        assert!(recipe("wipe").unwrap().compile_cut(&Params::resolve(&[], &BTreeMap::new(), |_| None), &TransitionCtx { progress: 0.0, canvas: SizeU::new(2, 2), output: SizeU::new(2, 2), seed: 0 }).is_some());
+        assert!(look.compile_cut(&Params::resolve(&[], &BTreeMap::new(), |_| None), &TransitionCtx { progress: 0.0, canvas: SizeU::new(2, 2), output: SizeU::new(2, 2), seed: 0 }).is_none(), "a clip recipe has no cut frame");
     }
 
     /// Refinements 1–3: the Look's presets are its variants, named from one

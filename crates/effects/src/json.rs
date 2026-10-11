@@ -96,6 +96,25 @@ pub fn params_from_json_in(
     Ok(out)
 }
 
+/// Client parameters of a transition recipe — numbers and choice strings
+/// (a cut has no point or moment) — each checked like a command would.
+pub fn cut_params_from_json(def: &RecipeDef, json: &Map<String, Value>) -> Result<BTreeMap<String, ParamValue>, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in json {
+        let d = def
+            .param(k)
+            .ok_or_else(|| format!("{} has no parameter {k:?} (it has {})", def.id, def.params.iter().map(|d| d.key).collect::<Vec<_>>().join(", ")))?;
+        let value = match d.kind {
+            ParamKind::Number { .. } => ParamValue::Number(v.as_f64().ok_or_else(|| format!("{k} must be a number"))?),
+            ParamKind::Choice { .. } => ParamValue::Choice(v.as_str().ok_or_else(|| format!("{k} must be a string"))?.to_string()),
+            ParamKind::Point | ParamKind::Moment => return Err(format!("{k} is not a parameter a transition takes")),
+        };
+        d.check(&value)?;
+        out.insert(k.clone(), value);
+    }
+    Ok(out)
+}
+
 /// `{at_ms}` (timeline, inside the clip), `{source_ms}`, or what
 /// [`value_json`] writes, `{at_ms, source_ms, visible}`: then both must
 /// name the same frame (`source_ms`, the exact one, is taken; an `at_ms`
@@ -170,7 +189,7 @@ mod tests {
     #[test]
     fn the_registry_describes_types_ranges_options_and_defaults() {
         let all: Vec<Value> = registry().iter().map(recipe_json).collect();
-        assert_eq!(all.len(), 7, "E2: five motion recipes, the Look, the Vignette");
+        assert_eq!(all.len(), 13, "E3: five motion recipes, the Look, two lights, five transitions");
         let look = all.iter().find(|r| r["id"] == "look").unwrap();
         assert_eq!((look["category"].as_str(), look["target"].as_str()), (Some("look"), Some("clip")));
         assert_eq!(look["params"][0], json!({"key": "preset", "type": "choice", "options": crate::look::preset_keys(), "default": "cinematic"}));
@@ -179,6 +198,20 @@ mod tests {
         assert_eq!(zoom["params"][0], json!({"key": "direction", "type": "choice", "options": ["in", "out"], "default": "in"}));
         assert_eq!(zoom["params"][1], json!({"key": "strength", "type": "number", "min": 0.0, "max": 1.0, "default": 0.6, "animatable": true}));
         assert_eq!(zoom["params"][2]["type"], "point");
+    }
+
+    #[test]
+    fn transition_recipes_go_on_cuts_and_take_numbers_and_choices() {
+        let all: Vec<Value> = registry().iter().map(recipe_json).collect();
+        let wipe = all.iter().find(|r| r["id"] == "wipe").unwrap();
+        assert_eq!((wipe["category"].as_str(), wipe["target"].as_str()), (Some("transition"), Some("cut")));
+        let def = recipe("wipe").unwrap();
+        let p = cut_params_from_json(def, &obj(json!({"direction": "up", "softness": 0.5}))).unwrap();
+        assert_eq!((p["direction"].clone(), p["softness"].clone()), (ParamValue::Choice("up".into()), ParamValue::Number(0.5)));
+        let err = |j: Value| cut_params_from_json(def, &obj(j)).unwrap_err();
+        assert!(err(json!({"direction": "sideways"})).contains("one of left, right, up, down"));
+        assert!(err(json!({"softness": 2})).contains("softness must be 0..1"));
+        assert!(err(json!({"strength": 0.5})).contains("wipe has no parameter \"strength\""));
     }
 
     #[test]
