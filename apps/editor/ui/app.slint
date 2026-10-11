@@ -77,6 +77,12 @@ export component AppWindow inherits Window {
     in property <bool> preview-offline;
     in property <bool> dev-overlay;
     in property <[DevRow]> dev-rows;
+    // Picking an effect's point on the preview (effects spec §6.2) and the
+    // focused effect's point marker, in canvas fractions.
+    in property <bool> fx-picking;
+    in property <bool> fx-point-shown;
+    in property <float> fx-point-x;
+    in property <float> fx-point-y;
     in property <[AngleView]> angles;
     in property <int> active-angle;
     callback angle-clicked(int);
@@ -210,6 +216,7 @@ export component AppWindow inherits Window {
     callback set-quality(int);
     callback set-zoom(int);
     callback scrub(float);
+    callback preview-point(float, float);
     callback tl-pointer(int, length, length, int, bool, bool, bool);
     callback tl-scroll(length, length, bool, bool);
     callback tl-ruler(int, length);
@@ -480,6 +487,11 @@ export component AppWindow inherits Window {
                     set-quality(q) => { root.set-quality(q); }
                     set-zoom(z) => { root.set-zoom(z); }
                     scrub(f) => { root.scrub(f); }
+                    picking: root.fx-picking;
+                    point-shown: root.fx-point-shown;
+                    point-x: root.fx-point-x;
+                    point-y: root.fx-point-y;
+                    point-picked(x, y) => { root.preview-point(x, y); root.focus-editor(); }
                 }
                 Splitter {
                     property <length> start;

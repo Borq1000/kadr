@@ -41,6 +41,14 @@ export component Preview inherits Rectangle {
     in property <[AngleView]> angles;
     in property <int> active-angle;
     callback angle-clicked(int);
+    // Effect point picking (effects spec §6.2): a crosshair over the frame,
+    // a click reports its canvas fraction; the marker shows the focused
+    // effect's point (canvas fractions too).
+    in property <bool> picking;
+    in property <bool> point-shown;
+    in property <float> point-x;
+    in property <float> point-y;
+    callback point-picked(float, float);
     callback transport(string);
     callback set-quality(int);
     callback set-zoom(int);
@@ -111,6 +119,25 @@ export component Preview inherits Rectangle {
                     Rectangle { width: 16px; height: 1px; background: #ffffff50; }
                     Rectangle { width: 1px; height: 16px; background: #ffffff50; }
                 }
+                // This rectangle is the canvas (the sequence's aspect, any
+                // size or zoom): its fractions are the canvas fractions.
+                if root.point-shown: Rectangle {
+                    x: parent.width * root.point-x - self.width / 2;
+                    y: parent.height * root.point-y - self.height / 2;
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                    background: #7c8cff55;
+                    drop-shadow-blur: 4px;
+                    drop-shadow-color: #000000a0;
+                    Rectangle { width: 4px; height: 4px; border-radius: 2px; background: #ffffff; }
+                }
+                if root.picking: TouchArea {
+                    mouse-cursor: crosshair;
+                    clicked => { root.point-picked(self.mouse-x / self.width, self.mouse-y / self.height); }
+                }
             }
             if root.clip-name != "" && root.empty-kind == 0: Rectangle {
                 x: 10px; y: 10px;
@@ -135,6 +162,24 @@ export component Preview inherits Rectangle {
                     spacing: 5px;
                     VerticalLayout { alignment: center; Icon { icon: Icons.close; width: 11px; height: 11px; color: Theme.danger; } }
                     Text { text: Tr.t("preview.empty.offline"); font-size: Theme.font-xs; color: #ffffffd8; vertical-alignment: center; overflow: elide; }
+                }
+            }
+            // Pick mode says what to do and how to leave it.
+            if root.picking: Rectangle {
+                width: min(pb.preferred-width, parent.width - 20px);
+                height: 24px;
+                x: (parent.width - self.width) / 2;
+                y: parent.height - self.height - 10px;
+                border-radius: 4px;
+                background: #000000c0;
+                border-width: 1px;
+                border-color: Theme.accent;
+                pb := HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 6px;
+                    VerticalLayout { alignment: center; Icon { icon: Icons.crosshair; width: 12px; height: 12px; color: Theme.accent; } }
+                    Text { text: Tr.t("fx.pick.hint"); font-size: Theme.font-xs; color: #ffffffe0; vertical-alignment: center; overflow: elide; }
                 }
             }
             if root.loading: Rectangle {

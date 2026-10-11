@@ -149,7 +149,8 @@ impl App {
             // No drag is cancelled by Esc in V1 (spec §6.2): during a timeline
             // drag Esc does nothing — the drag ends on release as usual and
             // the selection stays. Otherwise Esc closes the topmost overlay
-            // first, then clears the selection.
+            // first, then ends picking an effect point (effects spec §6.2;
+            // the selection stays), then clears the selection.
             if self.tl.drag.is_some() {
                 return true;
             }
@@ -176,6 +177,10 @@ impl App {
             }
             if ui.get_welcome_open() {
                 ui.set_welcome_open(false);
+                return true;
+            }
+            if self.fx.picking.is_some() {
+                self.fx_cancel_pick();
                 return true;
             }
             if self.fullscreen {

@@ -13,6 +13,7 @@ use kadr_core::{ClipId, EffectId, FrameRate, Time, Timecode};
 use kadr_effects::{Category, ParamDef, ParamKind, RecipeDef};
 use kadr_i18n::{t, t_in, tf, Lang};
 use kadr_project::{AppliedEffect, Clip, ParamValue, Sequence, SourceTime, TrackKey};
+use kadr_scene::{Layer, LayerContent, LayerId, SizeU};
 use kadr_timeline::EditCommand;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::collections::{BTreeMap, HashMap};
@@ -37,6 +38,11 @@ pub struct FxUi {
     pub drag: Option<FxDrag>,
     /// The cards' pictures (spec §6.1): cache, the batch in flight, the hover loop.
     pub thumbs: crate::fx_thumbs::Thumbs,
+    /// The effect point being picked on the preview.
+    pub picking: Option<Pick>,
+    /// The effect last used in the inspector: its point shows on the preview
+    /// (refinement 10).
+    pub focus: Option<EffectId>,
 }
 
 pub struct FxDrag {
@@ -270,6 +276,55 @@ pub fn can_reset(c: &Clip, e: &AppliedEffect, at: Time) -> bool {
     kadr_effects::definition(e).and_then(|d| reset_commands(c, e, d, at)).is_some()
 }
 
+/// The effect point being picked on the preview (spec §6.2 «Точка»).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub clip: ClipId,
+    pub effect: EffectId,
+    pub key: String,
+}
+
+/// The layer of `clip` in a scene's layers, also inside a transition.
+pub fn layer_of(layers: &[Layer], clip: ClipId) -> Option<&Layer> {
+    let id = LayerId::from(clip);
+    layers.iter().find_map(|l| match &l.content {
+        LayerContent::Transition(t) => layer_of(&t.from, clip).or_else(|| layer_of(&t.to, clip)),
+        _ => (l.id == id).then_some(l),
+    })
+}
+
+/// The point of `layer`'s picture under a click at canvas fraction (`fx`,
+/// `fy`) — through the placement as shown (zoomed, panned, turned) — as
+/// fractions of the picture (the content rectangle before crop,
+/// refinement 6); `None` off its visible part (review focus 4).
+pub fn pick_point(layer: &Layer, canvas: SizeU, fx: f64, fy: f64) -> Option<(f64, f64)> {
+    let inv = layer.placement.to_canvas().inverse()?;
+    let (x, y) = inv.apply(fx * canvas.w as f64, fy * canvas.h as f64);
+    let c = layer.crop;
+    let inside = x >= c.x0 as f64 && x <= c.x1 as f64 && y >= c.y0 as f64 && y <= c.y1 as f64;
+    let (w, h) = (layer.placement.size.x as f64, layer.placement.size.y as f64);
+    (inside && w > 0.0 && h > 0.0).then(|| ((x / w).clamp(0.0, 1.0), (y / h).clamp(0.0, 1.0)))
+}
+
+/// Where the point `(px, py)` of `layer`'s picture shows, as canvas fractions.
+pub fn point_on_canvas(layer: &Layer, canvas: SizeU, (px, py): (f64, f64)) -> (f64, f64) {
+    let (x, y) = layer.placement.to_canvas().apply(px * layer.placement.size.x as f64, py * layer.placement.size.y as f64);
+    (x / canvas.w.max(1) as f64, y / canvas.h.max(1) as f64)
+}
+
+/// Where the preview marks an effect's point (ruling R15): the point a zoom
+/// really holds still — `point` clamped into the clip's visible crop window
+/// as motion recipes do (ruling R6, `CompileCtx::window`; the layer's crop
+/// is that window in local pixels) — on the canvas as shown.
+pub fn marker_on_canvas(layer: &Layer, canvas: SizeU, (px, py): (f64, f64)) -> (f64, f64) {
+    let (w, h) = (layer.placement.size.x as f64, layer.placement.size.y as f64);
+    let c = layer.crop;
+    let (x0, y0, x1, y1) = (c.x0 as f64 / w, c.y0 as f64 / h, c.x1 as f64 / w, c.y1 as f64 / h);
+    // NaN fails both comparisons: no usable window, no clamp.
+    let point = if x0 < x1 && y0 < y1 { (px.clamp(x0, x1), py.clamp(y0, y1)) } else { (px, py) };
+    point_on_canvas(layer, canvas, point)
+}
+
 /// A row's nested list in the model on screen (an empty one stays as it is).
 fn same_list(old: ModelRc<SharedString>, new: ModelRc<SharedString>) -> ModelRc<SharedString> {
     if old.row_count() == 0 && new.row_count() == 0 {
@@ -295,9 +350,11 @@ fn reuse_param_rows(old: Option<ModelRc<FxParamRow>>, mut rows: Vec<FxParamRow>)
 
 impl App {
     /// The left panel switched tabs (0 media, 1 effects). Hidden, the tab
-    /// renders no thumbnails: the batch in flight stops.
+    /// renders no thumbnails: the batch in flight stops. The user moved on:
+    /// a point being picked is not any more.
     pub fn fx_tab_changed(&mut self, tab: i32) {
         self.fx_clear_hover();
+        self.fx_cancel_pick();
         if tab == 1 {
             self.refresh_effects();
         } else {
@@ -324,6 +381,8 @@ impl App {
         self.fx.preview = None;
         self.fx.drag = None;
         self.fx.thumbs.clear();
+        self.fx.picking = None;
+        self.fx.focus = None;
     }
 
     /// Chips, cards and the hint of the tab — only while it shows. Rows keep
@@ -599,7 +658,8 @@ impl App {
             .enumerate()
             .map(|(i, e)| {
                 let def = kadr_effects::definition(e);
-                let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, self.playhead, rate, false)).collect());
+                let picking = |key: &str| self.fx.picking.as_ref().is_some_and(|pk| pk.clip == c.id && pk.effect == e.id && pk.key == key);
+                let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, self.playhead, rate, picking(p.key))).collect());
                 let id: SharedString = e.id.to_string().into();
                 let params = reuse_param_rows(old_params.get(&id).cloned(), params);
                 FxRow { id, name: fx_name(e).into(), enabled: e.enabled, known: def.is_some(), resettable: can_reset(c, e, self.playhead), first: i == 0, last: i + 1 == c.effects.len(), params }
@@ -612,11 +672,19 @@ impl App {
     /// entry, nothing sent when nothing would change.
     pub fn fx_action(&mut self, effect: &str, action: &str) {
         let (Some(id), Some(eid)) = (self.inspected(), EffectId::parse(effect)) else { return };
+        self.fx.focus = Some(eid);
+        if let Some(key) = action.strip_prefix("pick:") {
+            return self.fx_toggle_pick(Pick { clip: id, effect: eid, key: key.to_string() });
+        }
         let seq = self.project.sequence();
         let Some(c) = seq.clip(id) else { return };
-        if let Some((label, commands)) = action_commands(c, eid, action, self.playhead, seq.frame_rate) {
-            self.execute(EditCommand::Batch { label, commands });
+        if let Some((label, commands)) = action_commands(c, eid, action, self.playhead, seq.frame_rate)
+            && self.execute(EditCommand::Batch { label, commands })
+        {
+            return; // the refresh after the edit moved the marker
         }
+        // Nothing sent: the focus moved all the same, the marker follows it.
+        self.fx_update_marker();
     }
 
     /// «Сбросить» of the section: every effect of the clip, after asking (spec §6.2).
@@ -630,6 +698,104 @@ impl App {
     pub fn fx_clear_now(&mut self, id: ClipId) {
         if let Some(cmd) = self.project.sequence().clip(id).and_then(clear_batch) {
             self.execute(cmd);
+        }
+    }
+
+    /// An inspector control of `prop` was used: an effect's number puts that
+    /// effect in focus (its point shows on the preview, refinement 10).
+    /// `true` when the focus moved.
+    pub fn fx_focus_prop(&mut self, prop: &str) -> bool {
+        let Some(TrackKey::Fx(f)) = anim_ui::track_of(prop) else { return false };
+        let moved = self.fx.focus != Some(f.effect);
+        self.fx.focus = Some(f.effect);
+        moved
+    }
+
+    /// «Выбрать на превью»: pick mode for the effect's point (crosshair over
+    /// the preview, Esc cancels), or its end when it is on already. Only a
+    /// point of a known recipe is picked.
+    fn fx_toggle_pick(&mut self, pick: Pick) {
+        if self.fx.picking.as_ref().is_some_and(|p| *p == pick) {
+            return self.fx_cancel_pick();
+        }
+        let is_point = self.project.sequence().clip(pick.clip).and_then(|c| c.effect(pick.effect)).and_then(kadr_effects::definition).and_then(|d| d.param(&pick.key)).is_some_and(|p| p.kind == ParamKind::Point);
+        if !is_point {
+            return;
+        }
+        self.fx.picking = Some(pick);
+        // The inspector shows the row active and sets `fx-picking`; it ends with the marker.
+        self.refresh_inspector();
+    }
+
+    /// Pick mode ends without a pick (Esc, the button again, another tab).
+    pub fn fx_cancel_pick(&mut self) {
+        if self.fx.picking.take().is_some() {
+            self.refresh_inspector();
+        }
+    }
+
+    /// The clip's layer in the frame the preview shows — the preview's own
+    /// snapshot, so «До» and the hover preview count — with the canvas size.
+    fn fx_shown_layer(&mut self, clip: ClipId) -> Option<(Layer, SizeU)> {
+        let scenes = self.preview_scenes();
+        let seq = self.project.sequence();
+        let t = self.playhead.min((seq.duration() - seq.frame_rate.frame_duration()).max(Time::ZERO));
+        let scene = kadr_playback::SceneSource::scene_at(&*scenes, t, &self.preview.output(&self.project));
+        layer_of(&scene.layers, clip).cloned().map(|l| (l, scene.canvas))
+    }
+
+    /// A click on the preview in pick mode, at canvas fraction (`fx`, `fy`):
+    /// the point of the picture under it becomes the effect's point (one
+    /// undo entry, none when it is the point already). Off the clip's
+    /// visible picture pick mode stays and says why (review focus 4).
+    pub fn fx_point_picked(&mut self, fx: f32, fy: f32) {
+        let Some(pick) = self.fx.picking.clone() else { return };
+        let Some((layer, canvas)) = self.fx_shown_layer(pick.clip) else {
+            return self.toast_warn(t("fx.pick.off_clip"));
+        };
+        let Some((x, y)) = pick_point(&layer, canvas, fx as f64, fy as f64) else {
+            return self.toast_warn(t("fx.pick.miss"));
+        };
+        self.fx_cancel_pick();
+        let round = |v: f64| (v * 10_000.0).round() / 10_000.0;
+        let v = ParamValue::Point { x: round(x), y: round(y) };
+        let Some(e) = self.project.sequence().clip(pick.clip).and_then(|c| c.effect(pick.effect)) else { return };
+        if e.params.get(&pick.key) == Some(&v) {
+            return; // the point already: no undo entry
+        }
+        let label = tf("cmd.update_effect_named", &[("name", &fx_name(e))]);
+        let set = EditCommand::UpdateEffect { clip: pick.clip, id: pick.effect, params: BTreeMap::from([(pick.key.clone(), v)]), enabled: None };
+        self.execute(EditCommand::Batch { label, commands: vec![set] });
+    }
+
+    /// The inspected clip's picked (or else focused) effect with a point, and
+    /// that point as its recipe sees it (`Params`: clamped into 0..1, the
+    /// centre when missing or broken).
+    fn fx_marker_target(&self) -> Option<(ClipId, (f64, f64))> {
+        let id = self.inspected()?;
+        let picking = self.fx.picking.as_ref().filter(|p| p.clip == id);
+        let effect = picking.map(|p| p.effect).or(self.fx.focus)?;
+        let e = self.project.sequence().clip(id)?.effect(effect)?;
+        let def = kadr_effects::definition(e)?;
+        let key = match picking {
+            Some(p) => def.param(&p.key).filter(|d| d.kind == ParamKind::Point)?.key,
+            None => def.params.iter().find(|p| p.kind == ParamKind::Point)?.key,
+        };
+        Some((id, kadr_effects::Params::resolve(def.params, &e.params, |_| None).point(key)))
+    }
+
+    /// The point marker on the preview (spec §6.2, ruling R15): where the
+    /// focused effect's zoom holds still in the frame shown — while paused.
+    pub fn fx_update_marker(&mut self) {
+        let shown = match self.fx_marker_target() {
+            Some((clip, point)) if !self.playing => self.fx_shown_layer(clip).map(|(l, canvas)| marker_on_canvas(&l, canvas, point)),
+            _ => None,
+        };
+        let ui = self.ui();
+        ui.set_fx_point_shown(shown.is_some());
+        if let Some((x, y)) = shown {
+            ui.set_fx_point_x(x as f32);
+            ui.set_fx_point_y(y as f32);
         }
     }
 }
@@ -693,7 +859,8 @@ mod tests {
     use kadr_core::{AssetId, FrameRate, MediaInfo, MediaKind, TimeRange, VideoInfo};
     use kadr_playback::SceneSource;
     use kadr_project::{Clip, MediaAsset, ParamValue, Project, SourceTime, Track, TrackKey, TrackKind};
-    use kadr_scene::{OutputSpec, RenderQuality, SizeU};
+    use kadr_effects::PlacementDelta;
+    use kadr_scene::{BlendMode, Layer, LayerContent, LayerId, OutputSpec, Placement, RectF, RenderQuality, Rgba, SizeU, TransitionLayer, TransitionOp, Vec2};
 
     /// V2 (locked) above V1, and A1: V1 0..10 s, V2 2..4 s, A1 0..10 s.
     fn seq() -> (Sequence, [ClipId; 3]) {
@@ -1046,6 +1213,91 @@ mod tests {
         let off = reuse_param_rows(Some(first.clone()), rows(25));
         assert!(off == first, "a changed row is updated in place");
         assert!(!off.row_data(1).unwrap().k.enabled);
+    }
+
+    fn layer_with(placement: Placement, crop: Option<RectF>) -> Layer {
+        Layer { id: LayerId(1), content: LayerContent::Solid(Rgba::BLACK), crop: crop.unwrap_or(placement.full_crop()), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] }
+    }
+
+    #[test]
+    fn a_click_picks_the_point_of_the_picture_as_shown() {
+        let canvas = SizeU::new(1920, 1080);
+        let base = Placement::fill(canvas);
+        assert_eq!(pick_point(&layer_with(base, None), canvas, 0.25, 0.75), Some((0.25, 0.75)));
+        // Zoomed ×2 about the centre: a click a quarter across shows the picture's 3/8.
+        let zoomed = PlacementDelta { scale: 2.0, ..PlacementDelta::IDENTITY }.apply(&base);
+        let (x, y) = pick_point(&layer_with(zoomed, None), canvas, 0.25, 0.5).unwrap();
+        assert!((x - 0.375).abs() < 1e-6 && (y - 0.5).abs() < 1e-6, "{x} {y}");
+        let back = point_on_canvas(&layer_with(zoomed, None), canvas, (0.375, 0.5));
+        assert!((back.0 - 0.25).abs() < 1e-6 && (back.1 - 0.5).abs() < 1e-6, "the marker lands where the click was");
+    }
+
+    /// Review focus 4: outside the clip's visible picture nothing is picked.
+    #[test]
+    fn a_click_off_the_picture_picks_nothing() {
+        let canvas = SizeU::new(1920, 1080);
+        // A vertical video pillarboxed in a 16:9 frame: 607.5 px wide in the middle.
+        let p = Placement { size: Vec2::new(607.5, 1080.0), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(960.0, 540.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+        assert!(pick_point(&layer_with(p, None), canvas, 0.1, 0.5).is_none(), "the black bar");
+        assert!(pick_point(&layer_with(p, None), canvas, 0.5, 0.5).is_some());
+        let left_cropped = RectF::new(303.75, 0.0, 607.5, 1080.0);
+        assert!(pick_point(&layer_with(p, Some(left_cropped)), canvas, 0.45, 0.5).is_none(), "a cropped-away part");
+        assert!(pick_point(&layer_with(p, Some(left_cropped)), canvas, 0.55, 0.5).is_some());
+    }
+
+    #[test]
+    fn the_layer_of_a_clip_is_found_inside_a_transition_too() {
+        let clip = ClipId::new();
+        let mut inner = layer_with(Placement::fill(SizeU::new(100, 100)), None);
+        inner.id = LayerId::from(clip);
+        let tr = Layer {
+            id: LayerId(9),
+            content: LayerContent::Transition(Box::new(TransitionLayer { op: TransitionOp::Dissolve, progress: 0.5, from: vec![], to: vec![inner.clone()] })),
+            ..layer_with(Placement::fill(SizeU::new(100, 100)), None)
+        };
+        assert_eq!(layer_of(std::slice::from_ref(&tr), clip), Some(&inner));
+        assert_eq!(layer_of(&[], clip), None);
+    }
+
+    /// Ruling R15: the marker shows the effective anchor — the stored point
+    /// clamped into the clip's visible crop window (ruling R6) — where the
+    /// zoom really holds still, not a cropped-away spot.
+    #[test]
+    fn the_marker_shows_the_point_clamped_into_the_crop_window() {
+        let canvas = SizeU::new(1920, 1080);
+        let base = Placement::fill(canvas);
+        let left_quarter_cropped = RectF::new(480.0, 0.0, 1920.0, 1080.0);
+        let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6;
+        let m = marker_on_canvas(&layer_with(base, Some(left_quarter_cropped)), canvas, (0.1, 0.5));
+        assert!(close(m, (0.25, 0.5)), "cropped away: drawn at the window's edge, {m:?}");
+        let m = marker_on_canvas(&layer_with(base, Some(left_quarter_cropped)), canvas, (0.6, 0.3));
+        assert!(close(m, (0.6, 0.3)), "inside the window: the point itself, {m:?}");
+        let m = marker_on_canvas(&layer_with(base, None), canvas, (0.1, 0.5));
+        assert!(close(m, (0.1, 0.5)), "no crop: the point itself, {m:?}");
+
+        // The real thing: Smooth Zoom about (0.1, 0.5) of a clip whose left
+        // quarter is cropped away. The marker stays on one spot of the
+        // screen while the picture grows around it; the stored point drifts.
+        let (mut p, id) = project_with_clip();
+        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let (ti, ci) = p.sequence().locate_clip(id).unwrap();
+        let c = &mut p.sequence_mut().tracks[ti].clips[ci];
+        c.transform.crop_left = 0.25;
+        let mut e = kadr_effects::fresh(def, c, Time::ZERO);
+        e.params.insert("point".into(), ParamValue::Point { x: 0.1, y: 0.5 });
+        c.effects.push(e);
+        let out = OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewFast);
+        let scenes = crate::scene_source::ProjectScenes::new(&p, false);
+        let at = |secs: i64| {
+            let scene = scenes.scene_at(Time::from_secs(secs), &out);
+            (layer_of(&scene.layers, id).unwrap().clone(), scene.canvas)
+        };
+        let ((start, canvas), (later, _)) = (at(0), at(6));
+        assert!(later.placement.scale.x > 1.05, "zoomed in by 6 s");
+        let (m0, m6) = (marker_on_canvas(&start, canvas, (0.1, 0.5)), marker_on_canvas(&later, canvas, (0.1, 0.5)));
+        assert!(close(m0, (0.25, 0.5)) && close(m0, m6), "the marker is where the zoom holds still: {m0:?} {m6:?}");
+        let raw = point_on_canvas(&later, canvas, (0.1, 0.5));
+        assert!((raw.0 - 0.1).abs() > 0.005, "the cropped-away point itself moves: {raw:?}");
     }
 
     #[test]

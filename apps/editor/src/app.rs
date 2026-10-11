@@ -419,6 +419,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_set_quality, |q| |app: &mut App| app.set_quality(q));
     cb!(ui.on_set_zoom, |z| |app: &mut App| app.set_preview_zoom(z));
     cb!(ui.on_scrub, |f| |app: &mut App| app.scrub(f));
+    cb!(ui.on_preview_point, |x, y| |app: &mut App| app.fx_point_picked(x, y));
 
     cb!(ui.on_tl_pointer, |k, x, y, b, s, c, a| |app: &mut App| app.tl_pointer(k, x, y, b, s, c, a));
     cb!(ui.on_tl_scroll, |dx, dy, c, s| |app: &mut App| app.tl_scroll(dx, dy, c, s));

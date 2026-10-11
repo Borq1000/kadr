@@ -797,5 +797,6 @@
   "dlg.clear_effects.title": "Remove all effects of the clip?",
   "dlg.clear_effects.body.one": "{n} effect will be removed. You can undo it.",
   "dlg.clear_effects.body.other": "{n} effects will be removed. You can undo it.",
-  "dlg.clear_effects.ok": "Remove"
+  "dlg.clear_effects.ok": "Remove",
+  "fx.pick.miss": "Click inside the clip's picture"
 }

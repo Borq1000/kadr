@@ -159,6 +159,16 @@ impl App {
 
     pub fn refresh_inspector(&mut self) {
         let ui = self.ui();
+        // A pick whose clip is no longer inspected, or whose effect is gone,
+        // ends (a selection change, undo, a deleted clip); the preview's
+        // crosshair follows the state here, also after a project change.
+        let stale_pick = self.fx.picking.as_ref().is_some_and(|p| {
+            self.inspected() != Some(p.clip) || self.project.sequence().clip(p.clip).and_then(|c| c.effect(p.effect)).is_none()
+        });
+        if stale_pick {
+            self.fx.picking = None;
+        }
+        ui.set_fx_picking(self.fx.picking.is_some());
         let seq = self.project.sequence();
         let fr = seq.frame_rate;
         let multi = if self.inspected().is_some() { 0 } else { self.tl.selection.len() as i32 };
@@ -257,10 +267,13 @@ impl App {
         // A selection change, an edit, undo/redo and a language change all
         // pass here: the effect cards follow (fit, hints, the hover preview).
         self.refresh_effects();
+        // And the focused effect's point on the preview (spec §6.2).
+        self.fx_update_marker();
     }
 
     pub fn inspector_live(&mut self, prop: &str, v: f32) {
         let Some(id) = self.inspected() else { return };
+        self.fx_focus_prop(prop);
         if prop == "speed" {
             return; // changes duration: applied on commit only
         }
@@ -309,6 +322,7 @@ impl App {
             }
             return;
         };
+        self.fx_focus_prop(prop);
         let seq = self.project.sequence();
         let frame = seq.frame_rate.frame_duration();
         let cur = &seq.tracks[ti].clips[ci];
@@ -393,6 +407,9 @@ impl App {
     /// most one undo entry; nothing is sent when nothing would change.
     pub fn inspector_key(&mut self, prop: &str, action: &str) {
         let (Some(id), Some(p)) = (self.inspected(), anim_ui::track_of(prop)) else { return };
+        if self.fx_focus_prop(prop) {
+            self.fx_update_marker(); // ◀ ▶ and an action that sends nothing refresh nothing
+        }
         let seq = self.project.sequence();
         let Some(c) = seq.clip(id) else { return };
         let frame = seq.frame_rate.frame_duration();

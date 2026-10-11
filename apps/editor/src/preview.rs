@@ -153,6 +153,8 @@ impl App {
         if let Some(cpu) = &self.preview.cpu {
             cpu.player().show(t);
         }
+        // The focused effect's point in this frame (its zoom, crop, the playhead).
+        self.fx_update_marker();
     }
 
     /// The snapshot the preview shows (taken now if the project changed),
@@ -267,6 +269,8 @@ impl App {
         // dialog pumping events), it retries instead of never starting the audio.
         slint::Timer::single_shot(PREROLL_FALLBACK, move || post(move |app| app.start_pending_audio(generation)));
         self.playing = true;
+        // The point marker shows on a still frame only.
+        self.fx_update_marker();
         let ui = self.ui();
         ui.set_playing(true);
         ui.set_preview_empty(0);
