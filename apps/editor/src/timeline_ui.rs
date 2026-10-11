@@ -472,11 +472,12 @@ impl App {
         }
     }
 
-    /// A diamond-drag step: the moment's keyframes (every property) go live
-    /// to the target frame, computed from the recorded clip; history is
-    /// untouched. A target taken by another keyframe of one of those
-    /// properties keeps the last preview and says so; the release then gets
-    /// the engine's refusal (no partial move).
+    /// A diamond-drag step: the moment's editable keyframes (every property
+    /// and effect number this build can change, ruling R8) go live to the
+    /// target frame, computed from the recorded clip; history is untouched.
+    /// A target taken by another keyframe of one of those tracks keeps the
+    /// last preview and says so; the release then gets the engine's refusal
+    /// (no partial move). Read-only keyframes stay (and still show).
     fn drag_keys(&mut self, mut d: KeyDrag, x: f64, y: f64) {
         if !d.started && (x - d.start_x).abs() <= DRAG_THRESHOLD {
             self.tl.drag = Some(Drag::Keys(d));
@@ -495,9 +496,10 @@ impl App {
         let live = self.live_edit.recorded(d.clip);
         let armed = live.is_some();
         let rec = live.unwrap_or(&seq.tracks[ti].clips[ci]);
-        let params = rec.animation.keys_at(d.at);
+        let params = kadr_timeline::editable_keys_at(rec, d.at);
         if params.is_empty() {
-            self.ui().set_tl_tip_text("".into()); // the moment is gone: the drag ends
+            // The moment is gone, or holds read-only keyframes only: the drag ends.
+            self.ui().set_tl_tip_text("".into());
             return;
         }
         let from = rec.timeline_time_of(d.at.0);
@@ -537,7 +539,8 @@ impl App {
 
     /// The release of a diamond press: a click selects the clip and puts
     /// the playhead on the moment; a drag rolls its preview back and records
-    /// one `MoveKeyframes` — none when the keyframes end where they started.
+    /// one `MoveKeyframes` of the editable keyframes — none when they end
+    /// where they started.
     fn commit_keys(&mut self, d: KeyDrag) {
         self.ui().set_tl_tip_text("".into());
         let rolled_back = self.live_edit.roll_back(self.project.sequence_mut());
@@ -562,9 +565,7 @@ impl App {
         // (undo, AI) may have changed: still on frames inside its visible range.
         let cmd = d.to.and_then(|to| {
             let to = to.max(c.timeline_in).min((c.timeline_out - frame).max(c.timeline_in));
-            let new_at = SourceTime(c.source_time_at(to));
-            let moves: Vec<_> = c.animation.keys_at(d.at).into_iter().map(|p| (p, d.at, new_at)).collect();
-            (new_at != d.at && !moves.is_empty()).then_some(EditCommand::MoveKeyframes { clip: d.clip, moves })
+            anim_ui::move_moment(c, d.at, SourceTime(c.source_time_at(to)))
         });
         let recorded = cmd.is_some_and(|cmd| self.execute(cmd));
         if !recorded && rolled_back {
@@ -575,7 +576,8 @@ impl App {
     /// The keyframe menu (spec §6.2): `key-ease:<key>` sets the curve of the
     /// moment's keyframes that differ (R14), `key-delete` removes all of
     /// them — the picture at the playhead stays for a property losing its
-    /// last keyframe. One undo entry; nothing when nothing would change.
+    /// last keyframe. Only editable keyframes (ruling R8). One undo entry;
+    /// nothing when nothing would change.
     fn key_menu_action(&mut self, action: &str) {
         let Some((clip, at)) = self.tl.menu_key else { return };
         let seq = self.project.sequence();
@@ -591,15 +593,7 @@ impl App {
             }
             None => {
                 let shown = anim_ui::shown_time(c, self.playhead, seq.frame_rate.frame_duration());
-                let commands: Vec<EditCommand> = c
-                    .animation
-                    .keys_at(at)
-                    .into_iter()
-                    .map(|param| {
-                        let keep = c.track_value(&param, shown);
-                        EditCommand::RemoveKeyframe { clip, param, at, keep }
-                    })
-                    .collect();
+                let commands = anim_ui::delete_moment(c, at, shown);
                 (t(if commands.len() > 1 { "cmd.remove_keyframes" } else { "cmd.remove_keyframe" }), commands)
             }
         };

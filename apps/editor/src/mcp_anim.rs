@@ -256,7 +256,12 @@ pub fn anim_op(_project: &Project, seq: &Sequence, op: &Value) -> Option<Result<
                 if to == from {
                     return Err(bad("no change: the keyframes are already at that moment"));
                 }
-                let params: Vec<TrackKey> = p.map_or_else(|| c.animation.keys_at(from), |p| vec![p.into()]);
+                // Every track of the moment: the editable ones; a read-only
+                // track (a newer Kadr's effect) keeps its keyframe (ruling R8).
+                let params: Vec<TrackKey> = p.map_or_else(|| kadr_timeline::editable_keys_at(c, from), |p| vec![p.into()]);
+                if params.is_empty() {
+                    return Err(bad("the keyframes at this moment belong to an effect this version cannot edit"));
+                }
                 if let Some(q) = params.iter().find(|q| c.animation.track(*q).iter().any(|k| k.at == to)) {
                     return Err(bad(format!("{} already has a keyframe at {to_ms} ms; move or remove it first", q.key_string())));
                 }
@@ -598,5 +603,26 @@ mod tests {
         assert!(msg(&mut p, json!({"type": "remove_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000})).contains("no keyframe"));
         assert!(msg(&mut p, json!({"type": "set_video_fade", "clip_id": id})).contains("fade_in_ms"));
         assert!(msg(&mut p, json!({"type": "set_video_fade", "clip_id": id, "fade_in_ms": -5})).contains("negative"));
+    }
+
+    /// Ruling R8: moving every keyframe of a moment moves the editable ones
+    /// and leaves a newer Kadr's effect's keyframes where they are; a moment
+    /// of those alone is refused with the reason.
+    #[test]
+    fn move_keyframes_leaves_read_only_tracks_where_they_are() {
+        let (mut p, id) = project();
+        run(&mut p, json!({"type": "set_keyframe", "clip_id": id, "param": "x", "at_ms": 6_000, "value": 1.0})).unwrap();
+        let future = kadr_project::AppliedEffect::new("glitch_v2", 3, [("amount".to_string(), kadr_project::ParamValue::Number(0.5))].into());
+        let newer = TrackKey::fx(future.id, "amount");
+        let c = &mut p.sequence_mut().tracks[0].clips[0];
+        let at = c.animation.track(AnimParam::X)[0].at;
+        c.effects.push(future);
+        c.animation.set_key(&newer, at, 0.5, None);
+        run(&mut p, json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 8_000})).unwrap();
+        let c = &p.sequence().tracks[0].clips[0];
+        assert_ne!(c.animation.track(AnimParam::X)[0].at, at, "x moved");
+        assert_eq!(c.animation.track(&newer).iter().map(|k| k.at).collect::<Vec<_>>(), [at], "the newer effect's key stayed");
+        let e = run(&mut p, json!({"type": "move_keyframes", "clip_id": id, "from_ms": 6_000, "to_ms": 9_000})).unwrap_err().message;
+        assert!(e.contains("belong to an effect this version cannot edit"), "{e}");
     }
 }

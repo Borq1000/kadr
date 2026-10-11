@@ -2,6 +2,7 @@
 
 use kadr_core::{FrameRate, Time};
 use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, SourceTime, TrackKey};
+use kadr_timeline::{editable_keys_at, EditCommand};
 
 /// Inspector property names of the animatable rows (Temperature has no row).
 pub const PROPS: [(&str, AnimParam); 12] = [
@@ -316,20 +317,44 @@ pub fn key_drag_to(c: &Clip, from: Time, dt: Time, fr: FrameRate) -> Time {
     fr.snap(from + dt).max(c.timeline_in).min(last)
 }
 
-/// The UI name of the curve every track's keyframe at `at` shares;
-/// `""` when they differ or there is none (the menu marks nothing).
+/// The UI name of the curve every editable keyframe at `at` shares (the
+/// ones the menu changes, `editable_keys_at`); `""` when they differ or
+/// there is none (the menu marks nothing).
 pub fn moment_ease(c: &Clip, at: SourceTime) -> &'static str {
-    let mut keys = c.animation.keys_at(at).into_iter().filter_map(|p| c.animation.track(&p).iter().find(|k| k.at == at).map(|k| ease_key(&k.ease)));
+    let mut keys = editable_keys_at(c, at).into_iter().filter_map(|p| c.animation.track(&p).iter().find(|k| k.at == at).map(|k| ease_key(&k.ease)));
     match keys.next() {
         Some(first) if keys.all(|k| k == first) => first,
         _ => "",
     }
 }
 
-/// The tracks whose keyframe at `at` does not have curve `e` yet: the
-/// keyframe menu changes only those (none — no command at all).
+/// The editable tracks whose keyframe at `at` does not have curve `e` yet:
+/// the keyframe menu changes only those (none — no command at all). A
+/// read-only track keeps its curve (ruling R8).
 pub fn ease_targets(c: &Clip, at: SourceTime, e: &Ease) -> Vec<TrackKey> {
-    c.animation.keys_at(at).into_iter().filter(|p| c.animation.track(p).iter().any(|k| k.at == at && k.ease != *e)).collect()
+    editable_keys_at(c, at).into_iter().filter(|p| c.animation.track(p).iter().any(|k| k.at == at && k.ease != *e)).collect()
+}
+
+/// A diamond drag of the moment `at` to `to`: one `MoveKeyframes` of its
+/// editable keyframes; read-only ones stay where they are (ruling R8).
+/// `None` when nothing would move.
+pub fn move_moment(c: &Clip, at: SourceTime, to: SourceTime) -> Option<EditCommand> {
+    let moves: Vec<_> = editable_keys_at(c, at).into_iter().map(|p| (p, at, to)).collect();
+    (to != at && !moves.is_empty()).then_some(EditCommand::MoveKeyframes { clip: c.id, moves })
+}
+
+/// The keyframe menu's delete of the moment `at`: its editable keyframes
+/// (ruling R8); a track losing its last one keeps the value it has at
+/// timeline time `shown` (`shown_time`), so the picture stays. Empty when
+/// there is nothing to delete.
+pub fn delete_moment(c: &Clip, at: SourceTime, shown: Time) -> Vec<EditCommand> {
+    editable_keys_at(c, at)
+        .into_iter()
+        .map(|param| {
+            let keep = c.track_value(&param, shown);
+            EditCommand::RemoveKeyframe { clip: c.id, param, at, keep }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -694,5 +719,55 @@ mod tests {
         let other = SourceTime(Time::from_secs(6));
         c.animation.set_key(AnimParam::X, other, 1.0, Some(Ease::Unknown(Default::default())));
         assert_eq!(moment_ease(&c, other), "other");
+    }
+
+    /// Ruling R8: the diamond drag and the keyframe menu edit the moment's
+    /// editable keyframes only; a newer Kadr's effect and an orphan `fx:`
+    /// track keep theirs where they are (they still show on the diamond).
+    /// A moment of read-only keys alone gives no command at all.
+    #[test]
+    fn gestures_on_a_moment_leave_read_only_tracks_where_they_are() {
+        use kadr_project::{AppliedEffect, ParamValue, Project};
+        use kadr_timeline::{EditCommand, EditEngine};
+        let mut c = clip();
+        let (at, to) = (SourceTime(Time::from_secs(4)), SourceTime(Time::from_secs(6)));
+        let future = AppliedEffect::new("glitch_v2", 3, [("amount".to_string(), ParamValue::Number(0.5))].into());
+        let newer = TrackKey::fx(future.id, "amount");
+        c.effects.push(future);
+        let orphan = TrackKey::fx(kadr_core::EffectId::new(), "strength");
+        for k in [&newer, &orphan] {
+            c.animation.set_key(k, at, 0.5, Some(Ease::Hold));
+        }
+        let shown = Time::from_secs(14);
+        assert_eq!(move_moment(&c, at, to), None, "only read-only keys: no command");
+        assert_eq!(delete_moment(&c, at, shown), vec![]);
+        assert_eq!(ease_targets(&c, at, &Ease::Linear), vec![]);
+        assert_eq!(moment_ease(&c, at), "");
+        c.animation.set_key(AnimParam::X, at, 1.0, Some(Ease::Linear));
+        assert_eq!(moment_ease(&c, at), "linear", "the curve of what the menu edits");
+        assert_eq!(ease_targets(&c, at, &Ease::Hold), vec![TrackKey::from(AnimParam::X)]);
+        assert_eq!(move_moment(&c, at, at), None, "back on its own moment");
+        let x = |at| EditCommand::RemoveKeyframe { clip: c.id, param: AnimParam::X.into(), at, keep: Some(1.0) };
+        assert_eq!(delete_moment(&c, at, shown), vec![x(at)]);
+
+        let mut p = Project::new("t");
+        p.sequence_mut().tracks[0].clips.push(c.clone());
+        let read_only = |p: &Project| {
+            let a = &p.sequence().tracks[0].clips[0].animation;
+            [a.track(&newer).to_vec(), a.track(&orphan).to_vec()]
+        };
+        let before = read_only(&p);
+        let mut e = EditEngine::new();
+        e.execute(&mut p, move_moment(&c, at, to).unwrap()).unwrap();
+        let a = &p.sequence().tracks[0].clips[0].animation;
+        assert_eq!((a.keys_at(to), a.track(AnimParam::X).len()), (vec![TrackKey::from(AnimParam::X)], 1), "the drag moved the editable key");
+        assert_eq!(read_only(&p), before, "and left the others");
+        e.undo(&mut p);
+        let ease = ease_targets(&c, at, &Ease::Hold).into_iter().map(|param| EditCommand::SetKeyframeEase { clip: c.id, param, at, ease: Ease::Hold }).collect();
+        e.execute(&mut p, EditCommand::Batch { label: "ease".into(), commands: ease }).unwrap();
+        assert_eq!(p.sequence().tracks[0].clips[0].animation.track(AnimParam::X)[0].ease, Ease::Hold);
+        e.execute(&mut p, EditCommand::Batch { label: "delete".into(), commands: delete_moment(&c, at, shown) }).unwrap();
+        assert!(!p.sequence().tracks[0].clips[0].animation.is_animated(AnimParam::X));
+        assert_eq!(read_only(&p), before);
     }
 }

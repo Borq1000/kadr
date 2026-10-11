@@ -724,6 +724,15 @@ pub fn track_def(c: &Clip, k: &TrackKey) -> Result<Option<&'static ParamDef>, Ed
     Ok(Some(d))
 }
 
+/// The tracks a gesture on the keyframe moment `at` edits (ruling R8):
+/// those with a keyframe there that keyframe commands may change
+/// (`track_def`). A read-only track — an effect from a newer Kadr, an
+/// orphan `fx:` track — keeps its keyframe where it is; empty when the
+/// moment has only such keys (the gesture then does nothing).
+pub fn editable_keys_at(c: &Clip, at: SourceTime) -> Vec<TrackKey> {
+    c.animation.keys_at(at).into_iter().filter(|k| track_def(c, k).is_ok()).collect()
+}
+
 /// A static value for a track: an effect number is kept in its range — the
 /// value the picture showed (the evaluator clamps a track the same way).
 fn in_range(d: Option<&ParamDef>, v: f64) -> f64 {

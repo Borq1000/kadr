@@ -393,3 +393,34 @@ fn an_effect_number_left_by_its_keys_stays_in_range() {
     e.execute(&mut p, EditCommand::RemoveKeyframe { clip: v, param: k.clone(), at: SourceTime(s(102)), keep: Some(0.25) }).unwrap();
     assert_eq!(strength(&p), Some(0.25));
 }
+
+/// Ruling R8: a gesture on a keyframe moment edits the tracks it may and
+/// leaves read-only ones — a newer Kadr's effect, an orphan `fx:` track —
+/// where they are, instead of failing whole.
+#[test]
+fn a_moment_s_editable_keys_skip_read_only_tracks() {
+    let (mut p, mut e, v, _) = setup();
+    let z = zoom();
+    let strength = TrackKey::fx(z.id, "strength");
+    e.execute(&mut p, EditCommand::AddEffect { clip: v, effect: z }).unwrap();
+    let future = AppliedEffect::new("glitch_v2", 3, BTreeMap::from([("amount".to_string(), ParamValue::Number(0.5))]));
+    let newer = TrackKey::fx(future.id, "amount");
+    push(&mut p, v, future);
+    let orphan = TrackKey::fx(EffectId::new(), "strength");
+    let (at, to) = (SourceTime(s(104)), SourceTime(s(106)));
+    let c = clip_mut(&mut p, v);
+    for k in [newer.clone(), orphan.clone()] {
+        c.animation.set_key(k, at, 0.5, None);
+    }
+    assert!(editable_keys_at(c, at).is_empty(), "only read-only keys: nothing to edit");
+    c.animation.set_key(AnimParam::Scale, at, 2.0, None);
+    c.animation.set_key(strength.clone(), at, 0.3, None);
+    let keys = editable_keys_at(c, at);
+    assert_eq!(keys, [TrackKey::from(AnimParam::Scale), strength.clone()]);
+    let moves = keys.into_iter().map(|k| (k, at, to)).collect();
+    e.execute(&mut p, EditCommand::MoveKeyframes { clip: v, moves }).unwrap();
+    let c = p.sequence().clip(v).unwrap();
+    assert_eq!(c.animation.keys_at(to), [TrackKey::from(AnimParam::Scale), strength]);
+    assert_eq!(c.animation.keys_at(at).len(), 2, "the read-only keys stay");
+    assert!(c.animation.keys_at(at).contains(&newer) && c.animation.keys_at(at).contains(&orphan));
+}
