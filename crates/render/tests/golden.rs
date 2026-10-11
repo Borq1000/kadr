@@ -274,6 +274,53 @@ fn grain() {
     check("grain", s, i);
 }
 
+fn generator_layer(g: Generator, placement: Placement) -> Layer {
+    layer(LayerContent::Generator(g), placement)
+}
+
+fn stop(pos: f32, c: Rgba) -> GradientStop {
+    GradientStop { pos, colour: c }
+}
+
+#[test]
+fn gradients() {
+    // A warm band across the video in Screen, and a cold radial glow from
+    // the top-left corner of a turned picture-in-picture in Screen.
+    let warm = rgb(1.0, 0.75, 0.45);
+    let band = Gradient { shape: GradientShape::Linear { angle: 0.4, offset: 90.0, length: 110.0 }, stops: vec![stop(0.0, Rgba { a: 0.0, ..warm }), stop(0.5, warm), stop(1.0, Rgba { a: 0.0, ..warm })] };
+    let mut band_layer = generator_layer(Generator::Gradient(band), Placement::fill(CANVAS));
+    band_layer.blend = BlendMode::Screen;
+    let pip = placement((320.0, 180.0), (230.0, 120.0), 0.4, 0.15);
+    let cold = rgb(0.5, 0.75, 1.0);
+    let glow = Gradient { shape: GradientShape::Radial { centre: Vec2::new(0.0, 0.0), radius: 300.0 }, stops: vec![stop(0.0, cold), stop(0.45, Rgba { a: 0.45, ..cold }), stop(1.0, Rgba { a: 0.0, ..cold })] };
+    let mut glow_layer = generator_layer(Generator::Gradient(glow), pip);
+    glow_layer.blend = BlendMode::Screen;
+    let s = scene(OUT, vec![full(AlphaMode::Opaque), band_layer, media(pip, AlphaMode::Opaque), glow_layer]);
+    check("gradients", s, vec![LayerInput::Cpu(video()), LayerInput::None, LayerInput::Cpu(checker(320, 180)), LayerInput::None]);
+}
+
+#[test]
+fn noise() {
+    // Coarse pink noise alone on the left half, the same in Screen over the photo on the right.
+    let n = Noise { cell: 40.0, seed: 7, time: 0.6, colour: rgb(1.0, 0.45, 0.62), amount: 1.0, contrast: 1.6 };
+    let left = placement((160.0, 180.0), (80.0, 90.0), 1.0, 0.0);
+    let right = placement((160.0, 180.0), (240.0, 90.0), 1.0, 0.0);
+    let mut over_photo = generator_layer(Generator::Noise(n), right);
+    over_photo.blend = BlendMode::Screen;
+    let s = scene(OUT, vec![generator_layer(Generator::Noise(n), left), media(right, AlphaMode::Opaque), over_photo]);
+    check("noise", s, vec![LayerInput::None, LayerInput::Cpu(photo()), LayerInput::None]);
+}
+
+#[test]
+fn over_40() {
+    // A push 40 % through: the video leaves to the left, the checkerboard follows it in, edge to edge.
+    let fill = Placement::fill(CANVAS);
+    let from = media(Placement { position: Vec2::new(160.0 - 128.0, 90.0), ..fill }, AlphaMode::Opaque);
+    let to = media(Placement { position: Vec2::new(160.0 + 192.0, 90.0), ..fill }, AlphaMode::Opaque);
+    let t = transition(TransitionOp::Over, 0.4, vec![from], vec![to]);
+    check("over_40", scene(OUT, vec![t]), vec![LayerInput::Transition { from: vec![LayerInput::Cpu(video())], to: vec![LayerInput::Cpu(checker(320, 180))] }]);
+}
+
 /// One golden per Look preset at «Обычно» (spec §9): `look_<key>.png`.
 /// Re-bless after the owner tunes `looks.json` (Task 9).
 #[test]

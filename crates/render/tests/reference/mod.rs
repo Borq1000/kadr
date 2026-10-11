@@ -32,13 +32,16 @@
 //! - A neutral primitive is skipped wherever it stands in a chain (an
 //!   identity curve does not clamp its input); a chain of only neutral
 //!   primitives is skipped entirely, its final clamp included (ruling E2-R1).
+//! - A generator layer's sample is `Generator::at` of the local position
+//!   `inv(canvas position)` — the normative helper, called (E2-R2); it has
+//!   no sampling clamp; its crop limits coverage only.
 
 #![allow(dead_code)]
 
 use kadr_core::CpuFrame;
 use kadr_core::color::AlphaMode;
 use kadr_render::{LayerInput, RenderInputs};
-use kadr_scene::{BlendMode, Effect, FrameScene, Layer, LayerContent, Rgba, TransitionOp, Vignette, grain_weight, hue_offset, luma709, tone_lookup};
+use kadr_scene::{BlendMode, Effect, FrameScene, Generator, Layer, LayerContent, Rgba, TransitionOp, Vignette, grain_weight, hue_offset, luma709, tone_lookup};
 use std::cell::RefCell;
 
 /// Premultiplied RGBA, components in [0, 1].
@@ -189,12 +192,14 @@ fn mix(g: &Geo, op: &TransitionOp, p: f64, from: Px, to: Px, canvas_pos: (f64, f
             let m = (0.5 + e / (w * g.k).max(1.0)).clamp(0.0, 1.0);
             lerp(from, to, m)
         }
+        TransitionOp::Over => [0, 1, 2, 3].map(|c| to[c] + from[c] * (1.0 - to[3])),
     }
 }
 
 enum Source<'a> {
     Solid(Px),
     Texels(&'a CpuFrame),
+    Generator(&'a Generator),
 }
 
 fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
@@ -209,6 +214,7 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
     let source = match (&layer.content, input) {
         (LayerContent::Solid(c), _) => Source::Solid(premul(*c)),
         (LayerContent::Media { .. }, LayerInput::Cpu(f)) => Source::Texels(f),
+        (LayerContent::Generator(g), _) => Source::Generator(g),
         _ => Source::Solid(premul(Rgba::MISSING)),
     };
 
@@ -233,6 +239,7 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
             let mut sample = match &source {
                 Source::Solid(p) => *p,
                 Source::Texels(f) => bilinear(f, layer, lx, ly),
+                Source::Generator(g) => g.at(lx, ly),
             };
             sample = apply_effects(&layer.effects, sample, (cx, cy), (g.cw, g.ch));
             let s = sample.map(|v| v * unit(layer.opacity) * coverage);

@@ -199,6 +199,22 @@ fn sanity_dip_to_colour_and_wipe() {
 }
 
 #[test]
+fn sanity_generators_are_their_helpers_and_over_stacks_the_sides() {
+    let cv = (16, 8);
+    let g = Generator::Gradient(Gradient {
+        shape: GradientShape::Linear { angle: 0.0, offset: 0.0, length: 16.0 },
+        stops: vec![GradientStop { pos: 0.0, colour: rgba(0.0, 0.0, 0.0, 0.0) }, GradientStop { pos: 1.0, colour: rgba(1.0, 1.0, 1.0, 1.0) }],
+    });
+    let out = reference_of(&scene(cv, cv, rgba(0.0, 0.0, 0.0, 0.0), vec![full_layer(cv, LayerContent::Generator(g))]));
+    // t = 3.5 / 16 = 0.21875: premultiplied white × t = 55.78 → 56.
+    assert_eq!(px(&out, 16, 3, 2), [56, 56, 56, 56]);
+    let t = transition(cv, TransitionOp::Over, 0.7, vec![solid(cv, rgba(1.0, 0.0, 0.0, 1.0))], vec![solid(cv, rgba(0.0, 0.0, 1.0, 0.5))]);
+    let out = reference_of(&scene(cv, cv, Rgba::BLACK, vec![t]));
+    // to stored (0, 0, 128, 128): 1 − 128/255 = 0.49804 of red → 127.
+    assert_eq!(px(&out, 16, 5, 5), [127, 0, 128, 255]);
+}
+
+#[test]
 fn sanity_bilinear_is_confined_to_the_frame_and_flips_mirror() {
     // A 2×1 frame, black and white, on a 4×1 canvas.
     let data = vec![0, 0, 0, 255, 255, 255, 255, 255];
@@ -586,9 +602,10 @@ impl Gen {
     }
 
     fn transition(&mut self) -> (Layer, LayerInput) {
-        let op = match self.rng.int(0, 2) {
+        let op = match self.rng.int(0, 3) {
             0 => TransitionOp::Dissolve,
             1 => TransitionOp::DipToColor(self.colour(true)),
+            2 => TransitionOp::Over,
             _ => {
                 let angle = match self.rng.int(0, 9) {
                     0 => 0.0,
@@ -627,6 +644,26 @@ impl Gen {
         (layer, LayerInput::Transition { from: from_in, to: to_in })
     }
 
+    /// A gradient (linear or radial, 0–3 stops, degenerate lengths now and
+    /// then) or a noise (cells from half a pixel to 40, any time, contrast
+    /// and an amount past 1).
+    fn generator(&mut self) -> Generator {
+        let r = &mut self.rng;
+        let colour = |r: &mut Rng| Rgba { r: r.f() as f32, g: r.f() as f32, b: r.f() as f32, a: if r.chance(0.3) { 1.0 } else { r.f() as f32 } };
+        if r.chance(0.5) {
+            let n = r.int(0, 3);
+            let stops = (0..n).map(|_| GradientStop { pos: r.range(-0.2, 1.2) as f32, colour: colour(r) }).collect();
+            let shape = if r.chance(0.5) {
+                GradientShape::Linear { angle: r.range(0.0, 7.0) as f32, offset: r.range(-40.0, 40.0) as f32, length: if r.chance(0.05) { 0.0 } else { r.range(1.0, 120.0) as f32 } }
+            } else {
+                GradientShape::Radial { centre: Vec2::new(r.range(-20.0, 120.0) as f32, r.range(-20.0, 120.0) as f32), radius: r.range(0.0, 150.0) as f32 }
+            };
+            Generator::Gradient(Gradient { shape, stops })
+        } else {
+            Generator::Noise(Noise { cell: [0.5, 1.0, 3.0, 9.0, 40.0][r.int(0, 4) as usize], seed: r.next(), time: r.range(-3.0, 5.0) as f32, colour: colour(r), amount: r.range(0.0, 1.2) as f32, contrast: r.range(0.0, 4.0) as f32 })
+        }
+    }
+
     fn scene(mut self) -> (FrameScene, RenderInputs) {
         let background = match self.rng.int(0, 4) {
             0 => Rgba::BLACK,
@@ -634,7 +671,18 @@ impl Gen {
             _ => self.colour(false),
         };
         let n = self.rng.int(1, 4);
-        let (layers, inputs): (Vec<Layer>, Vec<LayerInput>) = (0..n).map(|_| self.layer(true)).unzip();
+        let (mut layers, mut inputs): (Vec<Layer>, Vec<LayerInput>) = (0..n).map(|_| self.layer(true)).unzip();
+        // E3: a generator layer now and then, drawn after the others so they stay as they were.
+        if self.rng.chance(0.35) {
+            let at = self.rng.int(0, layers.len() as u32) as usize;
+            let placement = self.placement();
+            let crop = self.crop(placement.size);
+            let (opacity, blend, effects) = (self.opacity(), self.blend(0.4), self.effects());
+            let content = LayerContent::Generator(self.generator());
+            let id = self.id();
+            layers.insert(at, Layer { id, content, placement, crop, opacity, blend, effects });
+            inputs.insert(at, LayerInput::None);
+        }
         let time = Time::ZERO;
         let scene = FrameScene { time, canvas: self.canvas, output: OutputSpec::new(self.out, RenderQuality::Export), background, layers };
         (scene, RenderInputs { layers: inputs })
@@ -843,6 +891,52 @@ fn cpu_renderer_matches_the_reference_on_every_look_preset() {
     assert_eq!(grain_cells.into_iter().collect::<Vec<_>>(), [1, 2], "both grain cells were drawn");
 }
 
+/// Generators on full-frame and turned picture-in-picture layers, in
+/// Normal and Screen, under a chain, inside a transition's side and behind
+/// `Over`, into letterboxed, scaled and pillarboxed outputs.
+#[test]
+fn cpu_renderer_matches_the_reference_on_generators() {
+    let canvas = SizeU::new(48, 27);
+    let (cw, ch) = (48.0f32, 27.0f32);
+    let gens = [
+        Generator::Gradient(Gradient { shape: GradientShape::Linear { angle: 0.7, offset: -5.0, length: 30.0 }, stops: vec![GradientStop { pos: 0.0, colour: rgba(1.0, 0.6, 0.2, 0.0) }, GradientStop { pos: 0.5, colour: rgba(1.0, 0.6, 0.2, 1.0) }, GradientStop { pos: 1.0, colour: rgba(1.0, 0.6, 0.2, 0.0) }] }),
+        Generator::Gradient(Gradient { shape: GradientShape::Radial { centre: Vec2::new(4.0, 3.0), radius: 40.0 }, stops: vec![GradientStop { pos: 0.0, colour: rgba(1.0, 0.4, 0.6, 1.0) }, GradientStop { pos: 1.0, colour: rgba(0.0, 0.0, 0.0, 0.0) }] }),
+        Generator::Noise(Noise { cell: 5.0, seed: 77, time: 1.6, colour: rgba(0.4, 0.7, 1.0, 1.0), amount: 1.0, contrast: 1.6 }),
+        Generator::Noise(Noise { cell: 1.0, seed: 3, time: -0.4, colour: rgba(1.0, 1.0, 1.0, 0.7), amount: 0.8, contrast: 3.0 }),
+    ];
+    let pip = Placement { size: Vec2::new(cw, ch), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(cw * 0.65, ch * 0.4), scale: Vec2::new(0.45, 0.45), rotation: 0.3 };
+    let outputs = [(48, 27), (24, 14), (96, 54), (40, 30), (64, 27)];
+    let chain = vec![Effect::ColorAdjust(ColorAdjust { exposure: 0.5, saturation: 0.7, ..ColorAdjust::NEUTRAL })];
+    let mut renderer = CpuRenderer::new();
+    let mut renders = 0;
+    for (gi, g) in gens.iter().enumerate() {
+        for placement in [Placement::fill(canvas), pip] {
+            for (blend, effects) in [(BlendMode::Normal, vec![]), (BlendMode::Screen, vec![]), (BlendMode::Screen, chain.clone())] {
+                let gl = Layer { id: LayerId(2), content: LayerContent::Generator(g.clone()), crop: placement.full_crop(), placement, opacity: 0.8, blend, effects };
+                let base = solid((48, 27), rgba(0.2, 0.3, 0.25, 1.0));
+                let side = |l: Layer| transition((48, 27), TransitionOp::Over, 0.5, vec![solid((48, 27), rgba(0.6, 0.1, 0.1, 1.0))], vec![l]);
+                for layers in [vec![base.clone(), gl.clone()], vec![base.clone(), side(gl.clone())]] {
+                    for &(ow, oh) in &outputs {
+                        let out = SizeU::new(ow, oh);
+                        assert!(!has_boundary_tie(canvas, out), "{ow}x{oh}");
+                        let scene = FrameScene { time: Time::ZERO, canvas, output: OutputSpec::new(out, RenderQuality::Export), background: Rgba::BLACK, layers: layers.clone() };
+                        let inputs = RenderInputs { layers: solid_inputs(&scene.layers) };
+                        let (expected, ties) = render_reference_with_ties(&scene, &inputs);
+                        let mut actual = vec![0xAAu8; ow as usize * oh as usize * 4];
+                        renderer.render(&PreparedFrame { scene: &scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(ow, oh, &mut actual))).unwrap();
+                        for (at, (e, a)) in expected.iter().zip(&actual).enumerate() {
+                            let pix = at / 4;
+                            assert!(e.abs_diff(*a) <= 1 + ties[pix].min(1), "generator {gi}, {blend:?}, output {ow}x{oh}: pixel ({}, {}) channel {}: reference {e}, renderer {a}", pix % ow as usize, pix / ow as usize, at % 4);
+                        }
+                        renders += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(renders, 4 * 2 * 3 * 2 * 5);
+}
+
 /// The generator itself is deterministic and covers what the parity test claims to cover.
 #[test]
 fn generator_is_deterministic_and_varied() {
@@ -852,7 +946,7 @@ fn generator_is_deterministic_and_varied() {
     assert_eq!(shape(&a), shape(&b));
 
     let (mut transitions, mut media, mut missing, mut solids, mut crops_beyond, mut letterbox, mut full_frame) = (0, 0, 0, 0, 0, 0, 0);
-    let (mut curves, mut spatial) = (0usize, 0usize);
+    let (mut curves, mut spatial, mut generators) = (0usize, 0usize, 0usize);
     for i in 0..400 {
         let (s, inputs) = Gen::new(scene_seed(BASE_SEED, i)).scene();
         let k = (s.output.size.w as f64 / s.canvas.w as f64).min(s.output.size.h as f64 / s.canvas.h as f64);
@@ -863,6 +957,7 @@ fn generator_is_deterministic_and_varied() {
             match (&l.content, inp) {
                 (LayerContent::Transition(_), _) => transitions += 1,
                 (LayerContent::Solid(_), _) => solids += 1,
+                (LayerContent::Generator(_), _) => generators += 1,
                 (LayerContent::Media { .. }, LayerInput::Missing(_)) => missing += 1,
                 (LayerContent::Media { .. }, LayerInput::Cpu(f)) => {
                     media += 1;
@@ -880,7 +975,7 @@ fn generator_is_deterministic_and_varied() {
         }
     }
     println!(
-        "generator over 400 scenes: {media} media, {solids} solid, {missing} missing, {transitions} transitions, {crops_beyond} crops beyond content, {letterbox} scenes with margins, {full_frame} full-frame layers, {curves} tone curves, {spatial} spatial primitives"
+        "generator over 400 scenes: {media} media, {solids} solid, {missing} missing, {transitions} transitions, {crops_beyond} crops beyond content, {letterbox} scenes with margins, {full_frame} full-frame layers, {curves} tone curves, {spatial} spatial primitives, {generators} generators"
     );
-    assert!(transitions > 100 && media > 300 && missing > 20 && solids > 50 && crops_beyond > 10 && letterbox > 50 && full_frame > 20 && curves > 30 && spatial > 30);
+    assert!(transitions > 100 && media > 300 && missing > 20 && solids > 50 && crops_beyond > 10 && letterbox > 50 && full_frame > 20 && curves > 30 && spatial > 30 && generators > 60);
 }

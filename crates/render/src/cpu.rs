@@ -13,7 +13,7 @@ use crate::{LayerInput, PreparedFrame, RenderError, RenderStats, RenderTarget, R
 use kadr_core::color::AlphaMode;
 use kadr_core::hash::{pcg32_at, pcg32_stream};
 use kadr_core::{CpuFrame, FramePool};
-use kadr_scene::{hue_offset, tone_lookup, Affine2, BlendMode, ColorAdjust, Effect, FrameScene, Grain, Layer, LayerContent, Rgba, TransitionLayer, TransitionOp};
+use kadr_scene::{hue_offset, smooth_bilerp, stop_colour, tone_lookup, Affine2, BlendMode, ColorAdjust, Effect, FrameScene, Generator, Gradient, GradientShape, Grain, Layer, LayerContent, Noise, RectF, Rgba, TransitionLayer, TransitionOp, UsableStop};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -93,7 +93,7 @@ fn check_inputs(layers: &[Layer], inputs: &[LayerInput], within: &'static str) -
     for (n, (layer, input)) in layers.iter().zip(inputs).enumerate() {
         match (&layer.content, input) {
             (LayerContent::Media { .. }, LayerInput::Cpu(f)) => check_frame(f).map_err(|m| RenderError::InputMismatch(format!("layer {n}{within}: {m}")))?,
-            (LayerContent::Media { .. }, LayerInput::Missing(_)) | (LayerContent::Solid(_), LayerInput::None) => {}
+            (LayerContent::Media { .. }, LayerInput::Missing(_)) | (LayerContent::Solid(_) | LayerContent::Generator(_), LayerInput::None) => {}
             (LayerContent::Transition(t), LayerInput::Transition { from, to }) => {
                 check_inputs(&t.from, from, " in a transition's `from`")?;
                 check_inputs(&t.to, to, " in a transition's `to`")?;
@@ -103,6 +103,7 @@ fn check_inputs(layers: &[Layer], inputs: &[LayerInput], within: &'static str) -
                     LayerContent::Media { .. } => "media",
                     LayerContent::Solid(_) => "solid",
                     LayerContent::Transition(_) => "transition",
+                    LayerContent::Generator(_) => "generator",
                 };
                 let input = match input {
                     LayerInput::Cpu(_) => "Cpu",
@@ -634,6 +635,121 @@ impl<const ALPHA: u8> Sampler for Texels<'_, ALPHA> {
     }
 }
 
+/// A gradient, its axis and stops taken once per layer; the per-pixel
+/// formula is `Gradient::t` with `stop_colour`, in f64.
+struct GradientFx {
+    shape: GradShape,
+    stops: Vec<UsableStop>,
+}
+
+enum GradShape {
+    Linear { c: f64, s: f64, offset: f64, len: f64 },
+    Radial { cx: f64, cy: f64, r: f64 },
+}
+
+impl GradientFx {
+    fn new(g: &Gradient) -> GradientFx {
+        let shape = match g.shape {
+            GradientShape::Linear { angle, offset, length } => {
+                let (s, c) = (angle as f64).sin_cos();
+                GradShape::Linear { c, s, offset: offset as f64, len: length as f64 }
+            }
+            GradientShape::Radial { centre, radius } => GradShape::Radial { cx: centre.x as f64, cy: centre.y as f64, r: radius as f64 },
+        };
+        GradientFx { shape, stops: g.usable_stops() }
+    }
+}
+
+impl Sampler for GradientFx {
+    #[inline(always)]
+    fn sample(&self, u: f64, v: f64) -> [f32; 4] {
+        let (d, len) = match self.shape {
+            GradShape::Linear { c, s, offset, len } => (u * c + v * s - offset, len),
+            GradShape::Radial { cx, cy, r } => ((u - cx).hypot(v - cy), r),
+        };
+        let t = d / len.max(1e-3);
+        let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+        stop_colour(&self.stops, t).map(|x| x as f32)
+    }
+}
+
+/// `Noise::lattice` from the slices' streams: `pcg32_hash(seed, i)` is
+/// `pcg32_at(pcg32_stream(seed), i)`.
+#[inline(always)]
+fn lattice_value(streams: (u64, u64), w: f64, i: i64, j: i64) -> f64 {
+    let idx = Noise::lattice_index(i, j);
+    let (a, b) = (pcg32_at(streams.0, idx) as f64 / u32::MAX as f64, pcg32_at(streams.1, idx) as f64 / u32::MAX as f64);
+    a + (b - a) * w
+}
+
+/// Value noise with the lattice the layer's crop can read (two cells of
+/// margin for the coverage band) in a table — the "low resolution" image —
+/// and every other point hashed (a crop of more than 65 536 cells has no table).
+struct NoiseFx {
+    noise: Noise,
+    s: f64,
+    streams: (u64, u64),
+    w: f64,
+    i0: i64,
+    j0: i64,
+    cols: usize,
+    rows: usize,
+    table: Vec<f64>,
+}
+
+impl NoiseFx {
+    fn new(n: &Noise, crop: RectF) -> NoiseFx {
+        let s = n.cell_size();
+        let (s0, s1, w) = n.slices();
+        let streams = (pcg32_stream(s0), pcg32_stream(s1));
+        let cell = |v: f32| (v as f64 / s).floor() as i64;
+        let (i0, j0) = (cell(crop.x0).saturating_sub(2), cell(crop.y0).saturating_sub(2));
+        let (i1, j1) = (cell(crop.x1).saturating_add(2), cell(crop.y1).saturating_add(2));
+        let span = |a: i64, b: i64| b.saturating_sub(a).saturating_add(1).max(0) as u64;
+        let (cols, rows) = (span(i0, i1), span(j0, j1));
+        let fits = cols.checked_mul(rows).is_some_and(|c| c <= 1 << 16);
+        let (cols, rows) = if fits { (cols as usize, rows as usize) } else { (0, 0) };
+        let table = (0..rows).flat_map(|r| (0..cols).map(move |c| (c, r))).map(|(c, r)| lattice_value(streams, w, i0 + c as i64, j0 + r as i64)).collect();
+        NoiseFx { noise: *n, s, streams, w, i0, j0, cols, rows, table }
+    }
+
+    #[inline(always)]
+    fn lattice(&self, i: i64, j: i64) -> f64 {
+        let (c, r) = (i.wrapping_sub(self.i0), j.wrapping_sub(self.j0));
+        if c >= 0 && r >= 0 && (c as usize) < self.cols && (r as usize) < self.rows {
+            self.table[r as usize * self.cols + c as usize]
+        } else {
+            lattice_value(self.streams, self.w, i, j)
+        }
+    }
+}
+
+impl Sampler for NoiseFx {
+    #[inline(always)]
+    fn sample(&self, u: f64, v: f64) -> [f32; 4] {
+        let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
+        let (gx, gy) = (finite(u / self.s), finite(v / self.s));
+        let (fi, fj) = (gx.floor(), gy.floor());
+        let (i, j) = (fi as i64, fj as i64);
+        let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
+        let value = smooth_bilerp([self.lattice(i, j), self.lattice(i1, j), self.lattice(i, j1), self.lattice(i1, j1)], gx - fi, gy - fj);
+        self.noise.shade(value).map(|x| x as f32)
+    }
+}
+
+/// A generator layer: its normative colour at every covered pixel's local
+/// position (`plan.tex` is `plan.inv` here), then the layer's chain,
+/// opacity, coverage and blend — one pass.
+fn draw_generator(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, generator: &Generator, passes: &mut u32) -> Drawn {
+    let Some(plan) = Plan::new(g, layer) else { return Drawn::Nothing };
+    match generator {
+        Generator::Gradient(gr) => draw_sampled(data, stride, &plan, &GradientFx::new(gr)),
+        Generator::Noise(n) => draw_sampled(data, stride, &plan, &NoiseFx::new(n, layer.crop)),
+    }
+    *passes += 1;
+    Drawn::Sampled
+}
+
 /// Effects, opacity and coverage on a sample, composited into `px`; `pos`
 /// is the pixel centre's canvas position (read only by a spatial chain).
 #[inline(always)]
@@ -786,6 +902,8 @@ enum Mix {
     Dip { colour: [f32; 4], p: f32 },
     /// Mask `m = clamp(0.5 + e / band, 0, 1)` with `e = (E − dot(canvas point, u)) · k`.
     Wipe { edge: f64, ux: f64, uy: f64, band: f64 },
+    /// `to + from·(1 − to.a)`
+    Over,
 }
 
 impl Mix {
@@ -802,6 +920,7 @@ impl Mix {
                 let (a, b) = (lo - w / 2.0, hi + w / 2.0);
                 Mix::Wipe { edge: a + (b - a) * p as f64, ux, uy, band: (w * g.k).max(1.0) }
             }
+            TransitionOp::Over => Mix::Over,
         }
     }
 
@@ -820,6 +939,7 @@ impl Mix {
                 let e = (edge - (cx * ux + cy * uy)) * g.k;
                 lerp(from, to, (0.5 + e / band).clamp(0.0, 1.0) as f32)
             }
+            Mix::Over => std::array::from_fn(|c| to[c] + from[c] * (1.0 - to[3])),
         }
     }
 }
@@ -829,6 +949,7 @@ impl CpuRenderer {
         match (&layer.content, input) {
             (LayerContent::Transition(t), LayerInput::Transition { from, to }) => self.draw_transition(data, stride, g, layer, t, from, to, passes),
             (LayerContent::Solid(c), _) => draw_flat(data, stride, g, layer, *c, passes),
+            (LayerContent::Generator(generator), _) => draw_generator(data, stride, g, layer, generator, passes),
             (LayerContent::Media { .. }, LayerInput::Cpu(f)) => draw_frame(data, stride, g, layer, f, passes),
             (LayerContent::Media { .. }, _) => draw_flat(data, stride, g, layer, Rgba::MISSING, passes),
             // Inputs are checked before drawing.
@@ -1332,6 +1453,96 @@ mod tests {
         let out = render(&scene((4, 4), (4, 4), Rgba::BLACK, vec![media(Placement::fill(c))]), vec![LayerInput::Missing(MissingReason::Offline)]);
         let m = Rgba::MISSING;
         assert_eq!(px(&out, 4, 2, 2), [store(m.r), store(m.g), store(m.b), 255]);
+    }
+
+    fn premul_u8(p: [f64; 4]) -> [u8; 4] {
+        p.map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8)
+    }
+
+    #[test]
+    fn a_linear_gradient_runs_along_its_angle_in_premultiplied_steps() {
+        let canvas = SizeU::new(8, 2);
+        let g = Gradient { shape: GradientShape::Linear { angle: 0.0, offset: 0.0, length: 8.0 }, stops: vec![GradientStop { pos: 0.0, colour: Rgba::TRANSPARENT }, GradientStop { pos: 1.0, colour: RED }] };
+        let l = layer(LayerContent::Generator(Generator::Gradient(g)), Placement::fill(canvas));
+        let out = render(&scene((8, 2), (8, 2), Rgba::TRANSPARENT, vec![l]), vec![LayerInput::None]);
+        for x in 0..8u32 {
+            let v = ((x as f64 + 0.5) / 8.0 * 255.0 + 0.5).floor() as u8;
+            assert!(near(px(&out, 8, x, 1), [v, 0, 0, v]), "x {x}: red × t, premultiplied: {:?}", px(&out, 8, x, 1));
+        }
+    }
+
+    /// A generator's sample is the normative helper at the pixel centre's
+    /// local position — also on a scaled, turned layer.
+    #[test]
+    fn generators_draw_their_normative_values_in_local_pixels() {
+        let canvas = SizeU::new(40, 30);
+        let pip = Placement { size: Vec2::new(40.0, 30.0), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(20.0, 15.0), scale: Vec2::new(0.5, 0.5), rotation: 0.3 };
+        let gens = [
+            Generator::Gradient(Gradient {
+                shape: GradientShape::Radial { centre: Vec2::new(8.0, 6.0), radius: 30.0 },
+                stops: vec![GradientStop { pos: 0.0, colour: RED }, GradientStop { pos: 0.6, colour: Rgba { a: 0.5, ..BLUE } }, GradientStop { pos: 1.0, colour: Rgba::TRANSPARENT }],
+            }),
+            Generator::Noise(Noise { cell: 7.0, seed: 3, time: 0.4, colour: Rgba { r: 1.0, g: 0.6, b: 0.2, a: 1.0 }, amount: 0.9, contrast: 1.5 }),
+        ];
+        let mut checked = 0;
+        for generator in gens {
+            for placement in [Placement::fill(canvas), pip] {
+                let l = layer(LayerContent::Generator(generator.clone()), placement);
+                let out = render(&scene((40, 30), (40, 30), Rgba::TRANSPARENT, vec![l]), vec![LayerInput::None]);
+                let inv = placement.to_canvas().inverse().unwrap();
+                for y in (1..30).step_by(4) {
+                    for x in (1..40).step_by(5) {
+                        let (lx, ly) = inv.apply(x as f64 + 0.5, y as f64 + 0.5);
+                        // Well inside the layer: coverage 1, the bare sample over transparent.
+                        if lx > 2.0 && lx < 38.0 && ly > 2.0 && ly < 28.0 {
+                            assert!(near(px(&out, 40, x, y), premul_u8(generator.at(lx, ly))), "{generator:?} at ({x}, {y})");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 60, "{checked}");
+    }
+
+    /// The renderer reads the noise lattice from a per-layer table and hashes
+    /// what the table does not hold: both are the normative lattice.
+    #[test]
+    fn the_noise_table_and_direct_hashing_agree() {
+        let n = Noise { cell: 1.0, seed: 11, time: 2.7, colour: WHITE, amount: 1.0, contrast: 1.0 };
+        let canvas = SizeU::new(24, 16);
+        let small = layer(LayerContent::Generator(Generator::Noise(n)), Placement::fill(canvas));
+        // A crop far past 65 536 lattice cells: no table, every point hashed.
+        let mut big = small.clone();
+        big.crop = RectF::new(-400.0, -400.0, 424.0, 416.0);
+        let a = render(&scene((24, 16), (24, 16), Rgba::TRANSPARENT, vec![big]), vec![LayerInput::None]);
+        let b = render(&scene((24, 16), (24, 16), Rgba::TRANSPARENT, vec![small]), vec![LayerInput::None]);
+        assert_eq!(a, b);
+        assert!(a.chunks(4).any(|p| p[3] > 180) && a.chunks(4).any(|p| p[3] < 80), "varied");
+    }
+
+    #[test]
+    fn a_generator_takes_no_input_and_draws_in_one_pass() {
+        let c = SizeU::new(8, 8);
+        let g = layer(LayerContent::Generator(Generator::Noise(Noise { cell: 3.0, seed: 1, time: 0.0, colour: WHITE, amount: 0.5, contrast: 1.0 })), Placement::fill(c));
+        let s = scene((8, 8), (8, 8), Rgba::BLACK, vec![g]);
+        let (_, stats) = render_with(&mut CpuRenderer::new(), &s, vec![LayerInput::None]);
+        assert_eq!((stats.passes, stats.layers_drawn, stats.fast_paths), (1, 1, 0));
+        let inputs = RenderInputs { layers: vec![LayerInput::Missing(MissingReason::Offline)] };
+        let mut out = vec![0u8; 8 * 8 * 4];
+        let r = CpuRenderer::new().render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(8, 8, &mut out)));
+        assert!(matches!(r, Err(RenderError::InputMismatch(m)) if m.contains("generator")), "a generator's input is None");
+    }
+
+    #[test]
+    fn over_puts_the_incoming_side_over_the_outgoing_one() {
+        let c = SizeU::new(10, 2);
+        let right_half = Placement { size: Vec2::new(5.0, 2.0), anchor: Vec2::new(0.0, 0.0), position: Vec2::new(5.0, 0.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+        let t = transition(TransitionOp::Over, 0.3, c, vec![solid(RED, Placement::fill(c))], vec![solid(Rgba { a: 0.5, ..BLUE }, right_half)]);
+        let out = render(&scene((10, 2), (10, 2), Rgba::BLACK, vec![t]), vec![LayerInput::Transition { from: vec![LayerInput::None], to: vec![LayerInput::None] }]);
+        assert_eq!(px(&out, 10, 2, 0), [255, 0, 0, 255], "only the outgoing side");
+        // to (0, 0, 128, 128) stored; out = to + from·(1 − 128/255).
+        assert!(near(px(&out, 10, 7, 0), [127, 0, 128, 255]), "{:?}", px(&out, 10, 7, 0));
     }
 
     fn transition_scene(op: TransitionOp, p: f32) -> (FrameScene, Vec<LayerInput>) {

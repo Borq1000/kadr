@@ -714,7 +714,7 @@ fn collect(
     let mut out = Vec::with_capacity(layers.len());
     for l in layers {
         out.push(match &l.content {
-            LayerContent::Solid(_) => Slot::Input(LayerInput::None),
+            LayerContent::Solid(_) | LayerContent::Generator(_) => Slot::Input(LayerInput::None),
             LayerContent::Transition(t) => {
                 let from = collect(&t.from, scene, source, medias, reqs, index);
                 let to = collect(&t.to, scene, source, medias, reqs, index);

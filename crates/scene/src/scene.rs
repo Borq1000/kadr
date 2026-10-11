@@ -3,7 +3,7 @@
 //! CPU frames today and GPU textures later without the scene changing.
 
 use crate::geom::{Placement, RectF, SizeU};
-use crate::primitives::{Grain, SplitTone, ToneCurve, Vignette};
+use crate::primitives::{Gradient, Grain, Noise, SplitTone, ToneCurve, Vignette};
 use kadr_core::{AssetId, ClipId, ColorInfo, Time, TransitionId};
 
 /// Stable identity of a layer (from a clip or transition id): the key for
@@ -20,6 +20,15 @@ impl From<ClipId> for LayerId {
 impl From<TransitionId> for LayerId {
     fn from(t: TransitionId) -> Self {
         LayerId(t.0.as_u128())
+    }
+}
+
+impl LayerId {
+    /// The `n`-th layer made for what `base` names — a clip effect's
+    /// overlays, a transition's band: `base` with its top bit flipped, xor
+    /// `n` — never `base` itself, one id per `n`.
+    pub fn derived(base: u128, n: u32) -> LayerId {
+        LayerId(base ^ (1 << 127) ^ n as u128)
     }
 }
 
@@ -133,6 +142,10 @@ pub enum TransitionOp {
     /// the blended band, in canvas pixels. Exact mask: crate docs,
     /// "Rendering contract".
     Wipe { angle: f32, softness: f32 },
+    /// The incoming side over the outgoing one, `out = to + from·(1 − to.a)`:
+    /// both pictures whole (Сдвиг moves them edge to edge). `progress` is
+    /// not used.
+    Over,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,11 +157,30 @@ pub struct TransitionLayer {
     pub to: Vec<Layer>,
 }
 
+/// A layer that makes its own picture (effects spec §4 «генераторы»):
+/// plain data; exact formulas in the crate docs, "Generators".
+#[derive(Clone, Debug, PartialEq)]
+pub enum Generator {
+    Gradient(Gradient),
+    Noise(Noise),
+}
+
+impl Generator {
+    /// The premultiplied colour at local point `(x, y)` (the normative helper).
+    pub fn at(&self, x: f64, y: f64) -> [f64; 4] {
+        match self {
+            Generator::Gradient(g) => g.at(x, y),
+            Generator::Noise(n) => n.at(x, y),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerContent {
     Media { media: MediaRef, source_time: Time },
     Solid(Rgba),
     Transition(Box<TransitionLayer>),
+    Generator(Generator),
 }
 
 #[derive(Clone, Debug, PartialEq)]

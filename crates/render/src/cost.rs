@@ -2,7 +2,7 @@
 //! per-pixel operations, so a future adaptive preview can lower quality
 //! before frames drop. Interface and measurements only — no scheduler yet.
 
-use kadr_scene::{Effect, FrameScene, Layer, LayerContent, RectF, RenderQuality};
+use kadr_scene::{Effect, FrameScene, Generator, Layer, LayerContent, RectF, RenderQuality};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CostClass {
@@ -91,6 +91,17 @@ fn covered_pixels(scene: &FrameScene, layer: &Layer) -> f64 {
     b.width() as f64 * b.height() as f64 * k * k
 }
 
+/// What making a generator's colour costs per covered pixel, besides the
+/// composite (one sample + blend ≈ 1): a gradient a few multiplies, the
+/// noise four lattice reads and two smoothsteps. Checked against the E3
+/// bench in Task 10.
+fn generator_ops(g: &Generator) -> f64 {
+    match g {
+        Generator::Gradient(_) => 0.3,
+        Generator::Noise(_) => 0.6,
+    }
+}
+
 /// Cost of drawing `layer` into `scene`'s output.
 pub fn layer_cost(scene: &FrameScene, layer: &Layer) -> Cost {
     let out_px = scene.output.size.w as u64 * scene.output.size.h as u64;
@@ -103,6 +114,7 @@ pub fn layer_cost(scene: &FrameScene, layer: &Layer) -> Cost {
             inner + 3.0 * out_px as f64
         }
         LayerContent::Media { .. } | LayerContent::Solid(_) => px * per_px,
+        LayerContent::Generator(g) => px * (per_px + generator_ops(g)),
     };
     Cost::of(own, out_px)
 }
@@ -200,6 +212,19 @@ mod tests {
         let two = with(vec![adjust(0.5), curve.clone()]) + (one - with(vec![]));
         assert!((split - two).abs() < 1e-6 * two, "a live curve between them: two ops, {split} vs {two}");
         assert_eq!(with(vec![adjust(0.5), adjust(0.9), curve.clone()]), with(vec![adjust(0.5), curve]));
+    }
+
+    #[test]
+    fn a_generator_costs_its_covered_pixels_and_its_ops() {
+        let canvas = SizeU::new(1920, 1080);
+        let scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewHigh));
+        let plain = layer_cost(&scene, &solid(canvas, 1.0)).ops;
+        let mut noise = solid(canvas, 1.0);
+        noise.content = LayerContent::Generator(Generator::Noise(Noise { cell: 100.0, seed: 1, time: 0.0, colour: Rgba::BLACK, amount: 1.0, contrast: 1.0 }));
+        let mut grad = solid(canvas, 0.5);
+        grad.content = LayerContent::Generator(Generator::Gradient(Gradient { shape: GradientShape::Radial { centre: Vec2::new(0.0, 0.0), radius: 10.0 }, stops: vec![] }));
+        assert!((layer_cost(&scene, &noise).ops - plain * 1.6).abs() < 1.0);
+        assert!((layer_cost(&scene, &grad).ops - plain / 4.0 * 1.3).abs() < 1.0, "a quarter of the frame");
     }
 
     /// The E2 bench (release, Винтаж's primitives each alone on a

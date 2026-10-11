@@ -1,4 +1,4 @@
-//! The colour primitives of effects E2 (effects spec §4; formulas: the
+//! The colour primitives of effects E2 and the generators of E3 (effects spec §4; formulas: the
 //! effects system draft §3 «Примитивы цвета», exact rules in the crate docs,
 //! "Point operations"): plain data, plus pure helpers that are the
 //! normative formulas — the test reference calls them and the CPU renderer
@@ -245,10 +245,198 @@ pub fn grain_weight(y: f64) -> f64 {
     4.0 * y * (1.0 - y)
 }
 
+// ------------------------------------------------------------ generators (E3)
+
+/// One colour of a [`Gradient`]: where it sits along the gradient (0..1)
+/// and its straight colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    pub pos: f32,
+    pub colour: crate::Rgba,
+}
+
+/// How a gradient runs in its layer's local pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientShape {
+    /// Straight bands across the unit vector `u = (cos angle, sin angle)`
+    /// (y down): `t = (dot(p, u) − offset) / length`.
+    Linear { angle: f32, offset: f32, length: f32 },
+    /// Circles about `centre`: `t = |p − centre| / radius`.
+    Radial { centre: crate::Vec2, radius: f32 },
+}
+
+/// A smooth colour generator (effects spec §4 «Gradient»): a recipe gives
+/// 2–3 stops along a linear or radial shape. Exact rules: crate docs,
+/// "Generators".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    pub shape: GradientShape,
+    /// Any list is accepted as given; a renderer uses [`Gradient::usable_stops`].
+    pub stops: Vec<GradientStop>,
+}
+
+/// A stop as a gradient uses it: its position in [0, 1] and its colour premultiplied.
+pub type UsableStop = (f64, [f64; 4]);
+
+impl Gradient {
+    /// `t` of local point `(x, y)`, in [0, 1]: the shape's distance over its
+    /// length or radius (below 1e-3, or not finite, it counts as 1e-3); a
+    /// NaN `t` (a non-finite geometry) is 0.
+    pub fn t(&self, x: f64, y: f64) -> f64 {
+        let (d, len) = match self.shape {
+            GradientShape::Linear { angle, offset, length } => {
+                let (s, c) = (angle as f64).sin_cos();
+                (x * c + y * s - offset as f64, length as f64)
+            }
+            GradientShape::Radial { centre, radius } => ((x - centre.x as f64).hypot(y - centre.y as f64), radius as f64),
+        };
+        let t = d / len.max(1e-3);
+        if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) }
+    }
+
+    /// The stops in use: non-finite positions dropped, the rest clamped
+    /// into [0, 1] (−0 counts as 0) and stably sorted by position — stops
+    /// sharing one are a hard edge, in the given order; each colour's
+    /// straight components clamped into [0, 1] (a non-finite one 0) and
+    /// premultiplied.
+    pub fn usable_stops(&self) -> Vec<UsableStop> {
+        let unit = |v: f32| if v.is_finite() { (v as f64).clamp(0.0, 1.0) } else { 0.0 };
+        let mut s: Vec<UsableStop> = self
+            .stops
+            .iter()
+            .filter(|s| s.pos.is_finite())
+            .map(|s| {
+                let a = unit(s.colour.a);
+                (unit(s.pos) + 0.0, [unit(s.colour.r) * a, unit(s.colour.g) * a, unit(s.colour.b) * a, a])
+            })
+            .collect();
+        s.sort_by(|a, b| a.0.total_cmp(&b.0));
+        s
+    }
+
+    /// The premultiplied colour at local point `(x, y)`.
+    pub fn at(&self, x: f64, y: f64) -> [f64; 4] {
+        stop_colour(&self.usable_stops(), self.t(x, y))
+    }
+}
+
+/// The colour of usable `stops` at `t`: transparent without stops; at or
+/// before the first the first's, at or after the last the last's; else
+/// linear, in premultiplied values, between the last stop at or before `t`
+/// and the next one (of stops sharing a position the later counts).
+pub fn stop_colour(stops: &[UsableStop], t: f64) -> [f64; 4] {
+    let (Some(first), Some(last)) = (stops.first(), stops.last()) else { return [0.0; 4] };
+    if t <= first.0 {
+        return first.1;
+    }
+    if t >= last.0 {
+        return last.1;
+    }
+    // first.0 < t < last.0: 1 ≤ k ≤ len − 1, and stops[k].0 > t ≥ stops[k − 1].0.
+    let k = stops.partition_point(|s| s.0 <= t);
+    let (a, b) = (stops[k - 1], stops[k]);
+    let f = (t - a.0) / (b.0 - a.0);
+    std::array::from_fn(|c| a.1[c] + (b.1[c] - a.1[c]) * f)
+}
+
+/// Soft value noise (effects spec §4 «Noise»: the light leak's texture): a
+/// lattice every `cell` local pixels, smoothstep-bilinear between its
+/// points, two time slices blended. Exact rules: crate docs, "Generators".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Noise {
+    /// Lattice spacing in local pixels (at least 1).
+    pub cell: f32,
+    pub seed: u64,
+    /// Slices `⌊time⌋` and the next one, blended by the fraction.
+    pub time: f32,
+    /// Straight colour at full value.
+    pub colour: crate::Rgba,
+    /// 0..1: the coverage at full value.
+    pub amount: f32,
+    /// Around ½: 1 keeps the values, more makes harder patches.
+    pub contrast: f32,
+}
+
+impl Noise {
+    /// The lattice spacing: `cell`, but at least 1 (below 1 or not finite: 1).
+    pub fn cell_size(&self) -> f64 {
+        let s = self.cell as f64;
+        if s.is_finite() && s >= 1.0 { s } else { 1.0 }
+    }
+
+    /// The two slices' seeds and the second's weight: with `n = ⌊time⌋`
+    /// (a non-finite time counts as 0), `seed ^ fmix64(n)`,
+    /// `seed ^ fmix64(n + 1)` and `smoothstep(0, 1, time − n)`.
+    pub fn slices(&self) -> (u64, u64, f64) {
+        let time = if self.time.is_finite() { self.time as f64 } else { 0.0 };
+        let n = time.floor();
+        let slice = |k: f64| self.seed ^ kadr_core::hash::fmix64(k as i64 as u64);
+        (slice(n), slice(n + 1.0), smoothstep(0.0, 1.0, time - n))
+    }
+
+    /// The hash index of lattice point `(i, j)`: `j << 32 | i`, each taken
+    /// as 32 bits (as [`Grain::cell_index`]).
+    #[inline]
+    pub fn lattice_index(i: i64, j: i64) -> u64 {
+        ((j as u32 as u64) << 32) | i as u32 as u64
+    }
+
+    /// The value of lattice point `(i, j)`, in [0, 1]: `lerp(h₀, h₁, w)`
+    /// with `h = pcg32_hash(slice seed, lattice_index) / (2³² − 1)`.
+    pub fn lattice(&self, i: i64, j: i64) -> f64 {
+        let (s0, s1, w) = self.slices();
+        let idx = Self::lattice_index(i, j);
+        let h = |s: u64| kadr_core::hash::pcg32_hash(s, idx) as f64 / u32::MAX as f64;
+        let (a, b) = (h(s0), h(s1));
+        a + (b - a) * w
+    }
+
+    /// The noise at local point `(x, y)`, in [0, 1]: the cell `(i, j) =
+    /// (⌊x/s⌋, ⌊y/s⌋)`, its four corners blended by [`smooth_bilerp`] at
+    /// `(x/s − i, y/s − j)`. A non-finite coordinate counts as 0.
+    pub fn value(&self, x: f64, y: f64) -> f64 {
+        let s = self.cell_size();
+        let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+        let (gx, gy) = (finite(x / s), finite(y / s));
+        let (fi, fj) = (gx.floor(), gy.floor());
+        let (i, j) = (fi as i64, fj as i64);
+        let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
+        smooth_bilerp([self.lattice(i, j), self.lattice(i1, j), self.lattice(i, j1), self.lattice(i1, j1)], gx - fi, gy - fj)
+    }
+
+    /// Value `v` as a premultiplied colour: `m = clamp((v − ½)·contrast + ½,
+    /// 0, 1) · clamp(amount, 0, 1)` (a non-finite contrast counts as 1, a
+    /// non-finite amount as 0) times the straight colour clamped into [0, 1]:
+    /// `(r·a·m, g·a·m, b·a·m, a·m)`.
+    pub fn shade(&self, v: f64) -> [f64; 4] {
+        let unit = |c: f32| if c.is_finite() { (c as f64).clamp(0.0, 1.0) } else { 0.0 };
+        let contrast = if self.contrast.is_finite() { self.contrast as f64 } else { 1.0 };
+        let shaped = ((v - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        let m = if shaped.is_nan() { 0.0 } else { shaped } * unit(self.amount);
+        let a = unit(self.colour.a) * m;
+        [unit(self.colour.r) * a, unit(self.colour.g) * a, unit(self.colour.b) * a, a]
+    }
+
+    /// The premultiplied colour at local point `(x, y)`.
+    pub fn at(&self, x: f64, y: f64) -> [f64; 4] {
+        self.shade(self.value(x, y))
+    }
+}
+
+/// `lerp(lerp(l00, l10, wx), lerp(l01, l11, wx), wy)` with
+/// `wx = smoothstep(0, 1, fx)`, `wy = smoothstep(0, 1, fy)`; `l = [l00, l10, l01, l11]`.
+#[inline]
+pub fn smooth_bilerp(l: [f64; 4], fx: f64, fy: f64) -> f64 {
+    let (wx, wy) = (smoothstep(0.0, 1.0, fx), smoothstep(0.0, 1.0, fy));
+    let top = l[0] + (l[1] - l[0]) * wx;
+    let bottom = l[2] + (l[3] - l[2]) * wx;
+    top + (bottom - top) * wy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ColorAdjust, Effect};
+    use crate::{ColorAdjust, Effect, LayerId, Rgba, Vec2};
 
     fn curve(points: &[(f32, f32)]) -> ToneCurve {
         ToneCurve { points: points.to_vec() }
@@ -373,5 +561,92 @@ mod tests {
         assert!(none.iter().all(Effect::is_neutral));
         assert_eq!(none.iter().map(Effect::is_spatial).collect::<Vec<_>>(), [false, false, false, true, true]);
         assert!(!Effect::Vignette(Vignette { amount: 0.3, midpoint: 0.5, feather: 0.5 }).is_neutral());
+    }
+
+    fn stop(pos: f32, r: f32, g: f32, b: f32, a: f32) -> GradientStop {
+        GradientStop { pos, colour: Rgba { r, g, b, a } }
+    }
+
+    #[test]
+    fn a_gradient_maps_its_shape_to_t_and_mixes_premultiplied_stops() {
+        let lin = Gradient { shape: GradientShape::Linear { angle: 0.0, offset: 10.0, length: 20.0 }, stops: vec![stop(0.0, 1.0, 0.0, 0.0, 1.0), stop(1.0, 0.0, 0.0, 1.0, 0.5)] };
+        assert_eq!(lin.t(5.0, 99.0), 0.0, "before its start: the first stop");
+        assert_eq!(lin.t(20.0, -3.0), 0.5, "only the axis counts");
+        assert_eq!(lin.t(40.0, 0.0), 1.0);
+        let mid = lin.at(20.0, 0.0);
+        // lerp((1, 0, 0, 1), (0, 0, 0.5, 0.5), ½): premultiplied, so the blue stop's alpha halves its blue.
+        assert!(mid.iter().zip([0.5, 0.0, 0.25, 0.75]).all(|(a, b)| (a - b).abs() < 1e-12), "{mid:?}");
+        let down = Gradient { shape: GradientShape::Linear { angle: std::f32::consts::FRAC_PI_2, offset: 0.0, length: 10.0 }, ..lin.clone() };
+        assert!((down.t(123.0, 5.0) - 0.5).abs() < 1e-6, "π/2 runs down the y axis (y points down)");
+        let radial = Gradient { shape: GradientShape::Radial { centre: Vec2::new(10.0, 10.0), radius: 5.0 }, stops: lin.stops.clone() };
+        assert_eq!((radial.t(10.0, 10.0), radial.t(13.0, 14.0), radial.t(30.0, 10.0)), (0.0, 1.0, 1.0));
+        let flat = Gradient { shape: GradientShape::Linear { angle: 0.0, offset: 0.0, length: 0.0 }, stops: vec![] };
+        assert_eq!(flat.t(0.0005, 0.0), 0.5, "a length under 1e-3 counts as 1e-3");
+        assert_eq!(Gradient { shape: GradientShape::Radial { centre: Vec2::new(f32::NAN, 0.0), radius: 1.0 }, stops: vec![] }.t(1.0, 1.0), 0.0, "a NaN t is 0");
+    }
+
+    #[test]
+    fn gradient_stops_are_cleaned_up_and_a_shared_position_is_a_hard_edge() {
+        let g = Gradient {
+            shape: GradientShape::Radial { centre: Vec2::new(0.0, 0.0), radius: 1.0 },
+            stops: vec![stop(0.75, 0.0, 1.0, 0.0, 1.0), stop(f32::NAN, 1.0, 1.0, 1.0, 1.0), stop(-2.0, 2.0, -1.0, 0.0, 1.5), stop(0.75, 0.0, 0.0, 1.0, 1.0)],
+        };
+        let s = g.usable_stops();
+        assert_eq!(s, vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (0.75, [0.0, 1.0, 0.0, 1.0]), (0.75, [0.0, 0.0, 1.0, 1.0])], "NaN dropped, clamped, sorted, equal positions kept in order");
+        assert_eq!(stop_colour(&s, 0.75), [0.0, 0.0, 1.0, 1.0], "at a shared position: the later stop");
+        assert_eq!(stop_colour(&s, 0.9), [0.0, 0.0, 1.0, 1.0], "past the last: the last");
+        let half = stop_colour(&s, 0.375);
+        assert!(half.iter().zip([0.5, 0.5, 0.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-12), "{half:?}");
+        assert_eq!(stop_colour(&[], 0.5), [0.0; 4], "no stops: nothing");
+    }
+
+    #[test]
+    fn noise_is_its_lattice_at_lattice_points_and_smooth_between() {
+        let n = Noise { cell: 8.0, seed: 5, time: 0.0, colour: Rgba { r: 1.0, g: 0.5, b: 0.0, a: 1.0 }, amount: 1.0, contrast: 1.0 };
+        let h = |seed: u64, i: i64, j: i64| kadr_core::hash::pcg32_hash(seed, Noise::lattice_index(i, j)) as f64 / u32::MAX as f64;
+        assert_eq!(n.lattice(3, -2), h(5 ^ kadr_core::hash::fmix64(0), 3, -2), "time 0: slice 0 alone");
+        assert_eq!(Noise::lattice_index(-1, 2), (2 << 32) | 0xFFFF_FFFF, "each coordinate taken as 32 bits");
+        assert_eq!(n.value(24.0, 16.0), n.lattice(3, 2), "a lattice point is its value");
+        let (a, b) = (n.lattice(3, 2), n.lattice(4, 2));
+        assert!((n.value(28.0, 16.0) - (a + b) / 2.0).abs() < 1e-12, "half way between two lattice points");
+        assert!((n.value(31.999, 20.0) - n.value(32.0, 20.0)).abs() < 1e-3, "continuous across a cell border");
+        for x in 0..64 {
+            let d = (n.value(x as f64 + 1.0, 9.5) - n.value(x as f64, 9.5)).abs();
+            assert!(d <= 1.5 / 8.0, "x {x}: one pixel moves the value at most the smoothstep's slope per cell, {d}");
+        }
+        assert!((0..200).all(|x| (0.0..=1.0).contains(&n.value(x as f64 * 1.7, x as f64 * 0.3))));
+    }
+
+    #[test]
+    fn noise_time_blends_two_slices_and_shade_maps_value_to_colour() {
+        let n = Noise { cell: 4.0, seed: 9, time: 1.25, colour: Rgba { r: 1.0, g: 0.5, b: 0.0, a: 0.8 }, amount: 0.5, contrast: 2.0 };
+        let (s0, s1, w) = n.slices();
+        assert_eq!((s0, s1), (9 ^ kadr_core::hash::fmix64(1), 9 ^ kadr_core::hash::fmix64(2)));
+        assert_eq!(w, smoothstep(0.0, 1.0, 0.25));
+        let idx = Noise::lattice_index(-1, 4);
+        let h = |s: u64| kadr_core::hash::pcg32_hash(s, idx) as f64 / u32::MAX as f64;
+        assert!((n.lattice(-1, 4) - (h(s0) + (h(s1) - h(s0)) * w)).abs() < 1e-15);
+        assert_eq!(Noise { time: 2.0, ..n }.lattice(-1, 4), h(s1), "a whole time is one slice");
+        // m = clamp((0.6 − ½)·2 + ½, 0, 1) · ½ = 0.35 on the straight colour (1, 0.5, 0, 0.8).
+        let c = n.shade(0.6);
+        // The colour's alpha is the f32 0.8, not the f64 one.
+        let a = 0.8f32 as f64 * 0.35;
+        assert!(c.iter().zip([a, 0.5 * a, 0.0, a]).all(|(x, y)| (x - y).abs() < 1e-12), "{c:?}");
+        assert_eq!(n.shade(0.0)[3], 0.0, "below the contrast's floor: nothing");
+        assert_eq!(Noise { cell: f32::NAN, ..n }.cell_size(), 1.0);
+        assert_eq!(Noise { cell: 0.2, ..n }.cell_size(), 1.0);
+        assert_eq!(Noise { time: f32::NAN, ..n }.slices().2, 0.0, "a non-finite time is 0");
+        assert_eq!(Noise { amount: f32::NAN, ..n }.shade(0.9)[3], 0.0, "a non-finite amount is 0");
+    }
+
+    #[test]
+    fn generators_dispatch_and_derived_layer_ids_differ() {
+        let n = Noise { cell: 3.0, seed: 1, time: 0.5, colour: Rgba::BLACK, amount: 1.0, contrast: 1.0 };
+        assert_eq!(crate::Generator::Noise(n).at(4.0, 5.0), n.at(4.0, 5.0));
+        let base = 0x1234_5678_9abc_def0_0fed_cba9_8765_4321u128;
+        let ids: Vec<LayerId> = (0..3).map(|k| LayerId::derived(base, k)).collect();
+        assert!(ids.iter().all(|l| l.0 != base), "never the base's own id");
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+        assert_eq!(LayerId::derived(base, 1), LayerId::derived(base, 1));
     }
 }

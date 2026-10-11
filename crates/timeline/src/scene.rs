@@ -66,11 +66,13 @@ fn covers_opaquely(l: &Layer, canvas: &RectF) -> bool {
         // `c.a · x.a`, so it needs an opaque dip colour).
         LayerContent::Transition(t) => {
             let opaque_op = match t.op {
-                TransitionOp::Dissolve | TransitionOp::Wipe { .. } => true,
+                TransitionOp::Dissolve | TransitionOp::Wipe { .. } | TransitionOp::Over => true,
                 TransitionOp::DipToColor(c) => c.a >= 1.0,
             };
             opaque_op && t.from.iter().any(|f| covers_opaquely(f, canvas)) && t.to.iter().any(|f| covers_opaquely(f, canvas))
         }
+        // A generator never occludes (D6): it is not proven opaque.
+        LayerContent::Generator(_) => false,
     };
     opaque_content
         && l.opacity >= 1.0

@@ -12,7 +12,7 @@
 //! - Working values are non-linear Rec.709 R'G'B' with **premultiplied**
 //!   alpha, components in [0, 1]. Texels arrive already converted to this
 //!   space by the resolver (source matrix, range and transfer per spec §6).
-//! - [`Rgba`] values in the scene ([`LayerContent::Solid`],
+//! - [`Rgba`] values in the scene ([`LayerContent::Solid`], a generator's colours,
 //!   [`FrameScene::background`], [`TransitionOp::DipToColor`]) are
 //!   **straight** alpha; the renderer premultiplies them:
 //!   `(r·a, g·a, b·a, a)`.
@@ -147,6 +147,37 @@
 //! out-of-range ones simply follow the formulas (an amount above 1 darkens
 //! past black, which the final clamp catches).
 //!
+//! ## Generators
+//!
+//! A [`LayerContent::Generator`] layer has no texels: its sample at an
+//! output pixel centre is the generator's premultiplied value at that
+//! centre's **local** position `l` — canvas → local as in Coordinates
+//! (local pixels are canvas pixels at the layer's scale 1, `(0, 0)` the
+//! content rectangle's top left; for a `Placement::fill` layer `l` is the
+//! canvas position) — [`Generator::at`]`(l)`, normative, computed in f64.
+//! There is no sampling clamp (a generator is defined everywhere); the
+//! crop limits coverage only. Effects, opacity, coverage and blend apply as
+//! for a Solid layer, and a renderer gives a generator layer no input.
+//!
+//! - **Gradient**: `t` = [`Gradient::t`] — linear `(x·cos a + y·sin a −
+//!   offset) / max(length, 1e-3)`, radial `|l − centre| / max(radius,
+//!   1e-3)`; NaN → 0; clamped into [0, 1]. The colour is [`stop_colour`] of
+//!   [`Gradient::usable_stops`] at `t`: stops with a finite position,
+//!   clamped into [0, 1], stably sorted, colours clamped and premultiplied;
+//!   the first's before them, the last's after, linear in premultiplied
+//!   values between the last stop at or before `t` and the next; none:
+//!   transparent.
+//! - **Noise**: with `s` = [`Noise::cell_size`], `(i, j) = (⌊x/s⌋, ⌊y/s⌋)`
+//!   (a non-finite coordinate counts as 0), `v` = [`smooth_bilerp`] of
+//!   [`Noise::lattice`] at the cell's four corners and `(x/s − i, y/s − j)`;
+//!   `L(i, j)` blends the slices of [`Noise::slices`] — `⌊time⌋` and the
+//!   next, seeds `seed ^ fmix64(n)`, weight `smoothstep(0, 1, fract)` — of
+//!   `pcg32_hash(slice seed, `[`Noise::lattice_index`]`) / (2³² − 1)`; the
+//!   colour is [`Noise::shade`]`(v)`: `m = clamp((v − ½)·contrast + ½, 0,
+//!   1)·clamp(amount, 0, 1)` times the clamped straight colour, premultiplied.
+//!   A renderer may read the lattice from a table of its own: the values are
+//!   the same numbers.
+//!
 //! ## Value domain
 //!
 //! The evaluator emits finite values, with every `opacity` and transition
@@ -226,6 +257,8 @@
 //!   `m = clamp(0.5 + e / max(w_out, 1), 0, 1)`, `out = lerp(from, to, m)`.
 //!   So with no softness the edge is anti-aliased over one output pixel,
 //!   like a layer edge.
+//! - Over: `out = to + from·(1 − to.a)` — the incoming side over the
+//!   outgoing one; `p` is not used.
 //! - The output alpha is whatever the formula yields; it is never forced
 //!   opaque.
 
