@@ -16,7 +16,8 @@ pub const DEFAULT_PRESET: &str = "cinematic";
 /// A Look's vignette has the Vignette effect's shape at softness 0.5 (refinement 7).
 pub const LOOK_VIGNETTE_MIDPOINT: f64 = 0.45;
 pub const LOOK_VIGNETTE_FEATHER: f64 = 0.5;
-/// Grain cells: 2 canvas pixels per 1080 canvas lines, at least 1 (refinement 6).
+/// Grain cells: 2 canvas pixels per 1080 pixels of the canvas's short side,
+/// at least 1 (refinement 6, ruling E2-R4).
 pub const GRAIN_CELL_PER_1080: f64 = 2.0;
 /// The Vignette effect at `k = 1` (D4): amount 0.35, midpoint 0.45,
 /// feather `0.15 + 0.7 · softness`.
@@ -106,9 +107,11 @@ pub fn frame_seed(ctx: &CompileCtx) -> u64 {
     ctx.seed ^ fmix64(ctx.frame.flicks() as u64)
 }
 
-/// The grain cell for a canvas: `GRAIN_CELL_PER_1080` per 1080 lines, at least 1 pixel.
+/// The grain cell for a canvas: `GRAIN_CELL_PER_1080` per 1080 pixels of
+/// its short side, at least 1 pixel — a vertical 1080 × 1920 canvas gets the
+/// grain of a 1920 × 1080 one (E2-R4).
 pub fn grain_cell(canvas: SizeU) -> f64 {
-    (GRAIN_CELL_PER_1080 * canvas.h as f64 / 1080.0).max(1.0)
+    (GRAIN_CELL_PER_1080 * canvas.w.min(canvas.h) as f64 / 1080.0).max(1.0)
 }
 
 /// `preset` at intensity `k` (D4): its correction, curve, split tone,
@@ -311,6 +314,9 @@ mod tests {
         assert_eq!(grain(hd, Time::ZERO).size, 2.0);
         assert_eq!(grain(SizeU::new(3840, 2160), Time::ZERO).size, 4.0);
         assert_eq!(grain(SizeU::new(640, 360), Time::ZERO).size, 1.0, "never below one canvas pixel");
+        assert_eq!(grain(SizeU::new(1080, 1920), Time::ZERO).size, grain(hd, Time::ZERO).size, "the short side: vertical as landscape (E2-R4)");
+        assert_eq!(grain(SizeU::new(2160, 3840), Time::ZERO).size, 4.0);
+        assert_eq!(grain(SizeU::new(1080, 1080), Time::ZERO).size, 2.0, "square");
     }
 
     #[test]
