@@ -2,16 +2,20 @@
 //! Hovering a card shows its effect on the selected clips without touching
 //! the project (`PreviewOverride`, applied to the preview's snapshot only);
 //! a click applies it to them, a drag to the one clip under the pointer.
+//! Also the inspector's «Эффекты клипа» (§6.2): one block per effect.
 //! Pure parts are free functions, tested without a window.
 
+use crate::anim_ui;
 use crate::app::App;
 use crate::timeline_ui::{rows, Row};
-use crate::{FxCardView, FxCategoryView};
-use kadr_core::{ClipId, Time};
-use kadr_effects::{Category, RecipeDef};
+use crate::{FxCardView, FxCategoryView, FxParamRow, FxRow, KeyState};
+use kadr_core::{ClipId, EffectId, FrameRate, Time, Timecode};
+use kadr_effects::{Category, ParamDef, ParamKind, RecipeDef};
 use kadr_i18n::{t, t_in, tf, Lang};
-use kadr_project::{AppliedEffect, Sequence};
+use kadr_project::{AppliedEffect, Clip, ParamValue, Sequence, SourceTime, TrackKey};
 use kadr_timeline::EditCommand;
+use slint::{Model, ModelRc, SharedString, VecModel};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// A press that moves less than this (window pixels) is a click.
@@ -154,6 +158,115 @@ fn batch_of(seq: &Sequence, def: &RecipeDef, effects: Vec<(ClipId, AppliedEffect
         .map(|(clip, effect)| EditCommand::AddEffect { clip, effect })
         .collect();
     (!commands.is_empty()).then(|| EditCommand::Batch { label: tf("cmd.effect_named", &[("name", &t(&def.name_key()))]), commands })
+}
+
+/// One parameter row of an effect block at the playhead (spec §6.2): a
+/// number with ◀ ◆ ▶ (its value at the playhead, or at the nearest edge),
+/// a choice, the point (pick on the preview) or the moment (to the playhead).
+pub fn param_row(c: &Clip, e: &AppliedEffect, p: &ParamDef, playhead: Time, rate: FrameRate, picking: bool) -> FxParamRow {
+    let frame = rate.frame_duration();
+    let on_clip = anim_ui::edit_time(c, playhead, frame).is_some();
+    let key = TrackKey::fx(e.id, p.key);
+    let mut row = FxParamRow { key: p.key.into(), prop: key.key_string().into(), label: t(&p.label_key()).into(), ..Default::default() };
+    match p.kind {
+        ParamKind::Number { min, max, default } => {
+            row.kind = 0;
+            row.value = c.track_value(&key, anim_ui::shown_time(c, playhead, frame)).unwrap_or(default) as f32;
+            (row.minimum, row.maximum, row.default_value) = (min as f32, max as f32, default as f32);
+            let info = anim_ui::key_info(c, &key, playhead, frame);
+            let ease = anim_ui::key_here(c, &key, playhead, frame).map_or("", |k| anim_ui::ease_key(&k.ease));
+            row.k = KeyState { state: info.state, prev: info.prev.is_some(), next: info.next.is_some(), enabled: on_clip, ease: ease.into() };
+            row.strength = p.key == "strength";
+        }
+        ParamKind::Choice { options, .. } => {
+            row.kind = 1;
+            let current = match e.params.get(p.key) {
+                Some(ParamValue::Choice(v)) => v.as_str(),
+                _ => "",
+            };
+            row.current = options.iter().position(|o| *o == current).map_or(-1, |i| i as i32);
+            row.options = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(*o)).collect::<Vec<_>>()));
+            row.tips = ModelRc::new(VecModel::from(options.iter().map(|o| SharedString::from(t(&format!("fx.choice.{o}")))).collect::<Vec<_>>()));
+        }
+        ParamKind::Point => {
+            row.kind = 2;
+            let (x, y) = match e.params.get(p.key) {
+                Some(ParamValue::Point { x, y }) => (*x, *y),
+                _ => (0.5, 0.5),
+            };
+            row.text = format!("{:.0} %, {:.0} %", x * 100.0, y * 100.0).into();
+            row.can_act = on_clip;
+            row.active = picking;
+            row.hint = if picking { t("fx.pick.hint") } else if on_clip { String::new() } else { t("fx.pick.off_clip") }.into();
+        }
+        ParamKind::Moment => {
+            row.kind = 3;
+            row.can_act = on_clip;
+            if let Some(ParamValue::Moment(m)) = e.params.get(p.key) {
+                let tl = c.timeline_time_of(m.0);
+                row.text = Timecode::from_time(tl.max(Time::ZERO), rate).to_string().into();
+                if tl < c.timeline_in || tl >= c.timeline_out {
+                    row.hint = t("fx.moment.outside").into();
+                }
+                row.can_act = on_clip && SourceTime(c.source_time_at(playhead)) != *m;
+            }
+        }
+    }
+    row
+}
+
+/// Whether a block of `c` shows a moment: its «к плейхеду» depends on the
+/// playhead's frame, so the inspector follows the playhead (as it does for
+/// keyframes) even on a clip without animation.
+pub fn has_moment(c: &Clip) -> bool {
+    c.effects.iter().filter_map(kadr_effects::definition).any(|d| d.params.iter().any(|p| p.kind == ParamKind::Moment))
+}
+
+/// «Сбросить» of one effect: its defaults (the moment: the frame at `at`)
+/// and no keyframes on its numbers — `None` when it is so already.
+pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) -> Option<Vec<EditCommand>> {
+    let defaults = kadr_effects::fresh(def, c, at).params;
+    let animated: Vec<(TrackKey, f64)> = def
+        .params
+        .iter()
+        .filter_map(|p| {
+            let k = TrackKey::fx(e.id, p.key);
+            let v = defaults.get(p.key)?.as_number()?;
+            c.animation.is_animated(&k).then_some((k, v))
+        })
+        .collect();
+    if animated.is_empty() && defaults.iter().all(|(k, v)| e.params.get(k) == Some(v)) {
+        return None;
+    }
+    let mut commands = vec![];
+    if !animated.is_empty() {
+        commands.push(EditCommand::ClearAnimation { clip: c.id, statics: animated });
+    }
+    commands.push(EditCommand::UpdateEffect { clip: c.id, id: e.id, params: defaults, enabled: None });
+    Some(commands)
+}
+
+/// A row's nested list in the model on screen (an empty one stays as it is).
+fn same_list(old: ModelRc<SharedString>, new: ModelRc<SharedString>) -> ModelRc<SharedString> {
+    if old.row_count() == 0 && new.row_count() == 0 {
+        return old;
+    }
+    crate::util::reuse_rows(Some(old), new.iter().collect())
+}
+
+/// `rows` into the model on screen, each row keeping its nested option
+/// lists (a fresh `ModelRc` would make every row look changed and rebuild
+/// its elements on each refresh).
+fn reuse_param_rows(old: Option<ModelRc<FxParamRow>>, mut rows: Vec<FxParamRow>) -> ModelRc<FxParamRow> {
+    if let Some(old) = &old {
+        for (i, r) in rows.iter_mut().enumerate() {
+            if let Some(o) = old.row_data(i) {
+                r.options = same_list(o.options, r.options.clone());
+                r.tips = same_list(o.tips, r.tips.clone());
+            }
+        }
+    }
+    crate::util::reuse_rows(old, rows)
 }
 
 impl App {
@@ -449,6 +562,105 @@ impl App {
             None => self.toast(tf("fx.already", &[("name", &t(&def.name_key()))])),
         }
     }
+
+    /// The «Эффекты клипа» rows of `c` (spec §6.2, mockup A), updating the
+    /// models on screen in place: the inspector refreshes ~10 times a second
+    /// during playback, and a rebuilt row would lose a press in flight.
+    pub fn fx_rows(&self, c: &Clip, old: ModelRc<FxRow>) -> ModelRc<FxRow> {
+        let rate = self.project.sequence().frame_rate;
+        let old_params: HashMap<SharedString, ModelRc<FxParamRow>> = old.iter().map(|r| (r.id, r.params)).collect();
+        let rows: Vec<FxRow> = c
+            .effects
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let def = kadr_effects::definition(e);
+                let params: Vec<FxParamRow> = def.map_or_else(Vec::new, |d| d.params.iter().map(|p| param_row(c, e, p, self.playhead, rate, false)).collect());
+                let id: SharedString = e.id.to_string().into();
+                let params = reuse_param_rows(old_params.get(&id).cloned(), params);
+                FxRow { id, name: fx_name(e).into(), enabled: e.enabled, known: def.is_some(), first: i == 0, last: i + 1 == c.effects.len(), params }
+            })
+            .collect();
+        crate::util::reuse_rows(Some(old), rows)
+    }
+
+    /// An effect block's action (spec §6.2, `action_commands`): one undo
+    /// entry, nothing sent when nothing would change.
+    pub fn fx_action(&mut self, effect: &str, action: &str) {
+        let (Some(id), Some(eid)) = (self.inspected(), EffectId::parse(effect)) else { return };
+        let seq = self.project.sequence();
+        let Some(c) = seq.clip(id) else { return };
+        if let Some((label, commands)) = action_commands(c, eid, action, self.playhead, seq.frame_rate) {
+            self.execute(EditCommand::Batch { label, commands });
+        }
+    }
+
+    /// «Сбросить» of the section: every effect of the clip, after asking (spec §6.2).
+    pub fn fx_ask_clear(&mut self, id: ClipId) {
+        let Some(n) = self.project.sequence().clip(id).map(|c| c.effects.len()).filter(|n| *n > 0) else { return };
+        let body = kadr_i18n::tn("dlg.clear_effects.body", n as i64, &[]);
+        self.ask(&t("dlg.clear_effects.title"), &body, &t("dlg.clear_effects.ok"), "", true, crate::app::Confirm::ClearEffects(id));
+    }
+
+    /// The confirmed section reset: one undo step removes every effect (and its keyframes).
+    pub fn fx_clear_now(&mut self, id: ClipId) {
+        if let Some(cmd) = self.project.sequence().clip(id).and_then(clear_batch) {
+            self.execute(cmd);
+        }
+    }
+}
+
+/// What an effect block's action does (spec §6.2) with the playhead at
+/// `playhead`: `toggle`, `reset`, `remove`, `up`, `down`,
+/// `choice:<key>:<index>`, `moment:<key>` (to the playhead) — the history
+/// label and the commands of one undo entry; `None` when nothing would
+/// change (the engine records an entry for every success). An effect from
+/// a newer Kadr is only moved or removed (§7).
+pub fn action_commands(c: &Clip, eid: EffectId, action: &str, playhead: Time, rate: FrameRate) -> Option<(String, Vec<EditCommand>)> {
+    let e = c.effect(eid)?;
+    let name = fx_name(e);
+    let def = kadr_effects::definition(e);
+    let pos = c.effects.iter().position(|x| x.id == eid)?;
+    let update = |params: BTreeMap<String, ParamValue>, enabled: Option<bool>| EditCommand::UpdateEffect { clip: c.id, id: eid, params, enabled };
+    Some(match action {
+        "toggle" if def.is_some() => {
+            let key = if e.enabled { "cmd.effect_off_named" } else { "cmd.effect_on_named" };
+            (tf(key, &[("name", &name)]), vec![update(BTreeMap::new(), Some(!e.enabled))])
+        }
+        "remove" => (tf("cmd.remove_effect_named", &[("name", &name)]), vec![EditCommand::RemoveEffect { clip: c.id, id: eid }]),
+        "up" if pos > 0 => (t("cmd.move_effect"), vec![EditCommand::MoveEffect { clip: c.id, id: eid, to: pos - 1 }]),
+        "down" if pos + 1 < c.effects.len() => (t("cmd.move_effect"), vec![EditCommand::MoveEffect { clip: c.id, id: eid, to: pos + 1 }]),
+        "reset" => (tf("cmd.reset_effect_named", &[("name", &name)]), reset_commands(c, e, def?, playhead)?),
+        a if a.starts_with("choice:") => {
+            let (key, index) = a["choice:".len()..].rsplit_once(':')?;
+            let ParamKind::Choice { options, .. } = def?.param(key)?.kind else { return None };
+            let v = ParamValue::Choice(options.get(index.parse::<usize>().ok()?)?.to_string());
+            if e.params.get(key) == Some(&v) {
+                return None;
+            }
+            (tf("cmd.effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
+        }
+        a if a.starts_with("moment:") => {
+            let key = &a["moment:".len()..];
+            if def?.param(key)?.kind != ParamKind::Moment {
+                return None;
+            }
+            let tt = anim_ui::edit_time(c, playhead, rate.frame_duration())?;
+            let v = ParamValue::Moment(SourceTime(c.source_time_at(tt)));
+            if e.params.get(key) == Some(&v) {
+                return None;
+            }
+            (tf("cmd.effect_named", &[("name", &name)]), vec![update(BTreeMap::from([(key.to_string(), v)]), None)])
+        }
+        _ => return None,
+    })
+}
+
+/// The section's confirmed «Сбросить»: every effect of `c` (and with it its
+/// keyframes) in one undo step; `None` without effects.
+pub fn clear_batch(c: &Clip) -> Option<EditCommand> {
+    let commands: Vec<EditCommand> = c.effects.iter().map(|e| EditCommand::RemoveEffect { clip: c.id, id: e.id }).collect();
+    (!commands.is_empty()).then(|| EditCommand::Batch { label: t("cmd.clear_effects"), commands })
 }
 
 #[cfg(test)]
@@ -457,7 +669,7 @@ mod tests {
     use crate::timeline_ui::rows;
     use kadr_core::{AssetId, FrameRate, MediaInfo, MediaKind, TimeRange, VideoInfo};
     use kadr_playback::SceneSource;
-    use kadr_project::{Clip, MediaAsset, Project, Track, TrackKind};
+    use kadr_project::{Clip, MediaAsset, ParamValue, Project, SourceTime, Track, TrackKey, TrackKind};
     use kadr_scene::{OutputSpec, RenderQuality, SizeU};
 
     /// V2 (locked) above V1, and A1: V1 0..10 s, V2 2..4 s, A1 0..10 s.
@@ -574,6 +786,182 @@ mod tests {
         assert_eq!(p, before, "the project does not");
         assert_eq!(crate::scene_source::ProjectScenes::new(&p, false).scene_at(Time::from_secs(4), &out).layers[0].placement.scale.x, 1.0, "nor does the next snapshot");
         assert_eq!(o.clips(), vec![id]);
+    }
+
+    /// Timeline 10..20 s showing source 30..40 s.
+    fn clip_10_20() -> Clip {
+        Clip::new(AssetId::new(), "c", TimeRange::new(Time::from_secs(30), Time::from_secs(40)), Time::from_secs(10))
+    }
+
+    #[test]
+    fn parameter_rows_follow_the_playhead_and_the_effect() {
+        let mut c = clip_10_20();
+        let def = kadr_effects::recipe("punch_in").unwrap();
+        let mut e = kadr_effects::fresh(def, &c, Time::from_secs(12));
+        e.params.insert("strength".into(), ParamValue::Number(0.9));
+        c.effects.push(e.clone());
+        let row = |key: &str, playhead: i64| param_row(&c, &e, def.param(key).unwrap(), Time::from_secs(playhead), FrameRate::FPS_30, false);
+        let s = row("strength", 12);
+        assert_eq!((s.kind, s.value, s.strength, s.prop.to_string()), (0, 0.9, true, format!("fx:{}:strength", e.id)));
+        assert_eq!((s.minimum, s.maximum, s.default_value), (0.0, 1.0, 0.6));
+        assert_eq!((s.k.state, s.k.enabled), (0, true));
+        assert!(!row("strength", 25).k.enabled, "off the clip: ◆ is disabled");
+        let m = row("moment", 12);
+        assert_eq!((m.kind, m.can_act, m.hint.as_str()), (3, false, ""), "already the playhead's frame: nothing to do");
+        assert!(row("moment", 15).can_act);
+        assert!(!row("moment", 25).can_act, "off the clip");
+        let p = row("point", 12);
+        assert_eq!((p.kind, p.text.as_str(), p.can_act, p.active), (2, "50 %, 50 %", true, false));
+        assert!(!row("point", 25).can_act);
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        let z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
+        let d = param_row(&c, &z, zoom.param("direction").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false);
+        assert_eq!((d.kind, d.current), (1, 0));
+        assert_eq!(d.options.iter().collect::<Vec<_>>(), vec![slint::SharedString::from("in"), slint::SharedString::from("out")]);
+    }
+
+    /// «К плейхеду» is enabled only off the moment's frame: a playhead move
+    /// must refresh the block even on a clip without keyframes.
+    #[test]
+    fn a_moment_row_follows_the_playhead() {
+        let mut c = clip_10_20();
+        assert!(!has_moment(&c));
+        c.effects.push(kadr_effects::fresh(kadr_effects::recipe("smooth_zoom").unwrap(), &c, Time::from_secs(12)));
+        assert!(!has_moment(&c), "no moment: nothing depends on the playhead's frame");
+        c.effects.push(AppliedEffect::new("punch_in", 9, BTreeMap::new()));
+        assert!(!has_moment(&c), "a newer Kadr's version shows no rows");
+        c.effects.push(kadr_effects::fresh(kadr_effects::recipe("punch_in").unwrap(), &c, Time::from_secs(12)));
+        assert!(has_moment(&c));
+    }
+
+    /// Review focus 4: a moment the trim left outside the visible clip says so.
+    #[test]
+    fn a_moment_off_the_visible_clip_is_flagged() {
+        let c = clip_10_20();
+        let def = kadr_effects::recipe("punch_in").unwrap();
+        let mut e = kadr_effects::fresh(def, &c, Time::from_secs(12));
+        e.params.insert("moment".into(), ParamValue::Moment(SourceTime(Time::from_secs(45))));
+        let m = param_row(&c, &e, def.param("moment").unwrap(), Time::from_secs(12), FrameRate::FPS_30, false);
+        assert_eq!(m.hint.to_string(), t("fx.moment.outside"));
+        assert!(m.can_act, "«к плейхеду» brings it back");
+    }
+
+    #[test]
+    fn resetting_an_effect_restores_defaults_and_drops_its_keyframes() {
+        let mut c = clip_10_20();
+        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let e = kadr_effects::fresh(def, &c, Time::from_secs(12));
+        c.effects.push(e.clone());
+        assert!(reset_commands(&c, &e, def, Time::from_secs(12)).is_none(), "already the defaults: no command");
+        let mut out = e.clone();
+        out.params.insert("direction".into(), ParamValue::Choice("out".into()));
+        c.effects[0] = out.clone();
+        assert!(matches!(reset_commands(&c, &out, def, Time::from_secs(12)).as_deref(), Some([EditCommand::UpdateEffect { .. }])));
+        let k = TrackKey::fx(e.id, "strength");
+        c.animation.set_key(k.clone(), SourceTime(Time::from_secs(31)), 0.1, None);
+        let cmds = reset_commands(&c, &out, def, Time::from_secs(12)).unwrap();
+        assert!(matches!(&cmds[..], [EditCommand::ClearAnimation { statics, .. }, EditCommand::UpdateEffect { .. }] if *statics == vec![(k.clone(), 0.6)]));
+    }
+
+    /// One command per click, none when nothing would change (the engine
+    /// records an entry for every Ok); an effect from a newer Kadr is only
+    /// moved or removed (spec §7, review focus 5).
+    #[test]
+    fn block_actions_send_one_command_or_none_when_nothing_changes() {
+        let mut c = clip_10_20();
+        let (zoom, punch) = (kadr_effects::recipe("smooth_zoom").unwrap(), kadr_effects::recipe("punch_in").unwrap());
+        let at = Time::from_secs(12);
+        let (z, p) = (kadr_effects::fresh(zoom, &c, at), kadr_effects::fresh(punch, &c, at));
+        let future = AppliedEffect::new("glitch_v2", 3, [("amount".to_string(), ParamValue::Number(0.5))].into());
+        c.effects = vec![z.clone(), p.clone(), future.clone()];
+        let act = |id, a: &str, playhead: i64| action_commands(&c, id, a, Time::from_secs(playhead), FrameRate::FPS_30);
+        let update = |id, params: BTreeMap<String, ParamValue>, enabled| vec![EditCommand::UpdateEffect { clip: c.id, id, params, enabled }];
+        let named = |key: &str| tf(key, &[("name", &t("fx.smooth_zoom"))]);
+
+        assert_eq!(act(z.id, "toggle", 12), Some((named("cmd.effect_off_named"), update(z.id, BTreeMap::new(), Some(false)))));
+        assert_eq!(act(z.id, "remove", 12), Some((named("cmd.remove_effect_named"), vec![EditCommand::RemoveEffect { clip: c.id, id: z.id }])));
+        assert_eq!(act(z.id, "up", 12), None, "the first has nothing above");
+        assert_eq!(act(z.id, "down", 12).map(|a| a.1), Some(vec![EditCommand::MoveEffect { clip: c.id, id: z.id, to: 1 }]));
+        assert_eq!(act(z.id, "reset", 12), None, "already the defaults");
+
+        assert_eq!(act(z.id, "choice:direction:0", 12), None, "already «in»");
+        let out = BTreeMap::from([("direction".to_string(), ParamValue::Choice("out".into()))]);
+        assert_eq!(act(z.id, "choice:direction:1", 12), Some((named("cmd.effect_named"), update(z.id, out, None))));
+        for bad in ["choice:direction:2", "choice:direction:x", "choice:strength:0", "choice:nope:0", "pick:point", "nonsense"] {
+            assert_eq!(act(z.id, bad, 12), None, "{bad}");
+        }
+
+        assert_eq!(act(p.id, "moment:moment", 12), None, "already the playhead's frame");
+        assert_eq!(act(p.id, "moment:moment", 25), None, "the playhead is off the clip");
+        assert_eq!(act(p.id, "moment:strength", 15), None, "not a moment");
+        let at_15 = BTreeMap::from([("moment".to_string(), ParamValue::Moment(SourceTime(Time::from_secs(35))))]);
+        assert_eq!(act(p.id, "moment:moment", 15).map(|a| a.1), Some(update(p.id, at_15, None)), "source-bound: 15 s on the timeline is 35 s of the source");
+
+        for locked in ["toggle", "reset", "choice:direction:0", "moment:moment"] {
+            assert_eq!(act(future.id, locked, 15), None, "{locked}: a newer Kadr's effect is not changed");
+        }
+        assert!(act(future.id, "remove", 12).is_some());
+        assert_eq!(act(future.id, "up", 12).map(|a| a.1), Some(vec![EditCommand::MoveEffect { clip: c.id, id: future.id, to: 1 }]));
+        assert_eq!(act(future.id, "down", 12), None, "the last has nothing below");
+        assert_eq!(act(kadr_core::EffectId::new(), "remove", 12), None, "not on the clip");
+    }
+
+    /// The effect's reset and the section's reset are one undo step each,
+    /// keyframes included (spec §6.2, keyframes spec §5).
+    #[test]
+    fn resets_are_one_undo_step_with_their_keyframes() {
+        use kadr_timeline::EditEngine;
+        let (mut p, id) = project_with_clip();
+        let def = kadr_effects::recipe("smooth_zoom").unwrap();
+        let (ti, ci) = p.sequence().locate_clip(id).unwrap();
+        let c = &mut p.sequence_mut().tracks[ti].clips[ci];
+        let mut e = kadr_effects::fresh(def, c, Time::from_secs(1));
+        e.params.insert("direction".into(), ParamValue::Choice("out".into()));
+        let k = TrackKey::fx(e.id, "strength");
+        c.effects.push(e.clone());
+        c.effects.push(kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), &c.clone(), Time::from_secs(1)));
+        c.animation.set_key(&k, SourceTime(Time::from_secs(1)), 0.2, None);
+        c.animation.set_key(&k, SourceTime(Time::from_secs(3)), 0.9, None);
+        let before = p.sequence().clone();
+        let clip = |p: &Project| p.sequence().clip(id).unwrap().clone();
+        let mut engine = EditEngine::new();
+
+        let (label, commands) = action_commands(&clip(&p), e.id, "reset", Time::from_secs(1), FrameRate::FPS_30).unwrap();
+        engine.execute(&mut p, EditCommand::Batch { label, commands }).unwrap();
+        let after = clip(&p);
+        assert_eq!(after.effects[0].params, kadr_effects::fresh(def, &after, Time::from_secs(1)).params, "the defaults");
+        assert!(!after.animation.is_animated(&k), "and no keyframes");
+        assert!(action_commands(&after, e.id, "reset", Time::from_secs(1), FrameRate::FPS_30).is_none(), "a second reset has nothing to do");
+        engine.undo(&mut p);
+        assert_eq!(*p.sequence(), before, "one undo brings back values and keyframes");
+
+        let clear = clear_batch(&clip(&p)).unwrap();
+        engine.execute(&mut p, clear).unwrap();
+        let cleared = clip(&p);
+        assert!(cleared.effects.is_empty() && !cleared.animation.has_effect_tracks(e.id), "every effect and its tracks");
+        assert!(clear_batch(&cleared).is_none(), "nothing left: no command");
+        engine.undo(&mut p);
+        assert_eq!(*p.sequence(), before, "one undo step");
+    }
+
+    /// The inspector refreshes ~10 times a second during playback: rows
+    /// that did not change keep their models (a new one would rebuild the
+    /// elements and lose a press in flight).
+    #[test]
+    fn a_refresh_keeps_the_parameter_models_on_screen() {
+        let c = clip_10_20();
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        let z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
+        let rows = |playhead: i64| zoom.params.iter().map(|p| param_row(&c, &z, p, Time::from_secs(playhead), FrameRate::FPS_30, false)).collect::<Vec<_>>();
+        let first = reuse_param_rows(None, rows(12));
+        let (options, tips, empty) = (first.row_data(0).unwrap().options, first.row_data(0).unwrap().tips, first.row_data(1).unwrap().options);
+        let again = reuse_param_rows(Some(first.clone()), rows(12));
+        assert!(again == first, "the same parameter model");
+        assert!(again.row_data(0).unwrap().options == options && again.row_data(0).unwrap().tips == tips, "the same option lists");
+        assert!(again.row_data(1).unwrap().options == empty, "an empty list stays as it is");
+        let off = reuse_param_rows(Some(first.clone()), rows(25));
+        assert!(off == first, "a changed row is updated in place");
+        assert!(!off.row_data(1).unwrap().k.enabled);
     }
 
     #[test]

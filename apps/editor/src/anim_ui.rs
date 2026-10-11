@@ -1,6 +1,7 @@
 //! Pure keyframe/fade UI logic shared by the inspector and the timeline.
 
 use kadr_core::{FrameRate, Time};
+use kadr_i18n::{t, tf};
 use kadr_project::{AnimParam, Clip, Ease, FadeEdge, Keyframe, SourceTime, TrackKey};
 use kadr_timeline::{editable_keys_at, EditCommand};
 
@@ -40,6 +41,32 @@ pub fn label_key(p: AnimParam) -> &'static str {
         AnimParam::Contrast => "inspector.contrast",
         AnimParam::Saturation => "inspector.saturation",
         AnimParam::Temperature => "inspector.temperature",
+    }
+}
+
+/// The track an inspector row edits: a clip property (`PROPS`) or an
+/// effect's number (`fx:<effect-id>:<key>`, effects spec §6.2).
+pub fn track_of(prop: &str) -> Option<TrackKey> {
+    param_of(prop).map(TrackKey::Clip).or_else(|| TrackKey::parse(prop).filter(|k| k.as_fx().is_some()))
+}
+
+/// The UI name of a track: the property's label, or «Сила (Плавный наезд)».
+pub fn track_label(c: &Clip, k: &TrackKey) -> String {
+    match k {
+        TrackKey::Clip(p) => t(label_key(*p)),
+        TrackKey::Fx(f) => {
+            let effect = c.effect(f.effect).map_or_else(String::new, crate::effects_ui::fx_name);
+            tf("fx.param_of", &[("param", &t(&format!("fx.param.{}", f.key))), ("effect", &effect)])
+        }
+    }
+}
+
+/// A slider value as stored: an effect's number rounded to 4 decimals (the
+/// f32 slider would store 0.6000000238 for 60 %); clip properties as they come.
+pub fn slider_value(k: &TrackKey, v: f32) -> f64 {
+    match k {
+        TrackKey::Fx(_) => (v as f64 * 10_000.0).round() / 10_000.0,
+        TrackKey::Clip(_) => v as f64,
     }
 }
 
@@ -367,6 +394,22 @@ mod tests {
     fn clip() -> Clip {
         // timeline 10..20 s, source 0..10 s
         Clip::new(AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(10)), Time::from_secs(10))
+    }
+
+    #[test]
+    fn effect_rows_are_tracks_too() {
+        let fx = kadr_core::EffectId::new();
+        assert_eq!(track_of(&format!("fx:{fx}:strength")), Some(TrackKey::fx(fx, "strength")));
+        assert_eq!(track_of("scale"), Some(TrackKey::Clip(AnimParam::Scale)));
+        assert_eq!(track_of("speed"), None);
+        assert_eq!(slider_value(&TrackKey::fx(fx, "strength"), 0.6), 0.6, "60 % is stored as 0.6, not 0.6000000238");
+        let mut c = clip();
+        let e = kadr_project::AppliedEffect::new("smooth_zoom", 1, Default::default());
+        let id = e.id;
+        c.effects.push(e);
+        let want = kadr_i18n::tf("fx.param_of", &[("param", &kadr_i18n::t("fx.param.strength")), ("effect", &kadr_i18n::t("fx.smooth_zoom"))]);
+        assert_eq!(track_label(&c, &TrackKey::fx(id, "strength")), want, "«Сила (Плавный наезд)»");
+        assert_eq!(track_label(&c, &AnimParam::Scale.into()), kadr_i18n::t("inspector.scale"));
     }
 
     #[test]

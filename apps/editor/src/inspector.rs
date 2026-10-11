@@ -1,7 +1,8 @@
 //! Inspector: slider drags mutate the clip live (no history), release
-//! commits exactly one undoable command (`SetClipProperty`, or the keyframe
-//! at the playhead for an animated property). With nothing selected it
-//! shows the sequence and its markers.
+//! commits exactly one undoable command (`SetClipProperty`, `UpdateEffect`
+//! for an effect's number, or the keyframe at the playhead for an animated
+//! property or effect number). With nothing selected it shows the sequence
+//! and its markers.
 
 use crate::anim_ui;
 use crate::app::{App, Prompt};
@@ -9,10 +10,11 @@ use crate::util::{fmt_secs, rgb};
 use crate::{InspectorData, KeyState, MarkerRow};
 use kadr_core::{ClipId, Time, Timecode};
 use kadr_i18n::{duration, t, tf, tn};
-use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, Sequence, SourceTime, TrackKey, TrackKind, Transform};
+use kadr_project::{AnimParam, AudioProps, Clip, ColorAdjust, Ease, ParamValue, Sequence, SourceTime, TrackKey, TrackKind, Transform};
 use kadr_timeline::commands::duration_at_speed;
 use kadr_timeline::{ClipProperty, EditCommand};
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{Model, ModelRc, VecModel};
+use std::collections::BTreeMap;
 
 fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
     // Fade durations from a slider: seconds → whole frames (rounded).
@@ -244,9 +246,8 @@ impl App {
             d.fade_in = c.audio.fade_in.as_secs_f64() as f32;
             d.fade_out = c.audio.fade_out.as_secs_f64() as f32;
             d.enabled = c.enabled;
-            let fx: Vec<SharedString> = c.effects.iter().map(|e| crate::effects_ui::fx_name(e).into()).collect();
-            d.effects = same_or_new(shown.effects, fx);
             if !is_audio {
+                d.fx = self.fx_rows(c, shown.fx);
                 let (rows, graded) = self.inspector_shots(c);
                 d.shots = same_or_new(shown.shots, rows);
                 d.shots_graded = graded;
@@ -271,13 +272,18 @@ impl App {
         let frame = self.project.sequence().frame_rate.frame_duration();
         let playhead = self.playhead;
         let c = &mut self.project.sequence_mut().tracks[ti].clips[ci];
-        match anim_ui::param_of(prop) {
+        match anim_ui::track_of(prop) {
             // An animated property moves its keyframe at the playhead —
             // never one at a hidden time (the slider is disabled there).
-            Some(p) if c.animation.is_animated(p) => {
+            Some(k) if c.animation.is_animated(&k) => {
                 let Some(tt) = anim_ui::edit_time(c, playhead, frame) else { return };
-                let at = anim_ui::key_here(c, p, playhead, frame).map_or(SourceTime(c.source_time_at(tt)), |k| k.at);
-                c.animation.set_key(p, at, v as f64, None);
+                let at = anim_ui::key_here(c, &k, playhead, frame).map_or(SourceTime(c.source_time_at(tt)), |key| key.at);
+                let value = anim_ui::slider_value(&k, v);
+                c.animation.set_key(&k, at, value, None);
+            }
+            // An effect's number: its stored value, live.
+            Some(k @ TrackKey::Fx(_)) => {
+                c.write_static(&k, anim_ui::slider_value(&k, v));
             }
             _ => apply(c, prop, v as f64, frame),
         }
@@ -306,17 +312,29 @@ impl App {
         let seq = self.project.sequence();
         let frame = seq.frame_rate.frame_duration();
         let cur = &seq.tracks[ti].clips[ci];
-        let cmd = match anim_ui::param_of(prop) {
+        let cmd = match anim_ui::track_of(prop) {
             // An animated property: one keyframe at the playhead, none at a hidden time.
-            Some(p) if cur.animation.is_animated(p) => {
+            Some(k) if cur.animation.is_animated(&k) => {
                 let Some(tt) = anim_ui::edit_time(cur, self.playhead, frame) else { return self.show_rolled_back() };
-                let here = anim_ui::key_here(cur, p, self.playhead, frame);
-                if here.is_some_and(|k| k.value == v as f64) {
+                let value = anim_ui::slider_value(&k, v);
+                let here = anim_ui::key_here(cur, &k, self.playhead, frame);
+                if here.is_some_and(|key| key.value == value) {
                     return self.show_rolled_back();
                 }
-                let at = here.map_or(SourceTime(cur.source_time_at(tt)), |k| k.at);
-                let label = tf("cmd.keyframe_named", &[("name", &t(anim_ui::label_key(p)))]);
-                let set = EditCommand::SetKeyframe { clip: id, param: p.into(), at, value: v as f64, ease: None };
+                let at = here.map_or(SourceTime(cur.source_time_at(tt)), |key| key.at);
+                let label = tf("cmd.keyframe_named", &[("name", &anim_ui::track_label(cur, &k))]);
+                EditCommand::Batch { label, commands: vec![EditCommand::SetKeyframe { clip: id, param: k, at, value, ease: None }] }
+            }
+            // An effect's number: one UpdateEffect («Эффект: Плавный наезд»).
+            Some(TrackKey::Fx(f)) => {
+                let k = TrackKey::Fx(f.clone());
+                let value = anim_ui::slider_value(&k, v);
+                let Some(e) = cur.effect(f.effect) else { return self.show_rolled_back() };
+                if cur.static_value(&k) == Some(value) {
+                    return self.show_rolled_back(); // nothing changed: no undo entry
+                }
+                let label = tf("cmd.effect_named", &[("name", &crate::effects_ui::fx_name(e))]);
+                let set = EditCommand::UpdateEffect { clip: id, id: f.effect, params: BTreeMap::from([(f.key.clone(), ParamValue::Number(value))]), enabled: None };
                 EditCommand::Batch { label, commands: vec![set] }
             }
             _ if prop == "speed" => {
@@ -374,16 +392,16 @@ impl App {
     /// `ease:<key>` (curve of the keyframe at the playhead). One click = at
     /// most one undo entry; nothing is sent when nothing would change.
     pub fn inspector_key(&mut self, prop: &str, action: &str) {
-        let (Some(id), Some(p)) = (self.inspected(), anim_ui::param_of(prop)) else { return };
+        let (Some(id), Some(p)) = (self.inspected(), anim_ui::track_of(prop)) else { return };
         let seq = self.project.sequence();
         let Some(c) = seq.clip(id) else { return };
         let frame = seq.frame_rate.frame_duration();
-        let info = anim_ui::key_info(c, p, self.playhead, frame);
+        let info = anim_ui::key_info(c, &p, self.playhead, frame);
         let edit = anim_ui::edit_time(c, self.playhead, frame);
-        let here = anim_ui::key_here(c, p, self.playhead, frame);
+        let here = anim_ui::key_here(c, &p, self.playhead, frame);
         // The picture at the playhead (or the nearest edge) stays as it is:
         // a first keyframe takes this value, removing the last one keeps it.
-        let value_here = c.anim_value(p, anim_ui::shown_time(c, self.playhead, frame));
+        let Some(value_here) = c.track_value(&p, anim_ui::shown_time(c, self.playhead, frame)) else { return };
         let cmd = match action {
             "prev" | "next" => {
                 if let Some(tt) = if action == "prev" { info.prev } else { info.next } {
@@ -392,21 +410,21 @@ impl App {
                 return;
             }
             "toggle" => match (edit, here) {
-                (Some(_), Some(k)) => EditCommand::RemoveKeyframe { clip: id, param: p.into(), at: k.at, keep: Some(value_here) },
-                (Some(tt), None) => EditCommand::SetKeyframe { clip: id, param: p.into(), at: SourceTime(c.source_time_at(tt)), value: value_here, ease: None },
+                (Some(_), Some(k)) => EditCommand::RemoveKeyframe { clip: id, param: p.clone(), at: k.at, keep: Some(value_here) },
+                (Some(tt), None) => EditCommand::SetKeyframe { clip: id, param: p.clone(), at: SourceTime(c.source_time_at(tt)), value: value_here, ease: None },
                 (None, _) => return,
             },
-            "clear" if c.animation.is_animated(p) => EditCommand::ClearAnimation { clip: id, statics: vec![(p.into(), value_here)] },
+            "clear" if c.animation.is_animated(&p) => EditCommand::ClearAnimation { clip: id, statics: vec![(p.clone(), value_here)] },
             a if a.starts_with("ease:") => {
                 let (Some(k), Some(e)) = (here, Ease::from_key(&a[5..])) else { return };
                 if k.ease == e {
                     return;
                 }
-                EditCommand::SetKeyframeEase { clip: id, param: p.into(), at: k.at, ease: e }
+                EditCommand::SetKeyframeEase { clip: id, param: p.clone(), at: k.at, ease: e }
             }
             _ => return,
         };
-        let label = tf(key_label(&cmd), &[("name", &t(anim_ui::label_key(p)))]);
+        let label = tf(key_label(&cmd), &[("name", &anim_ui::track_label(c, &p))]);
         self.execute(EditCommand::Batch { label, commands: vec![cmd] });
     }
 
@@ -414,6 +432,9 @@ impl App {
     /// properties, as one undo step (keyframes spec §5).
     pub fn inspector_reset(&mut self, section: &str) {
         let Some(id) = self.inspected() else { return };
+        if section == "effects" {
+            return self.fx_ask_clear(id);
+        }
         let Some(c) = self.project.sequence().clip(id) else { return };
         let params: &[AnimParam] = match section {
             "transform" => &AnimParam::ALL[..9],

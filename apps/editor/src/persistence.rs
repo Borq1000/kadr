@@ -163,6 +163,7 @@ impl App {
             (Confirm::ClearCache, true) => self.clear_cache_now(),
             (Confirm::RemoveAsset(id), true) => self.remove_asset_now(id),
             (Confirm::DeleteBin(id), true) => self.delete_bin_now(id),
+            (Confirm::ClearEffects(id), true) => self.fx_clear_now(id),
             _ => {}
         }
         self.ui().invoke_focus_editor();

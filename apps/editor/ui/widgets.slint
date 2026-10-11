@@ -286,6 +286,10 @@ export component PropSlider inherits Rectangle {
     // Has keyframes: accent label and a dot in the margin left of it (the
     // label keeps its full width).
     in property <bool> animated;
+    // Marks on the track; a drag within `snap` of one lands on it
+    // (Strength: 30 / 60 / 90 %, effects spec §2). At most three marks.
+    in property <[float]> marks;
+    in property <float> snap;
     callback changed(float);
     callback committed(float);
     // Right press on the slider or the value (window coordinates): the
@@ -322,6 +326,13 @@ export component PropSlider inherits Rectangle {
                 border-radius: 2px;
                 background: Theme.bg3;
             }
+            for m in root.marks: Rectangle {
+                x: parent.width * clamp((m - root.minimum) / (root.maximum - root.minimum), 0, 1) - 1px;
+                y: (parent.height - 10px) / 2;
+                width: 2px;
+                height: 10px;
+                background: Theme.border-strong;
+            }
             Rectangle {
                 x: 0;
                 y: (parent.height - 4px) / 2;
@@ -343,7 +354,12 @@ export component PropSlider inherits Rectangle {
             ta := TouchArea {
                 enabled: root.enabled;
                 mouse-cursor: ew-resize;
-                property <float> v: root.minimum + clamp(self.mouse-x / self.width, 0, 1) * (root.maximum - root.minimum);
+                property <float> raw: root.minimum + clamp(self.mouse-x / self.width, 0, 1) * (root.maximum - root.minimum);
+                property <float> v: root.snap <= 0 ? self.raw
+                    : root.marks.length > 0 && abs(self.raw - root.marks[0]) <= root.snap ? root.marks[0]
+                    : root.marks.length > 1 && abs(self.raw - root.marks[1]) <= root.snap ? root.marks[1]
+                    : root.marks.length > 2 && abs(self.raw - root.marks[2]) <= root.snap ? root.marks[2]
+                    : self.raw;
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.dragging = true; root.changed(self.v); }
                     if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) { root.dragging = false; root.committed(self.v); }
@@ -689,4 +705,79 @@ export component KeyCap inherits Rectangle {
     border-width: 1px;
     border-color: Theme.border-strong;
     kt := Text { text: root.text; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text; }
+}
+
+// ---------------------------------------------------------------- animation
+
+// An animatable property (keyframes spec §6.1): the slider, ◀ ◆ ▶ and a
+// right-click menu with the curve of the keyframe at the playhead and
+// "Reset property animation". Live/commit/key actions carry `prop`. Used by
+// the clip's properties and by effect numbers (`fx:<id>:<key>`).
+export component AnimRow inherits ContextMenuArea {
+    in property <string> prop;
+    in property <KeyState> k;
+    in property <bool> outside;
+    in property <string> label;
+    in property <float> value;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> default-value;
+    in property <float> display-scale: 1;
+    in property <int> decimals: 2;
+    in property <string> unit;
+    in property <[float]> marks;
+    in property <float> snap;
+    callback live(string, float);
+    callback commit(string, float);
+    callback key-action(string, string);
+    function menu-at(x: length, y: length) {
+        root.show({ x: x - root.absolute-position.x, y: y - root.absolute-position.y });
+    }
+    Menu {
+        Menu {
+            title: Tr.t("anim.ease");
+            for e in [
+                { key: "ease_in_out", title: Tr.t("anim.ease.ease_in_out") },
+                { key: "linear", title: Tr.t("anim.ease.linear") },
+                { key: "ease_in", title: Tr.t("anim.ease.ease_in") },
+                { key: "ease_out", title: Tr.t("anim.ease.ease_out") },
+                { key: "hold", title: Tr.t("anim.ease.hold") },
+            ]: MenuItem {
+                title: e.title;
+                enabled: root.k.state == 2;
+                checkable: true;
+                checked: root.k.ease == e.key;
+                activated => {
+                    if (root.k.ease != e.key) { root.key-action(root.prop, "ease:" + e.key); }
+                }
+            }
+            // A curve from a newer Kadr: shown, not editable until a known one is picked.
+            if root.k.ease == "other": MenuItem { title: Tr.t("anim.ease.other"); enabled: false; checkable: true; checked: true; }
+        }
+        MenuItem { title: Tr.t("anim.clear"); enabled: root.k.state > 0; activated => { root.key-action(root.prop, "clear"); } }
+    }
+    HorizontalLayout {
+        PropSlider {
+            label: root.label;
+            animated: root.k.state > 0;
+            enabled: !(root.outside && root.k.state > 0);
+            value: root.value;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            default-value: root.default-value;
+            display-scale: root.display-scale;
+            decimals: root.decimals;
+            unit: root.unit;
+            marks: root.marks;
+            snap: root.snap;
+            changed(v) => { root.live(root.prop, v); }
+            committed(v) => { root.commit(root.prop, v); }
+            menu-requested(x, y) => { root.menu-at(x, y); }
+        }
+        KeyNav {
+            k: root.k;
+            nav(a) => { root.key-action(root.prop, a); }
+            menu-requested(x, y) => { root.menu-at(x, y); }
+        }
+    }
 }

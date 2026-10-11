@@ -1,12 +1,12 @@
 // The «Эффекты» tab (effects spec §6.1): search, filter chips, a grid of
 // cards, a hint line. Rust builds the rows (stable models, keyed by recipe
 // id) and does hover delays, click and drag; Slint only draws and reports
-// the pointer.
+// the pointer. Also the inspector's effect blocks (§6.2, `FxBlock`).
 
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { Icon, PanelTabs, EmptyState, Tooltip } from "widgets.slint";
-import { ScrollView, LineEdit } from "std-widgets.slint";
+import { Icon, IconButton, PanelTabs, EmptyState, Tooltip, AnimRow, KeyState } from "widgets.slint";
+import { ScrollView, LineEdit, Switch } from "std-widgets.slint";
 
 export struct FxCategoryView {
     key: string,
@@ -205,5 +205,221 @@ export component EffectsPanel inherits Rectangle {
         text: root.cards[root.tip-index].hint;
         x: max(4px, min(root.width - self.width - 4px, root.tip-x - self.width / 2));
         y: root.tip-bottom + 4px + self.height <= root.height - 4px ? root.tip-bottom + 4px : root.tip-top - self.height - 4px;
+    }
+}
+
+// ------------------------------------------------------------ inspector
+
+export struct FxParamRow {
+    key: string,
+    // "fx:<effect-id>:<key>": a number row's live / commit / key actions.
+    prop: string,
+    kind: int, // 0 number, 1 choice, 2 point, 3 moment
+    label: string,
+    value: float,
+    minimum: float,
+    maximum: float,
+    default-value: float,
+    k: KeyState,
+    // Strength: 0–100 % with marks at 30 / 60 / 90 % and snapping.
+    strength: bool,
+    // A choice's option keys (the icons follow from them) and their names.
+    options: [string],
+    tips: [string],
+    current: int,
+    // Point: "50 %, 50 %"; Moment: the timecode of its frame.
+    text: string,
+    hint: string,
+    // Point: picking possible; Moment: "to the playhead" possible.
+    can-act: bool,
+    // Point: being picked on the preview now.
+    active: bool,
+}
+
+export struct FxRow {
+    id: string,
+    name: string,
+    enabled: bool,
+    // false: a recipe or version from a newer Kadr (kept, never run).
+    known: bool,
+    first: bool,
+    last: bool,
+    params: [FxParamRow],
+}
+
+// A choice drawn with icons (zoom in / out, pan arrows) and a tooltip naming
+// each option. Paths, not arrow glyphs (Windows may draw those as emoji).
+component ChoiceSegments inherits Rectangle {
+    in property <[string]> options;
+    in property <[string]> tips;
+    in property <int> current;
+    callback selected(int);
+    pure function icon-of(key: string) -> string {
+        return key == "in" ? Icons.zoom-in : key == "out" ? Icons.zoom-out : key == "left" ? Icons.arrow-left : key == "right" ? Icons.arrow-right : key == "up" ? Icons.arrow-up : key == "down" ? Icons.arrow-down : Icons.sparkle;
+    }
+    height: 26px;
+    width: root.options.length * 30px + 4px;
+    border-radius: 5px;
+    background: Theme.bg2;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 2px;
+        for o[i] in root.options: Rectangle {
+            width: 30px;
+            border-radius: 4px;
+            background: root.current == i ? Theme.bg4 : sa.has-hover ? Theme.bg3 : transparent;
+            accessible-role: button;
+            accessible-label: i < root.tips.length ? root.tips[i] : o;
+            Icon { icon: root.icon-of(o); width: 14px; height: 14px; color: root.current == i ? Theme.accent : sa.has-hover ? Theme.text : Theme.text-dim; }
+            sa := TouchArea {
+                mouse-cursor: root.current == i ? default : pointer;
+                clicked => {
+                    if (i != root.current) { root.selected(i); }
+                }
+            }
+            if sa.has-hover && i < root.tips.length: Tooltip { text: root.tips[i]; x: (parent.width - self.width) / 2; y: -self.height - 4px; }
+        }
+    }
+}
+
+// «Мягко / Обычно / Сильно» under the Strength track's three marks (0..1):
+// the label column (84 + 8 px) on the left; the value (62 + 8 px) and
+// ◀ ◆ ▶ on the right — PropSlider's geometry. Each caption is centred on
+// its mark; the outer two may move outwards by up to 6 px to keep 4 px from
+// the middle one. A track too narrow for that (a small inspector) keeps
+// «Обычно» alone — the preset as designed; the marks stay on the track.
+component MarkCaptions inherits Rectangle {
+    in property <[float]> marks;
+    in property <[string]> labels;
+    property <length> left: 92px;
+    property <length> track: max(0px, root.width - root.left - 70px - Theme.key-nav);
+    property <length> ax0: root.left + root.track * root.marks[0] - a.width / 2;
+    property <length> bx: root.left + root.track * root.marks[1] - b.width / 2;
+    property <length> cx0: root.left + root.track * root.marks[2] - c.width / 2;
+    property <length> ax: min(root.ax0, root.bx - 4px - a.width);
+    property <length> cx: max(root.cx0, root.bx + b.width + 4px);
+    property <bool> all: root.ax0 - root.ax <= 6px && root.cx - root.cx0 <= 6px;
+    // Drawn 3 px up, close under the marks (they reach 5 px below the track).
+    height: 10px;
+    a := Text { x: root.ax; y: -3px; width: self.preferred-width; visible: root.all; text: root.labels[0]; font-size: 9px; color: Theme.text-faint; }
+    b := Text { x: root.bx; y: -3px; width: self.preferred-width; visible: root.all || root.track >= self.width; text: root.labels[1]; font-size: 9px; color: Theme.text-faint; }
+    c := Text { x: root.cx; y: -3px; width: self.preferred-width; visible: root.all; text: root.labels[2]; font-size: 9px; color: Theme.text-faint; }
+}
+
+// One effect of the clip (spec §6.2, mockup A): a header — switch, name,
+// ⋯ with Сбросить / Удалить / Выше / Ниже — and its 1–5 parameters.
+export component FxBlock inherits VerticalLayout {
+    in property <FxRow> fx;
+    // The playhead is off the clip: animated numbers are locked (keyframes spec §6.1).
+    in property <bool> outside;
+    callback action(string /* effect id */, string /* toggle | reset | remove | up | down | choice:<key>:<i> | pick:<key> | moment:<key> */);
+    callback live(string, float);
+    callback commit(string, float);
+    callback key-action(string, string);
+    // The switch shows the project, never just the click: a click sets
+    // `checked` itself (which drops its binding), so it is put back at once
+    // and then follows every change of the row — the command, an undo, a
+    // refused edit, another effect taking this block's place.
+    changed fx => { sw.checked = root.fx.enabled; }
+    spacing: 2px;
+    padding-top: 6px;
+    menu := ContextMenuArea {
+        Menu {
+            MenuItem { title: Tr.t("fx.menu.reset"); enabled: root.fx.known; activated => { root.action(root.fx.id, "reset"); } }
+            MenuItem { title: Tr.t("fx.menu.remove"); activated => { root.action(root.fx.id, "remove"); } }
+            MenuSeparator {}
+            MenuItem { title: Tr.t("fx.menu.up"); enabled: !root.fx.first; activated => { root.action(root.fx.id, "up"); } }
+            MenuItem { title: Tr.t("fx.menu.down"); enabled: !root.fx.last; activated => { root.action(root.fx.id, "down"); } }
+        }
+        VerticalLayout {
+            // The header bar of the approved mockup.
+            Rectangle {
+                border-radius: Theme.radius;
+                background: Theme.bg2;
+                HorizontalLayout {
+                    height: 30px;
+                    padding-left: 6px;
+                    padding-right: 3px;
+                    spacing: 6px;
+                    VerticalLayout {
+                        alignment: center;
+                        sw := Switch {
+                            enabled: root.fx.known;
+                            checked: root.fx.enabled;
+                            toggled => {
+                                self.checked = root.fx.enabled;
+                                root.action(root.fx.id, "toggle");
+                            }
+                        }
+                    }
+                    Text { text: root.fx.name; font-size: Theme.font; font-weight: 600; color: root.fx.known && root.fx.enabled ? Theme.text : Theme.text-faint; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        more := IconButton {
+                            icon: Icons.more;
+                            filled: true;
+                            size: 24px;
+                            icon-size: 14px;
+                            tooltip: Tr.t("fx.menu.tip");
+                            tooltip-right: true;
+                            clicked => { menu.show({ x: more.absolute-position.x - menu.absolute-position.x, y: more.absolute-position.y - menu.absolute-position.y + more.height }); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !root.fx.known: Text { text: Tr.t("fx.unavailable"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+    for p in root.fx.params: VerticalLayout {
+        if p.kind == 0 && p.strength: AnimRow {
+            prop: p.prop; k: p.k; outside: root.outside; label: p.label; value: p.value;
+            minimum: p.minimum; maximum: p.maximum; default-value: p.default-value;
+            display-scale: 100; decimals: 0; unit: "%";
+            marks: [0.3, 0.6, 0.9]; snap: 0.025;
+            live(a, v) => { root.live(a, v); }
+            commit(a, v) => { root.commit(a, v); }
+            key-action(a, b) => { root.key-action(a, b); }
+        }
+        if p.kind == 0 && p.strength: MarkCaptions { marks: [0.3, 0.6, 0.9]; labels: [Tr.t("fx.strength.soft"), Tr.t("fx.strength.normal"), Tr.t("fx.strength.strong")]; }
+        if p.kind == 0 && !p.strength: AnimRow {
+            prop: p.prop; k: p.k; outside: root.outside; label: p.label; value: p.value;
+            minimum: p.minimum; maximum: p.maximum; default-value: p.default-value;
+            live(a, v) => { root.live(a, v); }
+            commit(a, v) => { root.commit(a, v); }
+            key-action(a, b) => { root.key-action(a, b); }
+        }
+        if p.kind == 1: HorizontalLayout {
+            height: 30px;
+            spacing: 8px;
+            Text { width: 84px; text: p.label; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
+            VerticalLayout { alignment: center; ChoiceSegments { options: p.options; tips: p.tips; current: p.current; selected(i) => { root.action(root.fx.id, "choice:" + p.key + ":" + i); } } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        if p.kind == 2: HorizontalLayout {
+            height: 28px;
+            spacing: 8px;
+            Text { width: 84px; text: p.label; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
+            Text { text: p.text; font-size: Theme.font-sm; font-family: Theme.mono; color: Theme.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                IconButton { icon: Icons.crosshair; active: p.active; enabled: p.can-act || p.active; size: 24px; icon-size: 14px; tooltip: p.active ? Tr.t("fx.pick.cancel_tip") : Tr.t("fx.pick.tip"); tooltip-right: true; clicked => { root.action(root.fx.id, "pick:" + p.key); } }
+            }
+        }
+        if p.kind == 3: HorizontalLayout {
+            height: 28px;
+            spacing: 8px;
+            Text { width: 84px; text: p.label; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
+            Text { text: p.text; font-size: Theme.font-sm; font-family: Theme.mono; color: Theme.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                IconButton { icon: Icons.to-playhead; enabled: p.can-act; size: 24px; icon-size: 14px; tooltip: Tr.t("fx.moment.to_playhead"); tooltip-right: true; clicked => { root.action(root.fx.id, "moment:" + p.key); } }
+            }
+        }
+        // Under the row's control, not its label (as in the mockup).
+        if p.hint != "": HorizontalLayout {
+            padding-left: 92px;
+            Text { text: p.hint; font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+        }
     }
 }

@@ -1198,12 +1198,13 @@ impl App {
         ui.set_duration_label(format!("/ {}", kadr_core::Timecode::from_time(dur, seq.frame_rate)).into());
         ui.set_scrub_fraction(if dur > Time::ZERO { (self.playhead.as_secs_f64() / dur.as_secs_f64()) as f32 } else { 0.0 });
         // The inspector follows the playhead (keyframes spec §6.1): animated
-        // values and ◆ states ~10 Hz while playing, at once when paused or
-        // scrubbing; entering or leaving the clip (◆ enabled, hint) at once.
+        // values, ◆ states and an effect moment's «к плейхеду» ~10 Hz while
+        // playing, at once when paused or scrubbing; entering or leaving the
+        // clip (◆ enabled, hint) at once.
         let Some(c) = self.inspected().and_then(|id| seq.clip(id)) else { return };
         let outside = crate::anim_ui::edit_time(c, self.playhead, seq.frame_rate.frame_duration()).is_none();
         let crossed = ui.get_inspector().outside != outside;
-        if c.animation.is_empty() && !crossed {
+        if c.animation.is_empty() && !crate::effects_ui::has_moment(c) && !crossed {
             return;
         }
         let due = crossed || !self.playing || self.inspector_refreshed.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));

@@ -1,6 +1,7 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyNav, KeyState } from "widgets.slint";
+import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyState, AnimRow } from "widgets.slint";
+import { FxBlock, FxRow } from "effects.slint";
 import { ScrollView, Switch } from "std-widgets.slint";
 
 export struct MarkerRow {
@@ -44,7 +45,8 @@ export struct InspectorData {
     fade-in: float,
     fade-out: float,
     enabled: bool,
-    effects: [string],
+    // Effects of the clip in order of application (effects spec §6.2).
+    fx: [FxRow],
     multi-count: int,
     // Sequence (shown when nothing is selected)
     seq-name: string,
@@ -77,74 +79,6 @@ component InfoRow inherits HorizontalLayout {
     Text { text: root.value; font-size: Theme.font-sm; color: Theme.text; wrap: word-wrap; horizontal-stretch: 1; }
 }
 
-// An animatable property (keyframes spec §6.1): the slider, ◀ ◆ ▶ and a
-// right-click menu with the curve of the keyframe at the playhead and
-// "Reset property animation". Live/commit/key actions carry `prop`.
-component AnimRow inherits ContextMenuArea {
-    in property <string> prop;
-    in property <KeyState> k;
-    in property <bool> outside;
-    in property <string> label;
-    in property <float> value;
-    in property <float> minimum;
-    in property <float> maximum: 1;
-    in property <float> default-value;
-    in property <float> display-scale: 1;
-    in property <int> decimals: 2;
-    in property <string> unit;
-    callback live(string, float);
-    callback commit(string, float);
-    callback key-action(string, string);
-    function menu-at(x: length, y: length) {
-        root.show({ x: x - root.absolute-position.x, y: y - root.absolute-position.y });
-    }
-    Menu {
-        Menu {
-            title: Tr.t("anim.ease");
-            for e in [
-                { key: "ease_in_out", title: Tr.t("anim.ease.ease_in_out") },
-                { key: "linear", title: Tr.t("anim.ease.linear") },
-                { key: "ease_in", title: Tr.t("anim.ease.ease_in") },
-                { key: "ease_out", title: Tr.t("anim.ease.ease_out") },
-                { key: "hold", title: Tr.t("anim.ease.hold") },
-            ]: MenuItem {
-                title: e.title;
-                enabled: root.k.state == 2;
-                checkable: true;
-                checked: root.k.ease == e.key;
-                activated => {
-                    if (root.k.ease != e.key) { root.key-action(root.prop, "ease:" + e.key); }
-                }
-            }
-            // A curve from a newer Kadr: shown, not editable until a known one is picked.
-            if root.k.ease == "other": MenuItem { title: Tr.t("anim.ease.other"); enabled: false; checkable: true; checked: true; }
-        }
-        MenuItem { title: Tr.t("anim.clear"); enabled: root.k.state > 0; activated => { root.key-action(root.prop, "clear"); } }
-    }
-    HorizontalLayout {
-        PropSlider {
-            label: root.label;
-            animated: root.k.state > 0;
-            enabled: !(root.outside && root.k.state > 0);
-            value: root.value;
-            minimum: root.minimum;
-            maximum: root.maximum;
-            default-value: root.default-value;
-            display-scale: root.display-scale;
-            decimals: root.decimals;
-            unit: root.unit;
-            changed(v) => { root.live(root.prop, v); }
-            committed(v) => { root.commit(root.prop, v); }
-            menu-requested(x, y) => { root.menu-at(x, y); }
-        }
-        KeyNav {
-            k: root.k;
-            nav(a) => { root.key-action(root.prop, a); }
-            menu-requested(x, y) => { root.menu-at(x, y); }
-        }
-    }
-}
-
 export component Inspector inherits Rectangle {
     in property <InspectorData> d;
     callback live(string, float);
@@ -155,6 +89,7 @@ export component Inspector inherits Rectangle {
     callback sequence-action(string);
     callback shot-clicked(int);
     callback key-action(string /* prop */, string /* prev | toggle | next | clear | ease:<key> */);
+    callback fx-action(string /* effect id */, string /* action */);
     background: Theme.bg1;
 
     VerticalLayout {
@@ -258,6 +193,18 @@ export component Inspector inherits Rectangle {
                     Switch { enabled: false; }
                 }
 
+                // Under the correction (effects spec §6.2, mockup A).
+                if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.fx"); resettable: root.d.fx.length > 0; reset => { root.reset("effects"); } }
+                if root.d.has-video-props && root.d.fx.length == 0: Text { text: Tr.t("inspector.fx.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
+                for e in root.d.fx: FxBlock {
+                    fx: e;
+                    outside: root.d.outside;
+                    action(id, a) => { root.fx-action(id, a); }
+                    live(p, v) => { root.live(p, v); }
+                    commit(p, v) => { root.commit(p, v); }
+                    key-action(p, a) => { root.key-action(p, a); }
+                }
+
                 // Each fade is at most the clip minus the other fade (spec §6.1).
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.fades"); }
                 if root.d.has-video-props: HorizontalLayout {
@@ -295,9 +242,6 @@ export component Inspector inherits Rectangle {
                 }
                 if root.d.shots-graded: Text { text: Tr.t("inspector.shots.hint"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
 
-                SectionTitle { text: Tr.t("inspector.effects"); }
-                if root.d.effects.length == 0: Text { text: Tr.t("inspector.effects.empty"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
-                for e in root.d.effects: Text { text: e; font-size: Theme.font-sm; color: Theme.text-dim; }
                 Text { text: Tr.t("inspector.hint.values"); font-size: Theme.font-xs; color: Theme.text-faint; wrap: word-wrap; }
             }
         }

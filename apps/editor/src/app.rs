@@ -61,6 +61,8 @@ pub enum Confirm {
     ClearCache,
     RemoveAsset(AssetId),
     DeleteBin(BinId),
+    /// The inspector section reset of a clip's effects (effects spec §6.2).
+    ClearEffects(ClipId),
 }
 
 /// What the text prompt dialog is editing.
@@ -436,6 +438,7 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_inspector_marker, |i, a| |app: &mut App| app.marker_action(i as usize, &a));
     cb!(ui.on_inspector_sequence, |a| |app: &mut App| app.sequence_action(&a));
     cb!(ui.on_inspector_key, |p, a| |app: &mut App| app.inspector_key(&p, &a));
+    cb!(ui.on_inspector_fx, |e, a| |app: &mut App| app.fx_action(&e, &a));
 
     cb!(ui.on_ai_send, |t| |app: &mut App| app.ai_send(&t));
     cb!(ui.on_ai_plan_action, |i, a| |app: &mut App| app.ai_plan_action(i as usize, &a));
