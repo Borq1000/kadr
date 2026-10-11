@@ -5,7 +5,7 @@
 //!   kadr-bench live --clip <file> [--seconds N] [--layers 1|3] [--quality full|half|quarter]
 //!                                                  the real app, headless, through kadr-mcp (3 layers: clip + rotated 4K PiP + logo)
 //!   kadr-bench scene                               cost of the scene evaluator (M1)
-//!   kadr-bench render                              CpuRenderer at 1080p and 4K, 1-3 layers and a transition (M2)
+//!   kadr-bench render                              CpuRenderer at 1080p and 4K, 1-3 layers, one layer with a Look and a transition (M2, E2)
 //!   kadr-bench playback [--quick]                 seek latency and sequential decode through Resolver + CpuRenderer (M3)
 //!   kadr-bench export [--diag]                    export on the render pipeline: fps rows and fast-path diagnosis (M5)
 //!   kadr-bench avsync-export                      20-minute cut-up timeline exported and analyzed for A/V sync (M5)
