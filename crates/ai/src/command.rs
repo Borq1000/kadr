@@ -448,15 +448,16 @@ fn validate_each(cmds: &[AiCommand], project: &Project, perms: &Permissions, str
                 let mut values = kadr_effects::json::params_from_json_in(def, c, params, current, half_frame).map_err(range)?;
                 kadr_effects::complete(def, &mut values, c, c.timeline_in + Time(c.duration().flicks() / 2));
                 let effect = AppliedEffect::new(def.id, def.version, values);
-                if !c.clone().put_effect(effect.clone()) {
+                let mut probe = c.clone();
+                if !probe.put_effect(effect.clone()) {
                     if strict {
                         return Err(range(format!("no change: the clip already has {recipe} with these parameters")));
                     }
                     out.push(None);
                     continue;
                 }
-                // Replacing an instance drops its keyframes.
-                if c.effects.iter().any(|x| x.recipe == *recipe && c.animation.has_effect_tracks(x.id)) {
+                // Replacing an instance with new parameters drops its keyframes.
+                if probe.animation != c.animation {
                     destructive(i)?;
                 }
                 EditCommand::AddEffect { clip: id, effect }
@@ -844,6 +845,10 @@ mod tests {
         p.sequence_mut().tracks[0].clips[0].animation.set_key(TrackKey::fx(fid, "strength"), SourceTime(Time::from_secs(31)), 0.2, None);
         assert!(matches!(validate(std::slice::from_ref(&add), &p, &no), Err(ValidationError::Permission { .. })));
         assert!(validate(&[add], &p, &Permissions::default()).is_ok());
+        // Switching it back on with the same parameters keeps its keyframes (E2-R6).
+        p.sequence_mut().tracks[0].clips[0].effects[0].enabled = false;
+        let same = cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "handheld"}));
+        assert!(validate(&[same], &p, &no).is_ok(), "nothing is lost");
     }
 
     /// R11(f): a locked track fails at validation, with a reason.

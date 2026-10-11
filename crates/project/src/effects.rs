@@ -201,11 +201,15 @@ impl Clip {
     }
 
     /// Applies `e`, one instance per recipe (spec §2): a new recipe is
-    /// appended; one the clip has is replaced in place — its id and position
-    /// stay, its `fx:` tracks go. When a lenient load left the clip two of
-    /// the recipe, the first is replaced that way and the others go with
-    /// their tracks: the clip ends with exactly the one applied. `false`
-    /// when nothing changed (then nothing was touched).
+    /// appended; one the clip has is replaced in place — its parameters,
+    /// version and enabled state become `e`'s, its id, position and
+    /// progress range stay (ruling E2-R6: a split half keeps its part of a
+    /// motion), and its `fx:` tracks go when its parameters or version
+    /// change. So the same parameters again change nothing — keyframes
+    /// included. When a lenient load left the clip two of the recipe, the
+    /// first is replaced that way and the others go with their tracks: the
+    /// clip ends with exactly the one applied. `false` when nothing changed
+    /// (then nothing was touched).
     pub fn put_effect(&mut self, mut e: AppliedEffect) -> bool {
         let mut same = self.effects.iter().enumerate().filter(|(_, x)| x.recipe == e.recipe).map(|(i, x)| (i, x.id));
         let Some((first, id)) = same.next() else {
@@ -216,13 +220,17 @@ impl Clip {
             return true;
         };
         let others: Vec<EffectId> = same.map(|(_, id)| id).collect();
-        e.id = id;
-        let mut had_tracks = false;
-        for id in std::iter::once(id).chain(others.iter().copied()) {
-            had_tracks |= self.animation.remove_effect(id);
-        }
-        if !had_tracks && others.is_empty() && self.effects[first] == e {
+        let old = &self.effects[first];
+        (e.id, e.progress) = (id, old.progress);
+        if others.is_empty() && *old == e {
             return false;
+        }
+        // Tracks animate the parameters of one version: new ones, new tracks.
+        if old.params != e.params || old.version != e.version {
+            self.animation.remove_effect(id);
+        }
+        for id in &others {
+            self.animation.remove_effect(*id);
         }
         // The others all come after the first: removing them keeps its index.
         self.effects.retain(|x| !others.contains(&x.id));
@@ -404,14 +412,40 @@ mod tests {
         c.animation.set_key(k.clone(), SourceTime(Time::ZERO), 0.2, None);
         let mut again = zoom.clone();
         again.id = EffectId::new();
-        assert!(c.put_effect(again.clone()), "the same parameters, but its keyframes go");
-        assert_eq!((c.effects[0].id, c.effects[0].recipe.as_str()), (zid, "smooth_zoom"), "same id, same place");
+        assert!(!c.put_effect(again.clone()), "the same parameters again: nothing changes, keyframes included (E2-R6)");
+        assert!(c.animation.is_animated(&k));
+        again.params.insert("strength".into(), ParamValue::Number(0.9));
+        assert!(c.put_effect(again.clone()), "new parameters: its keyframes go");
+        assert_eq!((c.effects[0].id, c.effects[0].recipe.as_str(), c.effects[0].number("strength")), (zid, "smooth_zoom", Some(0.9)), "same id, same place");
         assert!(!c.animation.is_animated(&k));
         assert!(!c.put_effect(again), "nothing left to change");
         let mut odd = AppliedEffect::new("cinematic_push", 1, BTreeMap::new());
         odd.id = zid;
         assert!(c.put_effect(odd));
         assert_ne!(c.effects[2].id, zid, "a new effect never takes an id the clip uses");
+    }
+
+    /// Ruling E2-R6: a replacement keeps the instance's progress range, so a
+    /// split half keeps its part of a motion and the same card applied to it
+    /// again changes nothing; a disabled one is switched on, its keys kept.
+    #[test]
+    fn put_effect_keeps_the_progress_range_of_the_instance_it_replaces() {
+        let mut c = crate::Clip::new(kadr_core::AssetId::new(), "c", kadr_core::TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let zoom = |s: f64| AppliedEffect::new("smooth_zoom", 1, BTreeMap::from([("strength".to_string(), ParamValue::Number(s))]));
+        let mut half = zoom(0.6);
+        half.progress = (0.5, 1.0);
+        let id = half.id;
+        c.effects.push(half.clone());
+        let k = crate::TrackKey::fx(id, "strength");
+        c.animation.set_key(k.clone(), SourceTime(Time::ZERO), 0.2, None);
+        assert!(!c.put_effect(zoom(0.6)), "a fresh (0, 1) of the same parameters: the half as it is");
+        assert_eq!(c.effects, [half.clone()]);
+        c.effects[0].enabled = false;
+        assert!(c.put_effect(zoom(0.6)), "switched back on");
+        assert_eq!((c.effects[0].enabled, c.effects[0].progress), (true, (0.5, 1.0)));
+        assert!(c.animation.is_animated(&k), "the same parameters keep their keys");
+        assert!(c.put_effect(zoom(0.9)));
+        assert_eq!((c.effects[0].id, c.effects[0].progress, c.effects[0].number("strength")), (id, (0.5, 1.0), Some(0.9)), "the continuation stays");
     }
 
     /// A lenient load keeps ids unique but not recipes: a clip may arrive

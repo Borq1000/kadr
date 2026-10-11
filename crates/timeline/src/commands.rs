@@ -129,10 +129,12 @@ pub enum EditCommand {
     ClearAnimation { clip: ClipId, statics: Vec<(TrackKey, f64)> },
     /// Applies an effect (effects spec §7), validated against the registry:
     /// a known recipe at its current version, a clip it fits, valid
-    /// parameters (missing ones get defaults). A recipe the clip has is
-    /// replaced in place — same id and position, the new parameters,
-    /// enabled, progress (0, 1), its `fx:` tracks dropped (spec §2); more
-    /// instances of it (a lenient load) go too (`Clip::put_effect`).
+    /// parameters (missing ones get defaults); a new effect covers the whole
+    /// clip (progress (0, 1)). A recipe the clip has is replaced in place —
+    /// same id, position and progress range (ruling E2-R6), the new
+    /// parameters, enabled, its `fx:` tracks dropped when the parameters
+    /// change (spec §2); more instances of it (a lenient load) go too
+    /// (`Clip::put_effect`). The same parameters again are a `NoOp`.
     AddEffect { clip: ClipId, effect: AppliedEffect },
     /// Removes an effect and its `fx:` tracks.
     RemoveEffect { clip: ClipId, id: EffectId },

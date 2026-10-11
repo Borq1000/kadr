@@ -86,6 +86,26 @@ fn applying_what_is_already_there_changes_nothing() {
     assert_eq!(entries(&p), before, "no empty history entry");
 }
 
+/// Ruling E2-R6: re-applying a recipe to a split half keeps the half's
+/// progress range — the same effect again is a true no-op (no entry), new
+/// parameters keep the motion continuous across the cut.
+#[test]
+fn reapplying_to_a_split_half_keeps_its_progress_range() {
+    let (mut p, mut e, v, _) = setup();
+    e.execute(&mut p, EditCommand::AddEffect { clip: v, effect: zoom() }).unwrap();
+    e.execute(&mut p, EditCommand::Split { at: s(5), clips: Some(vec![v]) }).unwrap();
+    let right = p.sequence().tracks[0].clips[1].id;
+    assert_eq!(effects(&p, right)[0].progress, (0.5, 1.0));
+    let n = entries(&p);
+    assert_eq!(e.execute(&mut p, EditCommand::AddEffect { clip: right, effect: zoom() }), Err(EditError::NoOp));
+    assert_eq!(entries(&p), n, "no empty history entry");
+    let mut stronger = zoom();
+    stronger.params.insert("strength".into(), ParamValue::Number(0.9));
+    e.execute(&mut p, EditCommand::AddEffect { clip: right, effect: stronger }).unwrap();
+    let fx = &effects(&p, right)[0];
+    assert_eq!((fx.progress, fx.number("strength")), ((0.5, 1.0), Some(0.9)), "the continuation of the left half");
+}
+
 #[test]
 fn unknown_newer_invalid_and_misplaced_effects_are_rejected() {
     let (mut p, mut e, v, a) = setup();
@@ -256,9 +276,10 @@ fn a_clip_with_a_recipe_twice_ends_with_one_after_applying_it() {
 
 /// An effect of a recipe this build knows, made by a newer version of it,
 /// cannot be changed — but applying the recipe again replaces it whole, as
-/// removing it and applying would (in its place, with its id): the result
-/// is a valid effect of this build, and the effects tab's hover preview
-/// (`Clip::put_effect`) shows exactly that.
+/// removing it and applying would (in its place, with its id, over its
+/// progress range — ruling E2-R6): the result is a valid effect of this
+/// build, and the effects tab's hover preview (`Clip::put_effect`) shows
+/// exactly that.
 #[test]
 fn applying_a_recipe_over_its_newer_version_replaces_it_whole() {
     let (mut p, mut e, v, _) = setup();
@@ -277,7 +298,7 @@ fn applying_a_recipe_over_its_newer_version_replaces_it_whole() {
     let c = p.sequence().clip(v).unwrap();
     assert_eq!(c.effects.len(), 1);
     let fx = &c.effects[0];
-    assert_eq!((fx.id, fx.version, fx.progress, fx.enabled), (nid, 1, (0.0, 1.0), true));
+    assert_eq!((fx.id, fx.version, fx.progress, fx.enabled), (nid, 1, (0.25, 1.0), true), "a split half's range stays (E2-R6)");
     assert_eq!(fx.params.keys().map(String::as_str).collect::<Vec<_>>(), ["direction", "point", "strength"], "this build's parameters only");
     assert!(fx.extra.is_empty() && c.animation.is_empty(), "the newer fields and tracks went with it");
 }

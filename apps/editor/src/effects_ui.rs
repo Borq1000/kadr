@@ -1223,6 +1223,35 @@ mod tests {
         assert!(apply_batch(&applied, card("look:dramatic"), &[v1], Time::from_secs(1)).is_none(), "the same preset again: nothing to send");
     }
 
+    /// Ruling E2-R6: on a split half (its part of the progress range) the
+    /// same card again sends nothing — the «уже применён» toast, no entry —
+    /// and another Look replaces the half's in place over the same range.
+    #[test]
+    fn the_same_card_on_a_split_half_sends_nothing() {
+        use kadr_timeline::EditEngine;
+        let (mut p, id) = project_with_clip();
+        let mut engine = EditEngine::new();
+        for c in ["look:warm", "smooth_zoom"] {
+            let apply = apply_batch(p.sequence(), card(c), &[id], Time::from_secs(1)).unwrap();
+            engine.execute(&mut p, apply).unwrap();
+        }
+        engine.execute(&mut p, EditCommand::Split { at: Time::from_secs(4), clips: Some(vec![id]) }).unwrap();
+        let right = p.sequence().tracks[0].clips[1].id;
+        let ranges = |p: &Project| p.sequence().clip(right).unwrap().effects.iter().map(|e| e.progress).collect::<Vec<_>>();
+        assert_eq!(ranges(&p), [(0.5, 1.0); 2]);
+        for c in ["look:warm", "smooth_zoom"] {
+            assert!(apply_batch(p.sequence(), card(c), &[right], Time::from_secs(6)).is_none(), "{c}: already applied");
+        }
+        let n = p.history_log.len();
+        let look = p.sequence().clip(right).unwrap().effects[0].id;
+        let vintage = apply_batch(p.sequence(), card("look:vintage"), &[right], Time::from_secs(6)).unwrap();
+        engine.execute(&mut p, vintage).unwrap();
+        assert_eq!(p.history_log.len(), n + 1);
+        let half = p.sequence().clip(right).unwrap();
+        assert_eq!((half.effects[0].id, &half.effects[0].params["preset"]), (look, &ParamValue::Choice("vintage".into())));
+        assert_eq!(ranges(&p), [(0.5, 1.0); 2], "the half keeps its part");
+    }
+
     /// Review focus 1: hovering a Look card over a clip with a Look shows the
     /// replacement — never both — and only in the preview's snapshot.
     #[test]
