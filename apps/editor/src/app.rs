@@ -780,6 +780,7 @@ impl App {
 
     pub fn shutdown(&mut self) {
         self.stop_playback();
+        self.fx.thumbs.shutdown();
         self.preview.shutdown();
         self.layout_changed();
         // A headless instance's copy is stale (loaded at its start): saving it

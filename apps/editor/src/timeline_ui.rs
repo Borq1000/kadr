@@ -1187,6 +1187,11 @@ impl App {
         let x = self.time_to_x(self.playhead);
         ui.set_playhead_x(x as f32);
         ui.set_show_playhead(x >= -1.0);
+        // The effect cards show the selected clip's frame under the playhead
+        // (effects spec §6.1) — while paused: nothing renders during play.
+        if !self.playing {
+            self.refresh_effects();
+        }
         let seq = self.project.sequence();
         ui.set_timecode(kadr_core::Timecode::from_time(self.playhead, seq.frame_rate).to_string().into());
         let dur = seq.duration();

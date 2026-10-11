@@ -31,6 +31,8 @@ pub struct FxUi {
     /// The hovered card's effect on the selected clips — app state only.
     pub preview: Option<PreviewOverride>,
     pub drag: Option<FxDrag>,
+    /// The cards' pictures (spec §6.1): cache, the batch in flight, the hover loop.
+    pub thumbs: crate::fx_thumbs::Thumbs,
 }
 
 pub struct FxDrag {
@@ -155,11 +157,14 @@ fn batch_of(seq: &Sequence, def: &RecipeDef, effects: Vec<(ClipId, AppliedEffect
 }
 
 impl App {
-    /// The left panel switched tabs (0 media, 1 effects).
+    /// The left panel switched tabs (0 media, 1 effects). Hidden, the tab
+    /// renders no thumbnails: the batch in flight stops.
     pub fn fx_tab_changed(&mut self, tab: i32) {
         self.fx_clear_hover();
         if tab == 1 {
             self.refresh_effects();
+        } else {
+            self.fx.thumbs.cancel();
         }
     }
 
@@ -175,37 +180,52 @@ impl App {
         }
     }
 
-    /// A project was opened or created: nothing hovered, dragged or picked.
+    /// A project was opened or created: nothing hovered, dragged or picked;
+    /// the thumbnail work stops and the old project's pictures are freed.
     pub fn fx_reset(&mut self) {
         self.fx.hover = None;
         self.fx.preview = None;
         self.fx.drag = None;
+        self.fx.thumbs.clear();
     }
 
     /// Chips, cards and the hint of the tab — only while it shows. Rows keep
-    /// their elements (`sync_rows_by_key`): a press in flight survives.
+    /// their elements (`sync_rows_by_key`): a press in flight survives, a
+    /// card's picture changes in place. Ends by asking for the pictures the
+    /// cards lack (rendered in the background, `fx_thumbs`).
     pub fn refresh_effects(&mut self) {
         let ui = self.ui();
         if ui.get_left_tab() != 1 {
             return;
         }
+        let listed = visible_recipes(&self.fx.category, &self.fx.search);
+        // The selected clip's frame under the playhead, or the sample; a
+        // card whose new picture is not rendered yet keeps its last one.
+        let base = crate::fx_thumbs::thumb_base(&self.project, self.inspected(), self.playhead);
+        let thumbs: Vec<Option<slint::Image>> = listed
+            .iter()
+            .map(|d| {
+                let now = self.fx_thumb(d, &base);
+                self.fx.thumbs.shown(d.id, now)
+            })
+            .collect();
         let seq = self.project.sequence();
         let mut chips = vec![FxCategoryView { key: "".into(), label: t("fx.cat.all").into() }];
         chips.extend(categories().into_iter().map(|c| FxCategoryView { key: c.key().into(), label: t(&c.label_key()).into() }));
         crate::util::sync_rows_by_key(ui.get_fx_categories(), chips, |c| c.key.clone(), |m| ui.set_fx_categories(m));
         ui.set_fx_category(self.fx.category.clone().into());
         let sel = &self.tl.selection;
-        let listed = visible_recipes(&self.fx.category, &self.fx.search);
         let cards: Vec<FxCardView> = listed
             .iter()
-            .map(|d| {
+            .zip(thumbs)
+            .map(|(d, thumb)| {
                 let hint = card_hint(seq, sel, d);
                 FxCardView {
                     id: d.id.into(),
                     name: t(&d.name_key()).into(),
                     category: d.category.key().into(),
-                    thumb: Default::default(),
-                    has_thumb: false,
+                    has_thumb: thumb.is_some(),
+                    thumb: thumb.unwrap_or_default(),
                     enabled: hint.is_none(),
                     hint: hint.map(t).unwrap_or_default().into(),
                 }
@@ -224,6 +244,7 @@ impl App {
             let next = self.fx.hover.and_then(|(r, _)| kadr_effects::recipe(r)).and_then(|d| self.fx_override(d));
             self.fx_set_preview(next);
         }
+        self.fx_request_thumbs(base);
     }
 
     pub fn fx_category(&mut self, key: &str) {
@@ -253,6 +274,17 @@ impl App {
             slint::Timer::single_shot(HOVER_DELAY, move || {
                 crate::app::with_app(|app| app.fx_hover_fire(generation));
             });
+            // A motion card plays its motion in a short loop while hovered
+            // (spec §6.1); another card's loop stops with its timer.
+            self.fx.thumbs.loop_frame = 0;
+            self.fx.thumbs.timer = (def.category == Category::Motion).then(|| {
+                let timer = slint::Timer::default();
+                timer.start(slint::TimerMode::Repeated, crate::fx_thumbs::LOOP_TICK, || {
+                    crate::app::with_app(|app| app.fx_loop_tick());
+                });
+                timer
+            });
+            self.refresh_effects();
         } else if self.fx.hover.is_some_and(|(r, _)| r == def.id) {
             self.fx_clear_hover();
         }
@@ -290,10 +322,15 @@ impl App {
         self.request_frame();
     }
 
-    /// Nothing hovered any more: the preview shows the project again.
+    /// Nothing hovered any more: the preview shows the project again, the
+    /// card's loop stops and it shows its still.
     pub fn fx_clear_hover(&mut self) {
         self.fx.hover = None;
         self.fx_clear_preview();
+        self.fx.thumbs.loop_frame = 0;
+        if self.fx.thumbs.timer.take().is_some() {
+            self.refresh_effects();
+        }
     }
 
     fn fx_clear_preview(&mut self) {

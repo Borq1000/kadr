@@ -8,6 +8,7 @@ mod anim_ui;
 mod app;
 mod app_settings;
 mod effects_ui;
+mod fx_thumbs;
 mod export_ui;
 mod file_drop;
 mod import;

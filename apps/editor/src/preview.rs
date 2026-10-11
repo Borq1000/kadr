@@ -257,6 +257,8 @@ impl App {
         }
         self.preview_scenes();
         self.audio.stop();
+        // Playback has the machine: effect thumbnails wait for the stop.
+        self.fx.thumbs.cancel();
         let cpu = self.preview.cpu.as_mut().expect("checked");
         // Pre-roll: the player renders the first frame, then the audio starts.
         let generation = cpu.player().play(from);
