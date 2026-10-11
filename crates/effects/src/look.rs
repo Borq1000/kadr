@@ -17,7 +17,7 @@ pub const DEFAULT_PRESET: &str = "cinematic";
 pub const LOOK_VIGNETTE_MIDPOINT: f64 = 0.45;
 pub const LOOK_VIGNETTE_FEATHER: f64 = 0.5;
 /// Grain cells: 2 canvas pixels per 1080 pixels of the canvas's short side,
-/// at least 1 (refinement 6, ruling E2-R4).
+/// rounded to whole pixels, at least 1 (refinement 6, ruling E2-R4).
 pub const GRAIN_CELL_PER_1080: f64 = 2.0;
 /// The Vignette effect at `k = 1` (D4): amount 0.35, midpoint 0.45,
 /// feather `0.15 + 0.7 · softness`.
@@ -110,10 +110,12 @@ pub fn frame_seed(ctx: &CompileCtx) -> u64 {
 }
 
 /// The grain cell for a canvas: `GRAIN_CELL_PER_1080` per 1080 pixels of
-/// its short side, at least 1 pixel — a vertical 1080 × 1920 canvas gets the
-/// grain of a 1920 × 1080 one (E2-R4).
+/// its short side, rounded to whole canvas pixels, at least 1 — a vertical
+/// 1080 × 1920 canvas gets the grain of a 1920 × 1080 one (E2-R4). Whole
+/// pixels: a fractional cell (1.33 at 720p) alternates 1- and 2-pixel cells
+/// in a fixed pattern, a grid printed on every frame.
 pub fn grain_cell(canvas: SizeU) -> f64 {
-    (GRAIN_CELL_PER_1080 * canvas.w.min(canvas.h) as f64 / 1080.0).max(1.0)
+    (GRAIN_CELL_PER_1080 * canvas.w.min(canvas.h) as f64 / 1080.0).round().max(1.0)
 }
 
 /// `preset` at intensity `k` (D4): its correction, curve, split tone,
@@ -363,6 +365,17 @@ mod tests {
         assert_eq!(grain(SizeU::new(1080, 1920), Time::ZERO).size, grain(hd, Time::ZERO).size, "the short side: vertical as landscape (E2-R4)");
         assert_eq!(grain(SizeU::new(2160, 3840), Time::ZERO).size, 4.0);
         assert_eq!(grain(SizeU::new(1080, 1080), Time::ZERO).size, 2.0, "square");
+        // Whole canvas pixels: 1.33 and 2.67 would print a fixed 1/2- and 2/3-pixel grid.
+        assert_eq!(grain(SizeU::new(1280, 720), Time::ZERO).size, 1.0, "720p");
+        assert_eq!(grain(SizeU::new(720, 1280), Time::ZERO).size, 1.0, "vertical 720p");
+        assert_eq!(grain(SizeU::new(2560, 1440), Time::ZERO).size, 3.0, "1440p");
+        assert_eq!(grain(SizeU::new(1440, 2560), Time::ZERO).size, 3.0, "vertical 1440p");
+        assert_eq!(grain(SizeU::new(720, 960), Time::ZERO).size, 1.0);
+        assert_eq!(grain(SizeU::new(320, 180), Time::ZERO).size, 1.0, "the goldens' canvas");
+        for side in (2..5000).step_by(7) {
+            let s = grain(SizeU::new(side * 2, side), Time::ZERO).size;
+            assert!(s >= 1.0 && s.fract() == 0.0, "{side}: {s}");
+        }
     }
 
     #[test]
