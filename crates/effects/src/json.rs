@@ -170,10 +170,10 @@ mod tests {
     #[test]
     fn the_registry_describes_types_ranges_options_and_defaults() {
         let all: Vec<Value> = registry().iter().map(recipe_json).collect();
-        assert_eq!(all.len(), registry().len());
+        assert_eq!(all.len(), 7, "E2: five motion recipes, the Look, the Vignette");
         let look = all.iter().find(|r| r["id"] == "look").unwrap();
         assert_eq!((look["category"].as_str(), look["target"].as_str()), (Some("look"), Some("clip")));
-        assert_eq!(look["params"][0], json!({"key": "preset", "type": "choice", "options": ["cinematic", "warm", "soft_film", "dramatic", "vintage", "natural"], "default": "cinematic"}));
+        assert_eq!(look["params"][0], json!({"key": "preset", "type": "choice", "options": crate::look::preset_keys(), "default": "cinematic"}));
         let zoom = &all[0];
         assert_eq!((zoom["id"].as_str(), zoom["category"].as_str(), zoom["target"].as_str()), (Some("smooth_zoom"), Some("motion"), Some("clip")));
         assert_eq!(zoom["params"][0], json!({"key": "direction", "type": "choice", "options": ["in", "out"], "default": "in"}));

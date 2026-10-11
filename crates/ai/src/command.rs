@@ -684,7 +684,7 @@ mod tests {
         let EditCommand::AddEffect { effect, .. } = &ok[0] else { panic!("{ok:?}") };
         assert_eq!((effect.recipe.as_str(), &effect.params["preset"], &effect.params["strength"]), ("look", &ParamValue::Choice("warm".into()), &ParamValue::Number(0.6)));
         let err = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "look", "params": {"preset": "sepia"}}))], &p, &perms).unwrap_err().to_string();
-        assert!(err.contains("preset must be one of cinematic, warm, soft_film, dramatic, vintage, natural"), "{err}");
+        assert!(err.contains(&format!("preset must be one of {}", kadr_effects::look::preset_keys().join(", "))), "{err}");
         let v = validate(&[cmd(json!({"type": "add_effect", "clip_id": id, "recipe": "vignette", "params": {"softness": 0.8}}))], &p, &perms).unwrap();
         assert!(matches!(&v[0], EditCommand::AddEffect { effect, .. } if effect.params["softness"] == ParamValue::Number(0.8) && effect.params["strength"] == ParamValue::Number(0.6)));
     }

@@ -1274,14 +1274,14 @@ mod tests {
         assert_eq!(categories(), vec![Category::Motion, Category::Look, Category::Light], "E2: motion, Looks, light");
         let ids = |v: Vec<Card>| v.into_iter().map(|c| c.id()).collect::<Vec<_>>();
         assert_eq!(visible_cards("", "").len(), 12, "5 motion, 6 Looks, the Vignette");
-        assert_eq!(ids(visible_cards("look", "")), ["look:cinematic", "look:warm", "look:soft_film", "look:dramatic", "look:vintage", "look:natural"]);
+        assert_eq!(ids(visible_cards("look", "")), kadr_effects::look::preset_keys().iter().map(|k| format!("look:{k}")).collect::<Vec<_>>(), "a card per preset, in looks.json's order");
         assert_eq!(ids(visible_cards("light", "")), ["vignette"]);
         assert!(visible_cards("transition", "").is_empty());
         assert_eq!(ids(visible_cards("", "наезд")), ["smooth_zoom", "cinematic_push", "punch_in"]);
         assert_eq!(ids(visible_cards("motion", "HAND")), ["handheld"], "English name, any case");
         assert_eq!(ids(visible_cards("", "  Ручная ")), ["handheld"], "trimmed");
         assert_eq!(ids(visible_cards("", "кино")), ["cinematic_push", "look:cinematic"], "a preset by its own name");
-        assert_eq!(visible_cards("", "LOOK").len(), 6, "the recipe's name finds every preset");
+        assert_eq!(visible_cards("", "LOOK").len(), kadr_effects::look::preset_keys().len(), "the recipe's name finds every preset");
         assert_eq!(ids(visible_cards("", "vintage")), ["look:vintage"]);
     }
 

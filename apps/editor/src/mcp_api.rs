@@ -635,7 +635,7 @@ mod tests {
         let add = |preset: &str| serde_json::json!([{"type": "add_effect", "clip_id": v.to_string(), "recipe": "look", "params": {"preset": preset}}]);
         let e = edit_commands(&p, &[], &add("sepia")).unwrap_err();
         assert_eq!(e.code, "edit_rejected");
-        assert!(e.message.starts_with("op #0: ") && e.message.contains("preset must be one of cinematic, warm, soft_film, dramatic, vintage, natural"), "{}", e.message);
+        assert!(e.message.starts_with("op #0: ") && e.message.contains(&format!("preset must be one of {}", kadr_effects::look::preset_keys().join(", "))), "{}", e.message);
         let c = p.sequence().clip(v).unwrap().clone();
         p.sequence_mut().tracks[0].clips[0].effects.push(kadr_effects::fresh(kadr_effects::recipe("look").unwrap(), &c, Time::ZERO));
         assert!(matches!(&edit_commands(&p, &[], &add("warm")).unwrap()[..], [EditCommand::AddEffect { .. }]), "another preset replaces the Look");

@@ -289,7 +289,6 @@ mod tests {
     #[test]
     fn the_look_has_one_variant_per_preset_named_in_its_own_keys() {
         let look = recipe("look").unwrap();
-        assert_eq!(look.variant_options(), ["cinematic", "warm", "soft_film", "dramatic", "vintage", "natural"]);
         assert_eq!(look.variant_options(), crate::look::preset_keys(), "the options are looks.json's keys");
         assert!(recipe("smooth_zoom").unwrap().variant_options().is_empty());
         assert_eq!(look.option_name_key("preset", "warm"), "fx.look.warm");
