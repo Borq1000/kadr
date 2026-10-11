@@ -4,13 +4,16 @@
 //! Within one layer everything is fused, as the contract allows: sample →
 //! effects → opacity and coverage → composite in f32, with coordinates,
 //! coverage and the wipe mask in f64; the destination is stored rounded after
-//! every layer. Effect chains are therefore not timed on their own
-//! (`RenderStats::effects` stays 0).
+//! every layer. A layer's effects are one fused chain of point operations
+//! (`PointFx`, the contract's "Point operations") run inside its sampling
+//! pass: they are not timed on their own (`RenderStats::effects` stays 0)
+//! and add no pass.
 
 use crate::{LayerInput, PreparedFrame, RenderError, RenderStats, RenderTarget, Renderer};
 use kadr_core::color::AlphaMode;
+use kadr_core::hash::{pcg32_at, pcg32_stream};
 use kadr_core::{CpuFrame, FramePool};
-use kadr_scene::{Affine2, BlendMode, ColorAdjust, Effect, FrameScene, Layer, LayerContent, Rgba, TransitionLayer, TransitionOp};
+use kadr_scene::{hue_offset, tone_lookup, Affine2, BlendMode, ColorAdjust, Effect, FrameScene, Grain, Layer, LayerContent, Rgba, TransitionLayer, TransitionOp};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -66,8 +69,9 @@ impl Renderer for CpuRenderer {
         // fills the output — the common export case).
         let canvas_overdrawn = scene.layers.iter().zip(&frame.inputs.layers).next().is_some_and(|(l, i)| covers_canvas(&grid, l, i));
         fill_base(t.data, t.stride, &grid, premul(scene.background), canvas_overdrawn);
+        let mut passes = 0;
         for (layer, input) in scene.layers.iter().zip(&frame.inputs.layers) {
-            match self.draw_layer(t.data, t.stride, &grid, layer, input) {
+            match self.draw_layer(t.data, t.stride, &grid, layer, input, &mut passes) {
                 Drawn::Nothing => {}
                 Drawn::Sampled => stats.layers_drawn += 1,
                 Drawn::FastPath => {
@@ -76,6 +80,7 @@ impl Renderer for CpuRenderer {
                 }
             }
         }
+        stats.passes = passes;
         stats.composite = start.elapsed();
         Ok(stats)
     }
@@ -293,14 +298,28 @@ fn covers_canvas(g: &Grid, layer: &Layer, input: &LayerInput) -> bool {
     (i0, i1) == (g.x0, g.x1) && (r0, r1) == (g.y0, g.y1)
 }
 
-/// A layer's effect chain as one affine map on unpremultiplied RGB. Every
-/// `ColorAdjust` step is affine — exposure `(c^2.4 · 2^ev)^(1/2.4)` is exactly
-/// `c · 2^(ev/2.4)` for `c ≥ 0` — and nothing is clamped before the end of
-/// the chain, so the whole chain composes into one matrix (in f64).
-#[derive(Clone, Copy)]
-struct ColorFx {
-    m: [[f32; 3]; 3],
-    t: [f32; 3],
+/// A layer's effects as one fused chain of point operations on
+/// unpremultiplied RGB (the contract's "Point operations"): consecutive
+/// `ColorAdjust`s fold into one affine map — every adjust step is affine,
+/// exposure `(c^2.4 · 2^ev)^(1/2.4)` being `c · 2^(ev/2.4)` for `c ≥ 0` —
+/// then the other primitives in list order, the clamp once at the end.
+/// Built once per layer and frame; run inside the layer's one pass.
+struct PointFx {
+    ops: Vec<Op>,
+    /// Some op reads the pixel's canvas position (vignette, grain).
+    spatial: bool,
+}
+
+enum Op {
+    Affine { m: [[f32; 3]; 3], t: [f32; 3] },
+    /// `ToneCurve::table`.
+    Curve(Box<[f32; 256]>),
+    /// The two hue offsets already scaled by their amounts, and `0.25 · balance`.
+    Split { shadow: [f32; 3], highlight: [f32; 3], bias: f32 },
+    /// The canvas centre, 1 / half the canvas diagonal, the smoothstep's edges, the amount.
+    Vignette { cx: f64, cy: f64, inv_r: f64, e0: f32, e1: f32, amount: f32 },
+    /// `pcg32_stream(seed)`, the cell side in canvas pixels, the amount.
+    Grain { stream: u64, size: f64, amount: f32 },
 }
 
 type Affine3 = ([[f64; 3]; 3], [f64; 3]);
@@ -318,41 +337,111 @@ fn adjust_affine(a: &ColorAdjust) -> Affine3 {
     (m, t)
 }
 
-impl ColorFx {
-    /// `None` when the chain does nothing.
-    fn of(effects: &[Effect]) -> Option<ColorFx> {
+/// `later` after `earlier`: `m2·(m1·c + t1) + t2`.
+fn compose((m1, t1): Affine3, (m2, t2): Affine3) -> Affine3 {
+    (
+        std::array::from_fn(|r| std::array::from_fn(|c| (0..3).map(|n| m2[r][n] * m1[n][c]).sum())),
+        std::array::from_fn(|r| (0..3).map(|n| m2[r][n] * t1[n]).sum::<f64>() + t2[r]),
+    )
+}
+
+fn affine_op((m, t): Affine3) -> Op {
+    Op::Affine { m: m.map(|r| r.map(|v| v as f32)), t: t.map(|v| v as f32) }
+}
+
+const LUMA_F32: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+#[inline(always)]
+fn luma_f32(c: [f32; 3]) -> f32 {
+    LUMA_F32[0] * c[0] + LUMA_F32[1] * c[1] + LUMA_F32[2] * c[2]
+}
+
+#[inline(always)]
+fn smoothstep_f32(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+impl PointFx {
+    /// `None` when every primitive is neutral: the chain — its clamp too —
+    /// is skipped. `canvas`: the canvas size in pixels.
+    fn of(effects: &[Effect], canvas: (f64, f64)) -> Option<PointFx> {
+        let mut ops = Vec::new();
         let mut acc: Option<Affine3> = None;
-        for e in effects {
+        // A neutral primitive is skipped wherever it stands: an identity
+        // curve does not clamp its input (the contract).
+        for e in effects.iter().filter(|e| !e.is_neutral()) {
+            if let Effect::ColorAdjust(a) = e {
+                let next = adjust_affine(a);
+                acc = Some(acc.map_or(next, |earlier| compose(earlier, next)));
+                continue;
+            }
+            if let Some(a) = acc.take() {
+                ops.push(affine_op(a));
+            }
             match e {
-                Effect::ColorAdjust(a) if a.is_neutral() => {}
-                Effect::ColorAdjust(a) => {
-                    let (m2, t2) = adjust_affine(a);
-                    acc = Some(match acc {
-                        None => (m2, t2),
-                        // Later after earlier: m2·(m1·c + t1) + t2.
-                        Some((m1, t1)) => (
-                            std::array::from_fn(|r| std::array::from_fn(|c| (0..3).map(|n| m2[r][n] * m1[n][c]).sum())),
-                            std::array::from_fn(|r| (0..3).map(|n| m2[r][n] * t1[n]).sum::<f64>() + t2[r]),
-                        ),
-                    });
+                Effect::ToneCurve(c) => ops.push(Op::Curve(Box::new(c.table()))),
+                Effect::SplitTone(s) => {
+                    let scaled = |hue: f32, amount: f32| hue_offset(hue as f64).map(|v| (v * amount as f64) as f32);
+                    ops.push(Op::Split { shadow: scaled(s.shadow_hue_deg, s.shadow_amount), highlight: scaled(s.highlight_hue_deg, s.highlight_amount), bias: 0.25 * s.balance });
                 }
+                Effect::Vignette(v) => ops.push(Op::Vignette {
+                    cx: canvas.0 / 2.0,
+                    cy: canvas.1 / 2.0,
+                    inv_r: 2.0 / (canvas.0 * canvas.0 + canvas.1 * canvas.1).sqrt(),
+                    e0: v.midpoint,
+                    e1: v.midpoint + v.feather.max(0.01),
+                    amount: v.amount,
+                }),
+                Effect::Grain(g) => ops.push(Op::Grain { stream: pcg32_stream(g.seed), size: g.cell_size(), amount: g.amount }),
                 // A primitive this renderer does not implement yet is skipped.
                 _ => {}
             }
         }
-        acc.map(|(m, t)| ColorFx { m: m.map(|r| r.map(|v| v as f32)), t: t.map(|v| v as f32) })
+        if let Some(a) = acc {
+            ops.push(affine_op(a));
+        }
+        if ops.is_empty() {
+            return None;
+        }
+        let spatial = ops.iter().any(|o| matches!(o, Op::Vignette { .. } | Op::Grain { .. }));
+        Some(PointFx { ops, spatial })
     }
 
-    /// On a premultiplied sample: unpremultiply, map, clamp once, premultiply.
+    /// On a premultiplied sample whose output pixel centre lies at canvas
+    /// position `pos`: unpremultiply, the ops, clamp once, premultiply.
     #[inline(always)]
-    fn apply(&self, s: [f32; 4]) -> [f32; 4] {
+    fn apply(&self, s: [f32; 4], pos: (f64, f64)) -> [f32; 4] {
         let a = s[3];
         if a == 0.0 {
             return s;
         }
-        let c = [s[0] / a, s[1] / a, s[2] / a];
-        let o = |r: usize| (self.m[r][0] * c[0] + self.m[r][1] * c[1] + self.m[r][2] * c[2] + self.t[r]).clamp(0.0, 1.0) * a;
-        [o(0), o(1), o(2), a]
+        let mut c = [s[0] / a, s[1] / a, s[2] / a];
+        for op in &self.ops {
+            match op {
+                Op::Affine { m, t } => c = std::array::from_fn(|r| m[r][0] * c[0] + m[r][1] * c[1] + m[r][2] * c[2] + t[r]),
+                Op::Curve(table) => c = c.map(|v| tone_lookup(table, v)),
+                Op::Split { shadow, highlight, bias } => {
+                    let yb = (luma_f32(c) + bias).clamp(0.0, 1.0);
+                    let (ws, wh) = ((1.0 - yb) * (1.0 - yb), yb * yb);
+                    c = std::array::from_fn(|k| c[k] + ws * shadow[k] + wh * highlight[k]);
+                }
+                Op::Vignette { cx, cy, inv_r, e0, e1, amount } => {
+                    let (dx, dy) = (pos.0 - cx, pos.1 - cy);
+                    let d = ((dx * dx + dy * dy).sqrt() * inv_r) as f32;
+                    let v = 1.0 - amount * smoothstep_f32(*e0, *e1, d);
+                    c = c.map(|x| x * v);
+                }
+                Op::Grain { stream, size, amount } => {
+                    let h = pcg32_at(*stream, Grain::cell_index(*size, pos.0, pos.1)) as f32 / u32::MAX as f32;
+                    let y = luma_f32(c).clamp(0.0, 1.0);
+                    let n = (h - 0.5) * amount * 4.0 * y * (1.0 - y);
+                    c = c.map(|x| x + n);
+                }
+            }
+        }
+        let o = |v: f32| v.clamp(0.0, 1.0) * a;
+        [o(c[0]), o(c[1]), o(c[2]), a]
     }
 }
 
@@ -375,10 +464,14 @@ struct Plan {
     edges: [[f64; 3]; 4],
     opacity: f32,
     blend: BlendMode,
-    fx: Option<ColorFx>,
+    fx: Option<PointFx>,
     /// Output rows and columns that can have coverage, within the canvas.
     rows: (usize, usize),
     cols: (usize, usize),
+    /// Output → canvas (`canvas = (output − o) / k`): the spatial ops' positions.
+    k: f64,
+    ox: f64,
+    oy: f64,
 }
 
 /// `v` as an index clamped into `lo..=hi` (NaN → `lo`).
@@ -420,7 +513,7 @@ impl Plan {
         if rows.0 >= rows.1 || cols.0 >= cols.1 {
             return None;
         }
-        Some(Plan { inv, tex: inv, edges, opacity, blend: layer.blend, fx: ColorFx::of(&layer.effects), rows, cols })
+        Some(Plan { inv, tex: inv, edges, opacity, blend: layer.blend, fx: PointFx::of(&layer.effects, (g.cw, g.ch)), rows, cols, k: g.k, ox: g.ox, oy: g.oy })
     }
 }
 
@@ -536,11 +629,12 @@ impl<const ALPHA: u8> Sampler for Texels<'_, ALPHA> {
     }
 }
 
-/// Effects, opacity and coverage on a sample, composited into `px`.
+/// Effects, opacity and coverage on a sample, composited into `px`; `pos`
+/// is the pixel centre's canvas position (read only by a spatial chain).
 #[inline(always)]
-fn shade(plan: &Plan, mut s: [f32; 4], cov: f32, px: &mut [u8; 4]) {
+fn shade(plan: &Plan, mut s: [f32; 4], pos: (f64, f64), cov: f32, px: &mut [u8; 4]) {
     if let Some(fx) = &plan.fx {
-        s = fx.apply(s);
+        s = fx.apply(s, pos);
     }
     let k = plan.opacity * cov;
     composite(plan.blend, s.map(|c| c * k), px);
@@ -548,35 +642,43 @@ fn shade(plan: &Plan, mut s: [f32; 4], cov: f32, px: &mut [u8; 4]) {
 
 /// The general path: every output pixel of the plan, evaluated at its centre.
 fn draw_sampled<S: Sampler>(data: &mut [u8], stride: usize, plan: &Plan, s: &S) {
+    let spatial = plan.fx.as_ref().is_some_and(|f| f.spatial);
     par_rows(data, stride, plan.rows, |j, row| {
         let y = j as f64 + 0.5;
         let e = plan.edges.map(|[a, b, c]| (a, b * y + c));
         let (outer, inner) = row_spans(&e, plan.cols);
         let t = &plan.tex;
         let (ub, vb) = (t.c * y + t.tx, t.d * y + t.ty);
+        // The pixel centre's canvas position exactly as the contract computes
+        // it (the grain cell must not flip): only a spatial chain needs it.
+        let cy = if spatial { (y - plan.oy) / plan.k } else { 0.0 };
+        let at = |x: f64| if spatial { ((x - plan.ox) / plan.k, cy) } else { (0.0, 0.0) };
         for i in (outer.0..inner.0).chain(inner.1..outer.1) {
             let x = i as f64 + 0.5;
             let d = e.map(|(a, b)| a * x + b);
             let cov = (axis_coverage(d[0], d[1]) * axis_coverage(d[2], d[3])) as f32;
             // Coverage 0 composites s = 0, which leaves the stored pixel as it is.
             if cov > 0.0 {
-                shade(plan, s.sample(t.a * x + ub, t.b * x + vb), cov, pixel(row, i));
+                shade(plan, s.sample(t.a * x + ub, t.b * x + vb), at(x), cov, pixel(row, i));
             }
         }
         for i in inner.0..inner.1 {
             let x = i as f64 + 0.5;
-            shade(plan, s.sample(t.a * x + ub, t.b * x + vb), 1.0, pixel(row, i));
+            shade(plan, s.sample(t.a * x + ub, t.b * x + vb), at(x), 1.0, pixel(row, i));
         }
     });
 }
 
-fn draw_flat(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, colour: Rgba) -> Drawn {
+fn draw_flat(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, colour: Rgba, passes: &mut u32) -> Drawn {
     let Some(mut plan) = Plan::new(g, layer) else { return Drawn::Nothing };
     let mut px = premul(colour);
-    if let Some(fx) = plan.fx.take() {
-        px = fx.apply(px);
+    // A chain that reads no position gives every pixel the same colour: once.
+    // A spatial one (vignette, grain) runs per pixel.
+    if let Some(fx) = plan.fx.take_if(|f| !f.spatial) {
+        px = fx.apply(px, (0.0, 0.0));
     }
     draw_sampled(data, stride, &plan, &Flat(px));
+    *passes += 1;
     Drawn::Sampled
 }
 
@@ -589,7 +691,7 @@ fn whole(v: f64) -> Option<isize> {
     ((v - r).abs() <= SNAP).then_some(r as isize)
 }
 
-fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &CpuFrame) -> Drawn {
+fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &CpuFrame, passes: &mut u32) -> Drawn {
     let Some(mut plan) = Plan::new(g, layer) else { return Drawn::Nothing };
     let size = layer.placement.size;
     let (tw, th) = (frame.width as f64, frame.height as f64);
@@ -610,6 +712,7 @@ fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &C
         && let Some(d) = grid_aligned(&plan.tex, crop, tw / sx, th / sy, tw, th)
     {
         copy_texels(data, stride, g, frame, d);
+        *passes += 1;
         return Drawn::FastPath;
     }
 
@@ -621,6 +724,7 @@ fn draw_frame(data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, frame: &C
         AlphaMode::Straight => draw_sampled(data, stride, &plan, &Texels::<STRAIGHT> { data: fd, stride: st, kx0, kx1, ky0, ky1 }),
         AlphaMode::Premultiplied => draw_sampled(data, stride, &plan, &Texels::<PREMULTIPLIED> { data: fd, stride: st, kx0, kx1, ky0, ky1 }),
     }
+    *passes += 1;
     Drawn::Sampled
 }
 
@@ -716,12 +820,12 @@ impl Mix {
 }
 
 impl CpuRenderer {
-    fn draw_layer(&self, data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, input: &LayerInput) -> Drawn {
+    fn draw_layer(&self, data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, input: &LayerInput, passes: &mut u32) -> Drawn {
         match (&layer.content, input) {
-            (LayerContent::Transition(t), LayerInput::Transition { from, to }) => self.draw_transition(data, stride, g, layer, t, from, to),
-            (LayerContent::Solid(c), _) => draw_flat(data, stride, g, layer, *c),
-            (LayerContent::Media { .. }, LayerInput::Cpu(f)) => draw_frame(data, stride, g, layer, f),
-            (LayerContent::Media { .. }, _) => draw_flat(data, stride, g, layer, Rgba::MISSING),
+            (LayerContent::Transition(t), LayerInput::Transition { from, to }) => self.draw_transition(data, stride, g, layer, t, from, to, passes),
+            (LayerContent::Solid(c), _) => draw_flat(data, stride, g, layer, *c, passes),
+            (LayerContent::Media { .. }, LayerInput::Cpu(f)) => draw_frame(data, stride, g, layer, f, passes),
+            (LayerContent::Media { .. }, _) => draw_flat(data, stride, g, layer, Rgba::MISSING, passes),
             // Inputs are checked before drawing.
             (LayerContent::Transition(_), _) => Drawn::Nothing,
         }
@@ -730,7 +834,7 @@ impl CpuRenderer {
     /// `from` and `to` into their own transparent buffers (canvas pixels
     /// only: margins are neither drawn nor read), mixed and composited.
     #[allow(clippy::too_many_arguments)]
-    fn draw_transition(&self, data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, t: &TransitionLayer, from: &[LayerInput], to: &[LayerInput]) -> Drawn {
+    fn draw_transition(&self, data: &mut [u8], stride: usize, g: &Grid, layer: &Layer, t: &TransitionLayer, from: &[LayerInput], to: &[LayerInput], passes: &mut u32) -> Drawn {
         let opacity = unit(layer.opacity);
         if g.is_empty() || opacity == 0.0 {
             return Drawn::Nothing;
@@ -740,7 +844,7 @@ impl CpuRenderer {
         for (buf, (layers, inputs)) in bufs.iter_mut().zip([(&t.from, from), (&t.to, to)]) {
             par_rows(buf, bs, (g.y0, g.y1), |_, row| row[g.x0 * 4..g.x1 * 4].fill(0));
             for (l, i) in layers.iter().zip(inputs) {
-                self.draw_layer(buf, bs, g, l, i);
+                self.draw_layer(buf, bs, g, l, i, passes);
             }
         }
         let (a, b) = (&bufs[0][..], &bufs[1][..]);
@@ -755,6 +859,7 @@ impl CpuRenderer {
                 composite(blend, m.map(|c| c * opacity), pixel(row, i));
             }
         });
+        *passes += 1;
         Drawn::Sampled
     }
 }
@@ -869,6 +974,150 @@ mod tests {
         let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
         let want = rgb.map(|c| ((y + (c - y) * 0.6).clamp(0.0, 1.0) * 0.5 * 255.0 + 0.5).floor() as u8);
         assert!(near(px(&out, 2, 0, 0), [want[0], want[1], want[2], 128]), "{:?} vs {want:?}", px(&out, 2, 0, 0));
+    }
+
+    fn grey(v: f32) -> Rgba {
+        Rgba { r: v, g: v, b: v, a: 1.0 }
+    }
+
+    /// A full-canvas solid of `colour` with `effects`; canvas = output = `w × h`.
+    fn graded_solid(w: u32, h: u32, colour: Rgba, effects: Vec<Effect>) -> Vec<u8> {
+        let mut l = solid(colour, Placement::fill(SizeU::new(w, h)));
+        l.effects = effects;
+        render(&scene((w, h), (w, h), Rgba::BLACK, vec![l]), vec![LayerInput::None])
+    }
+
+    #[test]
+    fn a_tone_curve_maps_every_channel_through_its_table() {
+        let flat = ToneCurve { points: vec![(0.0, 0.2), (1.0, 0.2)] };
+        assert!(near(px(&graded_solid(2, 2, Rgba { r: 0.9, g: 0.1, b: 0.5, a: 1.0 }, vec![Effect::ToneCurve(flat)]), 2, 0, 0), [51, 51, 51, 255]), "a flat curve at 0.2");
+        // Exposure pushes 0.8 past 1; the curve's input is clamped to its domain, its top is 0.5.
+        let half = ToneCurve { points: vec![(0.0, 0.0), (1.0, 0.5)] };
+        let out = graded_solid(2, 2, grey(0.8), vec![Effect::ColorAdjust(ColorAdjust { exposure: 2.4, ..ColorAdjust::NEUTRAL }), Effect::ToneCurve(half)]);
+        assert!(near(px(&out, 2, 1, 1), [128, 128, 128, 255]), "{:?}", px(&out, 2, 1, 1));
+    }
+
+    /// Ruling E2-R1: a neutral primitive is skipped wherever it stands — an
+    /// identity curve between a strong exposure and a contrast does not clamp
+    /// the 1.6 the exposure made, so the chain is the one without the curve.
+    #[test]
+    fn an_identity_curve_inside_a_chain_does_not_clamp() {
+        let exposure = Effect::ColorAdjust(ColorAdjust { exposure: 2.4, ..ColorAdjust::NEUTRAL });
+        let contrast = Effect::ColorAdjust(ColorAdjust { contrast: 0.3, ..ColorAdjust::NEUTRAL });
+        let with = graded_solid(2, 2, grey(0.8), vec![exposure.clone(), Effect::ToneCurve(ToneCurve::identity()), contrast.clone()]);
+        let without = graded_solid(2, 2, grey(0.8), vec![exposure, contrast]);
+        assert_eq!(with, without);
+        // (1.6 − 0.5)·0.3 + 0.5 = 0.83; a clamped 1 would give 0.65 (166).
+        assert!(near(px(&with, 2, 0, 0), [212, 212, 212, 255]), "{:?}", px(&with, 2, 0, 0));
+    }
+
+    #[test]
+    fn split_tone_tints_shadows_and_highlights_by_hue() {
+        // Grey 0.5: Yb = 0.5, ws = 0.25; red shadows at 1: d = (0.7874, −0.2126, −0.2126).
+        let red_shadows = SplitTone { shadow_hue_deg: 0.0, shadow_amount: 1.0, ..SplitTone::NEUTRAL };
+        let out = graded_solid(2, 2, grey(0.5), vec![Effect::SplitTone(red_shadows)]);
+        assert!(near(px(&out, 2, 0, 0), [178, 114, 114, 255]), "{:?}", px(&out, 2, 0, 0));
+        // Grey 0.8, orange (30°) highlights at 0.5: wh = 0.64 → (0.9375, 0.7775, 0.6175).
+        let warm_highlights = SplitTone { highlight_hue_deg: 30.0, highlight_amount: 0.5, ..SplitTone::NEUTRAL };
+        let out = graded_solid(2, 2, grey(0.8), vec![Effect::SplitTone(warm_highlights)]);
+        assert!(near(px(&out, 2, 0, 0), [239, 198, 157, 255]), "{:?}", px(&out, 2, 0, 0));
+    }
+
+    #[test]
+    fn the_vignette_darkens_by_canvas_distance_on_a_solid_too() {
+        // White 10 × 10, amount 1, midpoint 0, feather 1: v = 1 − smoothstep(0, 1, d) per pixel.
+        let v = Vignette { amount: 1.0, midpoint: 0.0, feather: 1.0 };
+        let out = graded_solid(10, 10, grey(1.0), vec![Effect::Vignette(v)]);
+        for ((x, y), want) in [((0, 0), 7u8), ((9, 9), 7), ((4, 4), 248), ((0, 4), 75)] {
+            assert!(px(&out, 10, x, y)[0].abs_diff(want) <= 1, "({x}, {y}): {:?} vs {want}", px(&out, 10, x, y));
+        }
+    }
+
+    /// Review focus 5: the vignette is measured on the canvas, not on the output.
+    #[test]
+    fn the_vignette_follows_the_canvas_on_a_letterboxed_output() {
+        // A 16 × 9 canvas in a 16 × 12 output: k = 1, o.y = 1.5, rows 1..=10 are canvas; rows 1
+        // and 10 sit on the layer's edges (half coverage), rows 2..=9 are fully covered.
+        let mut l = solid(grey(1.0), Placement::fill(SizeU::new(16, 9)));
+        l.effects = vec![Effect::Vignette(Vignette { amount: 1.0, midpoint: 0.0, feather: 1.0 })];
+        let out = render(&scene((16, 9), (16, 12), Rgba::BLACK, vec![l]), vec![LayerInput::None]);
+        // Canvas-space values (an output-space vignette would give 20, 154, 129 and 20).
+        for ((x, y), want) in [((0, 2), 7u8), ((4, 3), 139), ((4, 9), 113), ((15, 9), 7)] {
+            assert!(px(&out, 16, x, y)[0].abs_diff(want) <= 1, "({x}, {y}): {:?} vs {want}", px(&out, 16, x, y));
+        }
+        assert_eq!(px(&out, 16, 4, 0), [0, 0, 0, 255], "the margin is not drawn");
+    }
+
+    #[test]
+    fn grain_is_pinned_per_canvas_cell() {
+        let g = |size: f32| Effect::Grain(Grain { amount: 1.0, size, seed: 7 });
+        // Grey 0.5: the weight is 1, so the pixel is h = pcg32_hash(7, cell) / (2³² − 1).
+        let out = graded_solid(4, 4, grey(0.5), vec![g(1.0)]);
+        for ((x, y), want) in [((0, 0), 97u8), ((1, 0), 113), ((0, 1), 253)] {
+            assert!(px(&out, 4, x, y)[0].abs_diff(want) <= 1, "({x}, {y}): {:?} vs {want}", px(&out, 4, x, y));
+        }
+        let big = graded_solid(4, 4, grey(0.5), vec![g(2.0)]);
+        assert_eq!(px(&big, 4, 0, 0), px(&big, 4, 1, 1), "one 2 × 2 cell");
+        assert!(px(&big, 4, 0, 0)[0].abs_diff(97) <= 1);
+        assert_eq!(px(&graded_solid(2, 2, Rgba::BLACK, vec![g(1.0)]), 2, 0, 0), [0, 0, 0, 255], "no grain in black");
+    }
+
+    #[test]
+    fn primitives_apply_in_list_order() {
+        let flat = Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.2), (1.0, 0.2)] });
+        let dark = Effect::Vignette(Vignette { amount: 1.0, midpoint: 0.0, feather: 1.0 });
+        let curve_last = graded_solid(10, 10, grey(1.0), vec![dark.clone(), flat.clone()]);
+        let vignette_last = graded_solid(10, 10, grey(1.0), vec![flat, dark]);
+        assert!(near(px(&curve_last, 10, 0, 0), [51, 51, 51, 255]), "the curve last flattens the vignette away");
+        assert!(px(&vignette_last, 10, 0, 0)[0] <= 2, "the vignette last darkens the flat 0.2: {:?}", px(&vignette_last, 10, 0, 0));
+    }
+
+    /// Review focus 3: neutral primitives are no-ops — byte-identical, and the plain copy still runs.
+    #[test]
+    fn neutral_primitives_change_nothing_and_keep_the_fast_path() {
+        let c = SizeU::new(24, 16);
+        let f = gradient(24, 16);
+        let plain = scene((24, 16), (24, 16), Rgba::BLACK, vec![media(Placement::fill(c))]);
+        let (want, _) = render_with(&mut CpuRenderer::new(), &plain, vec![LayerInput::Cpu(f.clone())]);
+        let mut neutral = plain.clone();
+        neutral.layers[0].effects = vec![
+            Effect::ToneCurve(ToneCurve::identity()),
+            Effect::SplitTone(SplitTone::NEUTRAL),
+            Effect::Vignette(Vignette { amount: 0.0, midpoint: 0.4, feather: 0.3 }),
+            Effect::Grain(Grain { amount: 0.0, size: 2.0, seed: 9 }),
+            Effect::ColorAdjust(ColorAdjust::NEUTRAL),
+        ];
+        let (got, stats) = render_with(&mut CpuRenderer::new(), &neutral, vec![LayerInput::Cpu(f)]);
+        assert_eq!(got, want);
+        assert_eq!((stats.fast_paths, stats.passes), (1, 1), "still the plain copy, one pass");
+    }
+
+    /// Effects spec §4, D2: a Look's five primitives run fused inside the
+    /// layer's one pass — no extra pass, no buffer between them.
+    #[test]
+    fn a_full_look_renders_in_one_pass_without_new_buffers() {
+        let mut l = media(Placement::fill(SizeU::new(32, 18)));
+        l.effects = vec![
+            Effect::ColorAdjust(ColorAdjust { saturation: 0.85, ..ColorAdjust::NEUTRAL }),
+            Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.1), (0.5, 0.52), (1.0, 0.92)] }),
+            Effect::SplitTone(SplitTone { shadow_hue_deg: 40.0, shadow_amount: 0.2, highlight_hue_deg: 50.0, highlight_amount: 0.05, balance: 0.0 }),
+            Effect::Vignette(Vignette { amount: 0.3, midpoint: 0.45, feather: 0.5 }),
+            Effect::Grain(Grain { amount: 0.05, size: 1.0, seed: 3 }),
+        ];
+        let s = scene((32, 18), (32, 18), Rgba::BLACK, vec![l]);
+        let mut r = CpuRenderer::new();
+        for _ in 0..3 {
+            let (_, stats) = render_with(&mut r, &s, vec![LayerInput::Cpu(gradient(32, 18))]);
+            assert_eq!((stats.layers_drawn, stats.fast_paths, stats.passes), (1, 0, 1));
+        }
+        assert_eq!(r.pool_allocations(), 0, "no buffer between the primitives");
+    }
+
+    #[test]
+    fn passes_count_layers_and_transition_mixes() {
+        let (s, i) = transition_scene(TransitionOp::Dissolve, 0.5);
+        let (_, stats) = render_with(&mut CpuRenderer::new(), &s, i);
+        assert_eq!(stats.passes, 3, "`from`, `to` and the mix");
     }
 
     fn gradient(w: u32, h: u32) -> Arc<CpuFrame> {

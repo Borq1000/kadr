@@ -42,12 +42,20 @@ impl std::ops::Add for Cost {
     }
 }
 
-/// Relative cost of one effect per covered pixel. `quality` changes only
-/// how closely a future neighbourhood effect is approximated.
+/// Relative cost of one effect per covered pixel (one bilinear sample +
+/// blend ≈ 1). Point operations run fused into the layer's pass, so each
+/// costs less than a pass (refinement 11); `quality` will only change how
+/// closely a future neighbourhood effect is approximated.
 fn effect_ops(e: &Effect, _quality: RenderQuality) -> f64 {
+    if e.is_neutral() {
+        return 0.0;
+    }
     match e {
-        Effect::ColorAdjust(c) if c.is_neutral() => 0.0,
         Effect::ColorAdjust(_) => 0.5,
+        Effect::ToneCurve(_) => 0.3,
+        Effect::SplitTone(_) => 0.3,
+        Effect::Vignette(_) => 0.4,
+        Effect::Grain(_) => 0.6,
         // A primitive this estimate does not know yet: assume a full extra pass.
         _ => 1.0,
     }
@@ -115,5 +123,37 @@ mod tests {
         }
         assert_eq!(scene_cost(&scene).class, CostClass::Heavy);
         assert_eq!(full.class, CostClass::Cheap);
+    }
+
+    /// Refinement 11: a colour primitive costs less than a pass (it is fused
+    /// into the layer's one); a neutral one nothing; a full Look on a full
+    /// frame is Medium.
+    #[test]
+    fn colour_primitives_cost_less_than_a_pass_and_neutral_ones_nothing() {
+        let canvas = SizeU::new(1920, 1080);
+        let scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(SizeU::new(960, 540), RenderQuality::PreviewHigh));
+        let plain = layer_cost(&scene, &solid(canvas, 1.0)).ops;
+        let extra = |e: Effect| {
+            let mut l = solid(canvas, 1.0);
+            l.effects.push(e);
+            layer_cost(&scene, &l).ops - plain
+        };
+        let live = [
+            Effect::ToneCurve(ToneCurve { points: vec![(0.0, 0.1), (1.0, 0.9)] }),
+            Effect::SplitTone(SplitTone { shadow_amount: 0.2, ..SplitTone::NEUTRAL }),
+            Effect::Vignette(Vignette { amount: 0.3, midpoint: 0.45, feather: 0.5 }),
+            Effect::Grain(Grain { amount: 0.05, size: 2.0, seed: 1 }),
+        ];
+        for e in live.clone() {
+            let x = extra(e.clone());
+            assert!(x > 0.0 && x < plain, "{e:?}: {x}");
+        }
+        for e in [Effect::ToneCurve(ToneCurve::identity()), Effect::SplitTone(SplitTone::NEUTRAL), Effect::Vignette(Vignette { amount: 0.0, midpoint: 0.5, feather: 0.5 }), Effect::Grain(Grain { amount: 0.0, size: 1.0, seed: 1 })] {
+            assert_eq!(extra(e.clone()), 0.0, "{e:?}");
+        }
+        let mut look = solid(canvas, 1.0);
+        look.effects = live.to_vec();
+        look.effects.insert(0, Effect::ColorAdjust(ColorAdjust { saturation: 0.9, ..ColorAdjust::NEUTRAL }));
+        assert_eq!(layer_cost(&scene, &look).class, CostClass::Medium);
     }
 }

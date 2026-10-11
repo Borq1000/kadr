@@ -86,6 +86,11 @@ pub struct RenderStats {
     pub layers_drawn: u32,
     /// Layers drawn by a fast path (row copy) instead of per-pixel sampling.
     pub fast_paths: u32,
+    /// Per-pixel passes over the output or a transition buffer: one per layer
+    /// drawn — sampled or copied by a fast path, top level or inside a
+    /// transition — and one per transition mix. A layer's effects add none:
+    /// they run fused inside its pass (effects spec §4).
+    pub passes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
