@@ -288,25 +288,30 @@ component ChoiceSegments inherits Rectangle {
 // «Мягко / Обычно / Сильно» under the Strength track's three marks (0..1):
 // the label column (84 + 8 px) on the left; the value (62 + 8 px) and
 // ◀ ◆ ▶ on the right — PropSlider's geometry. Each caption is centred on
-// its mark; the outer two may move outwards by up to 6 px to keep 4 px from
-// the middle one. A track too narrow for that (a small inspector) keeps
-// «Обычно» alone — the preset as designed; the marks stay on the track.
+// its mark; the outer two move outwards as far as they must to keep 4 px
+// from the middle one — into the label and value columns, empty under the
+// slider — so all three show at any inspector width in RU and EN. Should
+// even the row not hold them, one caption shows, at its mark: that of the
+// band the value is in (< 0.45 «Мягко», < 0.75 «Обычно», else «Сильно»).
 component MarkCaptions inherits Rectangle {
     in property <[float]> marks;
     in property <[string]> labels;
+    // The strength (0..1): picks the caption shown alone.
+    in property <float> value;
     property <length> left: 92px;
     property <length> track: max(0px, root.width - root.left - 70px - Theme.key-nav);
     property <length> ax0: root.left + root.track * root.marks[0] - a.width / 2;
-    property <length> bx: root.left + root.track * root.marks[1] - b.width / 2;
+    property <length> bx0: root.left + root.track * root.marks[1] - b.width / 2;
     property <length> cx0: root.left + root.track * root.marks[2] - c.width / 2;
-    property <length> ax: min(root.ax0, root.bx - 4px - a.width);
-    property <length> cx: max(root.cx0, root.bx + b.width + 4px);
-    property <bool> all: root.ax0 - root.ax <= 6px && root.cx - root.cx0 <= 6px;
+    property <length> ax: min(root.ax0, root.bx0 - 4px - a.width);
+    property <length> cx: max(root.cx0, root.bx0 + b.width + 4px);
+    property <bool> all: root.ax >= 0 && root.cx + c.width <= root.width;
+    property <int> band: root.value < 0.45 ? 0 : root.value < 0.75 ? 1 : 2;
     // Drawn 3 px up, close under the marks (they reach 5 px below the track).
     height: 10px;
-    a := Text { x: root.ax; y: -3px; width: self.preferred-width; visible: root.all; text: root.labels[0]; font-size: 9px; color: Theme.text-faint; }
-    b := Text { x: root.bx; y: -3px; width: self.preferred-width; visible: root.all || root.track >= self.width; text: root.labels[1]; font-size: 9px; color: Theme.text-faint; }
-    c := Text { x: root.cx; y: -3px; width: self.preferred-width; visible: root.all; text: root.labels[2]; font-size: 9px; color: Theme.text-faint; }
+    a := Text { x: root.all ? root.ax : max(0px, min(root.width - self.width, root.ax0)); y: -3px; width: self.preferred-width; visible: root.all || root.band == 0; text: root.labels[0]; font-size: 9px; color: Theme.text-faint; }
+    b := Text { x: root.all ? root.bx0 : max(0px, min(root.width - self.width, root.bx0)); y: -3px; width: self.preferred-width; visible: root.all || root.band == 1; text: root.labels[1]; font-size: 9px; color: Theme.text-faint; }
+    c := Text { x: root.all ? root.cx : max(0px, min(root.width - self.width, root.cx0)); y: -3px; width: self.preferred-width; visible: root.all || root.band == 2; text: root.labels[2]; font-size: 9px; color: Theme.text-faint; }
 }
 
 // One effect of the clip (spec §6.2, mockup A): a header — switch, name,
@@ -376,7 +381,7 @@ export component FxBlock inherits VerticalLayout {
             commit(a, v) => { root.commit(a, v); }
             key-action(a, b) => { root.key-action(a, b); }
         }
-        if p.kind == 0 && p.strength: MarkCaptions { marks: [0.3, 0.6, 0.9]; labels: [Tr.t("fx.strength.soft"), Tr.t("fx.strength.normal"), Tr.t("fx.strength.strong")]; }
+        if p.kind == 0 && p.strength: MarkCaptions { marks: [0.3, 0.6, 0.9]; value: p.value; labels: [Tr.t("fx.strength.soft"), Tr.t("fx.strength.normal"), Tr.t("fx.strength.strong")]; }
         if p.kind == 0 && !p.strength: AnimRow {
             prop: p.prop; k: p.k; outside: root.outside; label: p.label; value: p.value;
             minimum: p.minimum; maximum: p.maximum; default-value: p.default-value;
