@@ -515,6 +515,10 @@ fn check(index: usize, name: &str, v: f64, lo: f64, hi: f64) -> Result<(), Valid
 
 /// JSON schema description embedded in LLM prompts.
 pub fn schema_for_prompt() -> String {
+    // Users name effects as the Effects tab does, in Russian: each recipe and
+    // Look preset carries its Russian name, so «кино» (the Look preset
+    // cinematic) is not taken for «Кино-наезд» (the motion cinematic_push).
+    let ru = |key: String| kadr_i18n::t_in(kadr_i18n::Lang::Ru, &key);
     let effects: Vec<String> = kadr_effects::registry()
         .iter()
         .map(|d| {
@@ -525,14 +529,15 @@ pub fn schema_for_prompt() -> String {
                     kadr_effects::ParamKind::Number { min, max, default } => format!("{} {min}..{max} (default {default})", p.key),
                     // A Look's presets are alternatives, not settings to combine.
                     kadr_effects::ParamKind::Choice { options, default } if d.variants == Some(p.key) => {
-                        format!("{} {} (alternatives: one {} per clip, adding another replaces it; default {default})", p.key, options.join("|"), d.id)
+                        let named: Vec<String> = options.iter().map(|o| format!("{o} «{}»", ru(d.option_name_key(p.key, o)))).collect();
+                        format!("{} {} (alternatives: one {} per clip, adding another replaces it; default {default})", p.key, named.join("|"), d.id)
                     }
                     kadr_effects::ParamKind::Choice { options, .. } => format!("{} {}", p.key, options.join("|")),
                     kadr_effects::ParamKind::Point => format!("{} {{\"x\":0..1,\"y\":0..1}}", p.key),
                     kadr_effects::ParamKind::Moment => format!("{} {{\"at_ms\":int}} (inside the clip; the effect is fully in at this frame)", p.key),
                 })
                 .collect();
-            format!("   {}: {}", d.id, params.join(", "))
+            format!("   {} «{}», {}: {}", d.id, ru(d.name_key()), d.category.key(), params.join(", "))
         })
         .collect();
     let head = r#"Respond with ONLY a JSON object: {"summary": string, "confidence": 0..1, "commands": [Command...]}
@@ -548,9 +553,9 @@ Command is one of (times are sequence milliseconds, integers):
  {"type":"add_marker","at_ms":int,"name":string,"reason":string}
  {"type":"add_transition","at_ms":int,"kind":"cross_dissolve"|"dip_to_black"|"wipe","duration_ms":int,"reason":string}
  {"type":"add_effect","clip_id":string,"recipe":string,"params"?:{...},"reason":string} (video clips; one per recipe per clip: an existing one is replaced; omitted params get defaults, strength 0.6 = normal)
- {"type":"set_effect","clip_id":string,"effect_id":string,"params"?:{...},"enabled"?:bool,"reason":string} (effect ids are in each clip's "effects"; an effect's "animated" lists its params that have keyframes: set_effect rejects those, leave them out)
+ {"type":"set_effect","clip_id":string,"effect_id":string,"params"?:{...},"enabled"?:bool,"reason":string} (effect ids are in each clip's "effects"; an effect's "animated" lists its params that have keyframes: set_effect rejects those, leave them out; on a look, set_effect {"params":{"preset":...}} switches its preset and keeps its strength and keyframes, while add_effect look replaces the look: strength back to 0.6 = normal unless given, keyframes dropped)
  {"type":"remove_effect","clip_id":string,"effect_id":string,"reason":string}
-Effects (recipe: params):
+Effects (recipe «its name in the Russian interface», kind: params):
 "#;
     let tail = r#"
 When deleting several ranges with ripple, list them from the LATEST to the EARLIEST.
@@ -760,10 +765,17 @@ mod tests {
             assert!(s.contains(d.id), "schema lacks {}", d.id);
         }
         assert!(s.contains("\"add_effect\"") && s.contains("\"set_effect\"") && s.contains("\"remove_effect\""));
-        assert!(s.contains("punch_in: ") && s.contains("fully in at this frame"), "ruling R17: the moment is where the punch is in");
-        let presets = kadr_effects::look::preset_keys().join("|");
-        assert!(s.contains(&format!("look: preset {presets} (alternatives: one look per clip, adding another replaces it; default cinematic)")), "{s}");
-        assert!(s.contains("vignette: strength 0..1 (default 0.6), softness 0..1 (default 0.5)"), "{s}");
+        assert!(s.contains("punch_in «") && s.contains("fully in at this frame"), "ruling R17: the moment is where the punch is in");
+        // Russian names, as the Effects tab shows them: «Кино» is the Look's
+        // preset cinematic, «Кино-наезд» the motion recipe cinematic_push.
+        let ru = |key: &str| kadr_i18n::t_in(kadr_i18n::Lang::Ru, key);
+        assert_eq!((ru("fx.look.cinematic"), ru("fx.cinematic_push")), ("Кино".to_string(), "Кино-наезд".to_string()), "the catalogs' names");
+        let presets: Vec<String> = kadr_effects::look::preset_keys().iter().map(|k| format!("{k} «{}»", ru(&format!("fx.look.{k}")))).collect();
+        assert!(presets[0] == "cinematic «Кино»" && s.contains("cinematic «Кино»|warm «Тёплый»|"), "{s}");
+        assert!(s.contains(&format!("look «Look», look: preset {} (alternatives: one look per clip, adding another replaces it; default cinematic)", presets.join("|"))), "{s}");
+        assert!(s.contains("   cinematic_push «Кино-наезд», motion: strength 0..1"), "{s}");
+        assert!(s.contains("vignette «Виньетка», light: strength 0..1 (default 0.6), softness 0..1 (default 0.5)"), "{s}");
+        assert!(s.contains("set_effect {\"params\":{\"preset\":...}} switches its preset and keeps its strength and keyframes, while add_effect look replaces the look"), "{s}");
         let (mut p, id) = fx_project();
         let cid = kadr_core::ClipId::parse(&id).unwrap();
         let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
