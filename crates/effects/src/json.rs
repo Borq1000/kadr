@@ -107,8 +107,9 @@ pub fn params_from_json_in(
 }
 
 /// `{at_ms}` (timeline, inside the clip), `{source_ms}`, or what
-/// [`value_json`] writes, `{at_ms, source_ms, visible}` — then `source_ms`
-/// wins, it is the exact one.
+/// [`value_json`] writes, `{at_ms, source_ms, visible}`: then both must
+/// name the same frame (`source_ms`, the exact one, is taken; an `at_ms`
+/// edited to another frame is refused, never silently overridden).
 fn moment_from_json(clip: &Clip, k: &str, v: &Value, stored: Option<SourceTime>, slack: Time) -> Result<SourceTime, String> {
     let shape = || format!("{k} must be {{\"at_ms\": int}} (timeline, inside the clip) or {{\"source_ms\": int}}");
     let o = v
@@ -224,8 +225,9 @@ mod tests {
         assert_eq!(effect_json(&c, &AppliedEffect::new("glitch_v2", 1, BTreeMap::new()))["known"], false);
     }
 
-    /// R11(a): what `value_json` writes is accepted back, `source_ms` wins,
-    /// and an echoed unchanged moment is that same moment (ms flooring).
+    /// R11(a): what `value_json` writes is accepted back (its exact
+    /// `source_ms` taken), and an echoed unchanged moment is that same
+    /// moment (ms flooring).
     #[test]
     fn a_moment_echoed_from_get_state_is_accepted_and_unchanged() {
         let c = clip();

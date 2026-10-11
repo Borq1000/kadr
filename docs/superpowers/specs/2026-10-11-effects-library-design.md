@@ -124,7 +124,9 @@ pub struct Compiled { pub placement: PlacementDelta, pub effects: Vec<Effect>,
   (cubic-bezier 0.45, 0, 0.2, 1), `Snap` (expo-out: `1 − 2^(−10u)`, нормированная к 1),
   `Gentle` (sine in-out). Формулы — сохраняемая семантика, закреплены тестами по точкам.
 - **Шум** `Noise1D { seed, frequency, amplitude }` — гладкий value-noise с
-  детерминированным целочисленным хэшем (PCG32), одинаковый на CPU и будущем GPU.
+  детерминированным целочисленным хэшем (seed и индекс решётки смешиваются `fmix64`,
+  значение — выход PCG32 XSH-RR; разные seed дают несвязанные последовательности),
+  одинаковый на CPU и будущем GPU.
 - **Пресеты Looks** — данные: `crates/effects/looks.json` (точки кривой, split-tone,
   виньетка, зерно, коррекция). Добавить Look = добавить запись, без кода.
 - **Evaluator** (`kadr-timeline::scene`): после `clip_state_at` для каждого включённого
