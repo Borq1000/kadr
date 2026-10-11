@@ -3049,6 +3049,8 @@ dependencies = [
  "kadr-render",
  "kadr-scene",
  "kadr-timeline",
+ "png 0.17.16",
+ "serde_json",
  "tempfile",
 ]
 
