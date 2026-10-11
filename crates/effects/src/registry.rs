@@ -307,6 +307,28 @@ mod tests {
         assert!(definition(&with(None)).is_some() && definition(&with(Some(ParamValue::Choice("warm".into())))).is_some());
     }
 
+    /// Refinement 3 at the project level: a Look of a preset from a newer
+    /// Kadr — with its strength keyframed — comes through `io::parse` and a
+    /// save as the same bytes, and is still not run after the round trip.
+    #[test]
+    fn a_look_of_a_preset_this_build_lacks_survives_parse_and_save() {
+        use kadr_project::{io, Ease, Project, SourceTime, TrackKey};
+        let mut p = Project::new("future look");
+        let mut c = Clip::new(AssetId::new(), "c", TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let params = [("preset".to_string(), ParamValue::Choice("bleach_bypass".into())), ("strength".to_string(), ParamValue::Number(0.8))].into_iter().collect();
+        let look = AppliedEffect::new("look", 1, params);
+        c.animation.set_key(TrackKey::fx(look.id, "strength"), SourceTime(Time::from_secs(1)), 0.3, Some(Ease::Linear));
+        c.effects.push(look);
+        p.sequence_mut().tracks[0].clips.push(c);
+        let saved = io::to_json(&p);
+        let loaded = io::parse(&saved, std::path::Path::new("future.kadr")).unwrap();
+        assert_eq!(io::to_json(&loaded), saved, "parse → save gives the same bytes");
+        assert_eq!(loaded, p);
+        let e = &loaded.sequence().tracks[0].clips[0].effects[0];
+        assert_eq!(e.params["preset"], ParamValue::Choice("bleach_bypass".into()), "the preset is kept as written");
+        assert!(definition(e).is_none(), "a newer Kadr's preset is not run");
+    }
+
     /// Spec §2: a recipe or a version from a newer Kadr is kept, not run.
     #[test]
     fn unknown_recipes_and_newer_versions_have_no_definition() {
