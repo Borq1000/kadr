@@ -181,6 +181,36 @@ impl Clip {
     pub fn effect_of(&self, recipe: &str) -> Option<&AppliedEffect> {
         self.effects.iter().find(|e| e.recipe == recipe)
     }
+
+    /// Applies `e`, one instance per recipe (spec §2): a new recipe is
+    /// appended; one the clip has is replaced in place — its id and position
+    /// stay, its `fx:` tracks go. When a lenient load left the clip two of
+    /// the recipe, the first is replaced that way and the others go with
+    /// their tracks: the clip ends with exactly the one applied. `false`
+    /// when nothing changed (then nothing was touched).
+    pub fn put_effect(&mut self, mut e: AppliedEffect) -> bool {
+        let mut same = self.effects.iter().enumerate().filter(|(_, x)| x.recipe == e.recipe).map(|(i, x)| (i, x.id));
+        let Some((first, id)) = same.next() else {
+            if self.effect(e.id).is_some() {
+                e.id = EffectId::new(); // never two effects with one id on a clip
+            }
+            self.effects.push(e);
+            return true;
+        };
+        let others: Vec<EffectId> = same.map(|(_, id)| id).collect();
+        e.id = id;
+        let mut had_tracks = false;
+        for id in std::iter::once(id).chain(others.iter().copied()) {
+            had_tracks |= self.animation.remove_effect(id);
+        }
+        if !had_tracks && others.is_empty() && self.effects[first] == e {
+            return false;
+        }
+        // The others all come after the first: removing them keeps its index.
+        self.effects.retain(|x| !others.contains(&x.id));
+        self.effects[first] = e;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -320,5 +350,50 @@ mod tests {
         c.effect_mut(id).unwrap().enabled = false;
         assert!(!c.effects[0].enabled);
         assert!(c.effect(EffectId::new()).is_none() && c.effect_of("smooth_zoom").is_none());
+    }
+
+    #[test]
+    fn put_effect_keeps_one_instance_per_recipe_in_place() {
+        let mut c = crate::Clip::new(kadr_core::AssetId::new(), "c", kadr_core::TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let zoom = AppliedEffect::new("smooth_zoom", 1, BTreeMap::from([("strength".to_string(), ParamValue::Number(0.6))]));
+        let zid = zoom.id;
+        assert!(c.put_effect(zoom.clone()));
+        assert!(c.put_effect(AppliedEffect::new("handheld", 1, BTreeMap::new())));
+        let k = crate::TrackKey::fx(zid, "strength");
+        c.animation.set_key(k.clone(), SourceTime(Time::ZERO), 0.2, None);
+        let mut again = zoom.clone();
+        again.id = EffectId::new();
+        assert!(c.put_effect(again.clone()), "the same parameters, but its keyframes go");
+        assert_eq!((c.effects[0].id, c.effects[0].recipe.as_str()), (zid, "smooth_zoom"), "same id, same place");
+        assert!(!c.animation.is_animated(&k));
+        assert!(!c.put_effect(again), "nothing left to change");
+        let mut odd = AppliedEffect::new("cinematic_push", 1, BTreeMap::new());
+        odd.id = zid;
+        assert!(c.put_effect(odd));
+        assert_ne!(c.effects[2].id, zid, "a new effect never takes an id the clip uses");
+    }
+
+    /// A lenient load keeps ids unique but not recipes: a clip may arrive
+    /// with two of one recipe. Applying that recipe leaves exactly one —
+    /// the first, in its place with its id — and the others go with their
+    /// tracks, so the clip shows what was applied and nothing more.
+    #[test]
+    fn put_effect_collapses_a_recipe_the_clip_has_twice_into_the_first() {
+        let mut c = crate::Clip::new(kadr_core::AssetId::new(), "c", kadr_core::TimeRange::new(Time::ZERO, Time::from_secs(4)), Time::ZERO);
+        let zoom = |s: f64| AppliedEffect::new("smooth_zoom", 1, BTreeMap::from([("strength".to_string(), ParamValue::Number(s))]));
+        let (first, hand, second) = (zoom(0.3), AppliedEffect::new("handheld", 1, BTreeMap::new()), zoom(0.9));
+        let ids = [first.id, hand.id, second.id];
+        c.effects = vec![first.clone(), hand, second];
+        let (k1, k2) = (crate::TrackKey::fx(ids[0], "strength"), crate::TrackKey::fx(ids[2], "strength"));
+        c.animation.set_key(k2.clone(), SourceTime(Time::ZERO), 0.1, None);
+        assert!(c.put_effect(first.clone()), "the first is as given and has no keyframes, but the second goes");
+        assert_eq!(c.effects.iter().map(|e| e.id).collect::<Vec<_>>(), [ids[0], ids[1]]);
+        assert!(!c.animation.is_animated(&k2), "the second's tracks went with it");
+        assert!(!c.put_effect(first), "one instance, unchanged: nothing to do");
+        c.effects.push(zoom(0.9));
+        c.animation.set_key(k1.clone(), SourceTime(Time::ZERO), 0.2, None);
+        assert!(c.put_effect(zoom(0.5)));
+        assert_eq!(c.effects.iter().map(|e| (e.id, e.number("strength"))).collect::<Vec<_>>(), [(ids[0], Some(0.5)), (ids[1], None)]);
+        assert!(c.animation.is_empty());
     }
 }

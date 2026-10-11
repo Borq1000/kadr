@@ -759,5 +759,12 @@
   "toast.no_video_part": "В выделении нет видео",
   "toast.no_audio_part": "В выделении нет аудио",
   "keys.unlink_link": "Разъединить аудио и видео / связать выделенные",
-  "err.edit.effect_not_found": "Эффект не найден"
+  "err.edit.effect_not_found": "Эффект не найден",
+  "cmd.add_effect": "Применение эффекта",
+  "cmd.remove_effect": "Удаление эффекта",
+  "cmd.update_effect": "Изменение эффекта",
+  "cmd.move_effect": "Порядок эффектов",
+  "err.edit.unknown_recipe": "Этот эффект недоступен в этой версии Kadr",
+  "err.edit.effect_target": "Этот эффект не подходит для такого клипа",
+  "err.edit.invalid_param": "Недопустимое значение параметра эффекта"
 }

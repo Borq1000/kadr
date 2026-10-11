@@ -4,13 +4,14 @@
 //! is observable (the engine restores the snapshot on error anyway).
 
 use crate::ops::{self, LinkRemap};
-use kadr_core::{AssetId, ClipId, MarkerId, MediaKind, Time, TimeRange, TrackId, TransitionId};
+use kadr_core::{AssetId, ClipId, EffectId, MarkerId, MediaKind, Time, TimeRange, TrackId, TransitionId};
+use kadr_effects::{ParamDef, ParamKind};
 use kadr_project::{
-    AnimError, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, Sequence, SourceTime,
-    Track, TrackKey, TrackKind, Transform, Transition,
+    AnimError, AppliedEffect, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, ParamValue, Sequence,
+    SourceTime, Track, TrackKey, TrackKind, Transform, Transition,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -37,6 +38,12 @@ pub enum EditError {
     KeyframeCollision,
     #[error("effect not found")]
     EffectNotFound,
+    #[error("unknown effect {0}")]
+    UnknownRecipe(String),
+    #[error("the effect does not fit this clip")]
+    EffectTarget,
+    #[error("invalid effect parameter: {0}")]
+    InvalidParam(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +115,8 @@ pub enum EditCommand {
     /// multicam clip at `range.start`, cutting at both edges (AI camera picks).
     SetAngleRange { range: TimeRange, angle: u32 },
     /// Inserts or updates a keyframe (`ease: None` -> keep / inherit, keyframes spec §3.1).
+    /// An effect parameter's keyframe edits need a number of an effect this
+    /// build runs, keys within its range (`track_def`).
     SetKeyframe { clip: ClipId, param: TrackKey, at: SourceTime, value: f64, ease: Option<Ease> },
     /// Removes a keyframe; if it was the track's last, the static value
     /// becomes `keep` (the value at the playhead) or the removed value.
@@ -118,6 +127,20 @@ pub enum EditCommand {
     SetKeyframeEase { clip: ClipId, param: TrackKey, at: SourceTime, ease: Ease },
     /// Drops the listed tracks and sets their static values.
     ClearAnimation { clip: ClipId, statics: Vec<(TrackKey, f64)> },
+    /// Applies an effect (effects spec §7), validated against the registry:
+    /// a known recipe at its current version, a clip it fits, valid
+    /// parameters (missing ones get defaults). A recipe the clip has is
+    /// replaced in place — same id and position, the new parameters,
+    /// enabled, progress (0, 1), its `fx:` tracks dropped (spec §2); more
+    /// instances of it (a lenient load) go too (`Clip::put_effect`).
+    AddEffect { clip: ClipId, effect: AppliedEffect },
+    /// Removes an effect and its `fx:` tracks.
+    RemoveEffect { clip: ClipId, id: EffectId },
+    /// Sets the given parameters (validated, merged into the stored ones)
+    /// and/or `enabled`. A recipe from a newer Kadr cannot be changed.
+    UpdateEffect { clip: ClipId, id: EffectId, params: BTreeMap<String, ParamValue>, enabled: Option<bool> },
+    /// Moves an effect to position `to` (clamped) of the clip's list.
+    MoveEffect { clip: ClipId, id: EffectId, to: usize },
     /// Applied atomically; one undo step (e.g. an AI edit).
     Batch { label: String, commands: Vec<EditCommand> },
 }
@@ -174,6 +197,10 @@ impl EditCommand {
             EditCommand::MoveKeyframes { .. } => "cmd.move_keyframes",
             EditCommand::SetKeyframeEase { .. } => "cmd.keyframe_ease",
             EditCommand::ClearAnimation { .. } => "cmd.clear_animation",
+            EditCommand::AddEffect { .. } => "cmd.add_effect",
+            EditCommand::RemoveEffect { .. } => "cmd.remove_effect",
+            EditCommand::UpdateEffect { .. } => "cmd.update_effect",
+            EditCommand::MoveEffect { .. } => "cmd.move_effect",
             EditCommand::Batch { label, .. } => return label.clone(),
         };
         k.to_string()
@@ -193,6 +220,9 @@ impl EditCommand {
             EditError::LastTrack => "err.edit.last_track",
             EditError::KeyframeCollision => "err.edit.keyframe_collision",
             EditError::EffectNotFound => "err.edit.effect_not_found",
+            EditError::UnknownRecipe(_) => "err.edit.unknown_recipe",
+            EditError::EffectTarget => "err.edit.effect_target",
+            EditError::InvalidParam(_) => "err.edit.invalid_param",
         }
     }
 
@@ -509,19 +539,18 @@ impl EditCommand {
                     return Err(EditError::InvalidRange);
                 }
                 let c = anim_clip(seq, *clip)?;
-                // An effect parameter's track needs its effect (its static value lives there).
-                if param.as_fx().is_some_and(|f| c.effect(f.effect).is_none()) {
-                    return Err(EditError::EffectNotFound);
+                if let Some(d) = track_def(c, param)? {
+                    d.check(&ParamValue::Number(*value)).map_err(EditError::InvalidParam)?;
                 }
                 c.animation.set_key(param, *at, *value, ease.clone());
                 Ok(())
             }
             EditCommand::RemoveKeyframe { clip, param, at, keep } => {
                 let c = anim_clip(seq, *clip)?;
+                let d = track_def(c, param)?;
                 let k = c.animation.remove_key(param, *at).ok_or(EditError::NoOp)?;
                 if !c.animation.is_animated(param) {
-                    // A track of a removed effect has no static slot: nothing to keep.
-                    c.write_static(param, keep.filter(|v| v.is_finite()).unwrap_or(k.value));
+                    c.write_static(param, in_range(d, keep.filter(|v| v.is_finite()).unwrap_or(k.value)));
                 }
                 Ok(())
             }
@@ -529,6 +558,9 @@ impl EditCommand {
                 let c = anim_clip(seq, *clip)?;
                 if moves.is_empty() {
                     return Err(EditError::NoOp);
+                }
+                for (p, _, _) in moves {
+                    track_def(c, p)?;
                 }
                 // Work on a copy and assign only on success: a failed move must not
                 // leave half the keys moved, also inside a `Batch` (which swallows `NoOp`).
@@ -549,7 +581,9 @@ impl EditCommand {
                 Ok(())
             }
             EditCommand::SetKeyframeEase { clip, param, at, ease } => {
-                anim_clip(seq, *clip)?.animation.set_ease(param, *at, ease.clone()).map_err(anim_err)
+                let c = anim_clip(seq, *clip)?;
+                track_def(c, param)?;
+                c.animation.set_ease(param, *at, ease.clone()).map_err(anim_err)
             }
             EditCommand::ClearAnimation { clip, statics } => {
                 let c = anim_clip(seq, *clip)?;
@@ -559,13 +593,72 @@ impl EditCommand {
                 if statics.iter().any(|(_, v)| !v.is_finite()) {
                     return Err(EditError::InvalidRange);
                 }
-                if statics.iter().any(|(p, _)| c.static_value(p).is_none()) {
-                    return Err(EditError::EffectNotFound);
-                }
-                for (p, v) in statics {
+                let defs = statics.iter().map(|(p, _)| track_def(c, p)).collect::<Result<Vec<_>, _>>()?;
+                for ((p, v), d) in statics.iter().zip(defs) {
                     c.animation.clear(p);
-                    c.write_static(p, *v);
+                    c.write_static(p, in_range(d, *v));
                 }
+                Ok(())
+            }
+
+            EditCommand::AddEffect { clip, effect } => {
+                let def = kadr_effects::recipe(&effect.recipe)
+                    .filter(|d| d.version == effect.version)
+                    .ok_or_else(|| EditError::UnknownRecipe(effect.recipe.clone()))?;
+                let (ti, ci) = seq.locate_clip(*clip).ok_or(EditError::ClipNotFound)?;
+                let t = &mut seq.tracks[ti];
+                if t.locked {
+                    return Err(EditError::TrackLocked(t.name.clone()));
+                }
+                if !kadr_effects::fits(def.target, t.kind) {
+                    return Err(EditError::EffectTarget);
+                }
+                kadr_effects::validate(def.params, &effect.params).map_err(EditError::InvalidParam)?;
+                let c = &mut t.clips[ci];
+                // Stored as validated: this build's fields only (`extra` is
+                // for a newer Kadr's file), applied whole and enabled.
+                let mut e = AppliedEffect { extra: BTreeMap::new(), ..effect.clone() };
+                // The moment of applying is unknown here: the clip's middle (refinement 4).
+                let middle = c.timeline_in + Time(c.duration().flicks() / 2);
+                kadr_effects::complete(def, &mut e.params, c, middle);
+                e.enabled = true;
+                e.progress = (0.0, 1.0);
+                if c.put_effect(e) { Ok(()) } else { Err(EditError::NoOp) }
+            }
+            EditCommand::RemoveEffect { clip, id } => {
+                let c = effect_clip(seq, *clip)?;
+                let i = c.effects.iter().position(|e| e.id == *id).ok_or(EditError::EffectNotFound)?;
+                c.effects.remove(i);
+                c.animation.remove_effect(*id);
+                Ok(())
+            }
+            EditCommand::UpdateEffect { clip, id, params, enabled } => {
+                let c = effect_clip(seq, *clip)?;
+                let e = c.effect_mut(*id).ok_or(EditError::EffectNotFound)?;
+                // A recipe this build cannot run cannot be validated, so it is not changed (spec §7).
+                let def = kadr_effects::definition(e).ok_or_else(|| EditError::UnknownRecipe(e.recipe.clone()))?;
+                kadr_effects::validate(def.params, params).map_err(EditError::InvalidParam)?;
+                // Merged into a copy: on "no change" the effect is left untouched (R11).
+                let mut next = e.clone();
+                next.params.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+                if let Some(on) = enabled {
+                    next.enabled = *on;
+                }
+                if next == *e {
+                    return Err(EditError::NoOp);
+                }
+                *e = next;
+                Ok(())
+            }
+            EditCommand::MoveEffect { clip, id, to } => {
+                let c = effect_clip(seq, *clip)?;
+                let from = c.effects.iter().position(|e| e.id == *id).ok_or(EditError::EffectNotFound)?;
+                let to = (*to).min(c.effects.len() - 1);
+                if from == to {
+                    return Err(EditError::NoOp);
+                }
+                let e = c.effects.remove(from);
+                c.effects.insert(to, e);
                 Ok(())
             }
 
@@ -596,6 +689,48 @@ fn anim_clip(seq: &mut Sequence, id: ClipId) -> Result<&mut Clip, EditError> {
         return Err(EditError::KindMismatch);
     }
     Ok(&mut t.clips[ci])
+}
+
+/// The unlocked clip `id` for an effect edit (any track kind: audio effects are E4).
+fn effect_clip(seq: &mut Sequence, id: ClipId) -> Result<&mut Clip, EditError> {
+    let (ti, ci) = seq.locate_clip(id).ok_or(EditError::ClipNotFound)?;
+    let t = &mut seq.tracks[ti];
+    if t.locked {
+        return Err(EditError::TrackLocked(t.name.clone()));
+    }
+    Ok(&mut t.clips[ci])
+}
+
+/// Whether keyframe commands may edit track `k` of `c` (ruling R4), with
+/// the parameter's definition for an effect parameter (`None`: a clip
+/// property, always editable). An effect parameter needs its effect on the
+/// clip and a recipe this build runs — one from a newer Kadr keeps its
+/// tracks as they are (spec §2, review focus 5) — and must be a `Number`
+/// of that recipe holding a number (only numbers animate, spec §2), so its
+/// static value is never written over something else. Callers that build
+/// commands for every track of a moment (`Animation::keys_at`) can filter
+/// with it.
+pub fn track_def(c: &Clip, k: &TrackKey) -> Result<Option<&'static ParamDef>, EditError> {
+    let Some(f) = k.as_fx() else { return Ok(None) };
+    let e = c.effect(f.effect).ok_or(EditError::EffectNotFound)?;
+    let def = kadr_effects::definition(e).ok_or_else(|| EditError::UnknownRecipe(e.recipe.clone()))?;
+    let d = def.param(&f.key).ok_or_else(|| EditError::InvalidParam(format!("{} has no parameter {:?}", def.id, f.key)))?;
+    if !d.animatable() {
+        return Err(EditError::InvalidParam(format!("{} is a {}: only numbers can be animated", f.key, d.kind.type_name())));
+    }
+    if c.static_value(k).is_none() {
+        return Err(EditError::InvalidParam(format!("{} holds no number this version can read", f.key)));
+    }
+    Ok(Some(d))
+}
+
+/// A static value for a track: an effect number is kept in its range — the
+/// value the picture showed (the evaluator clamps a track the same way).
+fn in_range(d: Option<&ParamDef>, v: f64) -> f64 {
+    match d.map(|d| d.kind) {
+        Some(ParamKind::Number { min, max, .. }) => v.clamp(min, max),
+        _ => v,
+    }
 }
 
 fn anim_err(e: AnimError) -> EditError {

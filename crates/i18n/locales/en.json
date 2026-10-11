@@ -731,5 +731,12 @@
   "toast.no_video_part": "No video in the selection",
   "toast.no_audio_part": "No audio in the selection",
   "keys.unlink_link": "Unlink audio and video / link the selection",
-  "err.edit.effect_not_found": "Effect not found"
+  "err.edit.effect_not_found": "Effect not found",
+  "cmd.add_effect": "Apply effect",
+  "cmd.remove_effect": "Remove effect",
+  "cmd.update_effect": "Change effect",
+  "cmd.move_effect": "Reorder effects",
+  "err.edit.unknown_recipe": "This effect is not available in this version of Kadr",
+  "err.edit.effect_target": "This effect does not fit this clip",
+  "err.edit.invalid_param": "Invalid effect setting"
 }
