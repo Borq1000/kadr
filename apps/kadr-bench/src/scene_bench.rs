@@ -98,7 +98,7 @@ fn sample(p: &Project) -> Stats {
     let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
     let fr = FrameRate::FPS_30;
     let mut samples = vec![];
-    // 200 batches of 100 evaluations cycle through frames 0..1800 (both scenes are
+    // 200 batches of 100 evaluations cycle through frames 0..1800 (all three scenes are
     // 60 s long; the M1 one has its transition at 29..31 s); each sample is the mean per call.
     for batch in 0..200 {
         let started = Instant::now();
