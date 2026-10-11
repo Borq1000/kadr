@@ -47,8 +47,11 @@ export struct ClipView {
     enabled: bool,
     linked: bool,
     speed-label: string,
-    // "fx N" for a clip with effects (effects spec §6.3) where the name bar has room for it, "" otherwise.
+    // "fx N" for a clip with effects (effects spec §6.3), drawn at `fx-x`
+    // (the badge's left edge in the clip): Rust places it and hit-tests its
+    // tooltip with the same `effects_ui::badge_place`. "" where there is no room.
     fx-label: string,
+    fx-x: length,
     thumb: image,
     has-thumb: bool,
     wave: image,
@@ -250,7 +253,7 @@ component ClipRect inherits Rectangle {
         // only on hover overlaps it for the moment instead, so names don't
         // slide as the pointer crosses clips.
         padding-left: root.cv.show-fade-in-handle && (root.cv.fade-in > 0 || root.cv.selected) ? max(6px, root.cv.fade-in-handle-x + 7px) : 6px;
-        padding-right: root.cv.show-fade-out-handle && (root.cv.fade-out > 0 || root.cv.selected) ? max(6px, root.cv.width - root.cv.fade-out-handle-x + 7px) : 6px;
+        padding-right: root.cv.fx-label != "" ? root.cv.width - root.cv.fx-x + 4px : root.cv.show-fade-out-handle && (root.cv.fade-out > 0 || root.cv.selected) ? max(6px, root.cv.width - root.cv.fade-out-handle-x + 7px) : 6px;
         spacing: 4px;
         if root.cv.linked: Icon { y: 2px; icon: Icons.link; width: 11px; height: 11px; color: #ffffffb0; }
         Text {
@@ -268,16 +271,23 @@ component ClipRect inherits Rectangle {
             color: Theme.warning;
             vertical-alignment: center;
         }
-        // Rust hit-tests this badge for its tooltip (`effects_ui::badge_place`): keep the width in step with BADGE_W.
-        if root.cv.fx-label != "": VerticalLayout {
-            alignment: center;
-            Rectangle {
-                width: 30px;
-                height: 12px;
-                border-radius: 3px;
-                background: #00000066;
-                Text { text: root.cv.fx-label; font-size: 9px; font-weight: 700; color: Theme.keyframe; }
-            }
+    }
+    // The effects badge, absolutely at the x Rust gives it (keep the width in
+    // step with `effects_ui::BADGE_W`); the name bar is padded clear of it.
+    if root.cv.fx-label != "": Rectangle {
+        x: root.cv.fx-x;
+        y: 2px;
+        width: 30px;
+        height: 12px;
+        border-radius: 3px;
+        background: #00000066;
+        Text {
+            text: root.cv.fx-label;
+            font-size: 9px;
+            font-weight: 700;
+            color: Theme.keyframe;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
     for m in root.cv.marks: Rectangle {

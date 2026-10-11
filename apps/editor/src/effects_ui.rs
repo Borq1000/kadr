@@ -84,10 +84,14 @@ pub fn fx_name(e: &AppliedEffect) -> String {
 
 /// Width of the `fx N` badge in a clip's name bar (timeline.slint draws it this wide).
 pub const BADGE_W: f64 = 30.0;
-/// Room the name keeps left of the badge (the link icon, if any, is extra).
-const NAME_MIN_W: f64 = 24.0;
+/// Room the name keeps left of the badge, with the gap to it (the link icon
+/// and the speed label, if any, are extra).
+const NAME_MIN_W: f64 = 28.0;
 /// A linked clip's icon with its spacing.
 const LINK_W: f64 = 15.0;
+/// The speed label ("2.00×") of a speed-changed clip, with its spacing: it
+/// never elides, so the name bar keeps its room generously.
+const SPEED_W: f64 = 40.0;
 
 /// The badge of a clip (spec §6.3): `fx N` for N effects, `""` without.
 pub fn fx_badge(c: &Clip) -> String {
@@ -95,15 +99,23 @@ pub fn fx_badge(c: &Clip) -> String {
 }
 
 /// The badge's tooltip: the effects in order of application, a switched-off
-/// one marked, one from a newer Kadr by its recipe id.
+/// one marked, one this version cannot run (a newer Kadr's) marked too.
 pub fn fx_tip(c: &Clip) -> String {
-    let names: Vec<String> = c.effects.iter().map(|e| if e.enabled { fx_name(e) } else { tf("fx.tip.off", &[("name", &fx_name(e))]) }).collect();
+    let names: Vec<String> = c
+        .effects
+        .iter()
+        .map(|e| match (kadr_effects::definition(e), e.enabled) {
+            (None, _) => tf("fx.tip.unavailable", &[("name", &fx_name(e))]),
+            (Some(_), false) => tf("fx.tip.off", &[("name", &fx_name(e))]),
+            (Some(_), true) => fx_name(e),
+        })
+        .collect();
     tf("fx.tip", &[("list", &names.join(", "))])
 }
 
 /// Where the badge is in a clip `width` px wide (clip x range): right-aligned
 /// in the name bar, left of a fade-out handle that stays on screen
-/// (`pinned_out`) — the same padding timeline.slint gives the name bar.
+/// (`pinned_out`).
 pub fn badge_span(width: f64, fade_out_px: f64, pinned_out: bool) -> (f64, f64) {
     let pad = if pinned_out { (width - anim_ui::handle_x(0.0, width, fade_out_px, FadeEdge::Out) + 7.0).max(6.0) } else { 6.0 };
     (width - pad - BADGE_W, width - pad)
@@ -111,26 +123,24 @@ pub fn badge_span(width: f64, fade_out_px: f64, pinned_out: bool) -> (f64, f64) 
 
 /// Where the badge of video clip `c`, `width` px wide at `pps` px/s, is drawn
 /// (clip x range) — `None` without effects, or where the name bar has no room
-/// for it beside the link icon and the fade handles that stay on screen
-/// (those of a locked track or blade mode do not). The view and the tooltip
-/// hit-test share this, so a hidden badge is never hit.
+/// for it. Rust positions the badge (`ClipView.fx-x`) and hit-tests it with
+/// this, so drawing and tooltip cannot disagree. The fade-out handle's room is
+/// kept whenever that handle can appear (also on a mere hover), so the badge
+/// never slides; the name's room counts the link icon and the speed label.
+/// `selected` only matters for the fade-in side, which pads the name when its
+/// handle stays on screen.
 pub fn badge_place(c: &Clip, width: f64, pps: f64, selected: bool, locked: bool, blade: bool) -> Option<(f64, f64)> {
     if c.effects.is_empty() {
         return None;
     }
     let (fi, fo) = (c.video_fade.fade_in, c.video_fade.fade_out);
-    // The same rule as timeline.slint's name-bar padding: a handle that is
-    // shown for its own fade or the selection, not for a mere hover.
-    let (pinned_in, pinned_out) = if locked || blade {
-        (false, false)
-    } else {
-        let (show_in, show_out) = anim_ui::shown_handles(width, true, fi, fo);
-        (show_in && (fi > Time::ZERO || selected), show_out && (fo > Time::ZERO || selected))
-    };
+    let (can_in, can_out) = if locked || blade { (false, false) } else { anim_ui::shown_handles(width, true, fi, fo) };
+    let pinned_in = can_in && (fi > Time::ZERO || selected);
     let pad_left = if pinned_in { (anim_ui::handle_x(0.0, width, fi.as_secs_f64() * pps, FadeEdge::In) + 7.0).max(6.0) } else { 6.0 };
-    let (a, b) = badge_span(width, fo.as_secs_f64() * pps, pinned_out);
-    let name_w = NAME_MIN_W + if c.link.is_some() { LINK_W } else { 0.0 };
-    (a - pad_left >= name_w).then_some((a, b))
+    let (a, b) = badge_span(width, fo.as_secs_f64() * pps, can_out);
+    let link = if c.link.is_some() { LINK_W } else { 0.0 };
+    let speed = if (c.speed() - 1.0).abs() > 0.001 { SPEED_W } else { 0.0 };
+    (a - pad_left >= NAME_MIN_W + link + speed).then_some((a, b))
 }
 
 /// The categories that have recipes, in tab order (refinement 8).
@@ -420,13 +430,12 @@ impl App {
     /// The badge tooltip (spec §6.3) while the pointer rests on a badge
     /// (`None`: the pointer left the lanes); a drag's own tips are untouched.
     pub fn fx_badge_hover(&mut self, at: Option<(f64, f64)>) {
+        // Not over a fade handle or a trim edge: they show their own cursor.
+        let at = at.filter(|&(x, y)| self.over_clip_body(x, y));
         match at.and_then(|(x, y)| self.fx_badge_at(x, y).map(|hit| (hit, x, y))) {
             Some(((id, text), x, y)) => {
                 self.fx.tip_clip = Some(id);
-                let ui = self.ui();
-                ui.set_tl_tip_text(text.into());
-                ui.set_tl_tip_x(x as f32);
-                ui.set_tl_tip_y(y as f32);
+                self.show_tip(text, x, y);
             }
             None => {
                 if self.fx.tip_clip.take().is_some() {
@@ -1395,8 +1404,11 @@ mod tests {
         off.enabled = false;
         c.effects = vec![AppliedEffect::new("smooth_zoom", 1, Default::default()), off, AppliedEffect::new("glitch_v2", 1, Default::default())];
         assert_eq!(fx_badge(&c), "fx 3");
-        let list = [t("fx.smooth_zoom"), tf("fx.tip.off", &[("name", &t("fx.handheld"))]), "glitch_v2".to_string()].join(", ");
+        let list = [t("fx.smooth_zoom"), tf("fx.tip.off", &[("name", &t("fx.handheld"))]), tf("fx.tip.unavailable", &[("name", "glitch_v2")])].join(", ");
         assert_eq!(fx_tip(&c), tf("fx.tip", &[("list", &list)]));
+        // A known recipe at a newer version cannot run here either.
+        c.effects = vec![AppliedEffect::new("smooth_zoom", 99, Default::default())];
+        assert_eq!(fx_tip(&c), tf("fx.tip", &[("list", &tf("fx.tip.unavailable", &[("name", &t("fx.smooth_zoom"))]))]));
     }
 
     /// The tooltip zone is where timeline.slint draws the badge: right-aligned
@@ -1411,25 +1423,73 @@ mod tests {
     }
 
     /// The badge is drawn (and hit) only where the name bar has room for it
-    /// beside the link icon and the fade handles that stay on screen.
+    /// beside the link icon, the speed label and the fade-in handle that
+    /// stays on screen; the fade-out handle's room is always kept.
     #[test]
     fn the_badge_hides_where_the_name_bar_has_no_room() {
         let mut c = clip_10_20();
         c.effects = vec![AppliedEffect::new("smooth_zoom", 1, Default::default())];
         let place = |c: &Clip, w: f64, selected: bool| badge_place(c, w, 40.0, selected, false, false);
-        assert_eq!(place(&c, 200.0, false), Some((164.0, 194.0)));
-        assert_eq!(place(&c, 60.0, false), None, "too narrow for the name and the badge");
-        assert!(place(&c, 70.0, false).is_some());
-        assert_eq!(place(&c, 70.0, true), None, "selected: both handles take their room");
-        assert!(place(&c, 140.0, true).is_some());
+        assert_eq!(place(&c, 200.0, false), Some((151.0, 181.0)), "clear of the fade-out handle that hover shows");
+        assert_eq!(place(&c, 82.0, false), None, "too narrow for the name and the badge");
+        assert!(place(&c, 83.0, false).is_some());
+        assert_eq!(place(&c, 95.0, true), None, "selected: the fade-in handle takes its room too");
+        assert!(place(&c, 96.0, true).is_some());
         c.link = Some(kadr_core::LinkId::new());
-        assert_eq!(place(&c, 70.0, false), None, "the link icon takes room too");
-        assert!(place(&c, 90.0, false).is_some());
-        // Locked track or blade mode: no handles, so no room is kept for them.
-        assert!(badge_place(&c, 90.0, 40.0, true, true, false).is_some());
-        assert!(badge_place(&c, 90.0, 40.0, true, false, true).is_some());
+        assert_eq!(place(&c, 97.0, false), None, "the link icon takes room too");
+        assert!(place(&c, 98.0, false).is_some());
+        // Locked track or blade mode: no handles at all, so no room is kept for them.
+        c.link = None;
+        for (locked, blade) in [(true, false), (false, true)] {
+            assert_eq!(badge_place(&c, 69.0, 40.0, true, locked, blade), None);
+            assert_eq!(badge_place(&c, 70.0, 40.0, true, locked, blade), Some((34.0, 64.0)));
+        }
         c.effects.clear();
         assert_eq!(place(&c, 200.0, false), None, "no effects, no badge");
+    }
+
+    /// Hovering a clip shows both fade handles, a zero fade's too: the badge
+    /// and the handle's grab zone never meet, at any width, and the badge
+    /// does not slide between rest, hover and selection.
+    #[test]
+    fn a_handle_shown_on_hover_never_meets_the_badge() {
+        let mut c = clip_10_20();
+        c.effects = vec![AppliedEffect::new("smooth_zoom", 1, Default::default())];
+        for w in 40..400 {
+            let w = w as f64;
+            let rest = badge_place(&c, w, 40.0, false, false, false);
+            if let (Some(rest), Some(selected)) = (rest, badge_place(&c, w, 40.0, true, false, false)) {
+                assert_eq!(rest, selected, "{w}: the badge stays put on selection");
+            }
+            let Some((a, b)) = rest else { continue };
+            let handle = anim_ui::handle_x(0.0, w, 0.0, kadr_project::FadeEdge::Out);
+            assert!(b + anim_ui::FADE_R < handle, "{w}: grab zone ({}..) vs badge ..{b}", handle - anim_ui::FADE_R);
+            assert!(a >= 0.0 && b <= w);
+        }
+    }
+
+    /// The speed label never elides: where the badge is shown, the row of
+    /// link icon, name, speed label and spacing fits left of it.
+    #[test]
+    fn a_speed_changed_clip_keeps_its_badge_in_place() {
+        let mut c = clip_10_20();
+        c.effects = vec![AppliedEffect::new("smooth_zoom", 1, Default::default())];
+        c.link = Some(kadr_core::LinkId::new());
+        c.timeline_out = c.timeline_in + Time::from_secs(5); // 10 s of source in 5 s
+        assert!((c.speed() - 2.0).abs() < 1e-9);
+        const NAME_MIN: f64 = 24.0;
+        const LINK: f64 = 11.0 + 4.0;
+        const SPEED_TEXT: f64 = 30.0; // "2.00×" at the timeline's small font, a generous measure
+        for selected in [false, true] {
+            for w in 40..500 {
+                let w = w as f64;
+                let Some((a, b)) = badge_place(&c, w, 40.0, selected, false, false) else { continue };
+                let pad_left = if selected { 19.0 } else { 6.0 };
+                let row = pad_left + LINK + NAME_MIN + 4.0 + SPEED_TEXT;
+                assert!(row + 4.0 <= a, "{w} selected={selected}: the row ({row}) spills under the badge ({a}..{b})");
+                assert_eq!(b - a, BADGE_W);
+            }
+        }
     }
 
     #[test]

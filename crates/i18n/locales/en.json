@@ -800,5 +800,6 @@
   "dlg.clear_effects.ok": "Remove",
   "fx.pick.miss": "Click inside the clip's picture",
   "fx.tip": "Effects: {list}",
-  "fx.tip.off": "{name} (off)"
+  "fx.tip.off": "{name} (off)",
+  "fx.tip.unavailable": "{name} (unavailable)"
 }

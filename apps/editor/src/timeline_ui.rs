@@ -362,6 +362,12 @@ impl App {
         }
     }
 
+    /// Whether the point is on a clip's body, not on a fade handle, a
+    /// keyframe diamond or a trim edge.
+    pub(crate) fn over_clip_body(&self, x: f64, y: f64) -> bool {
+        matches!(self.hit(x, y), Hit::Clip { edge: None, .. })
+    }
+
     fn clip_under(&self, x: f64, y: f64) -> Option<ClipId> {
         let seq = self.project.sequence();
         let r = rows(seq, self.tl.scroll_y).into_iter().find(|r| y >= r.y && y < r.y + r.h)?;
@@ -369,7 +375,7 @@ impl App {
     }
 
     /// A dragged handle's or diamond's value beside the pointer.
-    fn show_tip(&self, text: String, x: f64, y: f64) {
+    pub(crate) fn show_tip(&self, text: String, x: f64, y: f64) {
         let ui = self.ui();
         ui.set_tl_tip_text(text.into());
         ui.set_tl_tip_x(x as f32);
@@ -1223,6 +1229,9 @@ impl App {
     }
 
     pub fn refresh_timeline(&mut self) {
+        // The badge tooltip never outlives a change under a resting pointer
+        // (undo, delete, scroll, zoom); the next pointer move shows it again.
+        self.fx_badge_hover(None);
         let ui = self.ui();
         let (w, h) = self.lanes_size();
         let seq = self.project.sequence().clone();
@@ -1340,6 +1349,7 @@ impl App {
                     let marks = anim_ui::key_marks(&xs).into_iter().map(|(x, cluster)| KeyMark { x: x as f32, cluster }).collect();
                     (marks, before, after)
                 };
+                let badge = if is_audio { None } else { crate::effects_ui::badge_place(c, width, self.tl.pps, sel.contains(&c.id), t.locked, self.tl.blade) };
                 clips.push(ClipView {
                     id: c.id.to_string().into(),
                     x: x as f32,
@@ -1352,7 +1362,8 @@ impl App {
                     enabled: c.enabled,
                     linked: c.link.is_some(),
                     speed_label: if (speed - 1.0).abs() > 0.001 { format!("{speed:.2}×").into() } else { "".into() },
-                    fx_label: if is_audio || crate::effects_ui::badge_place(c, width, self.tl.pps, sel.contains(&c.id), t.locked, self.tl.blade).is_none() { "".into() } else { crate::effects_ui::fx_badge(c).into() },
+                    fx_label: if badge.is_some() { crate::effects_ui::fx_badge(c).into() } else { "".into() },
+                    fx_x: badge.map_or(0.0, |(a, _)| a) as f32,
                     has_thumb: thumb.is_some(),
                     thumb: thumb.unwrap_or_default(),
                     has_wave: wave.is_some(),

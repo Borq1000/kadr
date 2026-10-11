@@ -829,5 +829,6 @@
   "dlg.clear_effects.ok": "Удалить",
   "fx.pick.miss": "Щёлкните внутри кадра клипа",
   "fx.tip": "Эффекты: {list}",
-  "fx.tip.off": "{name} (выкл.)"
+  "fx.tip.off": "{name} (выкл.)",
+  "fx.tip.unavailable": "{name} (недоступен)"
 }
