@@ -1,6 +1,7 @@
-//! `kadr-bench scene`: cost of one `evaluate` (the scene evaluator), two
-//! rows — M1's realistic 3-layer scene with a transition, and the keyframes
-//! row: 10 clips × 13 animated params (keyframes spec §8, target ≤ 100 µs).
+//! `kadr-bench scene`: cost of one `evaluate` (the scene evaluator), three
+//! rows — M1's realistic 3-layer scene with a transition, the keyframes row
+//! (10 clips × 13 animated params, keyframes spec §8, target ≤ 100 µs) and the
+//! effects row (10 clips × 5 motion effects, effects spec §9).
 
 use crate::report::Report;
 use kadr_core::perf::Stats;
@@ -69,6 +70,28 @@ fn animated_project() -> Project {
     p
 }
 
+/// 10 full-length picture-in-picture clips on 10 video tracks, each with all
+/// five motion effects at 100 %.
+fn motion_project() -> Project {
+    let mut p = Project::new("bench-motion");
+    let a = asset(MediaKind::Video, 1920, 1080);
+    p.assets.push(a.clone());
+    for i in 1..10 {
+        p.sequence_mut().tracks.insert(i, Track::new(TrackKind::Video, format!("V{}", i + 1)));
+    }
+    for i in 0..10 {
+        let mut c = Clip::new(a.id, "c", TimeRange::new(Time::ZERO, Time::from_secs(60)), Time::ZERO);
+        c.transform.scale = 0.3; // none of the ten covers the canvas: nothing is culled
+        for def in kadr_effects::registry() {
+            let mut e = kadr_effects::fresh(def, &c, Time::from_secs(30));
+            e.params.insert("strength".into(), kadr_project::ParamValue::Number(1.0));
+            c.effects.push(e);
+        }
+        p.sequence_mut().tracks[i].clips.push(c);
+    }
+    p
+}
+
 /// Mean cost of one `evaluate` over batches of 100 calls sweeping the scenes' 60 s of frames.
 fn sample(p: &Project) -> Stats {
     let seq = p.sequence();
@@ -98,6 +121,10 @@ pub fn run() -> Result<Report, String> {
     let s = sample(&animated_project());
     for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
         r.push("scene", "10 clips × 13 animated params", metric, us(v), "µs");
+    }
+    let s = sample(&motion_project());
+    for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
+        r.push("scene", "10 clips × 5 motion effects", metric, us(v), "µs");
     }
     Ok(r)
 }
@@ -134,5 +161,16 @@ mod tests {
         let clips: Vec<_> = p.sequence().tracks.iter().flat_map(|t| &t.clips).collect();
         assert_eq!(clips.len(), 10);
         assert!(clips.iter().all(|c| c.animation.params().len() == 13));
+    }
+
+    /// The effects row really evaluates ten layers with five effects each.
+    #[test]
+    fn motion_bench_scene_keeps_ten_layers_with_their_effects() {
+        let p = motion_project();
+        let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
+        for f in (0..1800).step_by(30) {
+            assert_eq!(evaluate(&p, p.sequence(), FrameRate::FPS_30.frame_to_time(f), &out).layers.len(), 10, "frame {f}");
+        }
+        assert!(p.sequence().tracks.iter().flat_map(|t| &t.clips).all(|c| c.effects.len() == 5));
     }
 }

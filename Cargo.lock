@@ -2886,6 +2886,7 @@ name = "kadr-bench"
 version = "0.1.0"
 dependencies = [
  "kadr-core",
+ "kadr-effects",
  "kadr-media",
  "kadr-playback",
  "kadr-project",
