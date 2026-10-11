@@ -396,9 +396,11 @@ component ChoiceList inherits Rectangle {
                     }
                     ra := TouchArea {
                         mouse-cursor: pointer;
+                        // Report first: closing the popup destroys this row,
+                        // and its `i` would read 0 afterwards.
                         clicked => {
-                            popup.close();
                             if (i != root.current) { root.selected(i); }
+                            popup.close();
                         }
                     }
                 }
