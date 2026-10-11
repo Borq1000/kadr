@@ -173,6 +173,47 @@ export component PanelHeader inherits Rectangle {
     }
 }
 
+// A panel header whose title is a row of tabs (the left panel: Media ·
+// Effects); `@children` sit on the right, as in PanelHeader. The tab list
+// is a fixed model, so the buttons never rebuild. A narrow panel (the left
+// panel's 220 px minimum with three header buttons) gets tighter tabs.
+export component PanelTabs inherits Rectangle {
+    in property <[string]> tabs;
+    in property <int> current;
+    callback selected(int);
+    property <bool> tight: root.width < 260px;
+    height: Theme.panel-header;
+    background: Theme.bg1;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+    HorizontalLayout {
+        padding-left: root.tight ? 2px : 4px;
+        padding-right: root.tight ? 2px : 4px;
+        spacing: 2px;
+        for name[i] in root.tabs: Rectangle {
+            width: tt.preferred-width + (root.tight ? 10px : 20px);
+            accessible-role: AccessibleRole.tab;
+            accessible-label: name;
+            tt := Text {
+                text: name;
+                vertical-alignment: center;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                letter-spacing: root.tight ? 0.2px : 0.6px;
+                color: i == root.current || tta.has-hover ? Theme.text : Theme.text-faint;
+            }
+            Rectangle { y: parent.height - 2px; height: 2px; background: i == root.current ? Theme.accent : transparent; }
+            tta := TouchArea {
+                mouse-cursor: i == root.current ? default : pointer;
+                clicked => {
+                    if (i != root.current) { root.selected(i); }
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        @children
+    }
+}
+
 // Draggable divider. Reports the pointer delta since press.
 export component Splitter inherits Rectangle {
     in property <bool> vertical: true; // true = vertical bar (resizes width)

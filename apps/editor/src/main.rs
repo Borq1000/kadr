@@ -7,6 +7,7 @@ mod ai_ui;
 mod anim_ui;
 mod app;
 mod app_settings;
+mod effects_ui;
 mod export_ui;
 mod file_drop;
 mod import;

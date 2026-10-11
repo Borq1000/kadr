@@ -155,11 +155,18 @@ impl App {
         }
     }
 
-    /// The snapshot the preview shows (taken now if the project changed).
+    /// The snapshot the preview shows (taken now if the project changed),
+    /// with the hovered effect card's override applied to its copy only —
+    /// the project never sees it (effects spec §6.1). Setting or clearing
+    /// the override invalidates the snapshot.
     pub fn preview_scenes(&mut self) -> Arc<ProjectScenes> {
         let bypass = self.ui().get_bypass();
         let out = self.preview.output(&self.project);
         let mcp = self.preview.mcp_resolver.clone();
+        let snapshot = |project: &Project, fx: &crate::effects_ui::FxUi| match &fx.preview {
+            Some(o) => ProjectScenes::new_with(project, bypass, |seq| o.apply(seq)),
+            None => ProjectScenes::new(project, bypass),
+        };
         match &mut self.preview.cpu {
             Some(cpu) => {
                 cpu.set_output(out);
@@ -169,13 +176,13 @@ impl App {
                 match &cpu.scenes {
                     Some(s) if !cpu.dirty && s.bypass() == bypass => s.clone(),
                     _ => {
-                        let s = Arc::new(ProjectScenes::new(&self.project, bypass));
+                        let s = Arc::new(snapshot(&self.project, &self.fx));
                         cpu.set_scenes(s.clone(), mcp.as_deref());
                         s
                     }
                 }
             }
-            None => Arc::new(ProjectScenes::new(&self.project, bypass)),
+            None => Arc::new(snapshot(&self.project, &self.fx)),
         }
     }
 

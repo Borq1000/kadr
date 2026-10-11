@@ -258,6 +258,7 @@ impl App {
     fn set_project(&mut self, project: Project, path: Option<PathBuf>) {
         self.project = project;
         self.live_edit.forget();
+        self.fx_reset();
         self.path = path;
         self.engine.clear();
         self.saved_rev = self.engine.history_marker();

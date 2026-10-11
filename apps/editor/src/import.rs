@@ -38,6 +38,8 @@ impl App {
         let Some(media) = self.media.clone() else {
             return self.toast_error(t("err.ffmpeg_missing"));
         };
+        // The imported files appear in the media list: show it.
+        self.show_media_tab();
         let mut n = 0;
         for path in paths {
             if self.project.assets.iter().any(|a| a.path == path) {

@@ -2,13 +2,14 @@ import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
 import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip, KeyState } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
+import { EffectsPanel, FxCategoryView, FxCardView } from "effects.slint";
 import { Preview, AngleView, DevRow } from "preview.slint";
 import { Timeline, TrackView, ClipView, ClipMark, KeyMark, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -42,9 +43,19 @@ export component AppWindow inherits Window {
     in property <length> drag-x;
     in property <length> drag-y;
     in property <string> drag-label;
+    // The drag (an effect card) is over a target that refuses it.
+    in property <bool> drag-refused;
     // Files dragged in from Explorer.
     in property <bool> file-drop-active;
     in property <string> file-drop-label;
+
+    // ---- Left panel: 0 media, 1 effects (effects spec §6.1)
+    in-out property <int> left-tab;
+    in property <[FxCategoryView]> fx-categories;
+    in property <string> fx-category;
+    in property <[FxCardView]> fx-cards;
+    in property <string> fx-hint;
+    in-out property <string> fx-search;
 
     // ---- Preview
     in property <image> preview-frame;
@@ -188,6 +199,13 @@ export component AppWindow inherits Window {
     callback asset-released(string, length, length);
     callback asset-activated(string);
     callback asset-action(string, string);
+    callback left-tab-changed(int);
+    callback fx-category-selected(string);
+    callback fx-search-changed(string);
+    callback fx-card-hover(string, bool);
+    callback fx-card-pressed(string, length, length);
+    callback fx-card-moved(string, length, length);
+    callback fx-card-released(string, length, length);
     callback transport(string);
     callback set-quality(int);
     callback set-zoom(int);
@@ -377,7 +395,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 vertical-stretch: 1;
                 max-height: 100000px;
-                MediaLibrary {
+                if root.left-tab == 0: MediaLibrary {
                     width: root.library-width;
                     max-height: 100000px;
                     assets: root.assets;
@@ -396,6 +414,24 @@ export component AppWindow inherits Window {
                     asset-released(id, x, y) => { root.asset-released(id, x, y); root.focus-editor(); }
                     asset-activated(id) => { root.asset-activated(id); }
                     asset-action(id, a) => { root.asset-action(id, a); }
+                    tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); }
+                }
+                if root.left-tab == 1: EffectsPanel {
+                    width: root.library-width;
+                    max-height: 100000px;
+                    categories: root.fx-categories;
+                    category: root.fx-category;
+                    cards: root.fx-cards;
+                    hint: root.fx-hint;
+                    drag-refused: root.drag-refused;
+                    search <=> root.fx-search;
+                    tab-selected(i) => { root.left-tab = i; root.left-tab-changed(i); }
+                    category-selected(k) => { root.fx-category-selected(k); }
+                    search-changed(t) => { root.fx-search-changed(t); }
+                    card-hover(id, on) => { root.fx-card-hover(id, on); }
+                    card-pressed(id, x, y) => { root.fx-card-pressed(id, x, y); }
+                    card-moved(id, x, y) => { root.fx-card-moved(id, x, y); }
+                    card-released(id, x, y) => { root.fx-card-released(id, x, y); root.focus-editor(); }
                 }
                 Splitter {
                     property <length> start;
@@ -594,14 +630,14 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Drag ghost from media library
+    // Drag label (a media item, an effect card); red over a refused target.
     if root.drag-active: Rectangle {
         x: root.drag-x + 12px;
         y: root.drag-y + 8px;
         width: dl.preferred-width + 20px;
         height: 26px;
         border-radius: 5px;
-        background: #7c8cffd0;
+        background: root.drag-refused ? #ef5b5bd8 : #7c8cffd0;
         dl := Text { text: root.drag-label; color: Theme.text-on-accent; font-size: Theme.font-sm; font-weight: 600; }
     }
 

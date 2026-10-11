@@ -244,7 +244,7 @@ impl App {
             d.fade_in = c.audio.fade_in.as_secs_f64() as f32;
             d.fade_out = c.audio.fade_out.as_secs_f64() as f32;
             d.enabled = c.enabled;
-            let fx: Vec<SharedString> = c.effects.iter().map(|e| SharedString::from(e.recipe.as_str())).collect();
+            let fx: Vec<SharedString> = c.effects.iter().map(|e| crate::effects_ui::fx_name(e).into()).collect();
             d.effects = same_or_new(shown.effects, fx);
             if !is_audio {
                 let (rows, graded) = self.inspector_shots(c);
@@ -253,6 +253,9 @@ impl App {
             }
         }
         ui.set_inspector(d);
+        // A selection change, an edit, undo/redo and a language change all
+        // pass here: the effect cards follow (fit, hints, the hover preview).
+        self.refresh_effects();
     }
 
     pub fn inspector_live(&mut self, prop: &str, v: f32) {

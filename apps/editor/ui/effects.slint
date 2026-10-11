@@ -1,0 +1,196 @@
+// The «Эффекты» tab (effects spec §6.1): search, filter chips, a grid of
+// cards, a hint line. Rust builds the rows (stable models, keyed by recipe
+// id) and does hover delays, click and drag; Slint only draws and reports
+// the pointer.
+
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { Icon, PanelTabs, EmptyState, Tooltip } from "widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
+
+export struct FxCategoryView {
+    key: string,
+    label: string,
+}
+
+export struct FxCardView {
+    id: string,
+    name: string,
+    category: string,
+    thumb: image,
+    has-thumb: bool,
+    enabled: bool,
+    // Why the card is inactive ("" when it is not): shown on hover.
+    hint: string,
+}
+
+component FxCard inherits Rectangle {
+    in property <FxCardView> c;
+    // A drag from this card is over a target that refuses it.
+    in property <bool> refused;
+    callback hover(bool);
+    // Window coordinates.
+    callback pressed(length, length);
+    callback moved(length, length);
+    callback released(length, length);
+    border-radius: Theme.radius;
+    background: ta.pressed ? Theme.bg4 : ta.has-hover && root.c.enabled ? Theme.bg3 : Theme.bg2;
+    border-width: 1px;
+    border-color: ta.has-hover && root.c.enabled ? Theme.accent : Theme.border;
+    opacity: root.c.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.c.name;
+    animate background, border-color { duration: 90ms; }
+    VerticalLayout {
+        padding: 4px;
+        spacing: 4px;
+        // 16:9, as the thumbnails (rendered at 160 × 90).
+        Rectangle {
+            height: (root.width - 8px) * 9 / 16;
+            border-radius: 4px;
+            background: #000000;
+            clip: true;
+            if root.c.has-thumb: Image { width: parent.width; height: parent.height; source: root.c.thumb; image-fit: cover; }
+            if !root.c.has-thumb: Icon { icon: root.c.category == "motion" ? Icons.motion : Icons.sparkle; width: 22px; height: 22px; color: Theme.text-faint; }
+        }
+        // Two lines: a long name wraps in a narrow panel instead of eliding.
+        Text {
+            text: root.c.name;
+            font-size: Theme.font-sm;
+            color: Theme.text;
+            wrap: word-wrap;
+            overflow: elide;
+            horizontal-alignment: center;
+            vertical-alignment: top;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: self.pressed ? (root.refused ? no-drop : grabbing) : !root.c.enabled ? not-allowed : pointer;
+        changed has-hover => { root.hover(self.has-hover); }
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) { root.pressed(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
+            if (e.button == PointerEventButton.left && e.kind == PointerEventKind.up) { root.released(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
+        }
+        moved => {
+            if (self.pressed) { root.moved(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y); }
+        }
+    }
+}
+
+export component EffectsPanel inherits Rectangle {
+    in property <[FxCategoryView]> categories;
+    in property <string> category;
+    in property <[FxCardView]> cards;
+    // How to use the cards, or "Select a clip to try effects on it".
+    in property <string> hint;
+    // A card drag is over a target that refuses it.
+    in property <bool> drag-refused;
+    in-out property <string> search;
+    callback tab-selected(int);
+    callback category-selected(string);
+    callback search-changed(string);
+    callback card-hover(string, bool);
+    callback card-pressed(string, length, length);
+    callback card-moved(string, length, length);
+    callback card-released(string, length, length);
+    // The card under the pointer (its hint shows when it is inactive) and
+    // its box in panel coordinates. Drawn by the panel, not the card: the
+    // scroll area would clip a card's own tooltip at its edges.
+    property <int> tip-index: -1;
+    property <length> tip-x;
+    property <length> tip-top;
+    property <length> tip-bottom;
+    background: Theme.bg1;
+
+    VerticalLayout {
+        PanelTabs {
+            tabs: [Tr.t("media.title"), Tr.t("fx.title")];
+            current: 1;
+            selected(i) => { root.tab-selected(i); }
+        }
+        VerticalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 8px;
+            padding-bottom: 4px;
+            spacing: 8px;
+            LineEdit {
+                placeholder-text: Tr.t("fx.search");
+                text <=> root.search;
+                edited(t) => { root.search-changed(t); }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: start;
+                for cat in root.categories: Rectangle {
+                    width: ct.preferred-width + 20px;
+                    height: 24px;
+                    border-radius: 12px;
+                    background: root.category == cat.key ? Theme.bg4 : cta.has-hover ? Theme.bg3 : Theme.bg2;
+                    border-width: 1px;
+                    border-color: root.category == cat.key ? Theme.border-strong : Theme.border;
+                    accessible-role: button;
+                    accessible-label: cat.label;
+                    ct := Text { text: cat.label; font-size: Theme.font-sm; color: root.category == cat.key ? Theme.text : Theme.text-dim; }
+                    cta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.category-selected(cat.key); }
+                    }
+                }
+            }
+        }
+        if root.cards.length == 0: EmptyState {
+            icon: Icons.sparkle;
+            title: Tr.t("fx.no_match");
+            subtitle: "";
+        }
+        if root.cards.length > 0: sv := ScrollView {
+            vertical-stretch: 1;
+            property <length> gap: 8px;
+            // At least two columns, cards near the thumbnails' 160 px.
+            property <int> cols: max(2, floor((self.visible-width - 8px) / 168px));
+            property <length> card-w: (self.visible-width - 16px - (self.cols - 1) * self.gap) / self.cols;
+            // The 16:9 picture, paddings and two lines of name.
+            property <length> card-h: (self.card-w - 8px) * 9 / 16 + 42px;
+            content-width: self.visible-width;
+            content-height: ceil(root.cards.length * 1.0 / self.cols) * (self.card-h + self.gap) + 4px;
+            for card[i] in root.cards: FxCard {
+                x: 8px + mod(i, sv.cols) * (sv.card-w + sv.gap);
+                y: 4px + floor(i / sv.cols) * (sv.card-h + sv.gap);
+                width: sv.card-w;
+                height: sv.card-h;
+                c: card;
+                refused: root.drag-refused;
+                hover(on) => {
+                    if (on) {
+                        root.tip-index = i;
+                        root.tip-x = self.absolute-position.x - root.absolute-position.x + self.width / 2;
+                        root.tip-top = self.absolute-position.y - root.absolute-position.y;
+                        root.tip-bottom = root.tip-top + self.height;
+                    } else if (root.tip-index == i) {
+                        root.tip-index = -1;
+                    }
+                    root.card-hover(card.id, on);
+                }
+                pressed(x, y) => { root.card-pressed(card.id, x, y); }
+                moved(x, y) => { root.card-moved(card.id, x, y); }
+                released(x, y) => { root.card-released(card.id, x, y); }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 6px;
+            padding-bottom: 7px;
+            Text { text: root.hint; font-size: Theme.font-xs; color: Theme.text-dim; wrap: word-wrap; }
+        }
+    }
+
+    // The inactive card's hint: below it, or above when that leaves the panel.
+    if root.tip-index >= 0 && root.cards[root.tip-index].hint != "": Tooltip {
+        text: root.cards[root.tip-index].hint;
+        x: max(4px, min(root.width - self.width - 4px, root.tip-x - self.width / 2));
+        y: root.tip-bottom + 4px + self.height <= root.height - 4px ? root.tip-bottom + 4px : root.tip-top - self.height - 4px;
+    }
+}

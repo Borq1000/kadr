@@ -97,6 +97,8 @@ pub struct App {
     /// Pre-drag state of the clip a drag changes live (an inspector slider,
     /// a timeline fade handle); see `LiveEdit`.
     pub live_edit: crate::inspector::LiveEdit,
+    /// The «Эффекты» tab: filters, the hovered card's preview, a card drag.
+    pub fx: crate::effects_ui::FxUi,
     /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
     pub inspector_refreshed: Option<Instant>,
     pub library_drag: Option<LibDrag>,
@@ -204,6 +206,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         ai: AiUi::new(Assistant::new(ai_settings)),
         export: ExportUi::default(),
         live_edit: Default::default(),
+        fx: Default::default(),
         inspector_refreshed: None,
         library_drag: None,
         mc: Default::default(),
@@ -393,6 +396,13 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_asset_released, |id, x, y| |app: &mut App| app.asset_released(&id, x, y));
     cb!(ui.on_asset_activated, |id| |app: &mut App| app.asset_activated(&id));
     cb!(ui.on_asset_action, |id, a| |app: &mut App| app.asset_action(&id, &a));
+    cb!(ui.on_left_tab_changed, |i| |app: &mut App| app.fx_tab_changed(i));
+    cb!(ui.on_fx_category_selected, |k| |app: &mut App| app.fx_category(&k));
+    cb!(ui.on_fx_search_changed, |s| |app: &mut App| app.fx_search(&s));
+    cb!(ui.on_fx_card_hover, |id, on| |app: &mut App| app.fx_card_hover(&id, on));
+    cb!(ui.on_fx_card_pressed, |id, x, y| |app: &mut App| app.fx_card_pressed(&id, x, y));
+    cb!(ui.on_fx_card_moved, |id, x, y| |app: &mut App| app.fx_card_moved(&id, x, y));
+    cb!(ui.on_fx_card_released, |id, x, y| |app: &mut App| app.fx_card_released(&id, x, y));
     cb!(ui.on_inspector_shot, |i| |app: &mut App| app.inspector_shot_clicked(i));
     cb!(ui.on_angle_clicked, |i| |app: &mut App| {
         app.cut_to_angle(i as u32);

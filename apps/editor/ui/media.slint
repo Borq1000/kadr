@@ -1,6 +1,6 @@
 import { Theme, Icons } from "theme.slint";
 import { Tr } from "i18n.slint";
-import { Icon, IconButton, PanelHeader, EmptyState, Button, ProgressBar, Badge } from "widgets.slint";
+import { Icon, IconButton, PanelTabs, EmptyState, Button, ProgressBar, Badge } from "widgets.slint";
 import { ScrollView, LineEdit } from "std-widgets.slint";
 
 export struct AssetView {
@@ -140,12 +140,15 @@ export component MediaLibrary inherits Rectangle {
     callback asset-activated(string);
     callback asset-action(string, string);
     callback search-changed(string);
+    // The left panel's tabs (0 media, 1 effects).
+    callback tab-selected(int);
     background: Theme.bg1;
 
     VerticalLayout {
-        PanelHeader {
-            title: Tr.t("media.title");
-            icon: Icons.folder;
+        PanelTabs {
+            tabs: [Tr.t("media.title"), Tr.t("fx.title")];
+            current: 0;
+            selected(i) => { root.tab-selected(i); }
             VerticalLayout { alignment: center; IconButton { icon: Icons.multicam; tooltip: Tr.t("mc.new_tip"); clicked => { root.asset-action("", "mc-create"); } } }
             VerticalLayout { alignment: center; IconButton { icon: Icons.plus; tooltip: Tr.t("media.new_bin"); clicked => { root.new-bin(); } } }
             VerticalLayout { alignment: center; IconButton { icon: Icons.import; tooltip: Tr.t("media.import_tip"); clicked => { root.import(); } } }
