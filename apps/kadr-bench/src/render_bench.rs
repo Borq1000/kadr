@@ -1,5 +1,7 @@
-//! M2: `CpuRenderer` cost at 1080p and 4K for 1, 2 and 3 layers and for a
-//! transition alone, plus frame-sized allocations per frame after warm-up.
+//! M2: `CpuRenderer` cost at 1080p and 4K for 1, 2 and 3 layers, for one
+//! layer with a full Look (Винтаж: correction, curve, split-tone, vignette,
+//! grain — every point operation) and for a transition alone, plus
+//! frame-sized allocations per frame after warm-up.
 
 use crate::alloc;
 use crate::report::Report;
@@ -17,18 +19,20 @@ const WARMUP: usize = 5;
 enum Row {
     OneLayer,
     OneLayerScaled,
+    OneLayerLook,
     TwoLayers,
     ThreeLayers,
     Transition,
 }
 
 impl Row {
-    const ALL: [Row; 5] = [Row::OneLayer, Row::OneLayerScaled, Row::TwoLayers, Row::ThreeLayers, Row::Transition];
+    const ALL: [Row; 6] = [Row::OneLayer, Row::OneLayerScaled, Row::OneLayerLook, Row::TwoLayers, Row::ThreeLayers, Row::Transition];
 
     fn name(self) -> &'static str {
         match self {
             Row::OneLayer => "1 layer",
             Row::OneLayerScaled => "1 layer scaled",
+            Row::OneLayerLook => "1 layer + Look",
             Row::TwoLayers => "2 layers",
             Row::ThreeLayers => "3 layers",
             Row::Transition => "transition",
@@ -111,6 +115,13 @@ fn build(row: Row, a: &Assets) -> (FrameScene, RenderInputs) {
     match row {
         Row::OneLayer => add(media_layer(1, &a.video, fill)),
         Row::OneLayerScaled => add(media_layer(1, &a.video, Placement { scale: Vec2::new(0.98, 0.98), ..fill })),
+        Row::OneLayerLook => {
+            // Винтаж at «Обычно» uses all five point operations: the worst Look.
+            let (mut l, i) = media_layer(1, &a.video, fill);
+            let ctx = kadr_effects::CompileCtx::still(canvas, Time::ZERO, 7);
+            l.effects = kadr_effects::look::look_effects(kadr_effects::look::preset("vintage").expect("a spec preset"), 1.0, &ctx);
+            add((l, i));
+        }
         Row::TwoLayers | Row::ThreeLayers => {
             add(media_layer(1, &a.video, fill));
             add(media_layer(2, &a.video2, Placement { scale: Vec2::new(0.3, 0.3), rotation: 5.0_f32.to_radians(), position: Vec2::new(w * 0.75, h * 0.72), ..fill }));
@@ -180,7 +191,7 @@ mod tests {
     fn bench_scenes_have_the_advertised_layers() {
         let a = Assets::new(64, 36, 16);
         let is_media = |l: &Layer| matches!(l.content, LayerContent::Media { .. });
-        for (row, count) in [(Row::OneLayer, 1), (Row::OneLayerScaled, 1), (Row::TwoLayers, 2), (Row::ThreeLayers, 3), (Row::Transition, 1)] {
+        for (row, count) in [(Row::OneLayer, 1), (Row::OneLayerScaled, 1), (Row::OneLayerLook, 1), (Row::TwoLayers, 2), (Row::ThreeLayers, 3), (Row::Transition, 1)] {
             let (scene, inputs) = build(row, &a);
             assert_eq!(scene.layers.len(), count, "{row:?}");
             assert_eq!(inputs.layers.len(), count, "{row:?} inputs are parallel");
@@ -207,6 +218,29 @@ mod tests {
         assert_eq!(three.layers[2].placement.scale, Vec2::new(0.5, 0.5));
         assert_eq!(a.logo.color.alpha, AlphaMode::Straight);
         assert_eq!(a.video.color.alpha, AlphaMode::Opaque);
+    }
+
+    /// The Look row runs every point operation, fused into the layer's one pass.
+    #[test]
+    fn the_look_row_runs_the_whole_chain_in_one_pass() {
+        let a = Assets::new(64, 36, 16);
+        let (scene, inputs) = build(Row::OneLayerLook, &a);
+        let kinds: Vec<&str> = scene.layers[0]
+            .effects
+            .iter()
+            .map(|e| match e {
+                Effect::ColorAdjust(_) => "adjust",
+                Effect::ToneCurve(_) => "curve",
+                Effect::SplitTone(_) => "split",
+                Effect::Vignette(_) => "vignette",
+                Effect::Grain(_) => "grain",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["adjust", "curve", "split", "vignette", "grain"]);
+        let mut out = vec![0u8; 64 * 36 * 4];
+        let stats = CpuRenderer::new().render(&PreparedFrame { scene: &scene, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(64, 36, &mut out))).unwrap();
+        assert_eq!((stats.passes, stats.fast_paths), (1, 0));
     }
 
     #[test]

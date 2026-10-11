@@ -1,7 +1,8 @@
-//! `kadr-bench scene`: cost of one `evaluate` (the scene evaluator), three
+//! `kadr-bench scene`: cost of one `evaluate` (the scene evaluator), four
 //! rows — M1's realistic 3-layer scene with a transition, the keyframes row
-//! (10 clips × 13 animated params, keyframes spec §8, target ≤ 100 µs) and the
-//! effects row (10 clips × 5 motion effects, effects spec §9).
+//! (10 clips × 13 animated params, keyframes spec §8, target ≤ 100 µs), the
+//! effects row (10 clips × 5 motion effects, effects spec §9) and the colour
+//! row: the same with a Look (Винтаж) and a Vignette on every clip.
 
 use crate::report::Report;
 use kadr_core::perf::Stats;
@@ -92,6 +93,21 @@ fn motion_project() -> Project {
     p
 }
 
+/// The effects row with colour too: every clip also gets a Look (Винтаж,
+/// all five point operations) and a Vignette.
+fn look_project() -> Project {
+    let mut p = motion_project();
+    for track in &mut p.sequence_mut().tracks {
+        for c in &mut track.clips {
+            let mut look = kadr_effects::fresh(kadr_effects::recipe("look").expect("E2 recipe"), c, Time::from_secs(30));
+            look.params.insert("preset".into(), kadr_project::ParamValue::Choice("vintage".into()));
+            let vignette = kadr_effects::fresh(kadr_effects::recipe("vignette").expect("E2 recipe"), c, Time::from_secs(30));
+            c.effects.extend([look, vignette]);
+        }
+    }
+    p
+}
+
 /// Mean cost of one `evaluate` over batches of 100 calls sweeping the scenes' 60 s of frames.
 fn sample(p: &Project) -> Stats {
     let seq = p.sequence();
@@ -125,6 +141,10 @@ pub fn run() -> Result<Report, String> {
     let s = sample(&motion_project());
     for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
         r.push("scene", "10 clips × 5 motion effects", metric, us(v), "µs");
+    }
+    let s = sample(&look_project());
+    for (metric, v) in [("p50", s.p50), ("p90", s.p90), ("p99", s.p99), ("max", s.max)] {
+        r.push("scene", "10 clips × motion + Look + Vignette", metric, us(v), "µs");
     }
     Ok(r)
 }
@@ -172,5 +192,18 @@ mod tests {
             assert_eq!(evaluate(&p, p.sequence(), FrameRate::FPS_30.frame_to_time(f), &out).layers.len(), 10, "frame {f}");
         }
         assert!(p.sequence().tracks.iter().flat_map(|t| &t.clips).all(|c| c.effects.len() == 5));
+    }
+
+    /// The colour row really evaluates ten layers, each with its Look's grain.
+    #[test]
+    fn look_bench_scene_keeps_ten_graded_layers() {
+        let p = look_project();
+        let out = OutputSpec::new(SizeU::new(1920, 1080), RenderQuality::PreviewHigh);
+        for f in (0..1800).step_by(30) {
+            let scene = evaluate(&p, p.sequence(), FrameRate::FPS_30.frame_to_time(f), &out);
+            assert_eq!(scene.layers.len(), 10, "frame {f}");
+            assert!(scene.layers.iter().all(|l| l.effects.iter().any(|e| matches!(e, kadr_scene::Effect::Grain(_)))), "frame {f}");
+        }
+        assert!(p.sequence().tracks.iter().flat_map(|t| &t.clips).all(|c| c.effects.len() == 7));
     }
 }
