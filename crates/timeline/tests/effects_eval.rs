@@ -184,17 +184,22 @@ fn the_crop_window_is_the_crop_at_the_frame() {
     assert_eq!(placed, late.placement, "the public function reads the same window");
 }
 
-/// Spec §1: «Момент» is source-bound. Review focus 4: a moment before the
-/// visible start is done on the first frame; one past the end never comes.
+/// Spec §1: «Момент» is source-bound; ruling R17: the punch is fully in on
+/// the moment's own frame (its 0.12 s ramp ends there). Review focus 4: a
+/// moment before the visible start is done on the first frame; one past
+/// the end never comes.
 #[test]
 fn the_punch_moment_stays_on_its_source_frame() {
-    // Source 33 s = timeline 13 s.
+    // Source 33 s = timeline 13 s; the ramp runs 12.88..13 s.
     let (mut p, id) = project(vec![fx("punch_in", &[("moment", ParamValue::Moment(SourceTime(Time::from_secs(33))))])]);
-    assert!((scale(&p, 12_900) - 1.0).abs() < 1e-6);
+    assert!((scale(&p, 12_850) - 1.0).abs() < 1e-6);
+    assert!(scale(&p, 12_950) > 1.0 && scale(&p, 12_950) < 1.15, "on its way in");
+    assert!((scale(&p, 13_000) - 1.15).abs() < 1e-5, "the moment's own frame: in");
     assert!((scale(&p, 13_200) - 1.15).abs() < 1e-5);
     let (ti, ci) = p.sequence().locate_clip(id).unwrap();
     trim_start(&mut p.sequence_mut().tracks[ti].clips[ci], Time::from_secs(12));
-    assert!((scale(&p, 12_900) - 1.0).abs() < 1e-6, "the content frame decides, not the clip start");
+    assert!((scale(&p, 12_850) - 1.0).abs() < 1e-6, "the content frame decides, not the clip start");
+    assert!((scale(&p, 13_000) - 1.15).abs() < 1e-5);
     assert!((scale(&p, 13_200) - 1.15).abs() < 1e-5);
     trim_start(&mut p.sequence_mut().tracks[ti].clips[ci], Time::from_secs(14));
     assert!((scale(&p, 14_000) - 1.15).abs() < 1e-5, "punched before the visible start: held from the first frame");

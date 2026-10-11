@@ -17,7 +17,7 @@ pub const ZOOM_AMOUNT: f64 = 0.10;
 pub const PUSH_AMOUNT: f64 = 0.05;
 /// Резкий наезд: scale 1.00 → 1.15 …
 pub const PUNCH_AMOUNT: f64 = 0.15;
-/// … in 0.12 timeline seconds.
+/// … in the 0.12 timeline seconds that end at its moment.
 pub const PUNCH_SECS: f64 = 0.12;
 /// Плавная панорама: travel 6 % of the visible window (with the same scale-up).
 pub const PAN_TRAVEL: f64 = 0.06;
@@ -89,14 +89,17 @@ pub fn cinematic_push(p: &Params, ctx: &CompileCtx) -> Compiled {
     zoom(1.0 + PUSH_AMOUNT * intensity(p.number("strength")) * Curve::Cinematic.apply(ctx.progress), p, ctx)
 }
 
-/// In at the source moment, held to the end; no moment — no punch. The
-/// 0.12 s are on screen: source time since the moment ÷ speed.
+/// Fully in AT the source moment (ruling R17): the Snap ramp runs in the
+/// 0.12 s before it, so the moment's own frame — a beat, a hit — already
+/// shows the whole punch; held to the end; no moment — no punch. The 0.12 s
+/// are on screen: source time since the moment ÷ speed.
 pub fn punch_in(p: &Params, ctx: &CompileCtx) -> Compiled {
     let w = p.moment("moment").map_or(0.0, |m| {
         // saturating: a moment from a damaged file never overflows a frame
         let since = Time(ctx.source_time.0.flicks().saturating_sub(m.0.flicks()));
         let elapsed = since.as_secs_f64() / ctx.speed.max(1e-9);
-        if elapsed < 0.0 { 0.0 } else { Curve::Snap.apply(elapsed / PUNCH_SECS) }
+        // 0 until 0.12 s before the moment, 1 from the moment on
+        Curve::Snap.apply(((elapsed + PUNCH_SECS) / PUNCH_SECS).clamp(0.0, 1.0))
     });
     zoom(1.0 + PUNCH_AMOUNT * intensity(p.number("strength")) * w, p, ctx)
 }
@@ -226,12 +229,16 @@ mod tests {
             c.speed = speed;
             run("punch_in", &m, &c).scale
         };
-        assert!(close(at(4_999, 1.0), 1.0), "before the moment");
-        assert!(close(at(5_000, 1.0), 1.0), "the moment itself starts it");
-        assert!(close(at(5_060, 1.0), 1.0 + 0.15 * Curve::Snap.apply(0.5)));
-        assert!(close(at(5_120, 1.0), 1.15), "0.12 s later: in");
+        assert!(close(at(4_000, 1.0), 1.0), "well before the moment");
+        assert!(close(at(4_879, 1.0), 1.0), "before the ramp");
+        assert!(close(at(4_880, 1.0), 1.0), "the ramp starts 0.12 s before the moment");
+        assert!(close(at(4_940, 1.0), 1.0 + 0.15 * Curve::Snap.apply(0.5)));
+        let just_before = at(4_990, 1.0);
+        assert!(just_before > 1.14 && just_before < 1.15, "almost in a frame before: {just_before}");
+        assert!(close(at(5_000, 1.0), 1.15), "the moment's own frame shows the whole punch");
         assert!(close(at(9_000, 1.0), 1.15), "and it holds");
-        assert!(close(at(5_120, 2.0), 1.0 + 0.15 * Curve::Snap.apply(0.5)), "at 2× 0.12 s of source is 0.06 s on screen");
+        assert!(close(at(4_880, 2.0), 1.0 + 0.15 * Curve::Snap.apply(0.5)), "at 2× 0.12 s of source is 0.06 s on screen");
+        assert!(close(at(4_760, 2.0), 1.0), "and the ramp starts 0.12 s on screen before the moment");
         assert!(close(run("punch_in", &[], &ctx(0.5)).scale, 1.0), "no moment: no punch");
     }
 

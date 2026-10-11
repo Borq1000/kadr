@@ -524,7 +524,7 @@ pub fn schema_for_prompt() -> String {
                     kadr_effects::ParamKind::Number { min, max, default } => format!("{} {min}..{max} (default {default})", p.key),
                     kadr_effects::ParamKind::Choice { options, .. } => format!("{} {}", p.key, options.join("|")),
                     kadr_effects::ParamKind::Point => format!("{} {{\"x\":0..1,\"y\":0..1}}", p.key),
-                    kadr_effects::ParamKind::Moment => format!("{} {{\"at_ms\":int}}", p.key),
+                    kadr_effects::ParamKind::Moment => format!("{} {{\"at_ms\":int}} (inside the clip; the effect is fully in at this frame)", p.key),
                 })
                 .collect();
             format!("   {}: {}", d.id, params.join(", "))
@@ -740,6 +740,7 @@ mod tests {
             assert!(s.contains(d.id), "schema lacks {}", d.id);
         }
         assert!(s.contains("\"add_effect\"") && s.contains("\"set_effect\"") && s.contains("\"remove_effect\""));
+        assert!(s.contains("punch_in: ") && s.contains("fully in at this frame"), "ruling R17: the moment is where the punch is in");
         let (mut p, id) = fx_project();
         let cid = kadr_core::ClipId::parse(&id).unwrap();
         let e = kadr_effects::fresh(kadr_effects::recipe("handheld").unwrap(), p.sequence().clip(cid).unwrap(), Time::ZERO);
