@@ -10,7 +10,7 @@ use crate::app::App;
 use crate::timeline_ui::{rows, Row};
 use crate::{FxCardView, FxCategoryView, FxParamRow, FxRow, KeyState};
 use kadr_core::{ClipId, EffectId, FrameRate, Time, Timecode};
-use kadr_effects::{Category, ParamDef, ParamKind, RecipeDef};
+use kadr_effects::{Category, ParamDef, ParamKind, Params, RecipeDef};
 use kadr_i18n::{t, t_in, tf, Lang};
 use kadr_project::{AppliedEffect, Clip, FadeEdge, ParamValue, Sequence, SourceTime, TrackKey, TrackKind};
 use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, SizeU};
@@ -442,10 +442,12 @@ pub fn has_moment(c: &Clip) -> bool {
 }
 
 /// «Сбросить» of one effect: its settings back to the defaults and no
-/// keyframes on its numbers — `None` when it is so already. Every moment
-/// stays where it was put (ruling R13: a reset never re-times a punch); one
-/// the effect lacks gets its default (the frame at `at`). A variant — a
-/// Look's preset — stays too (refinement 5).
+/// keyframes on its numbers — `None` when it is so already, judged by what
+/// the recipe reads (a missing or invalid stored value reads as its
+/// default: writing the default in would be an empty undo entry, R14).
+/// Every moment stays where it was put (ruling R13: a reset never re-times
+/// a punch); one the effect lacks gets its default (the frame at `at`). A
+/// variant — a Look's preset — stays too (refinement 5).
 pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) -> Option<Vec<EditCommand>> {
     let mut defaults = kadr_effects::fresh(def, c, at).params;
     // A Look's preset is what the effect is (its card): a reset keeps it, as
@@ -472,7 +474,7 @@ pub fn reset_commands(c: &Clip, e: &AppliedEffect, def: &RecipeDef, at: Time) ->
             c.animation.is_animated(&k).then_some((k, v))
         })
         .collect();
-    if animated.is_empty() && defaults.iter().all(|(k, v)| e.params.get(k) == Some(v)) {
+    if animated.is_empty() && Params::resolve(def.params, &e.params, |_| None) == Params::resolve(def.params, &defaults, |_| None) {
         return None;
     }
     let mut commands = vec![];
@@ -1096,7 +1098,7 @@ impl App {
             Some(p) => def.param(&p.key).filter(|d| d.kind == ParamKind::Point)?.key,
             None => def.params.iter().find(|p| p.kind == ParamKind::Point)?.key,
         };
-        Some((id, kadr_effects::Params::resolve(def.params, &e.params, |_| None).point(key)))
+        Some((id, Params::resolve(def.params, &e.params, |_| None).point(key)))
     }
 
     /// The point marker on the preview (spec §6.2, ruling R15): where the
@@ -1644,6 +1646,31 @@ mod tests {
         assert_eq!(params["strength"], ParamValue::Number(0.6), "the settings go back");
         assert_eq!(params["moment"], ParamValue::Moment(SourceTime(Time::from_secs(37))), "the moment stays");
         assert_eq!(params["point"], ParamValue::Point { x: 0.5, y: 0.5 });
+    }
+
+    /// R14: a hand-edited effect whose stored values are invalid or missing
+    /// reads as the defaults — «Сбросить» would be an empty undo entry, so
+    /// there is none; a value that reads differently still resets.
+    #[test]
+    fn a_reset_compares_what_the_recipe_reads() {
+        let mut c = clip_10_20();
+        let zoom = kadr_effects::recipe("smooth_zoom").unwrap();
+        let mut z = kadr_effects::fresh(zoom, &c, Time::from_secs(12));
+        z.params.insert("direction".into(), ParamValue::Choice("diagonal".into()));
+        z.params.remove("strength");
+        z.params.insert("point".into(), ParamValue::Point { x: f64::NAN, y: 0.5 });
+        c.effects.push(z.clone());
+        assert!(reset_commands(&c, &z, zoom, Time::from_secs(12)).is_none(), "an invalid direction, a missing strength and a NaN point read as the defaults");
+        assert!(!can_reset(&c, &z, Time::from_secs(12)));
+        z.params.insert("strength".into(), ParamValue::Number(0.9));
+        c.effects[0] = z.clone();
+        let cmds = reset_commands(&c, &z, zoom, Time::from_secs(12));
+        let Some([EditCommand::UpdateEffect { params, .. }]) = cmds.as_deref() else { panic!("one UpdateEffect: {cmds:?}") };
+        assert_eq!((&params["strength"], &params["direction"]), (&ParamValue::Number(0.6), &ParamValue::Choice("in".into())), "the settings go back, the invalid one written as the default");
+        z.params.insert("strength".into(), ParamValue::Number(0.6));
+        z.params.insert("direction".into(), ParamValue::Choice("out".into()));
+        c.effects[0] = z.clone();
+        assert!(can_reset(&c, &z, Time::from_secs(12)), "a valid direction other than the default");
     }
 
     /// Refinement 5: a Look's «Сбросить» brings «Обычно» back but keeps its preset.
