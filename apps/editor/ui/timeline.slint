@@ -47,6 +47,8 @@ export struct ClipView {
     enabled: bool,
     linked: bool,
     speed-label: string,
+    // "fx N" for a clip with effects (effects spec §6.3) where the name bar has room for it, "" otherwise.
+    fx-label: string,
     thumb: image,
     has-thumb: bool,
     wave: image,
@@ -265,6 +267,17 @@ component ClipRect inherits Rectangle {
             font-size: Theme.font-xs;
             color: Theme.warning;
             vertical-alignment: center;
+        }
+        // Rust hit-tests this badge for its tooltip (`effects_ui::badge_place`): keep the width in step with BADGE_W.
+        if root.cv.fx-label != "": VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 30px;
+                height: 12px;
+                border-radius: 3px;
+                background: #00000066;
+                Text { text: root.cv.fx-label; font-size: 9px; font-weight: 700; color: Theme.keyframe; }
+            }
         }
     }
     for m in root.cv.marks: Rectangle {

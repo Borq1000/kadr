@@ -343,7 +343,10 @@ impl App {
                 Hit::Empty => {}
             },
             // The pointer left the lanes.
-            4 => self.set_hover_clip(None),
+            4 => {
+                self.set_hover_clip(None);
+                self.fx_badge_hover(None);
+            }
             // The grab was lost (focus gone mid-drag): no release will come,
             // so the drag ends here as released — one command, nothing live left.
             5 => self.pointer_up(),
@@ -603,6 +606,8 @@ impl App {
     }
 
     fn pointer_down(&mut self, x: f64, y: f64, shift: bool, ctrl: bool) {
+        // A press hides the badge tooltip before any drag tip.
+        self.fx_badge_hover(None);
         // A press while a drag is still on: its release never reached us —
         // end it as released first, so its live state is recorded, not lost.
         if self.tl.drag.is_some() {
@@ -687,6 +692,7 @@ impl App {
             None => {
                 let hover = self.clip_under(x, y);
                 self.set_hover_clip(hover);
+                self.fx_badge_hover(Some((x, y)));
                 let c = if self.tl.blade {
                     0
                 } else {
@@ -1346,6 +1352,7 @@ impl App {
                     enabled: c.enabled,
                     linked: c.link.is_some(),
                     speed_label: if (speed - 1.0).abs() > 0.001 { format!("{speed:.2}×").into() } else { "".into() },
+                    fx_label: if is_audio || crate::effects_ui::badge_place(c, width, self.tl.pps, sel.contains(&c.id), t.locked, self.tl.blade).is_none() { "".into() } else { crate::effects_ui::fx_badge(c).into() },
                     has_thumb: thumb.is_some(),
                     thumb: thumb.unwrap_or_default(),
                     has_wave: wave.is_some(),
