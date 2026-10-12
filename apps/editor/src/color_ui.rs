@@ -3,13 +3,14 @@
 //! kept in the settings).
 
 use crate::app::App;
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::ComponentHandle;
 
 /// "#rrggbb" or "#rrggbbaa" (the # optional, surrounding spaces ignored).
 pub fn parse_hex(s: &str) -> Option<[u8; 4]> {
     let t = s.trim();
     let h = t.strip_prefix('#').unwrap_or(t);
-    if !h.is_ascii() || !(h.len() == 6 || h.len() == 8) {
+    // Hex digits only: `from_str_radix` alone would take a sign ("+f").
+    if !(h.len() == 6 || h.len() == 8) || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
@@ -45,15 +46,14 @@ pub fn wire(ui: &crate::AppWindow) {
 }
 
 impl App {
-    /// Shows the settings' recent colours in every picker.
+    /// Shows the settings' recent colours (at most 8, whatever the file
+    /// holds) in every picker. The model is updated in place: a swatch
+    /// clicked in the recent row keeps its element while the row reorders.
     pub fn show_recent_colours(&self) {
-        let colours: Vec<slint::Color> = self.settings.recent_colors.iter().filter_map(|h| parse_hex(h)).map(to_slint).collect();
+        let colours: Vec<slint::Color> = self.settings.recent_colors.iter().filter_map(|h| parse_hex(h)).take(8).map(to_slint).collect();
         let ui = self.ui();
         let cu = ui.global::<crate::ColorUtil>();
-        let old = cu.get_recent();
-        if old.row_count() != colours.len() || old.iter().zip(&colours).any(|(a, b)| a != *b) {
-            cu.set_recent(ModelRc::new(VecModel::from(colours)));
-        }
+        crate::util::sync_rows(cu.get_recent(), colours, |m| cu.set_recent(m));
     }
 
     /// A colour was committed in a picker: it becomes the newest recent one.
@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(parse_hex("#FF8000"), Some([255, 128, 0, 255]));
         assert_eq!(parse_hex(" #ff800080"), Some([255, 128, 0, 128]));
         assert_eq!(parse_hex("ff8000"), Some([255, 128, 0, 255]), "the # is optional when typing");
-        for bad in ["#ff80", "#zz0000", "#ff800080ff", "", "#ффф000"] {
+        for bad in ["#ff80", "#zz0000", "#ff800080ff", "", "#ффф000", "#+f+f+f", "#-0-0-0"] {
             assert_eq!(parse_hex(bad), None, "{bad:?}");
         }
         assert_eq!(to_hex([255, 128, 0, 255], false), "#ff8000");
