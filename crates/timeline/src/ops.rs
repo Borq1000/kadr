@@ -56,6 +56,13 @@ pub fn split_clip(clip: &Clip, t: Time, links: &mut LinkRemap) -> (Clip, Clip) {
     for (l, r) in left.effects.iter_mut().zip(right.effects.iter_mut()) {
         (l.progress, r.progress) = l.split_progress(frac);
     }
+    // Titles spec §3: the appearance stays left, the disappearance right,
+    // the highlight span is cut where the cut is; both keep the seed.
+    if let Some(doc) = clip.text.as_deref() {
+        let (l, r) = doc.split_at(frac);
+        left.text = Some(Box::new(l));
+        right.text = Some(Box::new(r));
+    }
     right.id = ClipId::new();
     right.link = links.right_link(clip.link);
     (left, right)

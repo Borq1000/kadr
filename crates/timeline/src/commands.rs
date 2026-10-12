@@ -8,7 +8,7 @@ use kadr_core::{AssetId, ClipId, EffectId, MarkerId, MediaKind, Time, TimeRange,
 use kadr_effects::{ParamDef, ParamKind};
 use kadr_project::{
     AnimError, AppliedEffect, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, ParamValue, Sequence,
-    SourceTime, Track, TrackKey, TrackKind, Transform, Transition,
+    SourceTime, TextDoc, Track, TrackKey, TrackKind, Transform, Transition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -85,11 +85,19 @@ pub enum ClipProperty {
     Speed(f64),
     /// Video fade-in / fade-out durations (each >= 0, sum <= clip duration).
     VideoFade(EdgeFades),
+    /// A text clip's document (titles spec §7): not a text clip →
+    /// `KindMismatch`, the same document → `NoOp`.
+    Text(Box<TextDoc>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EditCommand {
     InsertClip { track: TrackId, clip: Clip, mode: InsertMode },
+    /// A text clip (titles spec §7, refinement 11): on `track` (a video
+    /// track, unlocked, free over the clip's frame-snapped range), or —
+    /// `None` — on the topmost video track when it is unlocked and free
+    /// there, else on a new video track above all. One undo entry.
+    AddText { clip: Clip, track: Option<TrackId> },
     /// Moves clips (and their linked partners) by `delta`; clips named in
     /// `clips` additionally move `track_delta` tracks within their kind.
     MoveClips { clips: Vec<ClipId>, delta: Time, track_delta: i32 },
@@ -186,6 +194,7 @@ impl EditCommand {
         let k = match self {
             EditCommand::InsertClip { mode: InsertMode::Insert, .. } => "cmd.insert",
             EditCommand::InsertClip { .. } => "cmd.overwrite",
+            EditCommand::AddText { .. } => "cmd.add_text",
             EditCommand::MoveClips { .. } => "cmd.move",
             EditCommand::TrimClip { ripple: true, .. } => "cmd.ripple_trim",
             EditCommand::TrimClip { .. } => "cmd.trim",
@@ -265,6 +274,9 @@ impl EditCommand {
         match self {
             EditCommand::InsertClip { track, clip, mode } => {
                 let t = unlocked_mut(seq, *track)?;
+                if clip.text.is_some() && t.kind != TrackKind::Video {
+                    return Err(EditError::KindMismatch);
+                }
                 let expected = if ctx.assets.iter().any(|a| a.id == clip.asset && a.info.kind == MediaKind::Audio) {
                     TrackKind::Audio
                 } else {
@@ -288,6 +300,8 @@ impl EditCommand {
                 ops::insert_sorted(t, clip);
                 Ok(())
             }
+
+            EditCommand::AddText { clip, track } => add_text(seq, clip, *track),
 
             EditCommand::MoveClips { clips, delta, track_delta } => move_clips(seq, clips, fr.snap(*delta), *track_delta),
 
@@ -384,6 +398,11 @@ impl EditCommand {
                     ClipProperty::Enabled(v) => c.enabled = *v,
                     ClipProperty::Name(v) => c.name = v.clone(),
                     ClipProperty::Link(v) => c.link = *v,
+                    ClipProperty::Text(doc) => match &c.text {
+                        None => return Err(EditError::KindMismatch),
+                        Some(cur) if **cur == **doc => return Err(EditError::NoOp),
+                        Some(_) => c.text = Some(doc.clone()),
+                    },
                     ClipProperty::VideoFade(f) => {
                         if f.fade_in < Time::ZERO || f.fade_out < Time::ZERO || f.fade_in > c.duration() - f.fade_out {
                             return Err(EditError::InvalidRange);
@@ -968,9 +987,12 @@ fn trim(seq: &mut Sequence, ctx: &EditContext, id: ClipId, edge: TrimEdge, to: T
             TrimEdge::Start => {
                 // Can't shrink below one frame.
                 delta = delta.min(c.duration() - min_len);
-                // Can't extend before source start.
-                let earliest = c.timeline_time_of(Time::ZERO);
-                delta = delta.max(earliest - c.timeline_in);
+                // Can't extend before source start — a text clip has no
+                // source to run out of (titles spec §2.1).
+                if c.text.is_none() {
+                    let earliest = c.timeline_time_of(Time::ZERO);
+                    delta = delta.max(earliest - c.timeline_in);
+                }
                 if !ripple {
                     let prev_out = ci.checked_sub(1).map_or(Time::ZERO, |p| t.clips[p].timeline_out);
                     delta = delta.max(prev_out - c.timeline_in);
@@ -1024,6 +1046,50 @@ fn trim(seq: &mut Sequence, ctx: &EditContext, id: ClipId, edge: TrimEdge, to: T
             }
         }
     }
+    Ok(())
+}
+
+fn add_text(seq: &mut Sequence, clip: &Clip, track: Option<TrackId>) -> Result<(), EditError> {
+    if clip.text.is_none() {
+        return Err(EditError::KindMismatch);
+    }
+    let fr = seq.frame_rate;
+    let mut clip = clip.clone();
+    clip.move_to(fr.snap(clip.timeline_in).max(Time::ZERO));
+    let len = fr.snap(clip.duration()).max(fr.frame_duration());
+    (clip.timeline_out, clip.source_out) = (clip.timeline_in + len, clip.source_in + len);
+    let range = clip.timeline_range();
+    let free = |t: &Track| t.clips.iter().all(|c| !c.timeline_range().overlaps(&range));
+    let ti = match track {
+        Some(id) => {
+            let ti = seq.tracks.iter().position(|t| t.id == id).ok_or(EditError::TrackNotFound)?;
+            let t = &seq.tracks[ti];
+            if t.kind != TrackKind::Video {
+                return Err(EditError::KindMismatch);
+            }
+            if t.locked {
+                return Err(EditError::TrackLocked(t.name.clone()));
+            }
+            if !free(t) {
+                return Err(EditError::Overlap);
+            }
+            ti
+        }
+        None => {
+            // Video tracks are stored V1 (bottom) first: the topmost is the last.
+            let top = seq.tracks.iter().rposition(|t| t.kind == TrackKind::Video);
+            match top.filter(|&i| !seq.tracks[i].locked && free(&seq.tracks[i])) {
+                Some(ti) => ti,
+                None => {
+                    let n = seq.tracks_of(TrackKind::Video).count() + 1;
+                    let at = top.map_or(0, |i| i + 1);
+                    seq.tracks.insert(at, Track::new(TrackKind::Video, format!("V{n}")));
+                    at
+                }
+            }
+        }
+    };
+    ops::insert_sorted(&mut seq.tracks[ti], clip);
     Ok(())
 }
 

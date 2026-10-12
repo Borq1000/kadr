@@ -174,6 +174,9 @@ pub struct Clip {
     /// swaps `asset`/source range using the group's sync offsets.
     #[serde(default)]
     pub multicam: Option<MulticamSelection>,
+    /// The picture of a text clip (titles spec §2.1); `None` for media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Box<crate::TextDoc>>,
 }
 
 fn yes() -> bool {
@@ -202,7 +205,20 @@ impl Clip {
             animation: Animation::default(),
             video_fade: EdgeFades::default(),
             multicam: None,
+            text: None,
         }
+    }
+
+    /// A text clip (titles spec §2.1): no media (`TEXT_ASSET`), its own
+    /// time from 0 at speed 1, named after its first line.
+    pub fn new_text(doc: crate::TextDoc, at: Time, duration: Time) -> Self {
+        let mut c = Clip::new(crate::TEXT_ASSET, doc.label(), TimeRange::new(Time::ZERO, duration), at);
+        c.text = Some(Box::new(doc));
+        c
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.text.is_some()
     }
 
     pub fn timeline_range(&self) -> TimeRange {

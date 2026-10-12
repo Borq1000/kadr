@@ -10,6 +10,7 @@ pub mod fades;
 pub mod io;
 pub mod model;
 pub mod sequence;
+pub mod text;
 pub mod transitions;
 
 pub use ai_log::*;
@@ -20,4 +21,5 @@ pub use effects::*;
 pub use fades::*;
 pub use model::*;
 pub use sequence::*;
+pub use text::*;
 pub use transitions::*;

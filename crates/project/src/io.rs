@@ -98,7 +98,9 @@ pub fn parse(bytes: &[u8], path: &Path) -> Result<Project, ProjectIoError> {
 /// never-evaluated `effects` with `AppliedEffect`s (effects spec §2).
 /// Transitions kept their `kind` in format 3: they are converted by content
 /// on every load (`migrate_transitions`, effects E3), without another
-/// format bump.
+/// format bump. Format 4 added text clips (titles spec §2.1): nothing to
+/// migrate — a format 3 file has none, and an older Kadr refuses a format 4
+/// file instead of dropping its text.
 fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
     if from < 2 {
         for_each_clip(&mut value, migrate_clip_keyframes);
@@ -109,6 +111,13 @@ fn migrate(mut value: serde_json::Value, from: u32) -> serde_json::Value {
         if let Some(obj) = value.as_object_mut() {
             obj.insert("format_version".into(), 3.into());
         }
+    }
+    // Format 4 added text clips (titles spec §2.1): nothing to migrate; the
+    // upgraded document is a format-4 document in memory too.
+    if from < 4
+        && let Some(obj) = value.as_object_mut()
+    {
+        obj.insert("format_version".into(), 4.into());
     }
     // E3, on every load: transitions named by an old kind become recipes on their cut.
     for_each_sequence(&mut value, migrate_transitions);
@@ -384,10 +393,22 @@ mod tests {
     }
 
     #[test]
-    fn a_format_3_file_is_too_new_for_a_format_2_reader() {
-        assert_eq!(FORMAT_VERSION, 3);
+    fn a_format_4_file_is_too_new_for_a_format_3_reader() {
+        assert_eq!(FORMAT_VERSION, 4);
         let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
         assert!(matches!(parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err(), ProjectIoError::TooNew { .. }));
+    }
+
+    /// Format 3 needs no migration for text: it opens, and saving writes format 4.
+    #[test]
+    fn a_format_3_project_opens_and_saves_as_format_4() {
+        let mut v = serde_json::to_value(crate::Project::new("old")).unwrap();
+        v["format_version"] = serde_json::json!(3);
+        let mut p = parse(&serde_json::to_vec(&v).unwrap(), Path::new("old.kadr")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        save(&mut p, &dir.path().join("p.kadr")).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(dir.path().join("p.kadr")).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], serde_json::json!(4));
     }
 
     /// Format 2 clip JSON with the old, never-evaluated effects list.
@@ -418,7 +439,7 @@ mod tests {
         assert_eq!(fx[1].params["strength"], crate::ParamValue::Number(1.0));
         let saved = serde_json::to_value(&p).unwrap();
         assert!(saved["sequences"][0]["tracks"][0]["clips"][0]["effects"][0].get("kind").is_none(), "the old field is never written");
-        assert_eq!(saved["format_version"], serde_json::json!(3));
+        assert_eq!(saved["format_version"], serde_json::json!(FORMAT_VERSION));
     }
 
     /// Two clips on V1 of `v2_project` meeting at 10 s; returns their ids.
@@ -456,7 +477,7 @@ mod tests {
                 let s = &saved["sequences"][0]["transitions"][0];
                 assert_eq!(s["params"], params, "{kind}");
                 assert!(s.get("kind").is_none() && s.get("track").is_none() && s.get("at").is_none(), "{kind}: the old fields are never written");
-                assert_eq!(saved["format_version"], serde_json::json!(3), "no new format (R2)");
+                assert_eq!(saved["format_version"], serde_json::json!(FORMAT_VERSION), "the current format (E3 added none, R2; titles made it 4)");
             }
         }
     }
@@ -572,7 +593,7 @@ mod tests {
             if kept == 1 {
                 assert_eq!((fx[0].recipe.as_str(), &fx[0].params["strength"]), ("smooth_zoom", &crate::ParamValue::Number(0.5)));
             }
-            assert_eq!(serde_json::to_value(&p).unwrap()["format_version"], serde_json::json!(3));
+            assert_eq!(serde_json::to_value(&p).unwrap()["format_version"], serde_json::json!(FORMAT_VERSION));
         }
     }
 
