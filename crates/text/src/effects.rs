@@ -65,32 +65,45 @@ pub(crate) fn blur(m: &mut Mask, r: f32) {
     // A box wider than the mask averages it whole: no wider box is needed.
     let r = r.min(w.max(h) as f32);
     let passes: Vec<Pass> = if r < TAPS_BELOW { vec![Pass::Taps(gaussian_taps(r))] } else { vec![extended_box(r / 3f32.sqrt()); 3] };
-    // Rows: each a line of one lane.
+    // Rows, one by one.
     let (mut a, mut b) = (vec![0.0f32; w], vec![0.0f32; w]);
     for row in m.a.chunks_exact_mut(w) {
         a.copy_from_slice(row);
         for p in &passes {
-            p.run(&a, &mut b, 1);
+            p.run_line(&a, &mut b);
             std::mem::swap(&mut a, &mut b);
         }
         row.copy_from_slice(&a);
     }
-    // Columns: a band of up to BAND of them at a time, gathered row by row.
-    let (mut a, mut b) = (vec![0.0f32; h * BAND.min(w)], vec![0.0f32; h * BAND.min(w)]);
-    for x0 in (0..w).step_by(BAND) {
-        let lanes = BAND.min(w - x0);
-        let (a, b) = (&mut a[..h * lanes], &mut b[..h * lanes]);
-        for (y, dst) in a.chunks_exact_mut(lanes).enumerate() {
-            dst.copy_from_slice(&m.a[y * w + x0..y * w + x0 + lanes]);
+    // Columns: BAND of them at a time, gathered row by row; the last few
+    // (fewer than BAND) one by one.
+    let (mut a, mut b) = (vec![0.0f32; h * BAND], vec![0.0f32; h * BAND]);
+    let banded = w - w % BAND;
+    for x0 in (0..banded).step_by(BAND) {
+        for (y, dst) in a.as_chunks_mut::<BAND>().0.iter_mut().enumerate() {
+            dst.copy_from_slice(&m.a[y * w + x0..y * w + x0 + BAND]);
+        }
+        for p in &passes {
+            p.run_band(&a, &mut b);
+            std::mem::swap(&mut a, &mut b);
+        }
+        for (y, src) in a.as_chunks::<BAND>().0.iter().enumerate() {
+            m.a[y * w + x0..y * w + x0 + BAND].copy_from_slice(src);
+        }
+    }
+    let (a, b) = (&mut a[..h], &mut b[..h]);
+    for x in banded..w {
+        for (y, v) in a.iter_mut().enumerate() {
+            *v = m.a[y * w + x];
         }
         let mut swapped = false;
         for p in &passes {
-            if swapped { p.run(b, a, lanes) } else { p.run(a, b, lanes) }
+            if swapped { p.run_line(b, a) } else { p.run_line(a, b) }
             swapped = !swapped;
         }
         let out = if swapped { &*b } else { &*a };
-        for (y, src) in out.chunks_exact(lanes).enumerate() {
-            m.a[y * w + x0..y * w + x0 + lanes].copy_from_slice(src);
+        for (y, v) in out.iter().enumerate() {
+            m.a[y * w + x] = *v;
         }
     }
 }
@@ -114,45 +127,94 @@ enum Pass {
 }
 
 impl Pass {
-    /// The pass along a line of `src.len() / lanes` steps, each step
-    /// `lanes` values side by side (lane `c` of step `i` at `i·lanes + c`),
-    /// into `dst`; zero outside the line.
-    fn run(&self, src: &[f32], dst: &mut [f32], lanes: usize) {
-        let n = src.len() / lanes;
-        let step = |i: usize| &src[i * lanes..(i + 1) * lanes];
+    /// The pass along a line `src` into `dst`; zero outside the line.
+    fn run_line(&self, src: &[f32], dst: &mut [f32]) {
+        let n = src.len();
         match self {
             Pass::Box { l, alpha } => {
                 let (l, alpha) = (*l, *alpha);
                 let k = 1.0 / (2.0 * l as f32 + 1.0 + 2.0 * alpha);
-                // The running sum of each lane over the steps within `l` of `i`.
-                let mut sum = vec![0.0f32; lanes];
-                for i in 0..=l.min(n - 1) {
-                    sum.iter_mut().zip(step(i)).for_each(|(s, v)| *s += v);
-                }
+                // The running sum over the steps within `l` of `i`.
+                let mut sum: f32 = src[..=l.min(n - 1)].iter().sum();
                 for i in 0..n {
-                    let out = &mut dst[i * lanes..(i + 1) * lanes];
-                    out.iter_mut().zip(&sum).for_each(|(d, s)| *d = s * k);
-                    if alpha > 0.0 {
-                        let ka = k * alpha;
-                        for s in [i.checked_sub(l + 1), Some(i + l + 1).filter(|&s| s < n)].into_iter().flatten() {
-                            out.iter_mut().zip(step(s)).for_each(|(d, v)| *d += v * ka);
-                        }
+                    let mut v = sum;
+                    if i > l {
+                        v += alpha * src[i - l - 1];
                     }
                     if i + l + 1 < n {
-                        sum.iter_mut().zip(step(i + l + 1)).for_each(|(s, v)| *s += v);
+                        v += alpha * src[i + l + 1];
+                        sum += src[i + l + 1];
                     }
                     if i >= l {
-                        sum.iter_mut().zip(step(i - l)).for_each(|(s, v)| *s -= v);
+                        sum -= src[i - l];
                     }
+                    dst[i] = v * k;
                 }
             }
             Pass::Taps(taps) => {
-                for i in 0..n {
-                    let out = &mut dst[i * lanes..(i + 1) * lanes];
-                    out.iter_mut().zip(step(i)).for_each(|(d, v)| *d = v * taps[0]);
+                for (i, out) in dst.iter_mut().enumerate() {
+                    let mut v = src[i] * taps[0];
                     for (j, &t) in taps.iter().enumerate().skip(1) {
-                        for s in [i.checked_sub(j), Some(i + j).filter(|&s| s < n)].into_iter().flatten() {
-                            out.iter_mut().zip(step(s)).for_each(|(d, v)| *d += v * t);
+                        if i >= j {
+                            v += src[i - j] * t;
+                        }
+                        if i + j < n {
+                            v += src[i + j] * t;
+                        }
+                    }
+                    *out = v;
+                }
+            }
+        }
+    }
+
+    /// [`Pass::run_line`] down [`BAND`] lines side by side: step `i` of
+    /// line `c` at `i·BAND + c` (row-major, Minor 5).
+    fn run_band(&self, src: &[f32], dst: &mut [f32]) {
+        let steps = src.as_chunks::<BAND>().0;
+        let n = steps.len();
+        let step = |i: usize| &steps[i];
+        match self {
+            Pass::Box { l, alpha } => {
+                let (l, alpha) = (*l, *alpha);
+                let k = 1.0 / (2.0 * l as f32 + 1.0 + 2.0 * alpha);
+                let mut sum = [0.0f32; BAND];
+                for i in 0..=l.min(n - 1) {
+                    let s = step(i);
+                    (0..BAND).for_each(|c| sum[c] += s[c]);
+                }
+                for (i, out) in dst.as_chunks_mut::<BAND>().0.iter_mut().enumerate() {
+                    let mut v = sum;
+                    if i > l {
+                        let s = step(i - l - 1);
+                        (0..BAND).for_each(|c| v[c] += alpha * s[c]);
+                    }
+                    if i + l + 1 < n {
+                        let s = step(i + l + 1);
+                        (0..BAND).for_each(|c| {
+                            v[c] += alpha * s[c];
+                            sum[c] += s[c];
+                        });
+                    }
+                    if i >= l {
+                        let s = step(i - l);
+                        (0..BAND).for_each(|c| sum[c] -= s[c]);
+                    }
+                    (0..BAND).for_each(|c| out[c] = v[c] * k);
+                }
+            }
+            Pass::Taps(taps) => {
+                for (i, out) in dst.as_chunks_mut::<BAND>().0.iter_mut().enumerate() {
+                    let s = step(i);
+                    (0..BAND).for_each(|c| out[c] = s[c] * taps[0]);
+                    for (j, &t) in taps.iter().enumerate().skip(1) {
+                        if i >= j {
+                            let s = step(i - j);
+                            (0..BAND).for_each(|c| out[c] += s[c] * t);
+                        }
+                        if i + j < n {
+                            let s = step(i + j);
+                            (0..BAND).for_each(|c| out[c] += s[c] * t);
                         }
                     }
                 }
