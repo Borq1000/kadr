@@ -78,7 +78,7 @@ fn text_goldens() {
     let mut caps = base("разрядка");
     caps.paragraph.caps = true;
     caps.paragraph.letter_spacing = 12.0;
-    caps.style.font = FontRef { family: "Oswald".into(), weight: 500, italic: false };
+    caps.style.font = FontRef::new("Oswald", 500, false);
     check("caps_spacing", &caps, Clock::REST, 1.0);
     check("title_plain_x2", &base("Привет, мир!"), Clock::REST, 2.0);
 }
