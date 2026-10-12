@@ -11,6 +11,7 @@ pub mod frame;
 pub mod layout;
 pub(crate) mod raster;
 pub mod shape;
+pub mod styles;
 
 pub use anim::{Clock, FrameAnim, GlyphAnim};
 pub use fonts::{fonts, Family, FontError, FontSource, BUNDLED_FAMILIES, DEFAULT_FAMILY};

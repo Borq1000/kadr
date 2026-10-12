@@ -287,3 +287,100 @@ fn a_plaque_does_not_change_how_the_text_moves() {
         assert_eq!((a.placement.scale, a.placement.rotation), (b.placement.scale, b.placement.rotation), "{ms} ms");
     }
 }
+
+/// The pixels and placement of the only layer at `t`.
+fn picture_at(p: &Project, t: Time) -> (Placement, Vec<u8>) {
+    let l = layer_at(p, t).remove(0);
+    let raster = text_of(&l).picture.render(1.0, &kadr_core::FramePool::new(0));
+    (l.placement, raster.data.to_vec())
+}
+
+fn edit(p: &Project, cmd: kadr_timeline::EditCommand) -> Project {
+    let mut q = p.clone();
+    kadr_timeline::EditEngine::new().execute(&mut q, cmd).unwrap();
+    q
+}
+
+/// Review Focus 5: a loop runs in source time and the highlight's span is
+/// cut at the split — the picture is the same on both sides of the joint.
+#[test]
+fn a_split_keeps_the_loop_picture_at_the_joint() {
+    let mut doc = TextDoc::starter("Пульс", 1080);
+    doc.anim.looping = Some(LoopAnim { preset: "wave".into(), unit: Unit::Letter, speed: 1.0, amount: 1.0, extra: Default::default() });
+    doc.anim.highlight = Some(Highlight { colour: Rgba8::rgba(255, 212, 0, 255), scale: 1.1, span: (0.0, 1.0), extra: Default::default() });
+    let (p, id) = project(doc);
+    let q = edit(&p, kadr_timeline::EditCommand::Split { at: s(2), clips: Some(vec![id]) });
+    assert_eq!(q.sequence().tracks[0].clips.len(), 2);
+    for t in [500, 1_960, 2_000, 2_040, 3_700, 4_960].map(Time::from_millis) {
+        assert!(picture_at(&p, t) == picture_at(&q, t), "the picture at {t:?} is the same after the split");
+    }
+    assert!(picture_at(&p, Time::from_millis(1_960)) != picture_at(&p, s(2)), "the loop moves across the joint");
+}
+
+/// Review Focus 5: the appearance stays with the left piece, the
+/// disappearance with the right one; in between the title is at rest.
+#[test]
+fn split_hands_in_to_the_left_and_out_to_the_right() {
+    let mut doc = TextDoc::starter("Раз два", 1080);
+    doc.anim.reveal_in = kadr_text::anim::reveal("rise").map(|r| r.fresh());
+    doc.anim.reveal_out = kadr_text::anim::reveal("fade").map(|r| r.fresh());
+    let (p, id) = project(doc);
+    let q = edit(&p, kadr_timeline::EditCommand::Split { at: Time::from_millis(2_500), clips: Some(vec![id]) });
+    let (l, r) = (&q.sequence().tracks[0].clips[0], &q.sequence().tracks[0].clips[1]);
+    let (ld, rd) = (l.text.as_deref().unwrap(), r.text.as_deref().unwrap());
+    assert!(ld.anim.reveal_in.is_some() && ld.anim.reveal_out.is_none() && rd.anim.reveal_in.is_none() && rd.anim.reveal_out.is_some());
+    for t in [200, 2_400, 2_460, 2_500, 2_600, 4_800, 4_960].map(Time::from_millis) {
+        assert!(picture_at(&p, t) == picture_at(&q, t), "at {t:?}: the in stays left, the out right, the middle at rest");
+    }
+}
+
+/// Review Focus 5: a trim of the start moves the appearance with the edge.
+#[test]
+fn trim_moves_the_reveals_with_the_edges() {
+    let mut doc = TextDoc::starter("Раз два", 1080);
+    doc.anim.reveal_in = kadr_text::anim::reveal("rise").map(|r| r.fresh());
+    doc.anim.reveal_out = kadr_text::anim::reveal("fade").map(|r| r.fresh());
+    let (p, id) = project(doc);
+    let q = edit(&p, kadr_timeline::EditCommand::TrimClip { clip: id, edge: kadr_timeline::TrimEdge::Start, to: s(1), ripple: false });
+    let raster = |pr: &Project, t: i64| picture_at(pr, Time::from_millis(t)).1;
+    assert!(raster(&q, 1_200) == raster(&p, 200), "the appearance starts at the new edge");
+    assert!(raster(&q, 1_200) != raster(&q, 2_200), "and is moving there");
+    let q = edit(&p, kadr_timeline::EditCommand::TrimClip { clip: id, edge: kadr_timeline::TrimEdge::End, to: s(4), ripple: false });
+    assert!(raster(&q, 3_800) == raster(&p, 4_800), "the disappearance ends at the new edge");
+}
+
+/// TX-R6: the disappearance finishes on the clip's last frame — nothing
+/// is drawn there — and the frame before still shows the title leaving.
+#[test]
+fn the_disappearance_finishes_on_the_last_frame() {
+    let mut doc = TextDoc::starter("Пока", 1080);
+    doc.anim.reveal_out = kadr_text::anim::reveal("fade").map(|r| r.fresh());
+    let (p, _) = project(doc);
+    let alpha = |t: i64| picture_at(&p, Time::from_millis(t)).1.as_chunks::<4>().0.iter().map(|px| px[3] as u32).sum::<u32>();
+    assert_eq!(alpha(4_960), 0, "the last frame: gone");
+    assert!(alpha(4_920) > 0 && alpha(4_920) < alpha(4_000), "one frame before: fading");
+}
+
+/// An animated title's picture key changes when its pixels do: the frames
+/// after a finished appearance are one picture (the player and the raster
+/// cache keep it), the frames of a moving one are not; so are a
+/// typewriter's frames between two letters.
+#[test]
+fn an_animated_titles_key_holds_while_its_picture_does() {
+    let mut doc = TextDoc::starter("Раз два три", 1080);
+    doc.anim.reveal_in = kadr_text::anim::reveal("rise").map(|r| r.fresh());
+    let (p, _) = project(doc);
+    let at = |t: i64| layer_at(&p, Time::from_millis(t)).remove(0);
+    let (a, b) = (at(2_000), at(2_040));
+    assert_eq!((text_of(&a), a.placement), (text_of(&b), b.placement), "at rest: one picture");
+    let (a, b) = (at(120), at(160));
+    assert_ne!(text_of(&a), text_of(&b), "rising: another picture each frame");
+    assert!(picture_at(&p, Time::from_millis(120)) != picture_at(&p, Time::from_millis(160)));
+    let mut typed = TextDoc::starter("абвгд", 1080);
+    typed.anim.reveal_in = Some(Reveal { preset: "typewriter".into(), unit: Unit::Letter, duration: Time::from_millis(1), stagger: Time::from_millis(100), ease: "linear".into(), extra: Default::default() });
+    let (p, _) = project(typed);
+    let at = |t: i64| layer_at(&p, Time::from_millis(t)).remove(0);
+    let (a, b, c) = (at(120), at(160), at(240));
+    assert_eq!((text_of(&a), a.placement), (text_of(&b), b.placement), "the same letters typed: one picture");
+    assert_ne!(text_of(&b), text_of(&c), "the next letter: another");
+}

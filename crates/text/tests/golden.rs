@@ -24,7 +24,11 @@ pub fn picture(frame: &TextFrame, scale: f32) -> (u32, u32, Vec<u8>) {
 }
 
 pub fn check(name: &str, doc: &TextDoc, clock: Clock, scale: f32) {
-    let (w, h, px) = picture(&TextFrame::new(doc, clock), scale);
+    check_px(name, picture(&TextFrame::new(doc, clock), scale));
+}
+
+/// Compares (or with `KADR_UPDATE_GOLDEN=1` writes) an opaque RGBA picture.
+fn check_px(name: &str, (w, h, px): (u32, u32, Vec<u8>)) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(format!("{name}.png"));
     if std::env::var("KADR_UPDATE_GOLDEN").as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -121,4 +125,96 @@ fn look_goldens() {
     emoji.style.outlines = vec![Outline { width: 3.0, colour: Rgba8::BLACK }];
     emoji.style.shadow = Some(Shadow { colour: Rgba8::rgba(0, 0, 0, 160), offset_x: 3.0, offset_y: 4.0, blur: 4.0 });
     check("emoji_styled", &emoji, Clock::REST, 1.0);
+}
+
+/// An opaque RGBA picture: width, height, pixels.
+type Picture = (u32, u32, Vec<u8>);
+
+/// Frames stacked top to bottom over the background colour, each placed
+/// so that its anchor (the layout box centre) lies at one point of its
+/// row — the motion shows against the title's place: the title at
+/// `at_ms` into a clip of `clip_ms` (loops in step, the highlight's
+/// progress across the clip), at half size.
+fn strip(doc: &TextDoc, at_ms: &[i64], clip_ms: i64) -> Picture {
+    let frames: Vec<(Picture, (u32, u32))> = at_ms
+        .iter()
+        .map(|&t| {
+            let ms = kadr_core::Time::from_millis;
+            let c = Clock { since_in: ms(t), until_out: ms(clip_ms - t), source: ms(t), highlight: t as f64 / clip_ms as f64 };
+            let f = TextFrame::new(doc, c);
+            let (w, h, px) = picture(&f, 0.5);
+            let b = f.bounds();
+            let anchor = ((-b.x0 * w as f32 / b.width()).round() as u32, (-b.y0 * h as f32 / b.height()).round() as u32);
+            ((w, h, px), anchor)
+        })
+        .collect();
+    let (left, right) = (frames.iter().map(|f| f.1.0).max().unwrap(), frames.iter().map(|f| f.0.0 - f.1.0).max().unwrap());
+    let (top, bottom) = (frames.iter().map(|f| f.1.1).max().unwrap(), frames.iter().map(|f| f.0.1 - f.1.1).max().unwrap());
+    let (w, ch) = (left + right, top + bottom);
+    let h = ch * frames.len() as u32;
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for p in out.as_chunks_mut::<4>().0 {
+        *p = [BG[0] as u8, BG[1] as u8, BG[2] as u8, 255];
+    }
+    for (i, ((fw, fh, px), (ax, ay))) in frames.into_iter().enumerate() {
+        let (x0, y0) = (left - ax, i as u32 * ch + top - ay);
+        for y in 0..fh {
+            let dst = (((y0 + y) * w + x0) * 4) as usize;
+            out[dst..dst + (fw * 4) as usize].copy_from_slice(&px[(y * fw * 4) as usize..((y + 1) * fw * 4) as usize]);
+        }
+    }
+    (w, h, out)
+}
+
+/// Pictures in a grid of `cols` columns, each centred in a cell as large
+/// as the largest, over the background colour.
+fn sheet(pics: Vec<Picture>, cols: usize) -> Picture {
+    let (cw, ch) = (pics.iter().map(|p| p.0).max().unwrap(), pics.iter().map(|p| p.1).max().unwrap());
+    let rows = pics.len().div_ceil(cols) as u32;
+    let (w, h) = (cw * cols as u32, ch * rows);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for p in out.as_chunks_mut::<4>().0 {
+        *p = [BG[0] as u8, BG[1] as u8, BG[2] as u8, 255];
+    }
+    for (i, (pw, ph, px)) in pics.into_iter().enumerate() {
+        let (x0, y0) = ((i % cols) as u32 * cw + (cw - pw) / 2, (i / cols) as u32 * ch + (ch - ph) / 2);
+        for y in 0..ph {
+            let dst = (((y0 + y) * w + x0) * 4) as usize;
+            out[dst..dst + (pw * 4) as usize].copy_from_slice(&px[(y * pw * 4) as usize..((y + 1) * pw * 4) as usize]);
+        }
+    }
+    (w, h, out)
+}
+
+#[test]
+fn motion_goldens() {
+    let mut rise = base("Раз два три");
+    rise.anim.reveal_in = kadr_text::anim::reveal("rise").map(|r| r.fresh());
+    check_px("anim_rise_strip", strip(&rise, &[0, 120, 240, 360, 480, 700], 4_000));
+    let mut pop = base("ХЛОП");
+    pop.anim.reveal_in = kadr_text::anim::reveal("pop").map(|r| r.fresh());
+    check_px("anim_pop_strip", strip(&pop, &[0, 60, 120, 180, 240, 450], 4_000));
+    let mut scatter = base("Рассыпание");
+    scatter.anim.reveal_in = kadr_text::anim::reveal("scatter").map(|r| r.fresh());
+    check_px("anim_scatter_strip", strip(&scatter, &[0, 150, 300, 450, 900], 4_000));
+    let mut hl = base("каждое слово по очереди");
+    hl.anim.highlight = Some(Highlight { colour: Rgba8::rgba(255, 212, 0, 255), scale: 1.12, span: (0.0, 1.0), extra: Default::default() });
+    check_px("anim_highlight_strip", strip(&hl, &[100, 1_100, 2_100, 3_100], 4_000));
+}
+
+/// Every built-in style at rest on a 960×540 frame (half of 1080p), four
+/// to a row, on its gallery's kind of text.
+#[test]
+fn styles_sheet_golden() {
+    let pics: Vec<Picture> = kadr_text::styles::builtin()
+        .iter()
+        .map(|s| {
+            let sample = if s.sample == "text.sample.score" { "2 : 1" } else { "Кадр 2026" };
+            let mut d = s.new_doc(sample, 960, 540);
+            d.seed = 1; // a fresh doc's seed is random: flicker would differ run to run
+            picture(&TextFrame::new(&d, Clock { highlight: 0.3, ..Clock::REST }), 1.0)
+        })
+        .collect();
+    assert_eq!(pics.len(), 22);
+    check_px("styles_sheet", sheet(pics, 4));
 }

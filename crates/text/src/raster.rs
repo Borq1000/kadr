@@ -21,7 +21,10 @@
 //! the finished raster. A tilted text draws its flat picture in a canvas
 //! of at most max(N, [`TILT_FLAT_PIXELS`]) px (Task 9 review, Minor 8) and
 //! then holds it with the N px RGBA8 result: at most 24 B × max(N, 4 Mpx).
-//! The blur's scratch is a few rows. Past [`MAX_RASTER_PIXELS`] nothing is
+//! The blur's scratch is a few rows. A glyph mid blur-in (titles spec §4)
+//! is blurred in a mask of its own (one glyph at a time; four masks for a
+//! colour glyph), each clipped to the raster and in practice a glyph's
+//! size and its blur's. Past [`MAX_RASTER_PIXELS`] nothing is
 //! allocated: the picture is a 1×1 transparent raster. Glyph images are
 //! cached up to [`GLYPH_CACHE_BYTES`].
 
@@ -226,6 +229,13 @@ fn rot((x, y): (f32, f32), a: f32) -> (f32, f32) {
     (x * c - y * s, x * s + y * c)
 }
 
+/// A glyph's blur as drawn (TX-R5): a blur-in's is a fraction of the
+/// glyph's size; none is wider than a shadow's ([`crate::effects::MAX_BLUR`]
+/// canvas px) and a value that is not a number is none.
+fn glyph_blur(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(0.0, crate::effects::MAX_BLUR) } else { 0.0 }
+}
+
 /// The glyphs along the shape, moved by the animation (titles spec §4):
 /// each turns and scales about its own centre and shifts; then the whole
 /// block turns, scales and shifts about the layout box centre.
@@ -250,7 +260,7 @@ pub(crate) fn finals(laid: &Laid, placed: &[Placed], anim: &FrameAnim) -> Vec<Fi
                 rotation: r + b.rotation,
                 scale: a.scale * b.scale,
                 opacity: (a.opacity * b.opacity).clamp(0.0, 1.0),
-                blur: a.blur.max(b.blur),
+                blur: glyph_blur(a.blur.max(b.blur)),
                 colour: a.colour,
                 still: a.rotation + b.rotation == 0.0 && a.scale * b.scale == 1.0,
             }
@@ -301,9 +311,10 @@ pub(crate) fn outline_reach(doc: &TextDoc) -> f32 {
 /// the layout box, or a curved text's glyphs as placed — TX-R15), every
 /// glyph's em box as drawn (a line's last letter without the letter
 /// spacing after it), the plaque, room for the outlines and ink beyond the
-/// em box — the text — then the glow round the text (3 × its radius) and
-/// the shadow (the text shifted, 3 σ of blur round it; the glow is not
-/// in the shadow).
+/// em box and 3 σ round the most blurred glyph drawn (a blur-in) — the
+/// text — then the glow round the text (3 × its radius) and the shadow
+/// (the text shifted, 3 σ of blur round it; the glow is not in the
+/// shadow).
 pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final]) -> Bounds {
     let (cx, cy) = (laid.width / 2.0, laid.height / 2.0);
     let mut b = Bounds { x0: block.x0 + cx, y0: block.y0 + cy, x1: block.x1 + cx, y1: block.y1 + cy };
@@ -317,7 +328,8 @@ pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final]
     for (x0, y0, x1, y1) in plaque_rects(doc, laid) {
         b = b.union(Bounds { x0, y0, x1, y1 });
     }
-    let margin = outline_reach(doc) + 0.15 * laid.max_size + 2.0;
+    let blur = laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0).map(|(_, f)| f.blur).fold(0.0f32, f32::max);
+    let margin = outline_reach(doc) + 0.15 * laid.max_size + 3.0 * blur + 2.0;
     let text = b.grow(margin);
     let mut b = text;
     if let Some((_, radius, _)) = crate::effects::glow(doc) {
@@ -568,15 +580,105 @@ impl Place {
     }
 }
 
-/// The union of every visible glyph's coverage, stroked by `stroke` canvas px when > 0.
+/// The union of every visible glyph's coverage, stroked by `stroke` canvas
+/// px when > 0; a glyph mid blur-in blurred alike (so its outline blurs
+/// with its fill).
 pub(crate) fn glyph_mask(laid: &Laid, finals: &[Final], at: &Place, w: usize, h: usize, stroke: f32) -> Mask {
     let mut m = Mask::new(w, h);
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
         if let Some((img, x0, y0)) = at.image(laid, g, f, stroke) {
-            m.union(&img, x0, y0, f.opacity);
+            match Blurred::of(&img, x0, y0, at.len(f.blur), w, h) {
+                Some(b) => b.union_into(&mut m, f.opacity),
+                None => m.union(&img, x0, y0, f.opacity),
+            }
         }
     }
     m
+}
+
+/// A glyph image blurred by `r` raster px (a blur-in, titles spec §4) in
+/// a mask of its own: the image's box grown by 3 r, clipped to the `w × h`
+/// raster — the glyph lies inside it (its bounds hold 3 σ round it), so
+/// nothing that would blur into the raster is cut, and the mask is never
+/// larger than the raster whatever `r`. A colour glyph's premultiplied
+/// red, green and blue are blurred alike. Only a glyph mid-reveal has
+/// one: at rest (`r` under half a pixel) the image is drawn as it is.
+struct Blurred {
+    x0: usize,
+    y0: usize,
+    cov: Mask,
+    colours: Option<[Mask; 3]>,
+}
+
+impl Blurred {
+    fn of(img: &Image, x0: i32, y0: i32, r: f32, w: usize, h: usize) -> Option<Blurred> {
+        if r.is_nan() || r < 0.5 || matches!(img.content, Content::SubpixelMask) {
+            return None;
+        }
+        let pad = (3.0 * r).ceil().min(w.max(h) as f32) as i64;
+        let p = img.placement;
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let (bx0, by0) = ((x0 - pad).max(0), (y0 - pad).max(0));
+        let (bx1, by1) = ((x0 + p.width as i64 + pad).min(w as i64), (y0 + p.height as i64 + pad).min(h as i64));
+        if bx1 <= bx0 || by1 <= by0 {
+            return None;
+        }
+        let (mw, mh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+        let (ox, oy) = ((x0 - bx0) as i32, (y0 - by0) as i32);
+        let mut cov = Mask::new(mw, mh);
+        cov.union(img, ox, oy, 1.0);
+        crate::effects::blur(&mut cov, r);
+        let colours = matches!(img.content, Content::Color).then(|| {
+            // COLR output is premultiplied; a colour bitmap is straight.
+            let straight = matches!(img.source, Source::ColorBitmap(_));
+            [0, 1, 2].map(|c| {
+                let mut m = Mask::new(mw, mh);
+                for row in 0..p.height as usize {
+                    for col in 0..p.width as usize {
+                        let s = &img.data[(row * p.width as usize + col) * 4..][..4];
+                        let v = s[c] as f32 / 255.0 * if straight { s[3] as f32 / 255.0 } else { 1.0 };
+                        let (x, y) = (ox as i64 + col as i64, oy as i64 + row as i64);
+                        if x >= 0 && y >= 0 && (x as usize) < mw && (y as usize) < mh {
+                            m.a[y as usize * mw + x as usize] = v;
+                        }
+                    }
+                }
+                crate::effects::blur(&mut m, r);
+                m
+            })
+        });
+        Some(Blurred { x0: bx0 as usize, y0: by0 as usize, cov, colours })
+    }
+
+    /// The raster pixel of mask pixel `i`.
+    fn pixel(&self, i: usize, raster_w: usize) -> (usize, usize, usize) {
+        let (x, y) = (self.x0 + i % self.cov.w, self.y0 + i / self.cov.w);
+        (x, y, y * raster_w + x)
+    }
+
+    /// Max-union of the blurred coverage times `k` into a raster-sized mask.
+    fn union_into(&self, m: &mut Mask, k: f32) {
+        for (i, &a) in self.cov.a.iter().enumerate() {
+            let (_, _, at) = self.pixel(i, m.w);
+            m.a[at] = m.a[at].max(a * k);
+        }
+    }
+
+    /// [`paint_glyph`] of the blurred glyph.
+    fn paint(&self, c: &mut Canvas, cover: &mut Mask, colour: impl Fn(usize, usize) -> [f32; 4], opacity: f32) {
+        for (i, &a) in self.cov.a.iter().enumerate() {
+            let cov = a * opacity;
+            if cov <= 0.0 {
+                continue;
+            }
+            let (x, y, at) = self.pixel(i, c.w);
+            match &self.colours {
+                None => c.over(at, colour(x, y), cov),
+                Some([r, g, b]) => c.over(at, [r.a[i], g.a[i], b.a[i], a], opacity),
+            }
+            cover.over(at, cov);
+        }
+    }
 }
 
 /// Draws one glyph's fill: its coverage in `colour` (premultiplied), or a
@@ -699,7 +801,7 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
 pub(crate) fn compose(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, at: &Place, w: usize, h: usize) -> Canvas {
     let finals = finals(laid, placed, anim);
     let block = crate::shape::block(doc, laid, placed);
-    let mut canvas = text_layer(doc, laid, block, &finals, at, w, h);
+    let mut canvas = text_layer(doc, laid, block, &finals, anim.cursor, at, w, h);
     // The shadow's mask is taken before the glow goes under the text.
     let shadow = crate::effects::shadow(doc).map(|(colour, dx, dy, blur)| {
         let mut m = canvas.alpha_at((dx * at.sx).round() as i64, (dy * at.sy).round() as i64);
@@ -736,8 +838,12 @@ pub(crate) fn compose(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Fram
 /// with outline 1 ⊆ `D₂`) and band `k` is added with the coverage `Dₖ −
 /// Dₖ₋₁` the inner region leaves of the pixel, so at an anti-aliased edge
 /// the fill and the bands sum to the silhouette's coverage: no dark seam.
-/// Holds the canvas and at most two masks at a time.
-fn text_layer(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final], at: &Place, w: usize, h: usize) -> Canvas {
+/// A glyph mid blur-in is drawn blurred (fill and outlines); the
+/// typewriter's cursor goes over the layer. Holds the canvas and at most
+/// two masks at a time, and a blurred glyph's own mask (four for a colour
+/// glyph) while it is drawn.
+#[allow(clippy::too_many_arguments)]
+fn text_layer(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final], cursor: Option<usize>, at: &Place, w: usize, h: usize) -> Canvas {
     let mut canvas = Canvas::new(w, h);
     let mut inside = Mask::new(w, h);
     // The fill paints through its colour or its gradient across the text
@@ -756,7 +862,11 @@ fn text_layer(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final], at: &
                 }
                 None => &paints[g.run.min(doc.runs.len())],
             };
-            paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |x, y| paint.at(x, y), f.opacity);
+            // Mid blur-in: the glyph's coverage blurred in a mask of its own, then painted.
+            match Blurred::of(&img, x0, y0, at.len(f.blur), w, h) {
+                Some(b) => b.paint(&mut canvas, &mut inside, |x, y| paint.at(x, y), f.opacity),
+                None => paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |x, y| paint.at(x, y), f.opacity),
+            }
         }
     }
     // Outline k's stroke is centred on the letters' edges, `2 ×` the
@@ -779,7 +889,42 @@ fn text_layer(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final], at: &
         }
         inside = grown;
     }
+    if let Some(gi) = cursor {
+        draw_cursor(&mut canvas, doc, laid, finals, at, gi);
+    }
     canvas
+}
+
+/// The typewriter's cursor (titles spec §4: «курсор за последней
+/// буквой»): a bar after glyph `gi` — 0.04 em past its advance, 0.08 em
+/// wide, from 0.8 em above its baseline to 0.15 em below, turned with it —
+/// over the text in its base colour (the first outline's when the fill is
+/// transparent), as opaque as that glyph. Part of the text layer: it casts
+/// the text's shadow and glows with it.
+fn draw_cursor(canvas: &mut Canvas, doc: &TextDoc, laid: &Laid, finals: &[Final], at: &Place, gi: usize) {
+    let (Some(g), Some(f)) = (laid.glyphs.get(gi), finals.get(gi)) else { return };
+    let colour = Some(doc.style.fill.colour).filter(|c| c.0[3] > 0).or_else(|| doc.style.outlines.first().map(|o| o.colour)).unwrap_or(Rgba8::WHITE);
+    let c = premul(colour, 1.0);
+    let em = g.size * f.scale;
+    let (s, co) = f.rotation.sin_cos();
+    // The bar's centre and half sizes, layout px, along and across the baseline.
+    let (u, v, hu, hv) = (g.advance * f.scale + 0.08 * em, -0.325 * em, 0.04 * em, 0.475 * em);
+    let (cx, cy) = (f.x + u * co - v * s, f.y + u * s + v * co);
+    let reach = hu.hypot(hv);
+    let ((ax, ay), (bx, by)) = (at.point(cx - reach, cy - reach), at.point(cx + reach, cy + reach));
+    let clip = |v: f32, n: usize| if v.is_finite() { v.clamp(0.0, n as f32) as usize } else { 0 };
+    for y in clip(ay.floor(), canvas.h)..clip(by.ceil(), canvas.h) {
+        for x in clip(ax.floor(), canvas.w)..clip(bx.ceil(), canvas.w) {
+            // The pixel's centre in layout px, then along and across the bar.
+            let (lx, ly) = (at.ox + (x as f32 + 0.5) / at.sx - cx, at.oy + (y as f32 + 0.5) / at.sy - cy);
+            let (pu, pv) = (lx * co + ly * s, -lx * s + ly * co);
+            let d = (pu.abs() - hu).max(pv.abs() - hv);
+            let cov = (0.5 - at.len(d)).clamp(0.0, 1.0) * f.opacity;
+            if cov > 0.0 {
+                canvas.over(y * canvas.w + x, c, cov);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -850,6 +995,49 @@ mod tests {
         anim.glyphs[1].rotation = 0.0;
         anim.block.rotation = 0.1;
         assert!(finals(&l, &placed, &anim).iter().all(|f| !f.still), "the whole block turning");
+    }
+
+    /// Per-frame cost of a reveal: the glyphs at rest (and those only
+    /// moved or faded) stay cached; only the ones the reveal is scaling or
+    /// turning right now are drawn anew.
+    #[test]
+    fn a_reveals_glyphs_at_rest_stay_cached() {
+        let mut d = TextDoc::new("раз два три");
+        d.style.size = 40.0;
+        d.anim.reveal_in = crate::anim::reveal("pop").map(|r| r.fresh());
+        let l = crate::layout::layout(&d);
+        let placed = crate::shape::place(&d, &l);
+        // Pop: letters 350 ms each, 30 ms apart — at 400 ms the first two are done, the rest growing or hidden.
+        let c = crate::Clock { since_in: kadr_core::Time::from_millis(400), until_out: kadr_core::Time::from_secs(9), source: kadr_core::Time::ZERO, highlight: 0.0 };
+        let anim = crate::anim::animate(&d, &l, c);
+        let f = finals(&l, &placed, &anim);
+        let still: Vec<bool> = l.glyphs.iter().zip(&f).filter(|(g, x)| g.visible && x.opacity > 0.0).map(|(_, x)| x.still).collect();
+        assert_eq!(&still[..2], [true, true], "done: kept");
+        assert!(still[2..].iter().all(|s| !s) && still.len() > 4, "growing: drawn anew ({still:?})");
+        // Rise moves and fades only: every glyph stays cached.
+        d.anim.reveal_in = crate::anim::reveal("rise").map(|r| r.fresh());
+        let anim = crate::anim::animate(&d, &l, c);
+        assert!(finals(&l, &placed, &anim).iter().all(|x| x.still));
+    }
+
+    /// A blur-in glyph's own mask is clipped to the raster: an absurd
+    /// radius never allocates more than the raster does.
+    #[test]
+    fn a_blurred_glyphs_mask_never_outgrows_the_raster() {
+        let (face, id) = zhe();
+        let img = glyph_image(&face, id, GlyphDraw::plain(40.0)).unwrap();
+        for r in [0.6, 5.0, 1e4, 1e30, f32::INFINITY] {
+            let b = Blurred::of(&img, 10, 12, r, 120, 90).expect("blurred");
+            assert!(b.cov.w <= 120 && b.cov.h <= 90 && b.x0 + b.cov.w <= 120 && b.y0 + b.cov.h <= 90, "r {r}: {}×{} at ({}, {})", b.cov.w, b.cov.h, b.x0, b.y0);
+            assert!(b.cov.a.iter().all(|v| v.is_finite()));
+        }
+        assert!(Blurred::of(&img, 10, 12, 0.4, 120, 90).is_none(), "under half a pixel: drawn sharp");
+        assert!(Blurred::of(&img, 10, 12, f32::NAN, 120, 90).is_none());
+        // A small blur keeps the ink: the blurred coverage sums to the sharp one.
+        let b = Blurred::of(&img, 30, 20, 2.0, 120, 90).unwrap();
+        let sharp: f32 = img.data.iter().map(|&v| v as f32 / 255.0).sum();
+        let soft: f32 = b.cov.a.iter().sum();
+        assert!((soft - sharp).abs() < 0.01 * sharp, "{soft} vs {sharp}");
     }
 
     /// Minor 11: a turned glyph keeps its place below a pixel vertically
