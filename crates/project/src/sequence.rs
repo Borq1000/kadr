@@ -210,9 +210,10 @@ impl Clip {
     }
 
     /// A text clip (titles spec §2.1): no media (`TEXT_ASSET`), its own
-    /// time from 0 at speed 1, named after its first line.
+    /// time from 0 at speed 1, named after its first line. A negative
+    /// `duration` counts as 0 (`AddText` gives it at least a frame).
     pub fn new_text(doc: crate::TextDoc, at: Time, duration: Time) -> Self {
-        let mut c = Clip::new(crate::TEXT_ASSET, doc.label(), TimeRange::new(Time::ZERO, duration), at);
+        let mut c = Clip::new(crate::TEXT_ASSET, doc.label(), TimeRange::new(Time::ZERO, duration.max(Time::ZERO)), at);
         c.text = Some(Box::new(doc));
         c
     }

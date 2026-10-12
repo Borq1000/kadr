@@ -127,3 +127,79 @@ fn a_text_clip_cannot_go_on_an_audio_track() {
     let cmd = EditCommand::InsertClip { track: a1, clip: title(1, 2), mode: InsertMode::Overwrite };
     assert_eq!(e.execute(&mut p, cmd), Err(EditError::KindMismatch));
 }
+
+#[test]
+fn a_document_with_a_non_finite_number_is_refused() {
+    let (mut p, mut e) = setup();
+    let mut nan = TextDoc::new("x");
+    nan.style.size = f32::NAN;
+    let bad = Clip::new_text(nan.clone(), s(2), s(5));
+    assert_eq!(e.execute(&mut p, EditCommand::AddText { clip: bad.clone(), track: None }), Err(EditError::InvalidRange));
+    let v2 = p.sequence().tracks[1].id;
+    assert_eq!(e.execute(&mut p, EditCommand::InsertClip { track: v2, clip: bad, mode: InsertMode::Overwrite }), Err(EditError::InvalidRange));
+    let t = title(2, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: t.clone(), track: None }).unwrap();
+    let set = EditCommand::SetClipProperty { clip: t.id, prop: ClipProperty::Text(Box::new(nan)) };
+    assert_eq!(e.execute(&mut p, set), Err(EditError::InvalidRange));
+    assert_eq!(p.sequence().clip(t.id).unwrap().text.as_ref().unwrap().style.size, 96.0, "unchanged");
+}
+
+#[test]
+fn the_text_property_stores_a_normalised_doc() {
+    let (mut p, mut e) = setup();
+    let t = title(2, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: t.clone(), track: None }).unwrap();
+    let mut split = p.sequence().clip(t.id).unwrap().text.as_deref().unwrap().clone();
+    split.runs = vec![TextRun { text: "Г".into(), ..Default::default() }, TextRun { text: "ол!".into(), ..Default::default() }];
+    let cmd = EditCommand::SetClipProperty { clip: t.id, prop: ClipProperty::Text(Box::new(split)) };
+    assert_eq!(e.execute(&mut p, cmd), Err(EditError::NoOp), "the same text in two runs of one style is the same document");
+}
+
+#[test]
+fn a_titles_name_follows_its_text_until_renamed() {
+    let (mut p, mut e) = setup();
+    let t = title(2, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: t.clone(), track: None }).unwrap();
+    let doc_of = |p: &Project| p.sequence().clip(t.id).unwrap().text.as_deref().unwrap().clone();
+    let set_text = |p: &Project, text: &str| {
+        let mut d = doc_of(p);
+        d.set_plain(text);
+        EditCommand::SetClipProperty { clip: t.id, prop: ClipProperty::Text(Box::new(d)) }
+    };
+    let name = |p: &Project| p.sequence().clip(t.id).unwrap().name.clone();
+    let cmd = set_text(&p, "Победа!\nвторая строка");
+    e.execute(&mut p, cmd).unwrap();
+    assert_eq!(name(&p), "Победа!", "the automatic name follows the first line");
+    e.execute(&mut p, EditCommand::SetClipProperty { clip: t.id, prop: ClipProperty::Name("Финал".into()) }).unwrap();
+    let cmd = set_text(&p, "Ничья");
+    e.execute(&mut p, cmd).unwrap();
+    assert_eq!(name(&p), "Финал", "a name the user gave stays");
+}
+
+#[test]
+fn text_clips_always_carry_the_text_asset() {
+    let (mut p, mut e) = setup();
+    let other = p.assets[0].id;
+    let mut a = title(12, 2);
+    a.asset = other;
+    e.execute(&mut p, EditCommand::AddText { clip: a.clone(), track: None }).unwrap();
+    assert_eq!(p.sequence().clip(a.id).unwrap().asset, TEXT_ASSET);
+    let mut b = title(20, 2);
+    b.asset = other;
+    let v1 = p.sequence().tracks[0].id;
+    e.execute(&mut p, EditCommand::InsertClip { track: v1, clip: b.clone(), mode: InsertMode::Overwrite }).unwrap();
+    assert_eq!(p.sequence().clip(b.id).unwrap().asset, TEXT_ASSET);
+}
+
+#[test]
+fn add_text_skips_a_hidden_topmost_track() {
+    let (mut p, mut e) = setup();
+    p.sequence_mut().tracks[1].muted = true;
+    let t = title(2, 3);
+    e.execute(&mut p, EditCommand::AddText { clip: t.clone(), track: None }).unwrap();
+    assert_eq!(track_of(&p, t.id), "V3", "V2 is hidden: a title there would not be seen");
+    let v2 = p.sequence().tracks[1].id;
+    let u = title(2, 3);
+    e.execute(&mut p, EditCommand::AddText { clip: u.clone(), track: Some(v2) }).unwrap();
+    assert_eq!(track_of(&p, u.id), "V2", "asked for by name: allowed");
+}

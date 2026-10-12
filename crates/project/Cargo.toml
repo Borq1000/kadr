@@ -11,6 +11,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+unicode-segmentation = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

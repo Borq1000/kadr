@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_format_4_file_is_too_new_for_a_format_3_reader() {
+    fn a_format_5_file_is_refused_as_too_new() {
         assert_eq!(FORMAT_VERSION, 4);
         let json = format!(r#"{{"format_version": {}}}"#, FORMAT_VERSION + 1);
         assert!(matches!(parse(json.as_bytes(), Path::new("x.kadr")).unwrap_err(), ProjectIoError::TooNew { .. }));
@@ -409,6 +409,32 @@ mod tests {
         save(&mut p, &dir.path().join("p.kadr")).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(dir.path().join("p.kadr")).unwrap()).unwrap();
         assert_eq!(saved["format_version"], serde_json::json!(4));
+    }
+
+    /// A project with a styled, animated title saves, loads and saves
+    /// again to the same bytes: nothing of the text is lost or reordered.
+    #[test]
+    fn a_text_clip_survives_save_load_save_byte_for_byte() {
+        use crate::{Clip, Fill, Highlight, Outline, Reveal, Rgba8, RunStyle, TextDoc, Unit};
+        use kadr_core::Time;
+        let mut doc = TextDoc::starter("Привет, мир! 🎉", 1080);
+        doc.style_range(0..12, &RunStyle { fill: Some(Fill::solid(Rgba8::rgba(255, 0, 0, 255))), size: Some(120.0), ..Default::default() });
+        doc.style.outlines = vec![Outline { width: 4.0, colour: Rgba8::BLACK }];
+        doc.anim.reveal_in = Some(Reveal { preset: "rise".into(), unit: Unit::Letter, duration: Time::from_millis(500), stagger: Time::from_millis(40), ease: "smooth".into(), extra: Default::default() });
+        doc.anim.highlight = Some(Highlight { colour: Rgba8::WHITE, scale: 1.1, span: (0.0, 0.5), extra: Default::default() });
+        doc.extra.insert("mask".into(), serde_json::json!({"shape": "star"}));
+        let mut p = crate::Project::new("titles");
+        p.sequence_mut().tracks[0].clips.push(Clip::new_text(doc, Time::from_secs(1), Time::from_secs(4)));
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.kadr"), dir.path().join("b.kadr"));
+        save(&mut p, &a).unwrap();
+        let mut back = load(&a).unwrap();
+        assert_eq!(back, p);
+        back.modified_ms = p.modified_ms;
+        assert_eq!(to_json(&back), fs::read(&a).unwrap(), "load → save writes the same bytes");
+        save(&mut back, &b).unwrap();
+        let (sa, sb): (serde_json::Value, serde_json::Value) = (serde_json::from_slice(&fs::read(&a).unwrap()).unwrap(), serde_json::from_slice(&fs::read(&b).unwrap()).unwrap());
+        assert_eq!(sa["sequences"], sb["sequences"]);
     }
 
     /// Format 2 clip JSON with the old, never-evaluated effects list.

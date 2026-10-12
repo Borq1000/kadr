@@ -8,7 +8,7 @@ use kadr_core::{AssetId, ClipId, EffectId, MarkerId, MediaKind, Time, TimeRange,
 use kadr_effects::{ParamDef, ParamKind};
 use kadr_project::{
     AnimError, AppliedEffect, AudioProps, Clip, ColorAdjust, EdgeFades, Ease, MediaAsset, Marker, ParamValue, Sequence,
-    SourceTime, TextDoc, Track, TrackKey, TrackKind, Transform, Transition,
+    SourceTime, TextDoc, Track, TrackKey, TrackKind, Transform, Transition, TEXT_ASSET,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -85,8 +85,10 @@ pub enum ClipProperty {
     Speed(f64),
     /// Video fade-in / fade-out durations (each >= 0, sum <= clip duration).
     VideoFade(EdgeFades),
-    /// A text clip's document (titles spec §7): not a text clip →
-    /// `KindMismatch`, the same document → `NoOp`.
+    /// A text clip's document (titles spec §7), normalised: not a text
+    /// clip → `KindMismatch`, a non-finite number → `InvalidRange`, the
+    /// same document → `NoOp`. The clip's name follows the text while it
+    /// is still the automatic one (the old text's label).
     Text(Box<TextDoc>),
 }
 
@@ -95,8 +97,10 @@ pub enum EditCommand {
     InsertClip { track: TrackId, clip: Clip, mode: InsertMode },
     /// A text clip (titles spec §7, refinement 11): on `track` (a video
     /// track, unlocked, free over the clip's frame-snapped range), or —
-    /// `None` — on the topmost video track when it is unlocked and free
-    /// there, else on a new video track above all. One undo entry.
+    /// `None` — on the topmost video track when it is unlocked, shown (not
+    /// muted) and free there, else on a new video track above all. One
+    /// undo entry. The document is normalised and must be finite
+    /// (`InvalidRange`); the clip's asset becomes `TEXT_ASSET`.
     AddText { clip: Clip, track: Option<TrackId> },
     /// Moves clips (and their linked partners) by `delta`; clips named in
     /// `clips` additionally move `track_delta` tracks within their kind.
@@ -277,6 +281,13 @@ impl EditCommand {
                 if clip.text.is_some() && t.kind != TrackKind::Video {
                     return Err(EditError::KindMismatch);
                 }
+                let text;
+                let clip = if clip.text.is_some() {
+                    text = text_clip(clip)?;
+                    &text
+                } else {
+                    clip
+                };
                 let expected = if ctx.assets.iter().any(|a| a.id == clip.asset && a.info.kind == MediaKind::Audio) {
                     TrackKind::Audio
                 } else {
@@ -398,11 +409,21 @@ impl EditCommand {
                     ClipProperty::Enabled(v) => c.enabled = *v,
                     ClipProperty::Name(v) => c.name = v.clone(),
                     ClipProperty::Link(v) => c.link = *v,
-                    ClipProperty::Text(doc) => match &c.text {
-                        None => return Err(EditError::KindMismatch),
-                        Some(cur) if **cur == **doc => return Err(EditError::NoOp),
-                        Some(_) => c.text = Some(doc.clone()),
-                    },
+                    ClipProperty::Text(doc) => {
+                        let Some(cur) = c.text.as_deref() else { return Err(EditError::KindMismatch) };
+                        let mut doc = doc.clone();
+                        doc.normalise();
+                        if !doc.is_finite() {
+                            return Err(EditError::InvalidRange);
+                        }
+                        if *cur == *doc {
+                            return Err(EditError::NoOp);
+                        }
+                        if c.name == cur.label() {
+                            c.name = doc.label();
+                        }
+                        c.text = Some(doc);
+                    }
                     ClipProperty::VideoFade(f) => {
                         if f.fade_in < Time::ZERO || f.fade_out < Time::ZERO || f.fade_in > c.duration() - f.fade_out {
                             return Err(EditError::InvalidRange);
@@ -1049,12 +1070,22 @@ fn trim(seq: &mut Sequence, ctx: &EditContext, id: ClipId, edge: TrimEdge, to: T
     Ok(())
 }
 
-fn add_text(seq: &mut Sequence, clip: &Clip, track: Option<TrackId>) -> Result<(), EditError> {
-    if clip.text.is_none() {
-        return Err(EditError::KindMismatch);
-    }
-    let fr = seq.frame_rate;
+/// A text clip as the commands store it: the nil asset, a normalised and
+/// finite document (`InvalidRange` otherwise). `KindMismatch` for media.
+fn text_clip(clip: &Clip) -> Result<Clip, EditError> {
     let mut clip = clip.clone();
+    let doc = clip.text.as_deref_mut().ok_or(EditError::KindMismatch)?;
+    doc.normalise();
+    if !doc.is_finite() {
+        return Err(EditError::InvalidRange);
+    }
+    clip.asset = TEXT_ASSET;
+    Ok(clip)
+}
+
+fn add_text(seq: &mut Sequence, clip: &Clip, track: Option<TrackId>) -> Result<(), EditError> {
+    let fr = seq.frame_rate;
+    let mut clip = text_clip(clip)?;
     clip.move_to(fr.snap(clip.timeline_in).max(Time::ZERO));
     let len = fr.snap(clip.duration()).max(fr.frame_duration());
     (clip.timeline_out, clip.source_out) = (clip.timeline_in + len, clip.source_in + len);
@@ -1076,9 +1107,10 @@ fn add_text(seq: &mut Sequence, clip: &Clip, track: Option<TrackId>) -> Result<(
             ti
         }
         None => {
-            // Video tracks are stored V1 (bottom) first: the topmost is the last.
+            // Video tracks are stored V1 (bottom) first: the topmost is the
+            // last. A locked or hidden (muted) one is not used.
             let top = seq.tracks.iter().rposition(|t| t.kind == TrackKind::Video);
-            match top.filter(|&i| !seq.tracks[i].locked && free(&seq.tracks[i])) {
+            match top.filter(|&i| !seq.tracks[i].locked && !seq.tracks[i].muted && free(&seq.tracks[i])) {
                 Some(ti) => ti,
                 None => {
                     let n = seq.tracks_of(TrackKind::Video).count() + 1;

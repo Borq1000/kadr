@@ -270,6 +270,7 @@ fn job_error(e: ExportError) -> JobError {
             let secs = time.as_secs_f64();
             JobError::Fatal(tf("export.err.missing_media", &[("path", &path), ("time", &duration(secs))]))
         }
+        ExportError::TextFailed { time, .. } => JobError::Fatal(tf("export.err.text_failed", &[("time", &duration(time.as_secs_f64()))])),
         e => JobError::Fatal(e.to_string()),
     }
 }
@@ -340,5 +341,14 @@ mod tests {
         assert_eq!(job.audio.len(), 1);
         assert_eq!((job.settings.crf, job.settings.preset.as_str()), (21, "fast"));
         assert_eq!(job.settings.sample_rate, p.sequence().sample_rate);
+    }
+
+    /// A title that fails to draw is reported in words, in the UI language,
+    /// not as the export's internal message (which names a layer id).
+    #[test]
+    fn a_failed_title_is_reported_in_the_ui_language() {
+        let e = ExportError::TextFailed { layer: kadr_scene::LayerId(7), time: Time::from_secs(2), frame: 50 };
+        let JobError::Fatal(m) = job_error(e) else { panic!("a failed title is fatal") };
+        assert!(!m.contains("export.err") && !m.contains("layer") && m.contains("2"), "{m}");
     }
 }

@@ -839,5 +839,6 @@
   "err.edit.not_a_cut": "the clips do not meet at a cut",
   "err.edit.transition_not_found": "transition not found",
   "cmd.add_text": "Add text",
-  "color.recent": "Recent"
+  "color.recent": "Recent",
+  "export.err.text_failed": "Couldn't draw the text (at {time})"
 }

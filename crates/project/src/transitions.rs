@@ -193,7 +193,11 @@ fn follow(tracks: &[Track], from: ClipId, to: ClipId) -> Option<ClipId> {
     let origin = track.clips.iter().find(|c| c.id == from).filter(|c| c.timeline_out <= cut)?;
     let end = track.clips[..ti].last().filter(|c| c.timeline_out == cut)?;
     let group = origin.multicam.as_ref().map(|m| m.group);
-    let carries = end.id == from || end.asset == origin.asset || group.is_some_and(|g| end.multicam.as_ref().is_some_and(|m| m.group == g));
+    // Every title has the nil asset: one title is another's piece only when
+    // it keeps its seed (a split does; another title does not).
+    let seed = |c: &crate::Clip| c.text.as_ref().map(|d| d.seed);
+    let same_medium = end.asset == origin.asset && seed(end) == seed(origin);
+    let carries = end.id == from || same_medium || group.is_some_and(|g| end.multicam.as_ref().is_some_and(|m| m.group == g));
     carries.then_some(end.id)
 }
 
@@ -279,6 +283,28 @@ mod tests {
         split(&mut seq, a, s(2));
         seq.tracks[0].clips[1].asset = AssetId::new();
         assert_eq!(seq.reconcile_transitions().len(), 1, "another file at the cut (a's tail overwritten): not a piece of a");
+    }
+
+    /// Titles all have the nil asset: a piece of a title (a split keeps the
+    /// seed) carries its transition, another title at the cut does not.
+    #[test]
+    fn a_title_carries_its_transition_only_into_its_own_pieces() {
+        let titled = || {
+            let (mut seq, ids) = seq3();
+            let doc = crate::TextDoc::new("Гол!");
+            let c = &mut seq.tracks[0].clips[0];
+            (c.asset, c.text) = (crate::TEXT_ASSET, Some(Box::new(doc)));
+            (seq, ids)
+        };
+        let (mut seq, [a, b, _]) = titled();
+        let a2 = split(&mut seq, a, s(2));
+        assert!(seq.reconcile_transitions().is_empty());
+        assert_eq!((seq.transitions[0].from, seq.transitions[0].to), (a2, b), "the title's right piece, same seed");
+
+        let (mut seq, [a, ..]) = titled();
+        split(&mut seq, a, s(2));
+        seq.tracks[0].clips[1].text = Some(Box::new(crate::TextDoc::new("Гол!")));
+        assert_eq!(seq.reconcile_transitions().len(), 1, "another title over a's tail (a new seed): not a piece of a");
     }
 
     /// E3-R6: between a batch's commands a transition follows what it can

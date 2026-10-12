@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The asset of every text clip: no media (titles spec §2.1). Never in
 /// `Project.assets`, so every asset lookup of a text clip finds nothing.
@@ -37,7 +38,8 @@ impl Rgba8 {
 
     pub fn parse(s: &str) -> Option<Rgba8> {
         let h = s.trim().strip_prefix('#')?;
-        if !h.is_ascii() || !(h.len() == 6 || h.len() == 8) {
+        // Hex digits only: `from_str_radix` alone would take a sign ("+f").
+        if !h.bytes().all(|b| b.is_ascii_hexdigit()) || !(h.len() == 6 || h.len() == 8) {
             return None;
         }
         let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
@@ -133,11 +135,19 @@ pub struct FontRef {
     pub weight: u16,
     #[serde(default)]
     pub italic: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl FontRef {
+    pub fn new(family: impl Into<String>, weight: u16, italic: bool) -> FontRef {
+        FontRef { family: family.into(), weight, italic, extra: Extra::new() }
+    }
 }
 
 impl Default for FontRef {
     fn default() -> Self {
-        FontRef { family: default_family(), weight: 700, italic: false }
+        FontRef::new(default_family(), 700, false)
     }
 }
 
@@ -150,11 +160,19 @@ pub struct GradientStop {
 
 /// A linear gradient across the text block: `angle` in degrees, 0 = left
 /// to right, 90 = top to bottom.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GradientFill {
     pub stops: Vec<GradientStop>,
     #[serde(default)]
     pub angle: f32,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl GradientFill {
+    pub fn new(stops: Vec<GradientStop>, angle: f32) -> GradientFill {
+        GradientFill { stops, angle, extra: Extra::new() }
+    }
 }
 
 /// The paint of letters: `colour`, or the `gradient` when there is one.
@@ -429,11 +447,21 @@ fn one_empty_run() -> Vec<TextRun> {
     vec![TextRun::default()]
 }
 
+/// `"runs": []` (a hand-edited or foreign file) reads as one empty run:
+/// a document always has a run to type into.
+fn runs_or_one<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<TextRun>, D::Error> {
+    let runs = Vec::<TextRun>::deserialize(d)?;
+    Ok(if runs.is_empty() { one_empty_run() } else { runs })
+}
+
+/// The style of no run at all (`run_style_at` on a doc without runs).
+static NO_STYLE: RunStyle = RunStyle { family: None, weight: None, italic: None, size: None, fill: None, letter_spacing: None, extra: BTreeMap::new() };
+
 /// A text clip's picture (titles spec §2.2). The text is the runs'
 /// concatenation; there is always at least one run (maybe empty).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextDoc {
-    #[serde(default = "one_empty_run")]
+    #[serde(default = "one_empty_run", deserialize_with = "runs_or_one")]
     pub runs: Vec<TextRun>,
     #[serde(default)]
     pub style: TextStyle,
@@ -452,13 +480,22 @@ pub struct TextDoc {
     pub extra: Extra,
 }
 
-/// The largest char boundary of `s` at or below `i` (clamped to its length).
-fn floor_boundary(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i -= 1;
+/// The largest grapheme boundary of `s` at or below `i` (clamped): a
+/// style never starts or ends inside an emoji sequence or a letter with
+/// its combining marks.
+fn floor_grapheme(s: &str, i: usize) -> usize {
+    let i = i.min(s.len());
+    s.grapheme_indices(true).map(|(at, _)| at).chain([s.len()]).take_while(|&at| at <= i).last().unwrap_or(0)
+}
+
+fn finite(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite())
+}
+
+impl Fill {
+    fn is_finite(&self) -> bool {
+        self.gradient.as_ref().is_none_or(|g| g.angle.is_finite() && g.stops.iter().all(|s| s.pos.is_finite()))
     }
-    i
 }
 
 impl TextDoc {
@@ -499,12 +536,43 @@ impl TextDoc {
     pub fn label(&self) -> String {
         let text = self.plain();
         let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-        if line.chars().count() > 60 { format!("{}…", line.chars().take(60).collect::<String>()) } else { line.to_string() }
+        // Cut between graphemes: never inside an emoji sequence or a letter
+        // with its combining marks.
+        match line.grapheme_indices(true).nth(60) {
+            Some((at, _)) => format!("{}…", &line[..at]),
+            None => line.to_string(),
+        }
     }
 
     pub fn is_animated(&self) -> bool {
         let a = &self.anim;
         a.reveal_in.is_some() || a.reveal_out.is_some() || a.looping.is_some() || a.highlight.is_some()
+    }
+
+    /// Every number of the document is finite: a NaN or an infinity from
+    /// a caller (JSON cannot carry them) never reaches layout. The edit
+    /// commands refuse a document that is not.
+    pub fn is_finite(&self) -> bool {
+        let (st, p, a) = (&self.style, &self.paragraph, &self.anim);
+        let shape = match self.shape {
+            TextShape::Straight => true,
+            TextShape::Arc { bend } => bend.is_finite(),
+            TextShape::Circle { radius, start_deg } => finite(&[radius, start_deg]),
+        };
+        finite(&[st.size, p.line_height, p.letter_spacing, p.wrap.unwrap_or(0.0)])
+            && st.fill.is_finite()
+            && st.outlines.iter().all(|o| o.width.is_finite())
+            && st.shadow.is_none_or(|s| finite(&[s.offset_x, s.offset_y, s.blur]))
+            && st.glow.is_none_or(|g| finite(&[g.radius, g.intensity]))
+            && st.plaque.is_none_or(|q| finite(&[q.radius, q.padding_x, q.padding_y]))
+            && shape
+            && self.perspective.is_none_or(|v| finite(&[v.tilt_x, v.tilt_y]))
+            && self.runs.iter().all(|r| {
+                let rs = &r.style;
+                finite(&[rs.size.unwrap_or(0.0), rs.letter_spacing.unwrap_or(0.0)]) && rs.fill.as_ref().is_none_or(Fill::is_finite)
+            })
+            && a.looping.as_ref().is_none_or(|l| l.speed.is_finite() && l.amount.is_finite())
+            && a.highlight.as_ref().is_none_or(|h| h.scale.is_finite() && h.span.0.is_finite() && h.span.1.is_finite())
     }
 
     /// The style of the run holding byte `at` (the last run at the end).
@@ -516,7 +584,7 @@ impl TextDoc {
             }
             start += r.text.len();
         }
-        &self.runs.last().expect("a doc has a run").style
+        self.runs.last().map_or(&NO_STYLE, |r| &r.style)
     }
 
     /// Makes `at` (a char boundary) a run boundary; returns the index of
@@ -558,7 +626,7 @@ impl TextDoc {
             suf -= 1;
         }
         let style = self.run_style_at(pre.saturating_sub(1)).clone();
-        let first_style = self.runs[0].style.clone();
+        let first_style = self.runs.first().map(|r| r.style.clone()).unwrap_or_default();
         let i = self.boundary(pre);
         let j = self.boundary(old.len() - suf);
         let inserted = &new[pre..new.len() - suf];
@@ -571,7 +639,8 @@ impl TextDoc {
     }
 
     /// Merges `patch` into the style of the text in `range` (bytes, floored
-    /// to char boundaries, clamped to the text). `false` when nothing changed.
+    /// to grapheme boundaries — so to char boundaries too — and clamped to
+    /// the text). `false` when nothing changed.
     pub fn style_range(&mut self, range: Range<usize>, patch: &RunStyle) -> bool {
         self.restyle(range, |s| s.merged(patch))
     }
@@ -583,7 +652,7 @@ impl TextDoc {
 
     fn restyle(&mut self, range: Range<usize>, f: impl Fn(&RunStyle) -> RunStyle) -> bool {
         let text = self.plain();
-        let (a, b) = (floor_boundary(&text, range.start), floor_boundary(&text, range.end));
+        let (a, b) = (floor_grapheme(&text, range.start), floor_grapheme(&text, range.end));
         if a >= b {
             return false;
         }
@@ -663,7 +732,7 @@ mod tests {
     fn colours_are_hex_strings() {
         assert_eq!(Rgba8::parse("#ff8000"), Some(Rgba8([255, 128, 0, 255])));
         assert_eq!(Rgba8::parse(" #FF800080 "), Some(Rgba8([255, 128, 0, 128])));
-        for bad in ["ff8000", "#ff80", "#gg8000", "#ff8000801", "#ффф000", ""] {
+        for bad in ["ff8000", "#ff80", "#gg8000", "#ff8000801", "#ффф000", "", "#+f8000", "#ff+f00", "#ff8000-1"] {
             assert_eq!(Rgba8::parse(bad), None, "{bad:?}");
         }
         assert_eq!(serde_json::to_value(Rgba8([1, 2, 3, 4])).unwrap(), json!("#01020304"));
@@ -681,6 +750,8 @@ mod tests {
         d.perspective = Some(Perspective { tilt_x: 20.0, tilt_y: 0.0 });
         d.anim.reveal_in = Some(Reveal { preset: "rise".into(), unit: Unit::Word, duration: Time::from_millis(500), stagger: Time::from_millis(80), ease: "smooth".into(), extra: Default::default() });
         d.anim.highlight = Some(Highlight { colour: Rgba8::rgba(255, 212, 0, 255), scale: 1.08, span: (0.25, 1.0), extra: Default::default() });
+        d.anim.looping = Some(LoopAnim { preset: "wave".into(), unit: Unit::Letter, speed: 2.0, amount: 0.3, extra: Default::default() });
+        d.style.fill.gradient = Some(GradientFill::new(vec![GradientStop { pos: 0.0, colour: Rgba8::WHITE }, GradientStop { pos: 1.0, colour: Rgba8::BLACK }], 90.0));
         let mut v = serde_json::to_value(&d).unwrap();
         assert_eq!(serde_json::from_value::<TextDoc>(v.clone()).unwrap(), d);
         // A newer Kadr's fields at every level that may grow survive load → save.
@@ -693,6 +764,9 @@ mod tests {
         v["anim"]["path"] = json!("zigzag");
         v["anim"]["in"]["bounce"] = json!(3);
         v["anim"]["highlight"]["word_times"] = json!([[0, 1]]);
+        v["anim"]["loop"]["wobble"] = json!(0.5);
+        v["style"]["font"]["stretch"] = json!("condensed");
+        v["style"]["fill"]["gradient"]["kind"] = json!("radial");
         let back = serde_json::to_value(serde_json::from_value::<TextDoc>(v.clone()).unwrap()).unwrap();
         assert_eq!(back, v);
     }
@@ -768,16 +842,93 @@ mod tests {
     }
 
     #[test]
+    fn empty_runs_load_as_one_empty_run_and_take_typing() {
+        let mut v = serde_json::to_value(TextDoc::new("x")).unwrap();
+        v["runs"] = json!([]);
+        let mut d: TextDoc = serde_json::from_value(v).unwrap();
+        assert_eq!((d.runs.len(), d.plain()), (1, String::new()), "a doc always has a run to type into");
+        assert!(d.set_plain("ок"));
+        assert!(d.style_range(0..2, &red()));
+        assert_eq!(texts(&d), [("о", true), ("к", false)]);
+        // Built without runs in code: nothing panics, typing still works.
+        let mut d = doc(&[]);
+        assert_eq!((d.run_style_at(0), d.run_style_at(9), d.plain()), (&RunStyle::default(), &RunStyle::default(), String::new()));
+        assert!(!d.style_range(0..3, &red()) && !d.reset_range(0..3));
+        assert!(d.set_plain("да"));
+        assert_eq!(texts(&d), [("да", false)]);
+        let mut d = doc(&[]);
+        d.normalise();
+        assert_eq!(d.runs.len(), 1);
+    }
+
+    /// Emoji (4 bytes), a ZWJ sequence and a combining mark: no panic, no
+    /// style boundary inside a grapheme, and the text is never cut apart.
+    #[test]
+    fn emoji_zwj_sequences_and_combining_marks_survive_editing() {
+        let family = "👨\u{200D}👩\u{200D}👧"; // bytes 6..24 below
+        let text = format!("a👍 {family} е\u{301}ж"); // «е» 25..27, the acute 27..29
+        let mut d = TextDoc::new(&text);
+        assert!(!d.style_range(2..4, &red()), "inside 👍: floored to 1..1");
+        assert!(!d.style_range(10..20, &red()), "inside the family: both ends floor to its start");
+        assert!(!d.style_range(25..28, &red()), "е without its accent: the accent belongs to it");
+        assert!(d.style_range(1..5, &red()));
+        assert!(d.style_range(8..29, &RunStyle { size: Some(50.0), ..Default::default() }), "8 floors to the family's start");
+        let sized: Vec<_> = d.runs.iter().map(|r| (r.text.as_str(), r.style.size.is_some())).collect();
+        let styled = format!("{family} е\u{301}");
+        assert_eq!(sized, [("a", false), ("👍", false), (" ", false), (styled.as_str(), true), ("ж", false)]);
+        assert_eq!(d.runs[1].style.fill, red().fill);
+        assert_eq!(d.plain(), text);
+
+        let boy = "👨\u{200D}👩\u{200D}👦";
+        let mut d = doc(&[(family, red()), ("!", RunStyle::default())]);
+        assert!(d.set_plain(&format!("{boy}!")), "👧 → 👦 shares 3 bytes: the edit floors to a char boundary");
+        assert_eq!(texts(&d), [(boy, true), ("!", false)], "the new emoji takes the style before it");
+        let mut d = doc(&[("е", red()), ("ж", RunStyle::default())]);
+        assert!(d.set_plain("е\u{301}ж"));
+        assert_eq!(texts(&d), [("е\u{301}", true), ("ж", false)], "a combining mark joins its letter's style");
+        let mut d = TextDoc::new("a👍b");
+        assert!(d.set_plain("a👎b") && d.plain() == "a👎b");
+        assert!(d.set_plain("ab") && d.plain() == "ab");
+
+        let d = TextDoc::new(&text);
+        let (l, r) = d.split_at(0.5);
+        assert_eq!((l.plain(), r.plain()), (text.clone(), text.clone()), "a split keeps the whole text on both sides");
+    }
+
+    #[test]
+    fn a_doc_with_a_non_finite_number_is_not_finite() {
+        let ok = TextDoc::starter("x", 1080);
+        assert!(ok.is_finite());
+        let bad: [fn(&mut TextDoc); 6] = [
+            |d| d.style.size = f32::NAN,
+            |d| d.paragraph.wrap = Some(f32::INFINITY),
+            |d| d.runs[0].style.letter_spacing = Some(f32::NAN),
+            |d| d.shape = TextShape::Circle { radius: f32::NAN, start_deg: 0.0 },
+            |d| d.style.fill.gradient = Some(GradientFill::new(vec![GradientStop { pos: f32::NAN, colour: Rgba8::WHITE }], 0.0)),
+            |d| d.anim.highlight = Some(Highlight { colour: Rgba8::WHITE, scale: 1.0, span: (0.0, f64::NAN), extra: Default::default() }),
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            let mut d = ok.clone();
+            f(&mut d);
+            assert!(!d.is_finite(), "case {i}");
+        }
+    }
+
+    #[test]
     fn starter_scales_with_the_frame_and_labels_cut_long_lines() {
         let hd = TextDoc::starter("x", 1080);
         assert_eq!(hd.style.size, 97.0);
         assert_eq!(TextDoc::starter("x", 2160).style.size, 194.0);
-        assert_eq!(hd.style.font, FontRef { family: "Montserrat".into(), weight: 700, italic: false });
+        assert_eq!(hd.style.font, FontRef::new("Montserrat", 700, false));
         assert!(hd.style.shadow.is_some() && hd.style.outlines.is_empty() && hd.anim.is_empty());
         assert_ne!(TextDoc::new("a").seed, TextDoc::new("a").seed);
         let long = TextDoc::new(&format!("\n  {}\nвторая", "ж".repeat(80)));
         assert_eq!(long.label(), format!("{}…", "ж".repeat(60)));
         assert_eq!(TextDoc::new("").label(), "");
+        let accented = "е\u{301}";
+        assert_eq!(TextDoc::new(&accented.repeat(70)).label(), format!("{}…", accented.repeat(60)), "60 letters, accents kept");
+        let family = "👨\u{200D}👩\u{200D}👧";
+        assert_eq!(TextDoc::new(&family.repeat(61)).label(), format!("{}…", family.repeat(60)), "never inside an emoji sequence");
     }
 
     #[test]
