@@ -1,8 +1,10 @@
 //! Pixels (titles spec §5.1): glyphs through swash into coverage masks and
-//! colour images, composed bottom to top into a premultiplied float
-//! buffer, stored as RGBA8 (contract rounding). Passes: plaque, (Task 9:
-//! shadow, glow), outline 2, outline 1, fill. Colour emoji (COLR / colour
-//! bitmaps) draw their own colours.
+//! colour images, composed into a premultiplied float buffer, stored as
+//! RGBA8 (contract rounding). Bottom to top: plaque, (Task 9: shadow,
+//! glow), the text — its fill with outline 1 round it and outline 2 round
+//! that, one layer, each outline knocked out of what is inside it (TX-R5).
+//! The text layer is drawn first and the passes below it under it. Colour
+//! emoji (COLR / colour bitmaps) draw their own colours.
 //!
 //! The picture fills its raster (the `TextPicture` contract, ruling TX-R3):
 //! a raster of `W × H = ⌈bounds · scale⌉` px draws the bounds with the
@@ -10,8 +12,9 @@
 //! bounds' edges and the renderer's stretch over `placement.size` is exact.
 //!
 //! Memory (TX-R5): drawing a raster of N px holds the float canvas (16 B
-//! per px), one coverage mask at a time (4 B per px) and the RGBA8 result
-//! (4 B per px) — about 24 B per raster px at the peak, so the resolver's
+//! per px) and at most two coverage masks at a time (4 B per px each), or
+//! the canvas and the RGBA8 result (4 B per px) at the end — about 24 B
+//! per raster px at the peak, so the resolver's
 //! 16 Mpx cap (`kadr_playback::MAX_TEXT_PIXELS`) peaks near 400 MB, not
 //! the 64 MB of the finished raster. Past [`MAX_RASTER_PIXELS`] nothing is
 //! allocated: the picture is a 1×1 transparent raster. Glyph images are
@@ -56,10 +59,33 @@ impl Canvas {
         }
     }
 
-    pub fn over_mask(&mut self, m: &Mask, c: [f32; 4]) {
+    /// Premultiplied `c` scaled by coverage `cov` added beside what is
+    /// there (a band of the text layer: its coverage is what the rest of
+    /// the layer leaves of the pixel).
+    #[inline]
+    pub fn add(&mut self, i: usize, c: [f32; 4], cov: f32) {
+        let d = &mut self.px[i];
+        for ch in 0..4 {
+            d[ch] += c[ch] * cov;
+        }
+    }
+
+    /// Destination-over: premultiplied `c` scaled by coverage `cov` drawn
+    /// under what is there. Over is associative, so drawing the lower
+    /// passes under the text layer equals drawing them first.
+    #[inline]
+    pub fn under(&mut self, i: usize, c: [f32; 4], cov: f32) {
+        let d = &mut self.px[i];
+        let k = cov * (1.0 - d[3]);
+        for ch in 0..4 {
+            d[ch] += c[ch] * k;
+        }
+    }
+
+    pub fn under_mask(&mut self, m: &Mask, c: [f32; 4]) {
         for (i, &cov) in m.a.iter().enumerate() {
             if cov > 0.0 {
-                self.over(i, c, cov);
+                self.under(i, c, cov);
             }
         }
     }
@@ -90,6 +116,14 @@ impl Mask {
     pub fn new(w: usize, h: usize) -> Mask {
         let (w, h) = (w.max(1), h.max(1));
         Mask { w, h, a: vec![0.0; w * h] }
+    }
+
+    /// Coverage `cov` over what the pixel has (`a + cov − a·cov`): the
+    /// coverage of glyphs painted over each other.
+    #[inline]
+    pub fn over(&mut self, i: usize, cov: f32) {
+        let a = &mut self.a[i];
+        *a = cov + *a * (1.0 - cov);
     }
 
     /// Max-union of a glyph image's coverage (a colour image's alpha) at
@@ -469,8 +503,9 @@ pub(crate) fn glyph_mask(laid: &Laid, finals: &[Final], at: &Place, w: usize, h:
 }
 
 /// Draws one glyph's fill: its coverage in `colour` (premultiplied), or a
-/// colour glyph's own colours, times its opacity.
-fn paint_glyph(c: &mut Canvas, img: &Image, x0: i32, y0: i32, colour: impl Fn(usize, usize) -> [f32; 4], opacity: f32) {
+/// colour glyph's own colours, times its opacity; `cover` gathers the
+/// coverage the fill gives each pixel (glyphs over each other).
+fn paint_glyph(c: &mut Canvas, cover: &mut Mask, img: &Image, x0: i32, y0: i32, colour: impl Fn(usize, usize) -> [f32; 4], opacity: f32) {
     let p = img.placement;
     for row in 0..p.height as i32 {
         let y = y0 + row;
@@ -489,6 +524,7 @@ fn paint_glyph(c: &mut Canvas, img: &Image, x0: i32, y0: i32, colour: impl Fn(us
                     let cov = img.data[i] as f32 / 255.0 * opacity;
                     if cov > 0.0 {
                         c.over(at, colour(x as usize, y as usize), cov);
+                        cover.over(at, cov);
                     }
                 }
                 Content::Color => {
@@ -497,6 +533,7 @@ fn paint_glyph(c: &mut Canvas, img: &Image, x0: i32, y0: i32, colour: impl Fn(us
                     // COLR output is premultiplied; a colour bitmap is straight.
                     let k = if matches!(img.source, Source::ColorBitmap(_)) { f(s[3]) } else { 1.0 };
                     c.over(at, [f(s[0]) * k, f(s[1]) * k, f(s[2]) * k, f(s[3])], opacity);
+                    cover.over(at, f(s[3]) * opacity);
                 }
                 Content::SubpixelMask => {}
             }
@@ -523,36 +560,63 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
         }
         return Canvas::new(1, 1).into_frame(pool);
     };
-    let mut canvas = Canvas::new(w, h);
     let finals = finals(laid, placed, anim);
-    // 1. The plaque.
+    // The text first — fill and outlines in one layer; the passes below it
+    // are drawn under it, top down.
+    let (mut canvas, _silhouette) = text_layer(doc, laid, &finals, &at, w, h);
+    // Shadow and glow: Task 9.
+    // The plaque, at the bottom.
     if let Some(p) = doc.style.plaque.filter(|p| p.colour.0[3] > 0) {
         let mut m = Mask::new(w, h);
         for (x0, y0, x1, y1) in plaque_rects(doc, laid) {
             let ((ax, ay), (bx, by)) = (at.point(x0, y0), at.point(x1, y1));
             m.round_rect(ax, ay, bx, by, at.len(p.radius.max(0.0)));
         }
-        canvas.over_mask(&m, premul(p.colour, anim.plaque_opacity));
-    }
-    // 2–3. Shadow and glow: Task 9.
-    // 4. Outlines, the outer one first: each a union of stroked glyphs in one colour.
-    let mut reach = outline_reach(doc);
-    for o in doc.style.outlines.iter().take(2).rev() {
-        let width = if o.width.is_finite() { o.width.clamp(0.0, 200.0) } else { 0.0 };
-        if width > 0.0 {
-            let m = glyph_mask(laid, &finals, &at, w, h, 2.0 * reach);
-            canvas.over_mask(&m, premul(o.colour, 1.0));
-        }
-        reach -= width;
-    }
-    // 5. The fill.
-    for (g, f) in laid.glyphs.iter().zip(&finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
-        if let Some((img, x0, y0)) = at.image(laid, g, f, 0.0) {
-            let colour = premul(f.colour.unwrap_or(fill_of(doc, g.run).colour), 1.0);
-            paint_glyph(&mut canvas, &img, x0, y0, |_, _| colour, f.opacity);
-        }
+        canvas.under_mask(&m, premul(p.colour, anim.plaque_opacity));
     }
     canvas.into_frame(pool)
+}
+
+/// The text itself as one layer (ruling TX-R5, the knock-out): the fill,
+/// then each outline as the band its stroke adds outside what is already
+/// there — outline 1 outside the fill, outline 2 outside outline 1 — so a
+/// translucent fill or inner outline shows what is under the text, never
+/// another outline. The coverages nest (the fill `D₀` ⊆ `D₁` = the fill
+/// with outline 1 ⊆ `D₂`) and band `k` is added with the coverage `Dₖ −
+/// Dₖ₋₁` the inner region leaves of the pixel, so at an anti-aliased edge
+/// the fill and the bands sum to the silhouette's coverage: no dark seam.
+/// Returns the layer and the silhouette (`D` of the outermost outline).
+/// Holds the canvas and at most two masks at a time.
+fn text_layer(doc: &TextDoc, laid: &Laid, finals: &[Final], at: &Place, w: usize, h: usize) -> (Canvas, Mask) {
+    let mut canvas = Canvas::new(w, h);
+    let mut inside = Mask::new(w, h);
+    for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
+        if let Some((img, x0, y0)) = at.image(laid, g, f, 0.0) {
+            let colour = premul(f.colour.unwrap_or(fill_of(doc, g.run).colour), 1.0);
+            paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |_, _| colour, f.opacity);
+        }
+    }
+    // Outline k's stroke is centred on the letters' edges, `2 ×` the
+    // widths up to it wide; with what is inside it, it is the letters
+    // grown by those widths.
+    let mut reach = 0.0;
+    for o in doc.style.outlines.iter().take(2) {
+        let width = if o.width.is_finite() { o.width.clamp(0.0, 200.0) } else { 0.0 };
+        if width <= 0.0 {
+            continue;
+        }
+        reach += width;
+        let mut grown = glyph_mask(laid, finals, at, w, h, 2.0 * reach);
+        let c = premul(o.colour, 1.0);
+        for (i, (d, &inner)) in grown.a.iter_mut().zip(&inside.a).enumerate() {
+            *d = d.max(inner);
+            if *d > inner {
+                canvas.add(i, c, *d - inner);
+            }
+        }
+        inside = grown;
+    }
+    (canvas, inside)
 }
 
 #[cfg(test)]
@@ -607,5 +671,70 @@ mod tests {
         let fresh = glyph_image_in(&Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES)), &face, id, b.0, b.1, b.2, 0.0, 1.0, b.3).unwrap();
         let at = |i: &Image| (i.placement.left, i.placement.top, i.placement.width, i.placement.height);
         assert_eq!((at(&hit), &hit.data), (at(&fresh), &fresh.data), "drawn afresh: the same pixels");
+    }
+
+    /// Thick capitals in `fill` with `outlines` (width, colour), inner first.
+    fn outlined(fill: Rgba8, outlines: &[(f32, Rgba8)]) -> TextDoc {
+        let mut d = TextDoc::new("НЖ");
+        d.style.size = 160.0;
+        d.style.fill = Fill::solid(fill);
+        d.style.outlines = outlines.iter().map(|&(width, colour)| kadr_project::Outline { width, colour }).collect();
+        d
+    }
+
+    /// The raster at scale 1, pixel by pixel. A transparent outline keeps
+    /// its room in the bounds, so docs that differ only in colours have
+    /// rasters of one size, pixel for pixel.
+    fn pixels(d: &TextDoc) -> Vec<[u8; 4]> {
+        let r = crate::TextFrame::new(d, crate::Clock::REST).raster(1.0);
+        (0..r.height).flat_map(|y| r.row(y).as_chunks::<4>().0.to_vec()).collect()
+    }
+
+    /// TX-R5 (knock-out): an outline lies outside the letters, so a
+    /// translucent fill shows what is under the text, never its outline.
+    #[test]
+    fn a_translucent_fill_shows_no_outline_through_it() {
+        let half = Rgba8::rgba(255, 255, 255, 128);
+        let alone = pixels(&outlined(half, &[(14.0, Rgba8::rgba(255, 0, 0, 0))]));
+        let red = pixels(&outlined(half, &[(14.0, Rgba8::rgba(255, 0, 0, 255))]));
+        assert_eq!(alone.len(), red.len());
+        // Inside the letters the fill covers its pixel whole: half-transparent white.
+        let inside: Vec<usize> = (0..alone.len()).filter(|&i| alone[i] == [128, 128, 128, 128]).collect();
+        assert!(inside.len() > 1000, "{} pixels inside the letters", inside.len());
+        for &i in &inside {
+            assert!(red[i][0].abs_diff(red[i][1]) <= 1 && red[i][3].abs_diff(128) <= 1, "red under the fill at {i}: {:?}", red[i]);
+        }
+        assert!(red.iter().filter(|p| **p == [255, 0, 0, 255]).count() > 1000, "the outline is drawn round the letters");
+    }
+
+    /// TX-R5 (knock-out): outline 2 lies outside outline 1, so a
+    /// translucent inner outline never shows the outer one through it.
+    #[test]
+    fn the_outer_outline_never_shows_inside_the_inner_one() {
+        let green = Rgba8::rgba(0, 255, 0, 128);
+        let inner = pixels(&outlined(Rgba8::WHITE, &[(6.0, green), (6.0, Rgba8::rgba(0, 0, 255, 0))]));
+        let both = pixels(&outlined(Rgba8::WHITE, &[(6.0, green), (6.0, Rgba8::rgba(0, 0, 255, 255))]));
+        assert_eq!(inner.len(), both.len());
+        // Outline 1's band where it covers its pixel whole and nothing else is there.
+        let band: Vec<usize> = (0..inner.len()).filter(|&i| inner[i] == [0, 128, 0, 128]).collect();
+        assert!(band.len() > 500, "{} pixels of outline 1", band.len());
+        for &i in &band {
+            assert!(both[i][2] <= 1 && both[i][1].abs_diff(128) <= 1, "outline 2 inside outline 1 at {i}: {:?}", both[i]);
+        }
+        assert!(both.iter().filter(|p| **p == [0, 0, 255, 255]).count() > 500, "outline 2 is drawn outside outline 1");
+    }
+
+    /// The fill and its outline share their anti-aliased edge: where the
+    /// letters' coverage is partial the outline makes up the rest, so a
+    /// white outline round white letters has no seam.
+    #[test]
+    fn a_fill_and_its_outline_meet_without_a_seam() {
+        let fill = pixels(&outlined(Rgba8::WHITE, &[(6.0, Rgba8::rgba(255, 255, 255, 0))]));
+        let both = pixels(&outlined(Rgba8::WHITE, &[(6.0, Rgba8::WHITE)]));
+        let edge: Vec<usize> = (0..fill.len()).filter(|&i| (1..255).contains(&fill[i][3])).collect();
+        assert!(edge.len() > 200, "{} edge pixels", edge.len());
+        for &i in &edge {
+            assert!(both[i][3] >= 254, "a seam at {i}: {:?} (the fill alone {:?})", both[i], fill[i]);
+        }
     }
 }
