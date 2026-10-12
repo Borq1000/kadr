@@ -12,7 +12,7 @@ pub(crate) mod raster;
 pub mod shape;
 
 pub use anim::{Clock, FrameAnim, GlyphAnim};
-pub use fonts::{fonts, Family, FontSource, BUNDLED_FAMILIES, DEFAULT_FAMILY};
+pub use fonts::{fonts, Family, FontError, FontSource, BUNDLED_FAMILIES, DEFAULT_FAMILY};
 pub use frame::{frame_size, Bounds, TextFrame};
 pub use layout::{layout, Laid};
 
@@ -21,10 +21,21 @@ pub use layout::{layout, Laid};
 #[cfg(test)]
 pub(crate) static TEST_FONTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// A 64-bit hash of a value's JSON (in-process cache keys only).
+/// A 64-bit hash of a value's JSON (in-process cache keys only), streamed
+/// into the hasher without building the JSON.
 pub(crate) fn hash_of(v: &impl serde::Serialize) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_vec(v).unwrap_or_default().hash(&mut h);
-    h.finish()
+    use std::hash::Hasher;
+    struct Sink(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink(std::collections::hash_map::DefaultHasher::new());
+    let _ = serde_json::to_writer(&mut sink, v);
+    sink.0.finish()
 }

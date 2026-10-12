@@ -150,21 +150,21 @@ impl Fonts {
         n
     }
 
-    /// «Добавить шрифт…»: registers the file and copies it into the user
-    /// font folder (when one was loaded), so it is there after a restart.
-    pub fn install_user_font(&self, file: &Path) -> Result<Vec<String>, String> {
-        let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-        let names = self.add_font_bytes(bytes);
-        if names.is_empty() {
-            return Err("not a font".into());
+    /// «Добавить шрифт…»: copies the file into the user font folder (when
+    /// one was loaded), so it is there after a restart, then registers it.
+    /// A file that is not a font, or that cannot be copied, adds nothing.
+    pub fn install_user_font(&self, file: &Path) -> Result<Vec<String>, FontError> {
+        let bytes = std::fs::read(file).map_err(|e| FontError::Unreadable(e.to_string()))?;
+        if families_in(&bytes).is_empty() {
+            return Err(FontError::NotAFont);
         }
         if let Some(dir) = self.user_dir.lock().clone() {
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let name = file.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "font.ttf".into());
-            let target = dir.join(name);
-            if !target.exists() {
-                std::fs::copy(file, &target).map_err(|e| e.to_string())?;
-            }
+            copy_into(&dir, Path::new(&name), &bytes).map_err(|e| FontError::CopyFailed(e.to_string()))?;
+        }
+        let names = self.add_font_bytes(bytes);
+        if names.is_empty() {
+            return Err(FontError::NotAFont);
         }
         self.remember_user(names.clone());
         Ok(names)
@@ -179,6 +179,75 @@ impl Fonts {
         }
         user.sort_by_key(|n| n.to_lowercase());
     }
+}
+
+/// Why «Добавить шрифт…» failed; the editor names each kind in its own words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FontError {
+    /// The file could not be read (the system's reason).
+    Unreadable(String),
+    /// The file holds no font Kadr can use.
+    NotAFont,
+    /// The font could not be copied into the user font folder (the
+    /// system's reason); it was not added.
+    CopyFailed(String),
+}
+
+impl FontError {
+    /// The kind as a stable word (`unreadable`, `not_a_font`, `copy_failed`):
+    /// the last part of the editor's catalog key.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FontError::Unreadable(_) => "unreadable",
+            FontError::NotAFont => "not_a_font",
+            FontError::CopyFailed(_) => "copy_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for FontError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FontError::Unreadable(why) => write!(f, "the font file cannot be read: {why}"),
+            FontError::NotAFont => f.write_str("not a font"),
+            FontError::CopyFailed(why) => write!(f, "the font cannot be copied into the font folder: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for FontError {}
+
+/// The families a font file's bytes hold, found without adding them to the
+/// process's fonts (none: not a font).
+fn families_in(bytes: &[u8]) -> Vec<String> {
+    let mut c = Collection::new(CollectionOptions { shared: false, system_fonts: false });
+    let ids: Vec<_> = c.register_fonts(Blob::from(bytes.to_vec()), None).into_iter().map(|(id, _)| id).collect();
+    ids.into_iter().filter_map(|id| c.family_name(id).map(str::to_owned)).collect()
+}
+
+/// Puts a font's `bytes` (from the file `name`) into `dir`: under its own
+/// name, or not at all when that file holds the same bytes already, else
+/// as `stem-2.ext`, `stem-3.ext`, … — a font never replaces another.
+fn copy_into(dir: &Path, name: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let stem = name.file_stem().map_or_else(|| "font".to_string(), |s| s.to_string_lossy().into_owned());
+    let ext = name.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 1..=1000 {
+        let target = dir.join(if n == 1 { format!("{stem}{ext}") } else { format!("{stem}-{n}{ext}") });
+        match std::fs::read(&target) {
+            Ok(there) if there == bytes => return Ok(target),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = std::fs::write(&target, bytes) {
+                    let _ = std::fs::remove_file(&target);
+                    return Err(e);
+                }
+                return Ok(target);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free file name"))
 }
 
 #[cfg(test)]
@@ -239,7 +308,77 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let junk = dir.join("junk.ttf");
         std::fs::write(&junk, b"nope").unwrap();
-        assert!(f.install_user_font(&junk).is_err(), "a file that is not a font is refused");
+        assert_eq!(f.install_user_font(&junk), Err(FontError::NotAFont), "a file that is not a font is refused");
+        assert!(matches!(f.install_user_font(&dir.join("absent.ttf")), Err(FontError::Unreadable(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Windows font file (they are not bundled), when this machine has it.
+    fn windows_font(file: &str) -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let path = std::path::Path::new(&root).join("Fonts").join(file);
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!("{} is not on this machine: skipped", path.display());
+            None
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kadr-text-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_user_font_is_copied_listed_once_as_the_users_and_never_replaces_a_namesake() {
+        let _serial = crate::TEST_FONTS.lock();
+        let Some(georgia) = windows_font("georgia.ttf") else { return };
+        let f = fonts();
+        let dir = scratch("user-fonts");
+        assert_eq!(f.load_user_dir(&dir), 0);
+        let g0 = f.generation();
+        let names = f.install_user_font(&georgia).expect("Georgia is a font");
+        assert!(names.iter().any(|n| n == "Georgia"), "{names:?}");
+        assert!(f.generation() > g0);
+        let file_name = georgia.file_name().unwrap();
+        assert_eq!(std::fs::read(dir.join(file_name)).unwrap(), std::fs::read(&georgia).unwrap(), "copied into the user folder");
+        let listed = |f: &Fonts| f.families().into_iter().filter(|x| x.name.eq_ignore_ascii_case("Georgia")).collect::<Vec<_>>();
+        assert_eq!(listed(f), [Family { name: "Georgia".into(), source: FontSource::User }], "once, as the user's");
+        // The same file again: nothing more in the folder, still listed once.
+        f.install_user_font(&georgia).unwrap();
+        // Another font under the same file name is kept beside it.
+        let elsewhere = scratch("namesake").join(file_name);
+        let (_, lobster) = BUNDLED_FILES.iter().find(|(n, _)| n.starts_with("lobster/")).unwrap();
+        std::fs::write(&elsewhere, lobster).unwrap();
+        assert!(f.install_user_font(&elsewhere).unwrap().iter().any(|n| n == "Lobster"));
+        let mut files: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        files.sort();
+        let (stem, ext) = (georgia.file_stem().unwrap().to_string_lossy(), georgia.extension().unwrap().to_string_lossy());
+        assert_eq!(files, [format!("{stem}-2.{ext}"), format!("{stem}.{ext}")]);
+        assert_eq!(listed(f).len(), 1);
+        assert!(f.families().iter().all(|x| !(x.name == "Lobster" && x.source != FontSource::Bundled)), "a bundled family stays bundled");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(elsewhere.parent().unwrap());
+    }
+
+    #[test]
+    fn a_font_that_cannot_be_copied_is_not_added() {
+        let _serial = crate::TEST_FONTS.lock();
+        let Some(verdana) = windows_font("verdana.ttf") else { return };
+        let f = fonts();
+        let dir = scratch("blocked");
+        let blocked = dir.join("not-a-folder");
+        std::fs::write(&blocked, b"a file where the font folder should be").unwrap();
+        f.load_user_dir(&blocked);
+        let g0 = f.generation();
+        let err = f.install_user_font(&verdana).unwrap_err();
+        assert!(matches!(err, FontError::CopyFailed(_)), "{err:?}");
+        assert_eq!(err.kind(), "copy_failed");
+        assert_eq!(f.generation(), g0, "nothing was registered");
+        assert!(f.families().iter().all(|x| !(x.name == "Verdana" && x.source == FontSource::User)), "no user entry for a font that was not added");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

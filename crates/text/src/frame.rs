@@ -48,14 +48,26 @@ pub struct TextFrame {
     key: u64,
 }
 
+/// The hash of everything in a document that [`crate::layout::shape_hash`]
+/// leaves out: with it, the whole document, each part hashed once.
+fn paint_hash(doc: &TextDoc) -> u64 {
+    // No `..`: a new field of `TextDoc` must be hashed here (or shape the layout).
+    let TextDoc { runs: _, style, paragraph: _, shape, perspective, anim, seed, extra } = doc;
+    crate::hash_of(&(style, shape, perspective, anim, seed, extra))
+}
+
 impl TextFrame {
     pub fn new(doc: &TextDoc, clock: Clock) -> TextFrame {
-        let laid = crate::layout::layout(doc);
+        // One font generation for the layout and the key: a font added
+        // meanwhile can never pair a new key with an old layout.
+        let generation = crate::fonts::fonts().generation();
+        let shape = crate::layout::shape_hash(doc);
+        let laid = crate::layout::layout_keyed(doc, shape, generation);
         let placed = crate::shape::place(doc, &laid);
         let anim = crate::anim::animate(doc, &laid, clock);
         let finals = crate::raster::finals(&laid, &placed, &anim);
         let bounds = crate::raster::bounds(doc, &laid, &finals);
-        let key = crate::hash_of(&(doc, anim.key(), crate::fonts::fonts().generation()));
+        let key = crate::hash_of(&(shape, paint_hash(doc), anim.key(), generation));
         TextFrame { doc: doc.clone(), laid, placed, anim, bounds, key }
     }
 
@@ -189,6 +201,40 @@ mod tests {
         assert_ne!(k(&d), k(&red));
         let later = Clock { since_in: kadr_core::Time::from_secs(9), ..Clock::REST };
         assert_eq!(kadr_scene::TextPicture::key(&TextFrame::new(&d, later)), k(&d), "a still text is the same picture at every instant");
+    }
+
+    fn is_blank_pixel(f: &kadr_core::CpuFrame) -> bool {
+        (f.width, f.height) == (1, 1) && f.row(0) == [0, 0, 0, 0]
+    }
+
+    #[test]
+    fn absurd_documents_and_scales_never_abort() {
+        // A wrap of 10¹² lays out at the widest wrap.
+        let mut wide = TextDoc::starter("широко", 1080);
+        wide.paragraph.wrap = Some(1e12);
+        let f = TextFrame::new(&wide, Clock::REST);
+        assert_eq!(f.layout_size().0, crate::layout::MAX_WRAP);
+        let r = f.raster(0.01);
+        assert_eq!((r.width, r.height), ((f.bounds().width() * 0.01).ceil() as u32, (f.bounds().height() * 0.01).ceil() as u32));
+        // Paddings of 10¹² are 10 000 px: at scale 1 that raster passes 64 Mpx and is one transparent pixel.
+        let mut padded = TextDoc::starter("плашка", 1080);
+        padded.style.plaque = Some(Plaque { per_line: true, colour: Rgba8::BLACK, radius: f32::INFINITY, padding_x: 1e12, padding_y: f32::NAN });
+        let f = TextFrame::new(&padded, Clock::REST);
+        let b = f.bounds();
+        assert!(b.width() > 20_000.0 && b.width() < 21_000.0 && b.height() < 1_000.0, "{b:?}");
+        padded.style.plaque.as_mut().unwrap().padding_y = 1e12;
+        let f = TextFrame::new(&padded, Clock::REST);
+        assert!(f.bounds().height() > 20_000.0 && f.bounds().height() < 21_000.0);
+        assert!(is_blank_pixel(&f.raster(1.0)), "past 64 Mpx: nothing is drawn");
+        assert!(f.raster(0.05).width > 1000, "a scale that fits draws it");
+        // Huge scales: nothing; scales that are not numbers count as 1.
+        let plain = TextFrame::new(&TextDoc::starter("Масштаб", 1080), Clock::REST);
+        for s in [1e6, 1e30, f32::MAX] {
+            assert!(is_blank_pixel(&plain.raster(s)), "scale {s}");
+        }
+        for s in [f32::INFINITY, f32::NAN, 0.0, -2.0] {
+            assert_eq!(plain.raster(s).width, plain.bounds().width().ceil() as u32, "scale {s}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ kadr-project = { path = "../project" }
 kadr-scene = { path = "../scene" }
 parley = { version = "=0.11.1", default-features = false, features = ["std", "system", "complex-scripts"] }
 swash = { version = "=0.2.10", default-features = false, features = ["std", "scale", "render"] }
+unicode-segmentation = "1"
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

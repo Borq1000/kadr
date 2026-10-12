@@ -3090,6 +3090,7 @@ dependencies = [
  "serde_json",
  "swash",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]

@@ -3,6 +3,10 @@
 //! and letter spacing, ALL CAPS — as glyphs in canvas px (layout box
 //! coordinates: origin top left, y down, `y` on the baseline) with their
 //! face, document run and animation units. Cached by what shapes it.
+//!
+//! Letter spacing follows each letter but the last of a line: alignment,
+//! the line boxes (and so a plaque per line) and the layout box end at the
+//! last letter's ink, not at the spacing after it.
 
 use crate::fonts::{fonts, DEFAULT_FAMILY};
 use kadr_project::{Align, TextDoc};
@@ -12,19 +16,26 @@ use parley::{Alignment, AlignmentOptions, FontFamily, FontStyle, FontWeight, Lin
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
+use unicode_segmentation::UnicodeSegmentation;
+
+/// The widest wrap a paragraph may ask for, canvas px (TX-R5: absurd
+/// values lay out at this width instead of growing without end).
+pub const MAX_WRAP: f32 = 100_000.0;
 
 /// The brush of laid-out text: the index of the document run it comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RunIx(pub u16);
 
 /// A face as a run uses it: the font file, its index, the variation
-/// coordinates (synthesis variations included) and the synthesis left to
-/// the rasteriser (fake bold, fake italic skew in degrees).
+/// coordinates (synthesis variations included) and their hash (the glyph
+/// cache's key part), and the synthesis left to the rasteriser (fake bold,
+/// fake italic skew in degrees).
 #[derive(Clone, Debug)]
 pub struct Face {
     pub data: Blob<u8>,
     pub index: u32,
     pub coords: Vec<i16>,
+    pub coords_hash: u64,
     pub embolden: bool,
     pub skew: Option<f32>,
 }
@@ -92,10 +103,22 @@ fn style(italic: bool) -> FontStyle {
     if italic { FontStyle::Italic } else { FontStyle::Normal }
 }
 
+/// The hash of what shapes a document's layout: its runs, base font and
+/// size and paragraph (not its paint, shape or animation).
+pub(crate) fn shape_hash(doc: &TextDoc) -> u64 {
+    crate::hash_of(&(&doc.runs, &doc.style.font, doc.style.size.to_bits(), &doc.paragraph))
+}
+
 /// The document's layout, from the cache when the runs, the base font and
 /// size, the paragraph and the font set are unchanged.
 pub fn layout(doc: &TextDoc) -> Arc<Laid> {
-    let key = crate::hash_of(&(&doc.runs, &doc.style.font, doc.style.size.to_bits(), &doc.paragraph, fonts().generation()));
+    layout_keyed(doc, shape_hash(doc), fonts().generation())
+}
+
+/// [`layout`] with the document's [`shape_hash`] and the font generation
+/// read once by the caller (a frame keys its picture by the same ones).
+pub(crate) fn layout_keyed(doc: &TextDoc, shape: u64, generation: u64) -> Arc<Laid> {
+    let key = crate::hash_of(&(shape, generation));
     if let Some(l) = CACHE.lock().get(&key) {
         return l.clone();
     }
@@ -137,7 +160,9 @@ fn build(doc: &TextDoc) -> Laid {
     let size = clamp_size(doc.style.size);
     let line_height = if doc.paragraph.line_height.is_finite() { doc.paragraph.line_height.clamp(0.5, 4.0) } else { 1.2 };
     let spacing = |v: f32| if v.is_finite() { v.clamp(-200.0, 2000.0) } else { 0.0 };
-    let wrap = doc.paragraph.wrap.filter(|w| w.is_finite() && *w > 0.0);
+    // The letter spacing parley adds after each letter of a run.
+    let run_spacing: Vec<f32> = doc.runs.iter().map(|r| spacing(r.style.letter_spacing.unwrap_or(doc.paragraph.letter_spacing))).collect();
+    let wrap = doc.paragraph.wrap.filter(|w| w.is_finite() && *w > 0.0).map(|w| w.min(MAX_WRAP));
     let layout = f.with_cx(|cx| {
         let mut b = cx.layout.ranged_builder(&mut cx.fonts, &text, 1.0, false);
         b.push_default(StyleProperty::FontFamily(FontFamily::named(&base_family)));
@@ -179,11 +204,12 @@ fn build(doc: &TextDoc) -> Laid {
         layout
     });
 
-    // Per byte of `text`: the letter and the word it belongs to.
+    // Per byte of `text`: the letter (a grapheme: an emoji sequence or a
+    // letter with its marks is one) and the word it belongs to.
     let (mut letter_at, mut word_at) = (vec![0usize; text.len() + 1], vec![0usize; text.len() + 1]);
     let (mut letters, mut words, mut in_word) = (0usize, 0usize, false);
-    for (i, ch) in text.char_indices() {
-        let ws = ch.is_whitespace();
+    for (i, grapheme) in text.grapheme_indices(true) {
+        let ws = grapheme.chars().all(char::is_whitespace);
         if !ws && !in_word {
             words += 1;
         }
@@ -191,17 +217,28 @@ fn build(doc: &TextDoc) -> Laid {
             letters += 1;
         }
         in_word = !ws;
-        for b in i..i + ch.len_utf8() {
+        for b in i..i + grapheme.len() {
             (letter_at[b], word_at[b]) = (letters.saturating_sub(1), words.saturating_sub(1));
         }
     }
 
+    // A line as parley placed it: its glyphs, its start, the advance of its
+    // content without the letter spacing after its last letter, its ink.
+    struct LinePlace {
+        glyphs: Range<usize>,
+        offset: f32,
+        content: f32,
+        left: f32,
+        right: f32,
+    }
     let mut faces: Vec<Face> = vec![];
     let mut glyphs = vec![];
     let mut lines = vec![];
+    let mut placed = vec![];
     for (li, line) in layout.lines().enumerate() {
         let m = line.metrics();
-        let (mut left, mut right) = (f32::MAX, f32::MIN);
+        let first = glyphs.len();
+        let (mut left, mut right, mut trail) = (f32::MAX, f32::MIN, 0.0f32);
         let (mut last_run, mut cursor) = (usize::MAX, 0usize);
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(gr) = item else { continue };
@@ -223,7 +260,8 @@ fn build(doc: &TextDoc) -> Laid {
             cursor += n;
             let font = run.font();
             let syn = run.synthesis();
-            let face = Face { data: font.data.clone(), index: font.index, coords: run.normalized_coords().to_vec(), embolden: syn.embolden(), skew: syn.skew() };
+            let coords = run.normalized_coords().to_vec();
+            let face = Face { data: font.data.clone(), index: font.index, coords_hash: crate::hash_of(&coords), coords, embolden: syn.embolden(), skew: syn.skew() };
             let fi = match faces.iter().position(|f| f.same(&face)) {
                 Some(i) => i,
                 None => {
@@ -237,17 +275,46 @@ fn build(doc: &TextDoc) -> Laid {
                 let visible = !text[span.clone()].chars().all(char::is_whitespace);
                 if visible {
                     left = left.min(g.x);
-                    right = right.max(g.x + g.advance);
+                    if g.x + g.advance > right {
+                        right = g.x + g.advance;
+                        trail = run_spacing.get(doc_run).copied().unwrap_or(0.0);
+                    }
                 }
                 glyphs.push(Glyph { face: fi, id: g.id as u16, x: g.x, y: g.y, size, advance: g.advance, run: doc_run, letter: letter_at[span.start], word: word_at[span.start], line: li, visible });
             }
         }
+        // The content from the line's start to its last letter's ink (parley's
+        // own trailing-whitespace figure counts a newline's letter spacing).
         if left > right {
             (left, right) = (m.offset, m.offset);
+        } else {
+            right -= trail;
         }
+        let content = right - m.offset;
+        placed.push(LinePlace { glyphs: first..glyphs.len(), offset: m.offset, content, left, right });
         lines.push(LineBox { top: m.block_min_coord, bottom: m.block_max_coord, baseline: m.baseline, left, right });
     }
-    let width = wrap.unwrap_or(layout.width()).max(size * 0.3);
+    let widest = placed.iter().map(|p| p.content).fold(0.0f32, f32::max);
+    let width = wrap.unwrap_or(widest).max(size * 0.3);
+    // Parley aligned each line by its advance with the spacing after its
+    // last letter, in a box as wide as the widest such line; align it again
+    // by its content in the layout box (its own rule: an overflowing line
+    // starts at the left). Right-to-left text keeps parley's placement.
+    if !layout.is_rtl() {
+        let k = match doc.paragraph.align {
+            Align::Left => 0.0,
+            Align::Center => 0.5,
+            Align::Right => 1.0,
+        };
+        for (p, line) in placed.iter().zip(&mut lines) {
+            let free = width - p.content;
+            let shift = if free <= 0.0 { 0.0 } else { k * free } - p.offset;
+            if shift.abs() > 1e-3 {
+                glyphs[p.glyphs.clone()].iter_mut().for_each(|g| g.x += shift);
+                (line.left, line.right) = (p.left + shift, p.right + shift);
+            }
+        }
+    }
     let height = layout.height().max(size * line_height);
     let max_size = glyphs.iter().map(|g| g.size).fold(size, f32::max);
     Laid { faces, glyphs, lines, width, height, letters, words, missing, max_size }
@@ -337,6 +404,69 @@ mod tests {
         m.style.font.family = crate::DEFAULT_FAMILY.into();
         let ids = |l: &Laid| l.glyphs.iter().map(|g| (g.id, g.x)).collect::<Vec<_>>();
         assert_eq!(ids(&l), ids(&layout(&m)), "drawn exactly as Montserrat");
+    }
+
+    #[test]
+    fn the_spacing_after_a_lines_last_letter_is_not_part_of_it() {
+        let mut d = doc("РАЗ ДВА\nТРИ");
+        d.paragraph.letter_spacing = 40.0;
+        let ink = |l: &Laid, i: usize| {
+            let line = l.lines[i];
+            let last = l.glyphs.iter().filter(|g| g.visible && g.line == i).max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
+            assert!((last.x + last.advance - 40.0 - line.right).abs() < 0.01, "the line ends at its last letter's ink: {line:?}");
+            line
+        };
+        let centred = layout(&d);
+        for i in 0..2 {
+            let line = ink(&centred, i);
+            assert!(((line.left + line.right) / 2.0 - centred.width / 2.0).abs() < 0.5, "centred by its letters: {line:?} in {}", centred.width);
+        }
+        assert!((ink(&centred, 0).right - ink(&centred, 0).left - centred.width).abs() < 0.5, "the box is as wide as the widest line's letters");
+        d.paragraph.align = kadr_project::Align::Right;
+        d.paragraph.wrap = Some(900.0);
+        let right = layout(&d);
+        for i in 0..2 {
+            assert!((ink(&right, i).right - 900.0).abs() < 0.5, "flush right: {:?}", right.lines[i]);
+        }
+        d.paragraph.align = kadr_project::Align::Left;
+        assert!(layout(&d).lines.iter().all(|l| l.left.abs() < 1.0));
+        // Without letter spacing parley's placement stands.
+        let plain = layout(&doc("РАЗ ДВА\nТРИ"));
+        assert!(((plain.lines[1].left + plain.lines[1].right) / 2.0 - plain.width / 2.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_letter_is_a_grapheme() {
+        // A ZWJ family, a skin tone, an emoji with VS16, a flag sequence, «й» as и + breve.
+        let l = layout(&doc("👨\u{200d}👩\u{200d}👧 👍🏽 ❤\u{fe0f} 🏳\u{fe0f}\u{200d}🌈 и\u{306}"));
+        assert_eq!((l.letters, l.words), (5, 5));
+        let letters: std::collections::BTreeSet<usize> = l.glyphs.iter().filter(|g| g.visible).map(|g| g.letter).collect();
+        assert_eq!(letters.into_iter().collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn emoji_sequences_never_draw_notdef() {
+        if !fonts().has("Segoe UI Emoji") {
+            eprintln!("no Segoe UI Emoji on this machine: skipped");
+            return;
+        }
+        for family in [crate::DEFAULT_FAMILY, "Playfair Display", "Press Start 2P"] {
+            let mut d = doc("👨\u{200d}👩\u{200d}👧 👍🏽 ❤\u{fe0f} 🏳\u{fe0f}\u{200d}🌈 🧑🏿\u{200d}💻 ✌\u{fe0f}");
+            d.style.font.family = family.into();
+            let l = layout(&d);
+            assert!(l.glyphs.iter().filter(|g| g.visible).all(|g| g.id != 0), "{family}: a .notdef glyph in {:?}", l.glyphs);
+        }
+    }
+
+    #[test]
+    fn absurd_wraps_lay_out_at_the_widest_wrap() {
+        let mut d = doc("широкий абзац");
+        for w in [1e12, f32::MAX, f32::INFINITY] {
+            d.paragraph.wrap = Some(w);
+            let l = layout(&d);
+            assert_eq!(l.width, if w.is_finite() { MAX_WRAP } else { l.width });
+            assert!(l.width.is_finite() && l.width <= MAX_WRAP && l.lines.len() == 1);
+        }
     }
 
     #[test]

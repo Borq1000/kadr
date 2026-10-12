@@ -8,6 +8,14 @@
 //! a raster of `W × H = ⌈bounds · scale⌉` px draws the bounds with the
 //! per-axis scales `W / width` and `H / height`, so its edges are the
 //! bounds' edges and the renderer's stretch over `placement.size` is exact.
+//!
+//! Memory (TX-R5): drawing a raster of N px holds the float canvas (16 B
+//! per px), one coverage mask at a time (4 B per px) and the RGBA8 result
+//! (4 B per px) — about 24 B per raster px at the peak, so the resolver's
+//! 16 Mpx cap (`kadr_playback::MAX_TEXT_PIXELS`) peaks near 400 MB, not
+//! the 64 MB of the finished raster. Past [`MAX_RASTER_PIXELS`] nothing is
+//! allocated: the picture is a 1×1 transparent raster. Glyph images are
+//! cached up to [`GLYPH_CACHE_BYTES`].
 
 use crate::anim::FrameAnim;
 use crate::frame::Bounds;
@@ -18,6 +26,7 @@ use kadr_project::{Fill, Rgba8, TextDoc};
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use swash::scale::image::{Content, Image};
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
@@ -196,14 +205,19 @@ pub(crate) fn premul(c: Rgba8, opacity: f32) -> [f32; 4] {
     [r * a, g * a, b * a, a]
 }
 
+/// The largest plaque padding, canvas px (TX-R5).
+pub(crate) const MAX_PADDING: f32 = 10_000.0;
+
 /// The plaque's rectangles in layout px: one per line with glyphs, or one
-/// round the block; padding added. None for a curved text (titles spec §1).
+/// round the block; padding (0..=[`MAX_PADDING`]) added. None for a curved
+/// text (titles spec §1).
 pub(crate) fn plaque_rects(doc: &TextDoc, laid: &Laid) -> Vec<(f32, f32, f32, f32)> {
     let Some(p) = doc.style.plaque else { return vec![] };
     if doc.shape != kadr_project::TextShape::Straight {
         return vec![];
     }
-    let (px, py) = (p.padding_x.max(0.0), p.padding_y.max(0.0));
+    let pad = |v: f32| if v.is_finite() { v.clamp(0.0, MAX_PADDING) } else { 0.0 };
+    let (px, py) = (pad(p.padding_x), pad(p.padding_y));
     let lines: Vec<_> = laid.lines.iter().filter(|l| l.right > l.left).collect();
     let (Some(first), Some(last)) = (lines.first(), lines.last()) else { return vec![] };
     if p.per_line {
@@ -220,13 +234,15 @@ pub(crate) fn outline_reach(doc: &TextDoc) -> f32 {
 }
 
 /// What the picture may cover, in canvas px about the layout box centre:
-/// the layout box, every glyph's em box as placed, the plaque, and room
-/// for the outlines and ink beyond the em box (Task 9 adds shadow, glow
-/// and perspective).
+/// the layout box, every glyph's em box as placed (a line's last letter
+/// without the letter spacing after it), the plaque, and room for the
+/// outlines and ink beyond the em box (Task 9 adds shadow, glow and
+/// perspective).
 pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
     let mut b = Bounds { x0: 0.0, y0: 0.0, x1: laid.width, y1: laid.height };
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, _)| g.visible) {
-        for corner in [(0.0, -g.size), (g.advance, -g.size), (g.advance, 0.35 * g.size), (0.0, 0.35 * g.size)] {
+        let advance = laid.lines.get(g.line).map_or(g.advance, |l| g.advance.min(l.right - g.x).max(0.0));
+        for corner in [(0.0, -g.size), (advance, -g.size), (advance, 0.35 * g.size), (0.0, 0.35 * g.size)] {
             let (x, y) = rot((corner.0 * f.scale, corner.1 * f.scale), f.rotation);
             b.add_point(f.x + x, f.y + y);
         }
@@ -255,7 +271,66 @@ struct GlyphKey {
     stretch: i32,
 }
 
-static GLYPHS: LazyLock<Mutex<HashMap<GlyphKey, Option<Arc<Image>>>>> = LazyLock::new(Default::default);
+/// The glyph cache's budget: the bytes of its images and entries (TX-R5).
+pub(crate) const GLYPH_CACHE_BYTES: usize = 64 << 20;
+/// A glyph image wider or taller than this is drawn but not kept.
+pub(crate) const MAX_CACHED_SIDE: u32 = 512;
+/// What an entry costs beyond its pixels (key, image header, map slot).
+const ENTRY_BYTES: usize = 192;
+
+/// Glyph images by what draws them, within a byte budget: an entry that
+/// would pass it empties the cache first. Animated glyphs (turned or
+/// scaled) and large images are never kept — each would be used once.
+pub(crate) struct GlyphCache {
+    map: HashMap<GlyphKey, Option<Arc<Image>>>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl GlyphCache {
+    pub fn new(budget: usize) -> GlyphCache {
+        GlyphCache { map: HashMap::new(), bytes: 0, budget }
+    }
+
+    /// Bytes held (images and entries).
+    #[cfg(test)]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn cost(img: &Option<Arc<Image>>) -> usize {
+        ENTRY_BYTES + img.as_ref().map_or(0, |i| i.data.len())
+    }
+
+    fn get(&self, key: &GlyphKey) -> Option<Option<Arc<Image>>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: GlyphKey, img: Option<Arc<Image>>) {
+        if img.as_ref().is_some_and(|i| i.placement.width > MAX_CACHED_SIDE || i.placement.height > MAX_CACHED_SIDE) {
+            return;
+        }
+        let cost = Self::cost(&img);
+        if cost > self.budget {
+            return;
+        }
+        if self.bytes + cost > self.budget {
+            self.map.clear();
+            self.bytes = 0;
+        }
+        if let Some(old) = self.map.insert(key, img) {
+            self.bytes -= Self::cost(&old);
+        }
+        self.bytes += cost;
+    }
+}
+
+static GLYPHS: LazyLock<Mutex<GlyphCache>> = LazyLock::new(|| Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES)));
 
 thread_local! {
     static SCALE: RefCell<ScaleContext> = RefCell::new(ScaleContext::new());
@@ -270,12 +345,17 @@ thread_local! {
 /// is cached by, so a cache hit is the same pixels as a miss.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glyph_image(face: &Face, id: u16, size: f32, frac: f32, stroke: f32, rotation: f32, scale: f32, stretch: f32) -> Option<Arc<Image>> {
-    let q = |v: f32| (v * 64.0).round() as i32;
-    let frac = ((frac * 4.0).floor() as i32).clamp(0, 3) as u8;
+    glyph_image_in(&GLYPHS, face, id, size, frac, stroke, rotation, scale, stretch)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glyph_image_in(cache: &Mutex<GlyphCache>, face: &Face, id: u16, size: f32, frac: f32, stroke: f32, rotation: f32, scale: f32, stretch: f32) -> Option<Arc<Image>> {
+    let q = |v: f32| if v.is_finite() { (v * 64.0).round().clamp(-1e9, 1e9) as i32 } else { 0 };
+    let frac = if frac.is_finite() { ((frac * 4.0).floor() as i32).clamp(0, 3) as u8 } else { 0 };
     let key = GlyphKey {
         blob: face.data.id(),
         index: face.index,
-        coords: crate::hash_of(&face.coords),
+        coords: face.coords_hash,
         id,
         size: q(size),
         frac,
@@ -286,8 +366,10 @@ pub(crate) fn glyph_image(face: &Face, id: u16, size: f32, frac: f32, stroke: f3
         scale: q(scale * 16.0),
         stretch: q(stretch * 16.0),
     };
-    if let Some(hit) = GLYPHS.lock().get(&key) {
-        return hit.clone();
+    // Only still glyphs are kept: an animated one is turned or scaled anew each frame.
+    let keep = key.rotation == 0 && key.scale == 1024;
+    if keep && let Some(hit) = cache.lock().get(&key) {
+        return hit;
     }
     let (size, stroke) = (key.size as f32 / 64.0, key.stroke as f32 / 64.0);
     let (rotation, scale, stretch) = (key.rotation as f32 / 1024.0, key.scale as f32 / 1024.0, key.stretch as f32 / 1024.0);
@@ -320,11 +402,9 @@ pub(crate) fn glyph_image(face: &Face, id: u16, size: f32, frac: f32, stroke: f3
         r.render(&mut scaler, id)
     })
     .map(Arc::new);
-    let mut cache = GLYPHS.lock();
-    if cache.len() >= 8192 {
-        cache.clear();
+    if keep {
+        cache.lock().insert(key, img.clone());
     }
-    cache.insert(key, img.clone());
     img
 }
 
@@ -341,13 +421,20 @@ pub(crate) struct Place {
 
 impl Place {
     /// The raster of `bounds` at `scale`: its size (`⌈bounds · scale⌉`, at
-    /// least 1 px) and the place that fills it.
-    pub fn fill(laid: &Laid, bounds: Bounds, scale: f32) -> (usize, usize, Place) {
+    /// least 1 px) and the place that fills it; `None` when that raster
+    /// would pass [`MAX_RASTER_PIXELS`] (or its size is not a number).
+    pub fn fill(laid: &Laid, bounds: Bounds, scale: f32) -> Option<(usize, usize, Place)> {
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         let (bw, bh) = (bounds.width(), bounds.height());
-        let (w, h) = (((bw * s).ceil() as usize).max(1), ((bh * s).ceil() as usize).max(1));
+        let (wf, hf) = ((bw * s).ceil().max(1.0), (bh * s).ceil().max(1.0));
+        let pixels = wf as f64 * hf as f64;
+        let finite = [laid.width, laid.height, bounds.x0, bounds.y0].iter().all(|v| v.is_finite());
+        if !finite || pixels.is_nan() || pixels > MAX_RASTER_PIXELS as f64 {
+            return None;
+        }
+        let (w, h) = (wf as usize, hf as usize);
         let per_axis = |n: usize, extent: f32| if extent > 0.0 { n as f32 / extent } else { s };
-        (w, h, Place { sx: per_axis(w, bw), sy: per_axis(h, bh), ox: laid.width / 2.0 + bounds.x0, oy: laid.height / 2.0 + bounds.y0 })
+        Some((w, h, Place { sx: per_axis(w, bw), sy: per_axis(h, bh), ox: laid.width / 2.0 + bounds.x0, oy: laid.height / 2.0 + bounds.y0 }))
     }
 
     /// A point in layout px, in raster px.
@@ -417,10 +504,25 @@ fn paint_glyph(c: &mut Canvas, img: &Image, x0: i32, y0: i32, colour: impl Fn(us
     }
 }
 
+/// The largest raster a text draws (64 Mpx, TX-R5): past it the picture is
+/// a 1×1 transparent raster and nothing is allocated. The resolver keeps
+/// its rasters far below (`kadr_playback::MAX_TEXT_PIXELS`); this guards
+/// any other caller and absurd documents.
+pub(crate) const MAX_RASTER_PIXELS: u64 = 64 << 20;
+
+/// Logged once per process: the first raster past [`MAX_RASTER_PIXELS`].
+static TOO_LARGE: AtomicBool = AtomicBool::new(false);
+
 /// The raster of a text at `scale` (titles spec §5.1): `⌈bounds · scale⌉`
-/// px, the bounds filling it (TX-R3).
+/// px, the bounds filling it (TX-R3); 1×1 and transparent when that is
+/// past [`MAX_RASTER_PIXELS`].
 pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, bounds: Bounds, scale: f32, pool: &FramePool) -> CpuFrame {
-    let (w, h, at) = Place::fill(laid, bounds, scale);
+    let Some((w, h, at)) = Place::fill(laid, bounds, scale) else {
+        if !TOO_LARGE.swap(true, Ordering::Relaxed) {
+            tracing::warn!(width = bounds.width(), height = bounds.height(), scale, "a text raster would pass 64 Mpx: drawn as nothing");
+        }
+        return Canvas::new(1, 1).into_frame(pool);
+    };
     let mut canvas = Canvas::new(w, h);
     let finals = finals(laid, placed, anim);
     // 1. The plaque.
@@ -451,4 +553,59 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
         }
     }
     canvas.into_frame(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kadr_project::TextDoc;
+
+    /// A face and a glyph of it: Montserrat's «Ж».
+    fn zhe() -> (Face, u16) {
+        let l = crate::layout::layout(&TextDoc::new("Ж"));
+        (l.faces[l.glyphs[0].face].clone(), l.glyphs[0].id)
+    }
+
+    #[test]
+    fn the_glyph_cache_keeps_within_its_budget() {
+        let (face, id) = zhe();
+        let small = Mutex::new(GlyphCache::new(256 << 10));
+        for size in 8..=400 {
+            assert!(glyph_image_in(&small, &face, id, size as f32, 0.0, 0.0, 0.0, 1.0, 1.0).is_some());
+            let bytes = small.lock().bytes();
+            assert!(bytes <= 256 << 10, "{bytes} bytes at size {size}");
+        }
+        assert!(small.lock().len() > 0, "it still keeps what fits");
+        for size in (8..=500).step_by(3) {
+            glyph_image(&face, id, size as f32, 0.5, 2.0, 0.0, 1.0, 1.0);
+        }
+        assert!(GLYPHS.lock().bytes() <= GLYPH_CACHE_BYTES);
+    }
+
+    #[test]
+    fn animated_and_large_glyphs_are_drawn_but_not_kept() {
+        let (face, id) = zhe();
+        let cache = Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES));
+        assert!(glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.3, 1.0, 1.0).is_some(), "turned");
+        assert!(glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.0, 1.5, 1.0).is_some(), "scaled");
+        let big = glyph_image_in(&cache, &face, id, 900.0, 0.0, 0.0, 0.0, 1.0, 1.0).expect("drawn");
+        assert!(big.placement.width > MAX_CACHED_SIDE || big.placement.height > MAX_CACHED_SIDE);
+        assert_eq!(cache.lock().len(), 0);
+        glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.0, 1.0, 1.0002);
+        assert_eq!(cache.lock().len(), 1, "a still glyph (the raster's stretch included) is kept");
+    }
+
+    #[test]
+    fn a_cache_hit_is_the_same_pixels_as_a_miss() {
+        let (face, id) = zhe();
+        // Two requests that differ below the cache's resolution share an entry.
+        let (a, b) = ((40.004, 0.26, 3.004, 1.0004), (40.001, 0.49, 3.001, 1.0001));
+        let first = Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES));
+        let miss = glyph_image_in(&first, &face, id, a.0, a.1, a.2, 0.0, 1.0, a.3).unwrap();
+        let hit = glyph_image_in(&first, &face, id, b.0, b.1, b.2, 0.0, 1.0, b.3).unwrap();
+        assert!(Arc::ptr_eq(&miss, &hit), "the second request is a hit");
+        let fresh = glyph_image_in(&Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES)), &face, id, b.0, b.1, b.2, 0.0, 1.0, b.3).unwrap();
+        let at = |i: &Image| (i.placement.left, i.placement.top, i.placement.width, i.placement.height);
+        assert_eq!((at(&hit), &hit.data), (at(&fresh), &fresh.data), "drawn afresh: the same pixels");
+    }
 }
