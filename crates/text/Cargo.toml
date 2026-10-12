@@ -1,0 +1,21 @@
+[package]
+name = "kadr-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kadr's text engine: fonts, layout, rasterisation, animation and styles of text clips (titles spec §5)"
+build = "build.rs"
+
+[dependencies]
+kadr-core = { path = "../core" }
+kadr-project = { path = "../project" }
+kadr-scene = { path = "../scene" }
+parley = { version = "=0.11.1", default-features = false, features = ["std", "system", "complex-scripts"] }
+swash = { version = "=0.2.10", default-features = false, features = ["std", "scale", "render"] }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+png = "0.17"

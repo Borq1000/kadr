@@ -1,0 +1,454 @@
+//! Pixels (titles spec §5.1): glyphs through swash into coverage masks and
+//! colour images, composed bottom to top into a premultiplied float
+//! buffer, stored as RGBA8 (contract rounding). Passes: plaque, (Task 9:
+//! shadow, glow), outline 2, outline 1, fill. Colour emoji (COLR / colour
+//! bitmaps) draw their own colours.
+//!
+//! The picture fills its raster (the `TextPicture` contract, ruling TX-R3):
+//! a raster of `W × H = ⌈bounds · scale⌉` px draws the bounds with the
+//! per-axis scales `W / width` and `H / height`, so its edges are the
+//! bounds' edges and the renderer's stretch over `placement.size` is exact.
+
+use crate::anim::FrameAnim;
+use crate::frame::Bounds;
+use crate::layout::{Face, Glyph, Laid};
+use crate::shape::Placed;
+use kadr_core::{ColorInfo, CpuFrame, FramePool};
+use kadr_project::{Fill, Rgba8, TextDoc};
+use parking_lot::Mutex;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+use swash::scale::image::{Content, Image};
+use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+use swash::zeno::{Angle, Format, Join, Stroke, Transform, Vector};
+use swash::FontRef;
+
+/// A premultiplied RGBA float buffer.
+pub(crate) struct Canvas {
+    pub w: usize,
+    pub h: usize,
+    pub px: Vec<[f32; 4]>,
+}
+
+impl Canvas {
+    pub fn new(w: usize, h: usize) -> Canvas {
+        let (w, h) = (w.max(1), h.max(1));
+        Canvas { w, h, px: vec![[0.0; 4]; w * h] }
+    }
+
+    /// Source-over of premultiplied `c` scaled by coverage `cov`.
+    #[inline]
+    pub fn over(&mut self, i: usize, c: [f32; 4], cov: f32) {
+        let d = &mut self.px[i];
+        let k = 1.0 - c[3] * cov;
+        for ch in 0..4 {
+            d[ch] = c[ch] * cov + d[ch] * k;
+        }
+    }
+
+    pub fn over_mask(&mut self, m: &Mask, c: [f32; 4]) {
+        for (i, &cov) in m.a.iter().enumerate() {
+            if cov > 0.0 {
+                self.over(i, c, cov);
+            }
+        }
+    }
+
+    /// RGBA8 in the working space: `floor(clamp(v)·255 + 0.5)`.
+    pub fn into_frame(self, pool: &FramePool) -> CpuFrame {
+        let mut f = CpuFrame::rgba8(pool, self.w as u32, self.h as u32, ColorInfo::WORKING_SDR);
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        for y in 0..self.h {
+            let row = f.row_mut(y as u32);
+            for x in 0..self.w {
+                let p = self.px[y * self.w + x];
+                row[x * 4..x * 4 + 4].copy_from_slice(&[q(p[0]), q(p[1]), q(p[2]), q(p[3])]);
+            }
+        }
+        f
+    }
+}
+
+/// A coverage buffer (0..1).
+pub(crate) struct Mask {
+    pub w: usize,
+    pub h: usize,
+    pub a: Vec<f32>,
+}
+
+impl Mask {
+    pub fn new(w: usize, h: usize) -> Mask {
+        let (w, h) = (w.max(1), h.max(1));
+        Mask { w, h, a: vec![0.0; w * h] }
+    }
+
+    /// Max-union of a glyph image's coverage (a colour image's alpha) at
+    /// `(x0, y0)`, times `k`.
+    pub fn union(&mut self, img: &Image, x0: i32, y0: i32, k: f32) {
+        let p = img.placement;
+        for row in 0..p.height as i32 {
+            let y = y0 + row;
+            if y < 0 || y >= self.h as i32 {
+                continue;
+            }
+            for col in 0..p.width as i32 {
+                let x = x0 + col;
+                if x < 0 || x >= self.w as i32 {
+                    continue;
+                }
+                let i = (row * p.width as i32 + col) as usize;
+                let cov = match img.content {
+                    Content::Mask => img.data[i] as f32 / 255.0,
+                    Content::Color => img.data[i * 4 + 3] as f32 / 255.0,
+                    Content::SubpixelMask => 0.0,
+                } * k;
+                let a = &mut self.a[y as usize * self.w + x as usize];
+                *a = a.max(cov);
+            }
+        }
+    }
+
+    /// Max-union of a rounded rectangle (raster px), anti-aliased by its
+    /// signed distance.
+    pub fn round_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) {
+        if !(x1 > x0 && y1 > y0) {
+            return;
+        }
+        let r = r.min((x1 - x0) / 2.0).min((y1 - y0) / 2.0).max(0.0);
+        let (cx, cy, hx, hy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0, (y1 - y0) / 2.0);
+        let (xa, xb) = ((x0.floor().max(0.0)) as usize, (x1.ceil().min(self.w as f32)) as usize);
+        let (ya, yb) = ((y0.floor().max(0.0)) as usize, (y1.ceil().min(self.h as f32)) as usize);
+        for y in ya..yb {
+            for x in xa..xb {
+                let qx = (x as f32 + 0.5 - cx).abs() - (hx - r);
+                let qy = (y as f32 + 0.5 - cy).abs() - (hy - r);
+                let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+                let a = &mut self.a[y * self.w + x];
+                *a = a.max((0.5 - d).clamp(0.0, 1.0));
+            }
+        }
+    }
+}
+
+/// A glyph as drawn: pen origin (layout px), rotation (radians, clockwise),
+/// scale, opacity, blur (canvas px) and the colour replacing its fill.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Final {
+    pub x: f32,
+    pub y: f32,
+    pub rotation: f32,
+    pub scale: f32,
+    pub opacity: f32,
+    pub blur: f32,
+    pub colour: Option<Rgba8>,
+}
+
+/// The glyph's centre relative to its pen origin, unrotated: half its
+/// advance along the baseline, 0.35 em above it.
+fn centre_offset(g: &Glyph) -> (f32, f32) {
+    (g.advance / 2.0, -0.35 * g.size)
+}
+
+fn rot((x, y): (f32, f32), a: f32) -> (f32, f32) {
+    let (s, c) = a.sin_cos();
+    (x * c - y * s, x * s + y * c)
+}
+
+/// The glyphs along the shape, moved by the animation (titles spec §4):
+/// each turns and scales about its own centre and shifts; then the whole
+/// block turns, scales and shifts about the layout box centre.
+pub(crate) fn finals(laid: &Laid, placed: &[Placed], anim: &FrameAnim) -> Vec<Final> {
+    let (bx, by) = (laid.width / 2.0, laid.height / 2.0);
+    let b = &anim.block;
+    laid.glyphs
+        .iter()
+        .zip(placed)
+        .zip(&anim.glyphs)
+        .map(|((g, p), a)| {
+            let u = centre_offset(g);
+            let c0 = rot(u, p.rotation);
+            let centre = (p.x + c0.0 + a.dx, p.y + c0.1 + a.dy);
+            let r = p.rotation + a.rotation;
+            let c1 = rot(u, r);
+            let origin = (centre.0 - a.scale * c1.0, centre.1 - a.scale * c1.1);
+            let o = rot((origin.0 - bx, origin.1 - by), b.rotation);
+            Final {
+                x: bx + b.scale * o.0 + b.dx,
+                y: by + b.scale * o.1 + b.dy,
+                rotation: r + b.rotation,
+                scale: a.scale * b.scale,
+                opacity: (a.opacity * b.opacity).clamp(0.0, 1.0),
+                blur: a.blur.max(b.blur),
+                colour: a.colour,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn fill_of(doc: &TextDoc, run: usize) -> &Fill {
+    doc.runs.get(run).and_then(|r| r.style.fill.as_ref()).unwrap_or(&doc.style.fill)
+}
+
+pub(crate) fn premul(c: Rgba8, opacity: f32) -> [f32; 4] {
+    let [r, g, b, a] = c.to_f32();
+    let a = a * opacity;
+    [r * a, g * a, b * a, a]
+}
+
+/// The plaque's rectangles in layout px: one per line with glyphs, or one
+/// round the block; padding added. None for a curved text (titles spec §1).
+pub(crate) fn plaque_rects(doc: &TextDoc, laid: &Laid) -> Vec<(f32, f32, f32, f32)> {
+    let Some(p) = doc.style.plaque else { return vec![] };
+    if doc.shape != kadr_project::TextShape::Straight {
+        return vec![];
+    }
+    let (px, py) = (p.padding_x.max(0.0), p.padding_y.max(0.0));
+    let lines: Vec<_> = laid.lines.iter().filter(|l| l.right > l.left).collect();
+    let (Some(first), Some(last)) = (lines.first(), lines.last()) else { return vec![] };
+    if p.per_line {
+        lines.iter().map(|l| (l.left - px, l.top - py, l.right + px, l.bottom + py)).collect()
+    } else {
+        let (l, r) = lines.iter().fold((f32::MAX, f32::MIN), |(a, b), l| (a.min(l.left), b.max(l.right)));
+        vec![(l - px, first.top - py, r + px, last.bottom + py)]
+    }
+}
+
+/// The outlines' total width (at most two, each ≤ 200 px).
+pub(crate) fn outline_reach(doc: &TextDoc) -> f32 {
+    doc.style.outlines.iter().take(2).map(|o| if o.width.is_finite() { o.width.clamp(0.0, 200.0) } else { 0.0 }).sum()
+}
+
+/// What the picture may cover, in canvas px about the layout box centre:
+/// the layout box, every glyph's em box as placed, the plaque, and room
+/// for the outlines and ink beyond the em box (Task 9 adds shadow, glow
+/// and perspective).
+pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
+    let mut b = Bounds { x0: 0.0, y0: 0.0, x1: laid.width, y1: laid.height };
+    for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, _)| g.visible) {
+        for corner in [(0.0, -g.size), (g.advance, -g.size), (g.advance, 0.35 * g.size), (0.0, 0.35 * g.size)] {
+            let (x, y) = rot((corner.0 * f.scale, corner.1 * f.scale), f.rotation);
+            b.add_point(f.x + x, f.y + y);
+        }
+    }
+    for (x0, y0, x1, y1) in plaque_rects(doc, laid) {
+        b = b.union(Bounds { x0, y0, x1, y1 });
+    }
+    let margin = outline_reach(doc) + 0.15 * laid.max_size + 2.0;
+    let b = b.grow(margin);
+    Bounds { x0: b.x0 - laid.width / 2.0, y0: b.y0 - laid.height / 2.0, x1: b.x1 - laid.width / 2.0, y1: b.y1 - laid.height / 2.0 }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    blob: u64,
+    index: u32,
+    coords: u64,
+    id: u16,
+    size: i32,
+    frac: u8,
+    stroke: i32,
+    embolden: bool,
+    skew: u32,
+    rotation: i32,
+    scale: i32,
+    stretch: i32,
+}
+
+static GLYPHS: LazyLock<Mutex<HashMap<GlyphKey, Option<Arc<Image>>>>> = LazyLock::new(Default::default);
+
+thread_local! {
+    static SCALE: RefCell<ScaleContext> = RefCell::new(ScaleContext::new());
+}
+
+/// A glyph's image from swash, cached: `size` px; a centred stroke of
+/// `stroke` px with round joins when `stroke > 0` (outlines only); turned
+/// by `rotation` (radians, clockwise on screen) and scaled by `scale`
+/// about the pen origin, then stretched horizontally by `stretch` (the
+/// raster's x scale over its y scale, TX-R3); shifted right by `frac`
+/// (0..1, in quarters). It is drawn with exactly the quantised values it
+/// is cached by, so a cache hit is the same pixels as a miss.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glyph_image(face: &Face, id: u16, size: f32, frac: f32, stroke: f32, rotation: f32, scale: f32, stretch: f32) -> Option<Arc<Image>> {
+    let q = |v: f32| (v * 64.0).round() as i32;
+    let frac = ((frac * 4.0).floor() as i32).clamp(0, 3) as u8;
+    let key = GlyphKey {
+        blob: face.data.id(),
+        index: face.index,
+        coords: crate::hash_of(&face.coords),
+        id,
+        size: q(size),
+        frac,
+        stroke: q(stroke),
+        embolden: face.embolden,
+        skew: face.skew.map_or(0, f32::to_bits),
+        rotation: q(rotation * 16.0),
+        scale: q(scale * 16.0),
+        stretch: q(stretch * 16.0),
+    };
+    if let Some(hit) = GLYPHS.lock().get(&key) {
+        return hit.clone();
+    }
+    let (size, stroke) = (key.size as f32 / 64.0, key.stroke as f32 / 64.0);
+    let (rotation, scale, stretch) = (key.rotation as f32 / 1024.0, key.scale as f32 / 1024.0, key.stretch as f32 / 1024.0);
+    let img = SCALE.with(|scx| {
+        let mut scx = scx.borrow_mut();
+        let font = FontRef::from_index(face.data.as_ref(), face.index as usize)?;
+        let mut scaler = scx.builder_with_id(font, [face.data.id(), face.index as u64]).size(size).hint(false).normalized_coords(&face.coords).build();
+        let colour = [Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline];
+        let plain = [Source::Outline];
+        let mut r = Render::new(if stroke > 0.0 { &plain } else { &colour });
+        r.format(Format::Alpha).offset(Vector::new(frac as f32 / 4.0, 0.0)).default_color([255, 255, 255, 255]);
+        if face.embolden {
+            r.embolden(size / 48.0);
+        }
+        let mut t = face.skew.map(|deg| Transform::skew(Angle::from_degrees(deg), Angle::ZERO));
+        if rotation != 0.0 || scale != 1.0 {
+            let m = Transform::scale(scale, scale).then(&Transform::rotation(Angle::from_radians(-rotation)));
+            t = Some(t.map_or(m, |s| s.then(&m)));
+        }
+        if stretch != 1.0 {
+            let m = Transform::scale(stretch, 1.0);
+            t = Some(t.map_or(m, |s| s.then(&m)));
+        }
+        r.transform(t);
+        if stroke > 0.0 {
+            let mut st = Stroke::new(stroke);
+            st.join(Join::Round);
+            r.style(st);
+        }
+        r.render(&mut scaler, id)
+    })
+    .map(Arc::new);
+    let mut cache = GLYPHS.lock();
+    if cache.len() >= 8192 {
+        cache.clear();
+    }
+    cache.insert(key, img.clone());
+    img
+}
+
+/// Where the picture goes in the raster (TX-R3): raster px per canvas px
+/// on each axis — `sx = W / width`, `sy = H / height` — and the layout px
+/// at the raster's top left. Glyphs are drawn at `sy` px per canvas px and
+/// stretched by `sx / sy`; lengths without an axis (strokes, radii) use `sy`.
+pub(crate) struct Place {
+    pub sx: f32,
+    pub sy: f32,
+    pub ox: f32,
+    pub oy: f32,
+}
+
+impl Place {
+    /// The raster of `bounds` at `scale`: its size (`⌈bounds · scale⌉`, at
+    /// least 1 px) and the place that fills it.
+    pub fn fill(laid: &Laid, bounds: Bounds, scale: f32) -> (usize, usize, Place) {
+        let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        let (bw, bh) = (bounds.width(), bounds.height());
+        let (w, h) = (((bw * s).ceil() as usize).max(1), ((bh * s).ceil() as usize).max(1));
+        let per_axis = |n: usize, extent: f32| if extent > 0.0 { n as f32 / extent } else { s };
+        (w, h, Place { sx: per_axis(w, bw), sy: per_axis(h, bh), ox: laid.width / 2.0 + bounds.x0, oy: laid.height / 2.0 + bounds.y0 })
+    }
+
+    /// A point in layout px, in raster px.
+    pub fn point(&self, x: f32, y: f32) -> (f32, f32) {
+        ((x - self.ox) * self.sx, (y - self.oy) * self.sy)
+    }
+
+    /// A length without an axis (a stroke, a radius), in raster px.
+    pub fn len(&self, v: f32) -> f32 {
+        v * self.sy
+    }
+
+    /// The glyph's image and its top-left in raster px.
+    pub fn image(&self, laid: &Laid, g: &Glyph, f: &Final, stroke: f32) -> Option<(Arc<Image>, i32, i32)> {
+        let (px, py) = self.point(f.x, f.y);
+        let ix = px.floor();
+        let img = glyph_image(&laid.faces[g.face], g.id, self.len(g.size), px - ix, self.len(stroke), f.rotation, f.scale, self.sx / self.sy)?;
+        let (x0, y0) = (ix as i32 + img.placement.left, py.round() as i32 - img.placement.top);
+        Some((img, x0, y0))
+    }
+}
+
+/// The union of every visible glyph's coverage, stroked by `stroke` canvas px when > 0.
+pub(crate) fn glyph_mask(laid: &Laid, finals: &[Final], at: &Place, w: usize, h: usize, stroke: f32) -> Mask {
+    let mut m = Mask::new(w, h);
+    for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
+        if let Some((img, x0, y0)) = at.image(laid, g, f, stroke) {
+            m.union(&img, x0, y0, f.opacity);
+        }
+    }
+    m
+}
+
+/// Draws one glyph's fill: its coverage in `colour` (premultiplied), or a
+/// colour glyph's own colours, times its opacity.
+fn paint_glyph(c: &mut Canvas, img: &Image, x0: i32, y0: i32, colour: impl Fn(usize, usize) -> [f32; 4], opacity: f32) {
+    let p = img.placement;
+    for row in 0..p.height as i32 {
+        let y = y0 + row;
+        if y < 0 || y >= c.h as i32 {
+            continue;
+        }
+        for col in 0..p.width as i32 {
+            let x = x0 + col;
+            if x < 0 || x >= c.w as i32 {
+                continue;
+            }
+            let i = (row * p.width as i32 + col) as usize;
+            let at = y as usize * c.w + x as usize;
+            match img.content {
+                Content::Mask => {
+                    let cov = img.data[i] as f32 / 255.0 * opacity;
+                    if cov > 0.0 {
+                        c.over(at, colour(x as usize, y as usize), cov);
+                    }
+                }
+                Content::Color => {
+                    let s = &img.data[i * 4..i * 4 + 4];
+                    let f = |v: u8| v as f32 / 255.0;
+                    // COLR output is premultiplied; a colour bitmap is straight.
+                    let k = if matches!(img.source, Source::ColorBitmap(_)) { f(s[3]) } else { 1.0 };
+                    c.over(at, [f(s[0]) * k, f(s[1]) * k, f(s[2]) * k, f(s[3])], opacity);
+                }
+                Content::SubpixelMask => {}
+            }
+        }
+    }
+}
+
+/// The raster of a text at `scale` (titles spec §5.1): `⌈bounds · scale⌉`
+/// px, the bounds filling it (TX-R3).
+pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, bounds: Bounds, scale: f32, pool: &FramePool) -> CpuFrame {
+    let (w, h, at) = Place::fill(laid, bounds, scale);
+    let mut canvas = Canvas::new(w, h);
+    let finals = finals(laid, placed, anim);
+    // 1. The plaque.
+    if let Some(p) = doc.style.plaque.filter(|p| p.colour.0[3] > 0) {
+        let mut m = Mask::new(w, h);
+        for (x0, y0, x1, y1) in plaque_rects(doc, laid) {
+            let ((ax, ay), (bx, by)) = (at.point(x0, y0), at.point(x1, y1));
+            m.round_rect(ax, ay, bx, by, at.len(p.radius.max(0.0)));
+        }
+        canvas.over_mask(&m, premul(p.colour, anim.plaque_opacity));
+    }
+    // 2–3. Shadow and glow: Task 9.
+    // 4. Outlines, the outer one first: each a union of stroked glyphs in one colour.
+    let mut reach = outline_reach(doc);
+    for o in doc.style.outlines.iter().take(2).rev() {
+        let width = if o.width.is_finite() { o.width.clamp(0.0, 200.0) } else { 0.0 };
+        if width > 0.0 {
+            let m = glyph_mask(laid, &finals, &at, w, h, 2.0 * reach);
+            canvas.over_mask(&m, premul(o.colour, 1.0));
+        }
+        reach -= width;
+    }
+    // 5. The fill.
+    for (g, f) in laid.glyphs.iter().zip(&finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
+        if let Some((img, x0, y0)) = at.image(laid, g, f, 0.0) {
+            let colour = premul(f.colour.unwrap_or(fill_of(doc, g.run).colour), 1.0);
+            paint_glyph(&mut canvas, &img, x0, y0, |_, _| colour, f.opacity);
+        }
+    }
+    canvas.into_frame(pool)
+}

@@ -3076,6 +3076,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadr-text"
+version = "0.1.0"
+dependencies = [
+ "kadr-core",
+ "kadr-project",
+ "kadr-scene",
+ "parking_lot",
+ "parley",
+ "png 0.17.16",
+ "serde",
+ "serde_json",
+ "swash",
+ "tracing",
+]
+
+[[package]]
 name = "kadr-timeline"
 version = "0.1.0"
 dependencies = [
