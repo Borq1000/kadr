@@ -7,9 +7,10 @@ import { Preview, AngleView, DevRow } from "preview.slint";
 import { Timeline, TrackView, ClipView, ClipMark, KeyMark, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
+import { ColorUtil } from "color_picker.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView }
+export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView, ColorUtil }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";

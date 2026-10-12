@@ -7,6 +7,7 @@ mod ai_ui;
 mod anim_ui;
 mod app;
 mod app_settings;
+mod color_ui;
 mod effects_ui;
 mod fx_thumbs;
 mod export_ui;

@@ -19,6 +19,9 @@ pub struct AppSettings {
     pub preview_quality: i32,
     pub snapping: bool,
     pub settings_tab: i32,
+    /// Recently committed picker colours, newest first (titles spec §6.4).
+    #[serde(default)]
+    pub recent_colors: Vec<String>,
     /// Let Claude control Kadr through MCP (Slint UI server + Kadr bridge).
     #[serde(default = "yes")]
     pub allow_mcp: bool,
@@ -78,6 +81,7 @@ impl Default for AppSettings {
             preview_quality: 1,
             snapping: true,
             settings_tab: 0,
+            recent_colors: vec![],
             allow_mcp: true,
             read_only: false,
         }

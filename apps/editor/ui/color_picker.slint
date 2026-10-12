@@ -1,0 +1,238 @@
+import { Theme } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { LineEdit } from "std-widgets.slint";
+
+/// Hex ↔ colour, in Rust (`color_ui.rs`), and the recent colours.
+export global ColorUtil {
+    /// "#rrggbb" / "#rrggbbaa" → the colour (transparent when not a colour: ask `valid`).
+    pure callback parse(string) -> color;
+    pure callback valid(string) -> bool;
+    /// "#rrggbb", or "#rrggbbaa" when `with-alpha` and not opaque.
+    pure callback hex(color, bool) -> string;
+    /// Newest first, at most 8.
+    in property <[color]> recent;
+}
+
+/// A colour swatch that opens the picker (titles spec §6.4): a saturation ×
+/// value square, a hue bar, an alpha bar (`alpha`), a hex field, 16 preset
+/// colours and the recent ones. `live` while the square or a bar is
+/// dragged; `committed` once — on release, on a preset or recent swatch,
+/// on an accepted hex. The popup closes on a click outside it.
+export component ColorSwatch inherits Rectangle {
+    in property <color> value;
+    in property <bool> alpha: true;
+    in property <bool> enabled: true;
+    in property <string> tooltip;
+    callback live(color);
+    callback committed(color);
+    property <float> h;
+    property <float> s;
+    property <float> v;
+    property <float> a: 1;
+    property <color> current: hsv(root.h, root.s, root.v, root.alpha ? root.a : 1);
+    property <[color]> presets: [#ffffff, #000000, #8e8e93, #ff3b30, #ff9500, #ffd400, #34c759, #00c7be, #00e5ff, #30b0ff, #007aff, #5856d6, #af52de, #ff2d55, #ff6ad5, #a2845e];
+    width: 30px;
+    height: 20px;
+    border-radius: 4px;
+    background: @linear-gradient(135deg, #bdbdbd 0%, #bdbdbd 50%, #7a7a7a 50%, #7a7a7a 100%);
+    border-width: 1px;
+    border-color: sw.has-hover && root.enabled ? Theme.border-strong : Theme.border;
+    opacity: root.enabled ? 1 : 0.4;
+    accessible-role: button;
+    accessible-label: root.tooltip;
+
+    function set-colour(c: color) {
+        root.h = c.to-hsv().hue;
+        root.s = c.to-hsv().saturation;
+        root.v = c.to-hsv().value;
+        root.a = c.to-hsv().alpha;
+    }
+    function pick-sv(x: float, y: float) {
+        root.s = clamp(x, 0, 1);
+        root.v = 1 - clamp(y, 0, 1);
+        root.live(root.current);
+    }
+    function pick-hue(x: float) {
+        root.h = clamp(x, 0, 1) * 360;
+        root.live(root.current);
+    }
+    function pick-alpha(x: float) {
+        root.a = clamp(x, 0, 1);
+        root.live(root.current);
+    }
+
+    Rectangle {
+        border-radius: 3px;
+        background: root.value;
+    }
+    sw := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.set-colour(root.value);
+            popup.show();
+        }
+    }
+    popup := PopupWindow {
+        x: root.width - self.width;
+        y: root.height + 4px;
+        width: 236px;
+        // Padding 20 + square 120 + hue 12 (+ alpha 12) + hex row 32 + presets
+        // 48 + «Недавние» ~13.3 + recent 22 + spacing 8 per gap.
+        height: root.alpha ? 328px : 308px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.bg2;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000080;
+        }
+        VerticalLayout {
+            // The hex field follows the colour (a typed value breaks a plain binding).
+            property <color> shown: root.current;
+            changed shown => { hexed.text = ColorUtil.hex(self.shown, root.alpha); }
+            padding: 10px;
+            spacing: 8px;
+            Rectangle {
+                height: 120px;
+                vertical-stretch: 0;
+                border-radius: 4px;
+                clip: true;
+                background: hsv(root.h, 1, 1);
+                Rectangle { background: @linear-gradient(90deg, #ffffff 0%, #ffffff00 100%); }
+                Rectangle { background: @linear-gradient(0deg, #000000 0%, #00000000 100%); }
+                Rectangle {
+                    x: root.s * parent.width - 6px;
+                    y: (1 - root.v) * parent.height - 6px;
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                    drop-shadow-blur: 2px;
+                    drop-shadow-color: #000000a0;
+                }
+                TouchArea {
+                    mouse-cursor: crosshair;
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) { root.pick-sv(self.mouse-x / self.width, self.mouse-y / self.height); }
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.up) { root.committed(root.current); }
+                    }
+                    moved => { if (self.pressed) { root.pick-sv(self.mouse-x / self.width, self.mouse-y / self.height); } }
+                }
+            }
+            Rectangle {
+                height: 12px;
+                vertical-stretch: 0;
+                border-radius: 6px;
+                background: @linear-gradient(90deg, #ff0000 0%, #ffff00 16.67%, #00ff00 33.33%, #00ffff 50%, #0000ff 66.67%, #ff00ff 83.33%, #ff0000 100%);
+                Rectangle {
+                    x: root.h / 360 * parent.width - 5px;
+                    y: -1px;
+                    width: 10px;
+                    height: 14px;
+                    border-radius: 3px;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                    background: hsv(root.h, 1, 1);
+                }
+                TouchArea {
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) { root.pick-hue(self.mouse-x / self.width); }
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.up) { root.committed(root.current); }
+                    }
+                    moved => { if (self.pressed) { root.pick-hue(self.mouse-x / self.width); } }
+                }
+            }
+            if root.alpha: Rectangle {
+                height: 12px;
+                vertical-stretch: 0;
+                border-radius: 6px;
+                clip: true;
+                background: @linear-gradient(135deg, #bdbdbd 0%, #bdbdbd 50%, #7a7a7a 50%, #7a7a7a 100%);
+                Rectangle { background: @linear-gradient(90deg, hsv(root.h, root.s, root.v, 0) 0%, hsv(root.h, root.s, root.v, 1) 100%); }
+                Rectangle {
+                    x: root.a * parent.width - 5px;
+                    width: 10px;
+                    border-radius: 3px;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                }
+                TouchArea {
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) { root.pick-alpha(self.mouse-x / self.width); }
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.up) { root.committed(root.current); }
+                    }
+                    moved => { if (self.pressed) { root.pick-alpha(self.mouse-x / self.width); } }
+                }
+            }
+            HorizontalLayout {
+                // The fluent LineEdit's minimum height.
+                height: 32px;
+                vertical-stretch: 0;
+                spacing: 6px;
+                Rectangle {
+                    width: 28px;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: root.current;
+                }
+                hexed := LineEdit {
+                    text: ColorUtil.hex(root.current, root.alpha);
+                    accepted(t) => {
+                        if (ColorUtil.valid(t)) {
+                            root.set-colour(ColorUtil.parse(t));
+                            root.committed(root.current);
+                        }
+                    }
+                }
+            }
+            // 16 presets, two rows of eight.
+            Rectangle {
+                height: 48px;
+                vertical-stretch: 0;
+                for c[i] in root.presets: Rectangle {
+                    x: mod(i, 8) * 27px;
+                    y: floor(i / 8) * 25px;
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 4px;
+                    background: c;
+                    border-width: 1px;
+                    border-color: pa.has-hover ? Theme.text : Theme.border;
+                    pa := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.set-colour(c);
+                            root.committed(root.current);
+                        }
+                    }
+                }
+            }
+            Text { text: Tr.t("color.recent"); font-size: Theme.font-xs; color: Theme.text-faint; vertical-stretch: 0; }
+            Rectangle {
+                height: 22px;
+                vertical-stretch: 0;
+                for c[i] in ColorUtil.recent: Rectangle {
+                    x: i * 27px;
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 4px;
+                    background: c;
+                    border-width: 1px;
+                    border-color: ra.has-hover ? Theme.text : Theme.border;
+                    ra := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.set-colour(c);
+                            root.committed(root.current);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

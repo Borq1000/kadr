@@ -838,5 +838,6 @@
   "cmd.update_transition_named": "Edit transition: {name}",
   "err.edit.not_a_cut": "the clips do not meet at a cut",
   "err.edit.transition_not_found": "transition not found",
-  "cmd.add_text": "Add text"
+  "cmd.add_text": "Add text",
+  "color.recent": "Recent"
 }

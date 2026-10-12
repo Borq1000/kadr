@@ -247,6 +247,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
             app.toast_error(t("err.ffmpeg_missing"));
         }
         app.refresh_all();
+        app.show_recent_colours();
         // `kadr project.kadr` opens a project; media paths are imported.
         let args: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
         let (projects, media): (Vec<_>, Vec<_>) =
@@ -387,6 +388,7 @@ fn wire_callbacks(ui: &AppWindow) {
         with_app(|app| app.on_key(text.as_str(), ctrl, shift, alt)).unwrap_or(false)
     });
     ui.on_import_media(crate::import::import_dialog);
+    crate::color_ui::wire(ui);
 
     cb!(ui.on_new_bin, | | |app: &mut App| app.new_bin());
     cb!(ui.on_select_bin, |id| |app: &mut App| app.select_bin(&id));

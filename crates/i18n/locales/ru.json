@@ -867,5 +867,6 @@
   "cmd.update_transition_named": "Изменение перехода: {name}",
   "err.edit.not_a_cut": "клипы не встречаются на склейке",
   "err.edit.transition_not_found": "переход не найден",
-  "cmd.add_text": "Добавление текста"
+  "cmd.add_text": "Добавление текста",
+  "color.recent": "Недавние"
 }
