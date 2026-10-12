@@ -80,7 +80,7 @@ impl ProjectScenes {
         offline
     }
 
-    /// The clip of the top-most media layer of `scene` (inside a
+    /// The clip of the top-most media or text layer of `scene` (inside a
     /// transition, the incoming side from half way on).
     pub fn top_clip(&self, scene: &FrameScene) -> Option<kadr_core::ClipId> {
         let id = top_media_layer(&scene.layers)?;
@@ -128,7 +128,7 @@ fn visit_media(layers: &[Layer], f: &mut impl FnMut(&Layer)) {
 
 fn top_media_layer(layers: &[Layer]) -> Option<LayerId> {
     layers.iter().rev().find_map(|l| match &l.content {
-        LayerContent::Media { .. } => Some(l.id),
+        LayerContent::Media { .. } | LayerContent::Text(_) => Some(l.id),
         LayerContent::Transition(t) => {
             let (first, second) = if t.progress >= 0.5 { (&t.to, &t.from) } else { (&t.from, &t.to) };
             top_media_layer(first).or_else(|| top_media_layer(second))

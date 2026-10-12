@@ -77,6 +77,14 @@
 //! layer of [`Rgba::MISSING`] with the same placement, crop, opacity, blend
 //! and effects; the scene itself never changes because of it.
 //!
+//! A [`LayerContent::Text`] layer's texels are the premultiplied raster
+//! the resolver got from its [`TextPicture`] (at any resolution: texel
+//! size is `placement.size / raster size`, as for a media frame); it is
+//! sampled, cropped, filtered by its effects and composited exactly like a
+//! `Media` layer. A text layer without a raster (a `Missing` input) draws
+//! nothing at all — never `Rgba::MISSING`. A text layer never counts as
+//! opaque when layers are culled.
+//!
 //! Effects apply to that sample: "Point operations (effects)" below.
 //!
 //! A layer draws nothing when its crop is empty (`RectF::is_empty`), its

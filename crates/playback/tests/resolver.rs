@@ -1,14 +1,16 @@
 //! Resolver, sessions and cache on the fake decoder.
 
 use kadr_core::perf::FramePerf;
-use kadr_core::{AssetId, CpuFrame, FrameRate, Time};
+use kadr_core::{AssetId, ColorInfo, CpuFrame, FramePool, FrameRate, Time};
 use kadr_playback::testing::{media_layer, read_fake_pixel, video_source, FakeDecoders, FakeMedia, FnSceneSource};
 use kadr_playback::{MediaSource, Mode, Resolver, ResolverConfig, SceneSource};
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, MissingReason, PreparedFrame, RenderInputs, RenderTarget, Renderer};
 use kadr_scene::{
-    BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, RectF, RenderQuality, Rgba, SizeU, SourceKind, TransitionLayer, TransitionOp, Vec2,
+    BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, RectF, RenderQuality, Rgba, SizeU, SourceKind, TextLayer, TextPicture, TransitionLayer,
+    TransitionOp, Vec2,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -612,4 +614,86 @@ fn superseding_u64_max_abandons_later_waits_too() {
     let (inputs, _) = prepare(&r, &scene(vec![media_layer(1, a, &m, Time::from_secs(1), CANVAS)]), &src, Mode::Export);
     assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::NotReady)), "{:?}", inputs.layers[0]);
     assert!(t0.elapsed() < ms(200), "waited {:?} for a cancelled export's frame", t0.elapsed());
+}
+
+/// A text picture that counts its renders and the scales asked for.
+#[derive(Debug)]
+struct Counting {
+    key: u64,
+    size: Vec2,
+    calls: AtomicU64,
+    scales: std::sync::Mutex<Vec<f32>>,
+}
+
+impl Counting {
+    fn new(key: u64, w: f32, h: f32) -> Arc<Counting> {
+        Arc::new(Counting { key, size: Vec2::new(w, h), calls: AtomicU64::new(0), scales: Default::default() })
+    }
+}
+
+impl TextPicture for Counting {
+    fn key(&self) -> u64 {
+        self.key
+    }
+    fn render(&self, scale: f32, _: &FramePool) -> CpuFrame {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.scales.lock().unwrap().push(scale);
+        let (w, h) = (((self.size.x * scale).ceil() as u32).max(1), ((self.size.y * scale).ceil() as u32).max(1));
+        CpuFrame::from_rgba8(w, h, ColorInfo::WORKING_SDR, vec![255; (w * h * 4) as usize])
+    }
+}
+
+fn text_layer(pic: &Arc<Counting>, scale: f32, canvas: SizeU) -> Layer {
+    let placement = Placement { size: pic.size, anchor: Vec2::new(0.5, 0.5), position: Vec2::new(canvas.w as f32 / 2.0, canvas.h as f32 / 2.0), scale: Vec2::new(scale, scale), rotation: 0.0 };
+    Layer { id: LayerId(77), content: LayerContent::Text(TextLayer { picture: pic.clone() }), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] }
+}
+
+fn text_scene(canvas: SizeU, out: SizeU, layers: Vec<Layer>) -> FrameScene {
+    FrameScene { layers, ..FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(out, RenderQuality::Export)) }
+}
+
+#[test]
+fn a_static_text_is_drawn_once_by_its_picture_and_never_decoded() {
+    let fake = fake(0, 0);
+    let r = resolver(&fake, ResolverConfig::default());
+    let pic = Counting::new(5, 20.0, 8.0);
+    let s = text_scene(CANVAS, CANVAS, vec![text_layer(&pic, 1.0, CANVAS)]);
+    for _ in 0..3 {
+        let (inputs, _) = prepare(&r, &s, &source(vec![]), Mode::Export);
+        let f = frame_of(&inputs.layers[0]);
+        assert_eq!((f.width, f.height), (20, 8));
+    }
+    assert_eq!(pic.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(r.text_stats(), (1, 2));
+    assert_eq!(fake.open_calls(), 0);
+    let other = Counting::new(6, 20.0, 8.0);
+    prepare(&r, &text_scene(CANVAS, CANVAS, vec![text_layer(&other, 1.0, CANVAS)]), &source(vec![]), Mode::Export);
+    assert_eq!(other.calls.load(Ordering::Relaxed), 1, "another key (an animation frame) is drawn anew");
+}
+
+#[test]
+fn text_rasters_follow_the_output_footprint() {
+    let fake = fake(0, 0);
+    let r = resolver(&fake, ResolverConfig::default());
+    let hd = SizeU::new(1920, 1080);
+    let cases = [(hd, SizeU::new(960, 540), 1.0, 0.5), (hd, hd, 1.0, 1.0), (hd, SizeU::new(3840, 2160), 1.0, 2.0), (hd, hd, 3.0, (13.0f32 / 8.0).exp2())];
+    for (i, (canvas, out, scale, want)) in cases.into_iter().enumerate() {
+        let pic = Counting::new(100 + i as u64, 600.0, 90.0);
+        let (inputs, _) = prepare(&r, &text_scene(canvas, out, vec![text_layer(&pic, scale, canvas)]), &source(vec![]), Mode::Export);
+        assert_eq!(pic.scales.lock().unwrap().as_slice(), [want], "case {i}");
+        assert_eq!(frame_of(&inputs.layers[0]).width, (600.0 * want).ceil() as u32, "case {i}: never upsampled from a smaller raster");
+    }
+}
+
+#[test]
+fn a_text_layer_that_draws_nothing_and_prefetch_never_draw_text() {
+    let fake = fake(0, 0);
+    let r = resolver(&fake, ResolverConfig::default());
+    let pic = Counting::new(9, 20.0, 8.0);
+    let mut hidden = text_layer(&pic, 1.0, CANVAS);
+    hidden.opacity = 0.0;
+    let (inputs, _) = prepare(&r, &text_scene(CANVAS, CANVAS, vec![hidden]), &source(vec![]), Mode::Export);
+    assert_eq!((frame_of(&inputs.layers[0]).width, pic.calls.load(Ordering::Relaxed)), (1, 0), "the blank frame, no render");
+    r.prefetch(&text_scene(CANVAS, CANVAS, vec![text_layer(&pic, 1.0, CANVAS)]), &source(vec![]));
+    assert_eq!(pic.calls.load(Ordering::Relaxed), 0, "prefetch is for decoders only");
 }

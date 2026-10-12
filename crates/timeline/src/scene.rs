@@ -74,6 +74,8 @@ fn covers_opaquely(l: &Layer, canvas: &RectF) -> bool {
         }
         // A generator never occludes (D6): it is not proven opaque.
         LayerContent::Generator(_) => false,
+        // Text never occludes (titles spec §5.2): its raster is not proven opaque.
+        LayerContent::Text(_) => false,
     };
     opaque_content
         && l.opacity >= 1.0

@@ -113,7 +113,7 @@ pub fn layer_cost(scene: &FrameScene, layer: &Layer) -> Cost {
             // Two buffers cleared, mixed and composited.
             inner + 3.0 * out_px as f64
         }
-        LayerContent::Media { .. } | LayerContent::Solid(_) => px * per_px,
+        LayerContent::Media { .. } | LayerContent::Solid(_) | LayerContent::Text(_) => px * per_px,
         LayerContent::Generator(g) => px * (per_px + generator_ops(g)),
     };
     Cost::of(own, out_px)
@@ -251,5 +251,29 @@ mod tests {
         }
         let look = 1.0 + measured.iter().map(|(e, _)| effect_ops(e, q)).sum::<f64>();
         assert!(within_2x(look, 2.3), "a full Look: {look} layers predicted, 2.3 measured");
+    }
+
+    #[test]
+    fn a_text_layer_costs_like_a_media_layer() {
+        #[derive(Debug)]
+        struct Pic;
+        impl kadr_scene::TextPicture for Pic {
+            fn key(&self) -> u64 {
+                1
+            }
+            fn render(&self, _: f32, _: &kadr_core::FramePool) -> kadr_core::CpuFrame {
+                unreachable!()
+            }
+        }
+        let canvas = SizeU::new(64, 36);
+        let p = Placement::fill(canvas);
+        let mk = |content| Layer { id: LayerId(1), content, crop: p.full_crop(), placement: p, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
+        let media = mk(LayerContent::Media {
+            media: MediaRef { media: kadr_core::AssetId::new(), stream: 0, kind: SourceKind::Video, display_size: canvas, color: kadr_core::ColorInfo::WORKING_SDR },
+            source_time: Time::ZERO,
+        });
+        let text = mk(LayerContent::Text(kadr_scene::TextLayer { picture: std::sync::Arc::new(Pic) }));
+        let scene = FrameScene::empty(Time::ZERO, canvas, OutputSpec::new(canvas, RenderQuality::Export));
+        assert_eq!(layer_cost(&scene, &text).ops, layer_cost(&scene, &media).ops);
     }
 }

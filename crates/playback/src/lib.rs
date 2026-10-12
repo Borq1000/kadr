@@ -11,6 +11,8 @@
 //! - [`Resolver`]: per media layer, decode size (footprint quantised to a
 //!   fraction of the display size) and source frame (clamped to the last
 //!   frame); cache or decoder session; waits per [`Mode`].
+//! - Text layers: drawn by their picture ([`text::TextRasters`]) at the
+//!   output footprint, synchronously, cached by key and scale step.
 //! - Decoder sessions: one thread and one stream per (media, decode size,
 //!   position); read forward within a window, reopen otherwise; always
 //!   towards the newest target; close when idle.
@@ -49,6 +51,7 @@ pub mod resolver;
 mod session;
 pub mod source;
 pub mod testing;
+pub mod text;
 
 pub use cache::{FrameCache, FrameKey};
 pub use decoders::{Decoders, FfmpegDecoders};
@@ -57,3 +60,4 @@ pub use pace::{pace, Clock, Pace, PlaySchedule, Step, WallClock};
 pub use player::{FrameInfo, FrameSink, PlayerConfig, PreviewPlayer};
 pub use resolver::{decode_size, Mode, Resolver, ResolverConfig, ResolverStats};
 pub use source::{MediaSource, SceneSource};
+pub use text::{step_scale, text_scale_step, TextRasters, MAX_TEXT_SIDE};

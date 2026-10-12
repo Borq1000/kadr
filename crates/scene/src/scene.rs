@@ -175,12 +175,37 @@ impl Generator {
     }
 }
 
+/// The text engine's picture of a text layer at one instant (titles spec
+/// §5.2): opaque to the scene and to renderers. The resolver asks it for
+/// texels at the scale the output needs (`kadr-playback`, `text`).
+pub trait TextPicture: Send + Sync + std::fmt::Debug {
+    /// Equal keys ⇒ pixel-identical rasters at every scale: the cache key.
+    fn key(&self) -> u64;
+    /// The picture's box — the layer's `placement.size`, canvas px — at
+    /// `scale` raster px per canvas px: premultiplied RGBA8 in the working
+    /// space, `max(1, ⌈size · scale⌉)` px each way.
+    fn render(&self, scale: f32, pool: &kadr_core::FramePool) -> kadr_core::CpuFrame;
+}
+
+/// A text layer (titles spec §5.2). Layers compare by their picture's key.
+#[derive(Clone, Debug)]
+pub struct TextLayer {
+    pub picture: std::sync::Arc<dyn TextPicture>,
+}
+
+impl PartialEq for TextLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.picture.key() == other.picture.key()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerContent {
     Media { media: MediaRef, source_time: Time },
     Solid(Rgba),
     Transition(Box<TransitionLayer>),
     Generator(Generator),
+    Text(TextLayer),
 }
 
 #[derive(Clone, Debug, PartialEq)]

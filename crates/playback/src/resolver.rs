@@ -157,6 +157,9 @@ struct Registry {
 /// re-sent if its session was retired or its target replaced meanwhile).
 const REASSERT: Duration = Duration::from_millis(50);
 
+/// Text rasters kept per resolver (titles spec §5.3).
+const TEXT_CACHE_BYTES: usize = 128 << 20;
+
 pub struct Resolver {
     config: ResolverConfig,
     env: Arc<Env>,
@@ -164,6 +167,7 @@ pub struct Resolver {
     /// The media each asset was last seen as: a change (relink) invalidates it.
     known: Mutex<HashMap<AssetId, Arc<MediaSource>>>,
     last_allocs: AtomicU64,
+    texts: crate::text::TextRasters,
 }
 
 impl Resolver {
@@ -179,6 +183,7 @@ impl Resolver {
         });
         Resolver {
             config,
+            texts: crate::text::TextRasters::new(env.pool.clone(), TEXT_CACHE_BYTES),
             env,
             registry: Mutex::new(Registry { sessions: vec![], retired: vec![], next_id: 0 }),
             known: Mutex::new(HashMap::new()),
@@ -229,6 +234,11 @@ impl Resolver {
         }
     }
 
+    /// (text rasters drawn, cache hits) since the start (titles spec §5.3).
+    pub fn text_stats(&self) -> (u64, u64) {
+        self.texts.stats()
+    }
+
     /// Forgets `media`: cached frames, sessions, end-of-stream and failure
     /// records. Call after relinking or replacing a file.
     pub fn invalidate_media(&self, media: AssetId) {
@@ -268,7 +278,7 @@ impl Resolver {
         };
         let reading = !matches!(mode, Mode::Scrub { .. });
         let export = mode == Mode::Export;
-        let (slots, mut reqs) = self.collect_scene(scene, source);
+        let (slots, mut reqs) = self.collect_scene(scene, source, Some(&self.texts));
         let mut pending = vec![];
         let fail_seq = {
             let mut b = self.env.cache.lock();
@@ -326,7 +336,7 @@ impl Resolver {
     /// another layer is using, and leaves frames a session can reach by
     /// reading forward to its read-ahead.
     pub fn prefetch(&self, scene: &FrameScene, source: &dyn SceneSource) {
-        let (_, mut reqs) = self.collect_scene(scene, source);
+        let (_, mut reqs) = self.collect_scene(scene, source, None);
         let misses: Vec<usize> = {
             let b = self.env.cache.lock();
             (0..reqs.len())
@@ -342,11 +352,11 @@ impl Resolver {
         }
     }
 
-    fn collect_scene(&self, scene: &FrameScene, source: &dyn SceneSource) -> (Vec<Slot>, Vec<Req>) {
+    fn collect_scene(&self, scene: &FrameScene, source: &dyn SceneSource, texts: Option<&crate::text::TextRasters>) -> (Vec<Slot>, Vec<Req>) {
         let mut medias = HashMap::new();
         let mut reqs = vec![];
         let mut index = HashMap::new();
-        let slots = collect(&scene.layers, scene, source, &mut medias, &mut reqs, &mut index);
+        let slots = collect(&scene.layers, scene, source, &mut medias, &mut reqs, &mut index, texts);
         let changed: Vec<AssetId> = {
             let mut known = self.known.lock();
             let mut changed = vec![];
@@ -710,16 +720,27 @@ fn collect(
     medias: &mut HashMap<AssetId, Option<Arc<MediaSource>>>,
     reqs: &mut Vec<Req>,
     index: &mut HashMap<FrameKey, usize>,
+    texts: Option<&crate::text::TextRasters>,
 ) -> Vec<Slot> {
     let mut out = Vec::with_capacity(layers.len());
     for l in layers {
         out.push(match &l.content {
             LayerContent::Solid(_) | LayerContent::Generator(_) => Slot::Input(LayerInput::None),
             LayerContent::Transition(t) => {
-                let from = collect(&t.from, scene, source, medias, reqs, index);
-                let to = collect(&t.to, scene, source, medias, reqs, index);
+                let from = collect(&t.from, scene, source, medias, reqs, index, texts);
+                let to = collect(&t.to, scene, source, medias, reqs, index, texts);
                 Slot::Transition { from, to }
             }
+            LayerContent::Text(_) if draws_nothing(l) => Slot::Input(LayerInput::Cpu(BLANK.clone())),
+            // Titles spec §5.3: drawn by its picture at the output footprint
+            // (prefetch, `None`, is for decoders: text waits for nothing).
+            LayerContent::Text(t) => match texts {
+                Some(texts) => {
+                    let step = crate::text::text_scale_step(&l.placement, scene.canvas, scene.output.size);
+                    Slot::Input(LayerInput::Cpu(texts.get(t.picture.as_ref(), step)))
+                }
+                None => Slot::Input(LayerInput::None),
+            },
             LayerContent::Media { .. } if draws_nothing(l) => Slot::Input(LayerInput::Cpu(BLANK.clone())),
             LayerContent::Media { media, source_time } => {
                 let m = medias.entry(media.media).or_insert_with(|| source.media(media.media).filter(|m| m.online).map(Arc::new)).clone();

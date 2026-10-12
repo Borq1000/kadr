@@ -979,3 +979,57 @@ fn generator_is_deterministic_and_varied() {
     );
     assert!(transitions > 100 && media > 300 && missing > 20 && solids > 50 && crops_beyond > 10 && letterbox > 50 && full_frame > 20 && curves > 30 && spatial > 30 && generators > 60);
 }
+
+#[derive(Debug)]
+struct NoPicture;
+impl TextPicture for NoPicture {
+    fn key(&self) -> u64 {
+        7
+    }
+    fn render(&self, _: f32, _: &kadr_core::FramePool) -> CpuFrame {
+        unreachable!("renderers get rasters as inputs")
+    }
+}
+
+/// Titles spec §5.3: a text raster — premultiplied, finer than the output,
+/// on a rotated, scaled, cropped, faded placement with a colour effect —
+/// renders the same in the CPU renderer and the reference; without a raster
+/// it is nothing in both.
+#[test]
+fn cpu_renderer_matches_the_reference_on_text_layers() {
+    let (w, h) = (48u32, 27u32);
+    let raster: Vec<u8> = (0..60u32 * 20)
+        .flat_map(|i| {
+            let (x, y) = (i % 60, i / 60);
+            let a = ((x * 7 + y * 13) % 256) as u8;
+            let v = (a as u32 * ((x * 5) % 256) / 255) as u8;
+            [v, a / 2, a, a]
+        })
+        .collect();
+    let raster = Arc::new(CpuFrame::from_rgba8(60, 20, ColorInfo { alpha: AlphaMode::Premultiplied, ..ColorInfo::WORKING_SDR }, raster));
+    let placement = Placement { size: Vec2::new(30.0, 10.0), anchor: Vec2::new(0.4, 0.6), position: Vec2::new(24.0, 13.0), scale: Vec2::new(1.3, 1.3), rotation: 0.35 };
+    let text = Layer {
+        id: LayerId(9),
+        content: LayerContent::Text(TextLayer { picture: Arc::new(NoPicture) }),
+        crop: RectF::new(2.0, 1.0, 28.0, 10.0),
+        placement,
+        opacity: 0.8,
+        blend: BlendMode::Normal,
+        effects: vec![Effect::ColorAdjust(ColorAdjust { exposure: 0.3, contrast: 1.1, saturation: 0.8, temperature: 0.0, tint: 0.0 })],
+    };
+    let s = scene((w, h), (w, h), rgba(0.1, 0.3, 0.6, 1.0), vec![text]);
+    let background = reference_of(&scene((w, h), (w, h), rgba(0.1, 0.3, 0.6, 1.0), vec![]));
+    for input in [LayerInput::Cpu(raster), LayerInput::Missing(MissingReason::Offline)] {
+        let drawn = matches!(input, LayerInput::Cpu(_));
+        let inputs = RenderInputs { layers: vec![input] };
+        let mut cpu = vec![0u8; (w * h * 4) as usize];
+        CpuRenderer::new().render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(w, h, &mut cpu))).unwrap();
+        let (reference, ties) = render_reference_with_ties(&s, &inputs);
+        assert_eq!(cpu.len(), reference.len());
+        // 1 LSB, plus 1 at a pixel where the reference passed through a rounding tie (ties are per pixel).
+        for (i, (a, b)) in cpu.iter().zip(&reference).enumerate() {
+            assert!(a.abs_diff(*b) <= 1 + ties[i / 4].min(1), "byte {i}: cpu {a}, reference {b}");
+        }
+        assert_eq!(reference != background, drawn, "the raster draws; no raster draws nothing");
+    }
+}

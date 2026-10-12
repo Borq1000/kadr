@@ -215,6 +215,9 @@ fn draw_plain(g: &Geo, layer: &Layer, input: &LayerInput, buf: &mut [[u8; 4]]) {
         (LayerContent::Solid(c), _) => Source::Solid(premul(*c)),
         (LayerContent::Media { .. }, LayerInput::Cpu(f)) => Source::Texels(f),
         (LayerContent::Generator(g), _) => Source::Generator(g),
+        (LayerContent::Text(_), LayerInput::Cpu(f)) => Source::Texels(f),
+        // The contract: a text layer without a raster draws nothing.
+        (LayerContent::Text(_), _) => return,
         _ => Source::Solid(premul(Rgba::MISSING)),
     };
 

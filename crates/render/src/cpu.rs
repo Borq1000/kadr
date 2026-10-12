@@ -92,8 +92,8 @@ fn check_inputs(layers: &[Layer], inputs: &[LayerInput], within: &'static str) -
     }
     for (n, (layer, input)) in layers.iter().zip(inputs).enumerate() {
         match (&layer.content, input) {
-            (LayerContent::Media { .. }, LayerInput::Cpu(f)) => check_frame(f).map_err(|m| RenderError::InputMismatch(format!("layer {n}{within}: {m}")))?,
-            (LayerContent::Media { .. }, LayerInput::Missing(_)) | (LayerContent::Solid(_) | LayerContent::Generator(_), LayerInput::None) => {}
+            (LayerContent::Media { .. } | LayerContent::Text(_), LayerInput::Cpu(f)) => check_frame(f).map_err(|m| RenderError::InputMismatch(format!("layer {n}{within}: {m}")))?,
+            (LayerContent::Media { .. } | LayerContent::Text(_), LayerInput::Missing(_)) | (LayerContent::Solid(_) | LayerContent::Generator(_), LayerInput::None) => {}
             (LayerContent::Transition(t), LayerInput::Transition { from, to }) => {
                 check_inputs(&t.from, from, " in a transition's `from`")?;
                 check_inputs(&t.to, to, " in a transition's `to`")?;
@@ -104,6 +104,7 @@ fn check_inputs(layers: &[Layer], inputs: &[LayerInput], within: &'static str) -
                     LayerContent::Solid(_) => "solid",
                     LayerContent::Transition(_) => "transition",
                     LayerContent::Generator(_) => "generator",
+                    LayerContent::Text(_) => "text",
                 };
                 let input = match input {
                     LayerInput::Cpu(_) => "Cpu",
@@ -950,6 +951,9 @@ impl CpuRenderer {
             (LayerContent::Transition(t), LayerInput::Transition { from, to }) => self.draw_transition(data, stride, g, layer, t, from, to, passes),
             (LayerContent::Solid(c), _) => draw_flat(data, stride, g, layer, *c, passes),
             (LayerContent::Generator(generator), _) => draw_generator(data, stride, g, layer, generator, passes),
+            (LayerContent::Text(_), LayerInput::Cpu(f)) => draw_frame(data, stride, g, layer, f, passes),
+            // No raster: a text layer shows nothing (contract, «Text»).
+            (LayerContent::Text(_), _) => Drawn::Nothing,
             (LayerContent::Media { .. }, LayerInput::Cpu(f)) => draw_frame(data, stride, g, layer, f, passes),
             (LayerContent::Media { .. }, _) => draw_flat(data, stride, g, layer, Rgba::MISSING, passes),
             // Inputs are checked before drawing.
@@ -1760,5 +1764,40 @@ mod tests {
         l.opacity = 0.25;
         let out = render(&scene((2, 2), (2, 2), Rgba::TRANSPARENT, vec![l]), vec![LayerInput::None]);
         assert_eq!(px(&out, 2, 0, 0), [64, 64, 64, 64]);
+    }
+
+    /// A text picture for layers whose raster the test hands in as input.
+    #[derive(Debug)]
+    struct Pic;
+    impl kadr_scene::TextPicture for Pic {
+        fn key(&self) -> u64 {
+            1
+        }
+        fn render(&self, _: f32, _: &kadr_core::FramePool) -> CpuFrame {
+            unreachable!("renderers get rasters as inputs")
+        }
+    }
+
+    fn text_layer(placement: Placement) -> Layer {
+        layer(LayerContent::Text(kadr_scene::TextLayer { picture: Arc::new(Pic) }), placement)
+    }
+
+    #[test]
+    fn a_text_layer_samples_its_raster_like_media_and_without_one_draws_nothing() {
+        let c = SizeU::new(8, 8);
+        // A 16 × 16 raster on the 8 × 8 box: half-transparent white, premultiplied.
+        let raster = frame(16, 16, AlphaMode::Premultiplied, |x, _| if x < 8 { [128, 128, 128, 128] } else { [0, 0, 0, 0] });
+        let s = scene((8, 8), (8, 8), BLUE, vec![text_layer(Placement::fill(c))]);
+        let out = render(&s, vec![LayerInput::Cpu(raster.clone())]);
+        assert!(near(px(&out, 8, 1, 3), [128, 128, 255, 255]), "{:?}", px(&out, 8, 1, 3));
+        assert_eq!(px(&out, 8, 6, 3), [0, 0, 255, 255], "transparent texels leave the background");
+        let as_media = render(&scene((8, 8), (8, 8), BLUE, vec![media(Placement::fill(c))]), vec![LayerInput::Cpu(raster)]);
+        assert_eq!(out, as_media, "sampled exactly like a media frame of the same raster");
+        let missing = render(&s, vec![LayerInput::Missing(MissingReason::DecodeFailed)]);
+        assert!((0..8).all(|y| (0..8).all(|x| px(&missing, 8, x, y) == [0, 0, 255, 255])), "no raster: nothing — never the missing-media colour");
+        let inputs = RenderInputs { layers: vec![LayerInput::None] };
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        let err = CpuRenderer::new().render(&PreparedFrame { scene: &s, inputs: &inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(8, 8, &mut buf)));
+        assert!(matches!(err, Err(RenderError::InputMismatch(ref m)) if m.contains("text layer with a None input")), "{err:?}");
     }
 }
