@@ -1,10 +1,12 @@
 //! Pixels (titles spec §5.1): glyphs through swash into coverage masks and
 //! colour images, composed into a premultiplied float buffer, stored as
-//! RGBA8 (contract rounding). Bottom to top: plaque, (Task 9: shadow,
-//! glow), the text — its fill with outline 1 round it and outline 2 round
-//! that, one layer, each outline knocked out of what is inside it (TX-R5).
-//! The text layer is drawn first and the passes below it under it. Colour
-//! emoji (COLR / colour bitmaps) draw their own colours.
+//! RGBA8 (contract rounding). Bottom to top: plaque, shadow, glow, the
+//! text — its fill (a colour or a gradient) with outline 1 round it and
+//! outline 2 round that, one layer, each outline knocked out of what is
+//! inside it (TX-R5). The text layer is drawn first and the passes below
+//! it under it. Colour emoji (COLR / colour bitmaps) draw their own
+//! colours. A tilted text is that flat picture seen in perspective
+//! (`effects::warp`).
 //!
 //! The picture fills its raster (the `TextPicture` contract, ruling TX-R3):
 //! a raster of `W × H = ⌈bounds · scale⌉` px draws the bounds with the
@@ -14,7 +16,9 @@
 //! Memory (TX-R5): drawing a raster of N px holds the float canvas (16 B
 //! per px) and at most two coverage masks at a time (4 B per px each), or
 //! the canvas and the RGBA8 result (4 B per px) at the end — about 24 B
-//! per raster px at the peak, so the resolver's
+//! per raster px at the peak (a tilt: the flat canvas and the tilted
+//! RGBA8 result, whose sizes differ by at most the tilt's magnification),
+//! so the resolver's
 //! 16 Mpx cap (`kadr_playback::MAX_TEXT_PIXELS`) peaks near 400 MB, not
 //! the 64 MB of the finished raster. Past [`MAX_RASTER_PIXELS`] nothing is
 //! allocated: the picture is a 1×1 transparent raster. Glyph images are
@@ -90,22 +94,44 @@ impl Canvas {
         }
     }
 
-    /// RGBA8 in the working space: `floor(clamp(v)·255 + 0.5)`.
+    /// [`Canvas::under_mask`] of the mask shifted by whole pixels `(dx, dy)`.
+    pub fn under_mask_at(&mut self, m: &Mask, dx: i32, dy: i32, c: [f32; 4]) {
+        // In i64: a shift near i32's ends never overflows.
+        let (dx, dy) = (dx as i64, dy as i64);
+        let ys = 0.max(dy)..(self.h as i64).min(m.h as i64 + dy);
+        let xs = 0.max(dx)..(self.w as i64).min(m.w as i64 + dx);
+        for y in ys {
+            let (row, src) = (y as usize * self.w, (y - dy) as usize * m.w);
+            for x in xs.clone() {
+                let cov = m.a[src + (x - dx) as usize];
+                if cov > 0.0 {
+                    self.under(row + x as usize, c, cov);
+                }
+            }
+        }
+    }
+
+    /// RGBA8 in the working space (see [`rgba8`]).
     pub fn into_frame(self, pool: &FramePool) -> CpuFrame {
         let mut f = CpuFrame::rgba8(pool, self.w as u32, self.h as u32, ColorInfo::WORKING_SDR);
-        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         for y in 0..self.h {
             let row = f.row_mut(y as u32);
             for x in 0..self.w {
-                let p = self.px[y * self.w + x];
-                row[x * 4..x * 4 + 4].copy_from_slice(&[q(p[0]), q(p[1]), q(p[2]), q(p[3])]);
+                row[x * 4..x * 4 + 4].copy_from_slice(&rgba8(self.px[y * self.w + x]));
             }
         }
         f
     }
 }
 
+/// A premultiplied float pixel as RGBA8 in the working space:
+/// `floor(clamp(v)·255 + 0.5)`.
+pub(crate) fn rgba8(p: [f32; 4]) -> [u8; 4] {
+    p.map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+}
+
 /// A coverage buffer (0..1).
+#[derive(Clone)]
 pub(crate) struct Mask {
     pub w: usize,
     pub h: usize,
@@ -267,11 +293,11 @@ pub(crate) fn outline_reach(doc: &TextDoc) -> f32 {
     doc.style.outlines.iter().take(2).map(|o| if o.width.is_finite() { o.width.clamp(0.0, 200.0) } else { 0.0 }).sum()
 }
 
-/// What the picture may cover, in canvas px about the layout box centre:
-/// the layout box, every glyph's em box as placed (a line's last letter
-/// without the letter spacing after it), the plaque, and room for the
-/// outlines and ink beyond the em box (Task 9 adds shadow, glow and
-/// perspective).
+/// What the flat picture (before any tilt) may cover, in canvas px about
+/// the layout box centre: the layout box, every glyph's em box as placed
+/// (a line's last letter without the letter spacing after it), the
+/// plaque, room for the outlines and ink beyond the em box, the shadow
+/// (shifted, 3 σ of blur round it) and the glow (3 × its radius round it).
 pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
     let mut b = Bounds { x0: 0.0, y0: 0.0, x1: laid.width, y1: laid.height };
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, _)| g.visible) {
@@ -285,7 +311,13 @@ pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
         b = b.union(Bounds { x0, y0, x1, y1 });
     }
     let margin = outline_reach(doc) + 0.15 * laid.max_size + 2.0;
-    let b = b.grow(margin);
+    let mut b = b.grow(margin);
+    if let Some((_, dx, dy, blur)) = crate::effects::shadow(doc) {
+        b = b.union(Bounds { x0: b.x0 + dx, y0: b.y0 + dy, x1: b.x1 + dx, y1: b.y1 + dy }.grow(3.0 * blur + 1.0));
+    }
+    if let Some((_, radius, _)) = crate::effects::glow(doc) {
+        b = b.grow(3.0 * radius + 1.0);
+    }
     Bounds { x0: b.x0 - laid.width / 2.0, y0: b.y0 - laid.height / 2.0, x1: b.x1 - laid.width / 2.0, y1: b.y1 - laid.height / 2.0 }
 }
 
@@ -551,20 +583,54 @@ pub(crate) const MAX_RASTER_PIXELS: u64 = 64 << 20;
 static TOO_LARGE: AtomicBool = AtomicBool::new(false);
 
 /// The raster of a text at `scale` (titles spec §5.1): `⌈bounds · scale⌉`
-/// px, the bounds filling it (TX-R3); 1×1 and transparent when that is
-/// past [`MAX_RASTER_PIXELS`].
-pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, bounds: Bounds, scale: f32, pool: &FramePool) -> CpuFrame {
-    let Some((w, h, at)) = Place::fill(laid, bounds, scale) else {
+/// px, the bounds filling it (TX-R3) — the flat picture of `flat`, or for
+/// a tilted text that picture seen tilted (`bounds` its projection); 1×1
+/// and transparent when either raster would pass [`MAX_RASTER_PIXELS`].
+/// A tilt holds the flat float canvas and the RGBA8 result, never two
+/// float canvases.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, flat: Bounds, bounds: Bounds, scale: f32, pool: &FramePool) -> CpuFrame {
+    let tilt = crate::effects::tilt(doc);
+    let flat_at = Place::fill(laid, flat, scale);
+    let out = if tilt.is_some() { Place::fill(laid, bounds, scale).map(|(w, h, _)| (w, h)) } else { flat_at.as_ref().map(|(w, h, _)| (*w, *h)) };
+    let (Some((w, h, at)), Some((ow, oh))) = (flat_at, out) else {
         if !TOO_LARGE.swap(true, Ordering::Relaxed) {
             tracing::warn!(width = bounds.width(), height = bounds.height(), scale, "a text raster would pass 64 Mpx: drawn as nothing");
         }
         return Canvas::new(1, 1).into_frame(pool);
     };
+    let canvas = compose(doc, laid, placed, anim, &at, w, h);
+    match tilt {
+        None => canvas.into_frame(pool),
+        Some(p) => {
+            let mut f = CpuFrame::rgba8(pool, ow as u32, oh as u32, ColorInfo::WORKING_SDR);
+            crate::effects::warp(&canvas, flat, bounds, p, crate::effects::camera_distance(laid), &mut f);
+            f
+        }
+    }
+}
+
+/// The flat picture (before any tilt) in a `w × h` raster placed by `at`:
+/// the text layer, then under it, top down, the glow, the shadow and the
+/// plaque.
+pub(crate) fn compose(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, at: &Place, w: usize, h: usize) -> Canvas {
     let finals = finals(laid, placed, anim);
-    // The text first — fill and outlines in one layer; the passes below it
-    // are drawn under it, top down.
-    let (mut canvas, _silhouette) = text_layer(doc, laid, &finals, &at, w, h);
-    // Shadow and glow: Task 9.
+    let (mut canvas, silhouette) = text_layer(doc, laid, &finals, at, w, h);
+    // The glow (neon): the silhouette blurred by its radius, times its intensity.
+    if let Some((colour, radius, k)) = crate::effects::glow(doc) {
+        let mut m = silhouette.clone();
+        crate::effects::blur(&mut m, at.len(radius));
+        m.a.iter_mut().for_each(|a| *a = (*a * k).min(1.0));
+        canvas.under_mask(&m, premul(colour, 1.0));
+    }
+    // The shadow: the silhouette (the letters with their outlines), blurred, shifted.
+    if let Some((colour, dx, dy, blur)) = crate::effects::shadow(doc) {
+        let mut m = silhouette;
+        crate::effects::blur(&mut m, at.len(blur));
+        canvas.under_mask_at(&m, (dx * at.sx).round() as i32, (dy * at.sy).round() as i32, premul(colour, 1.0));
+    } else {
+        drop(silhouette);
+    }
     // The plaque, at the bottom.
     if let Some(p) = doc.style.plaque.filter(|p| p.colour.0[3] > 0) {
         let mut m = Mask::new(w, h);
@@ -574,7 +640,7 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
         }
         canvas.under_mask(&m, premul(p.colour, anim.plaque_opacity));
     }
-    canvas.into_frame(pool)
+    canvas
 }
 
 /// The text itself as one layer (ruling TX-R5, the knock-out): the fill,
@@ -590,10 +656,15 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
 fn text_layer(doc: &TextDoc, laid: &Laid, finals: &[Final], at: &Place, w: usize, h: usize) -> (Canvas, Mask) {
     let mut canvas = Canvas::new(w, h);
     let mut inside = Mask::new(w, h);
+    // The fill paints through its colour or its gradient across the layout box (raster px).
+    let ((bx0, by0), (bx1, by1)) = (at.point(0.0, 0.0), at.point(laid.width, laid.height));
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
         if let Some((img, x0, y0)) = at.image(laid, g, f, 0.0) {
-            let colour = premul(f.colour.unwrap_or(fill_of(doc, g.run).colour), 1.0);
-            paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |_, _| colour, f.opacity);
+            let paint = match f.colour {
+                Some(c) => crate::effects::Paint::Solid(premul(c, 1.0)),
+                None => crate::effects::Paint::of(fill_of(doc, g.run), [bx0, by0, bx1, by1]),
+            };
+            paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |x, y| paint.at(x, y), f.opacity);
         }
     }
     // Outline k's stroke is centred on the letters' edges, `2 ×` the

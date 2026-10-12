@@ -5,6 +5,7 @@
 //! resolver asks it for a raster through `kadr_scene::TextPicture`.
 
 pub mod anim;
+pub(crate) mod effects;
 pub mod fonts;
 pub mod frame;
 pub mod layout;

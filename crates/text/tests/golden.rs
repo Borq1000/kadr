@@ -82,3 +82,43 @@ fn text_goldens() {
     check("caps_spacing", &caps, Clock::REST, 1.0);
     check("title_plain_x2", &base("Привет, мир!"), Clock::REST, 2.0);
 }
+
+#[test]
+fn look_goldens() {
+    let mut grad = base("ГРАДИЕНТ");
+    grad.style.font = FontRef::new("Unbounded", 800, false);
+    grad.style.fill = Fill { colour: Rgba8::WHITE, gradient: Some(GradientFill::new(vec![GradientStop { pos: 0.0, colour: Rgba8::rgba(255, 140, 0, 255) }, GradientStop { pos: 1.0, colour: Rgba8::rgba(255, 0, 128, 255) }], 0.0)), extra: Default::default() };
+    check("gradient_fill", &grad, Clock::REST, 1.0);
+    let mut soft = base("Мягкая тень");
+    soft.style.shadow = Some(Shadow { colour: Rgba8::rgba(0, 0, 0, 200), offset_x: 4.0, offset_y: 6.0, blur: 8.0 });
+    check("shadow_soft", &soft, Clock::REST, 1.0);
+    let mut hard = base("ЖЁСТКАЯ");
+    hard.style.font = FontRef::new("Russo One", 400, false);
+    hard.style.outlines = vec![Outline { width: 3.0, colour: Rgba8::BLACK }];
+    hard.style.shadow = Some(Shadow { colour: Rgba8::rgba(255, 0, 80, 255), offset_x: 6.0, offset_y: 6.0, blur: 0.0 });
+    check("shadow_hard_outline", &hard, Clock::REST, 1.0);
+    let mut neon = base("НЕОН");
+    neon.style.font = FontRef::new("Comfortaa", 700, false);
+    neon.style.fill = Fill::solid(Rgba8::rgba(255, 230, 255, 255));
+    neon.style.glow = Some(Glow { colour: Rgba8::rgba(255, 40, 200, 255), radius: 10.0, intensity: 1.4 });
+    check("glow_neon", &neon, Clock::REST, 1.0);
+    let mut rainbow = base("Текст по дуге вверх");
+    rainbow.shape = TextShape::Arc { bend: 0.6 };
+    check("arc_rainbow", &rainbow, Clock::REST, 1.0);
+    let mut smile = rainbow.clone();
+    smile.shape = TextShape::Arc { bend: -0.6 };
+    check("arc_smile", &smile, Clock::REST, 1.0);
+    let mut circle = base("ПО КРУГУ • ПО КРУГУ • ПО КРУГУ •");
+    circle.style.size = 28.0;
+    circle.shape = TextShape::Circle { radius: 110.0, start_deg: 0.0 };
+    check("circle", &circle, Clock::REST, 1.0);
+    let mut tilt = base("Перспектива");
+    tilt.perspective = Some(Perspective { tilt_x: 35.0, tilt_y: 0.0 });
+    check("tilt_x", &tilt, Clock::REST, 1.0);
+    tilt.perspective = Some(Perspective { tilt_x: 0.0, tilt_y: -30.0 });
+    check("tilt_y", &tilt, Clock::REST, 1.0);
+    let mut emoji = base("Гол! ⚽🔥");
+    emoji.style.outlines = vec![Outline { width: 3.0, colour: Rgba8::BLACK }];
+    emoji.style.shadow = Some(Shadow { colour: Rgba8::rgba(0, 0, 0, 160), offset_x: 3.0, offset_y: 4.0, blur: 4.0 });
+    check("emoji_styled", &emoji, Clock::REST, 1.0);
+}

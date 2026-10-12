@@ -44,6 +44,9 @@ pub struct TextFrame {
     laid: Arc<Laid>,
     placed: Vec<Placed>,
     anim: FrameAnim,
+    /// What the flat picture covers (before any tilt).
+    flat: Bounds,
+    /// What the picture covers: `flat`, or its projection when tilted.
     bounds: Bounds,
     key: u64,
 }
@@ -66,9 +69,14 @@ impl TextFrame {
         let placed = crate::shape::place(doc, &laid);
         let anim = crate::anim::animate(doc, &laid, clock);
         let finals = crate::raster::finals(&laid, &placed, &anim);
-        let bounds = crate::raster::bounds(doc, &laid, &finals);
+        let flat = crate::raster::bounds(doc, &laid, &finals);
+        let bounds = match crate::effects::tilt(doc) {
+            Some(p) => crate::effects::project_bounds(flat, p, crate::effects::camera_distance(&laid)),
+            None => flat,
+        };
+        // The paint hash holds the style (shadow, glow), the shape and the perspective.
         let key = crate::hash_of(&(shape, paint_hash(doc), anim.key(), generation));
-        TextFrame { doc: doc.clone(), laid, placed, anim, bounds, key }
+        TextFrame { doc: doc.clone(), laid, placed, anim, flat, bounds, key }
     }
 
     /// What the picture may cover, canvas px about the layout box centre.
@@ -100,11 +108,31 @@ impl TextFrame {
 }
 
 /// The block the preview's handles frame (canvas px, centred on the
-/// layout box centre): the layout box (Task 9 widens it to a curved or
-/// tilted text's extent).
+/// layout box centre): the layout box, widened to a curved text's glyphs
+/// (their em boxes as placed, at rest) and then to its tilted image.
 pub fn frame_size(doc: &TextDoc) -> (f32, f32) {
-    let l = crate::layout::layout(doc);
-    (l.width, l.height)
+    let laid = crate::layout::layout(doc);
+    let (bx, by) = (laid.width / 2.0, laid.height / 2.0);
+    let (mut hw, mut hh) = (bx, by);
+    if doc.shape != kadr_project::TextShape::Straight {
+        let placed = crate::shape::place(doc, &laid);
+        let finals = crate::raster::finals(&laid, &placed, &FrameAnim::rest(laid.glyphs.len()));
+        for (g, f) in laid.glyphs.iter().zip(&finals).filter(|(g, _)| g.visible) {
+            for (x, y) in [(0.0, -g.size), (g.advance, -g.size), (g.advance, 0.3 * g.size), (0.0, 0.3 * g.size)] {
+                let (s, c) = f.rotation.sin_cos();
+                let (px, py) = (f.x + x * c - y * s, f.y + x * s + y * c);
+                if px.is_finite() && py.is_finite() {
+                    (hw, hh) = (hw.max((px - bx).abs()), hh.max((py - by).abs()));
+                }
+            }
+        }
+    }
+    if let Some(p) = crate::effects::tilt(doc) {
+        // The projected box, cut where it would come too near the camera (TX-R5).
+        let b = crate::effects::project_bounds(Bounds { x0: -hw, y0: -hh, x1: hw, y1: hh }, p, crate::effects::camera_distance(&laid));
+        (hw, hh) = (b.x0.abs().max(b.x1.abs()), b.y0.abs().max(b.y1.abs()));
+    }
+    (2.0 * hw, 2.0 * hh)
 }
 
 impl kadr_scene::TextPicture for TextFrame {
@@ -114,14 +142,14 @@ impl kadr_scene::TextPicture for TextFrame {
 
     /// `⌈bounds · scale⌉` px with the bounds filling it (TX-R3).
     fn render(&self, scale: f32, pool: &FramePool) -> CpuFrame {
-        crate::raster::render(&self.doc, &self.laid, &self.placed, &self.anim, self.bounds, scale, pool)
+        crate::raster::render(&self.doc, &self.laid, &self.placed, &self.anim, self.flat, self.bounds, scale, pool)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kadr_project::{Outline, Plaque, Rgba8, TextDoc};
+    use kadr_project::{Glow, Outline, Perspective, Plaque, Rgba8, Shadow, TextDoc, TextShape};
 
     fn styled() -> TextDoc {
         let mut d = TextDoc::starter("Йога\nкурсивом", 1080);
@@ -135,18 +163,128 @@ mod tests {
         f.row(y)[x as usize * 4 + 3]
     }
 
+    fn nothing_on_the_edge(f: &kadr_core::CpuFrame) -> bool {
+        let (w, h) = (f.width, f.height);
+        (0..w).all(|x| alpha_at(f, x, 0) == 0 && alpha_at(f, x, h - 1) == 0) && (0..h).all(|y| alpha_at(f, 0, y) == 0 && alpha_at(f, w - 1, y) == 0)
+    }
+
     #[test]
     fn bounds_hold_everything_drawn() {
-        for d in [styled(), TextDoc::starter("🎉 Гол! ⚽", 1080), TextDoc::starter("", 1080)] {
+        let starter = |text: &str, look: &dyn Fn(&mut TextDoc)| {
+            let mut d = TextDoc::starter(text, 1080);
+            look(&mut d);
+            d
+        };
+        let docs = [
+            styled(),
+            TextDoc::starter("🎉 Гол! ⚽", 1080),
+            TextDoc::starter("", 1080),
+            starter("Неон", &|d| d.style.glow = Some(Glow { colour: Rgba8::rgba(255, 0, 200, 255), radius: 12.0, intensity: 1.5 })),
+            starter("Тень", &|d| d.style.shadow = Some(Shadow { colour: Rgba8::BLACK, offset_x: 20.0, offset_y: 30.0, blur: 0.0 })),
+            starter("Текст по дуге", &|d| d.shape = TextShape::Arc { bend: 0.8 }),
+            starter("ПО КРУГУ • ПО КРУГУ •", &|d| d.shape = TextShape::Circle { radius: 160.0, start_deg: 0.0 }),
+            starter("Наклон", &|d| d.perspective = Some(Perspective { tilt_x: 40.0, tilt_y: 40.0 })),
+        ];
+        for d in docs {
             let f = TextFrame::new(&d, Clock::REST);
             let r = f.raster(1.0);
             let b = f.bounds();
             assert_eq!((r.width, r.height), (b.width().ceil() as u32, b.height().ceil() as u32));
-            let (w, h) = (r.width, r.height);
-            let edge = (0..w).all(|x| alpha_at(&r, x, 0) == 0 && alpha_at(&r, x, h - 1) == 0) && (0..h).all(|y| alpha_at(&r, 0, y) == 0 && alpha_at(&r, w - 1, y) == 0);
-            assert!(edge, "{:?}: something touches the raster's edge", d.plain());
+            assert!(nothing_on_the_edge(&r), "{:?}: something touches the raster's edge", d.plain());
             let (lw, lh) = f.layout_size();
-            assert!(b.x0 <= -lw / 2.0 && b.x1 >= lw / 2.0 && b.y0 <= -lh / 2.0 && b.y1 >= lh / 2.0, "the layout box is inside");
+            if d.perspective.is_none() {
+                assert!(b.x0 <= -lw / 2.0 && b.x1 >= lw / 2.0 && b.y0 <= -lh / 2.0 && b.y1 >= lh / 2.0, "the layout box is inside");
+            }
+            assert!((0..r.height).any(|y| r.row(y).as_chunks::<4>().0.iter().any(|p| p[3] > 0)) || d.plain().is_empty(), "{:?} draws", d.plain());
+        }
+    }
+
+    #[test]
+    fn a_tilted_text_is_its_flat_picture_seen_in_perspective() {
+        // Capitals only: every row of ink spans the word.
+        let mut d = TextDoc::starter("ПЕРСПЕКТИВА", 1080);
+        d.style.shadow = None;
+        let flat = TextFrame::new(&d, Clock::REST);
+        d.perspective = Some(Perspective { tilt_x: 35.0, tilt_y: 0.0 });
+        let tilted = TextFrame::new(&d, Clock::REST);
+        let (a, b) = (flat.bounds(), tilted.bounds());
+        assert!(b.width() > a.width() && b.height() < a.height(), "the near (bottom) edge widens, the height shrinks: {a:?} → {b:?}");
+        assert!(b.x0 < 0.0 && b.x1 > 0.0 && b.y0 < 0.0 && b.y1 > 0.0, "the centre stays inside");
+        assert_ne!(kadr_scene::TextPicture::key(&flat), kadr_scene::TextPicture::key(&tilted));
+        // Ink per row: the top row of letters is narrower than the bottom one.
+        let r = tilted.raster(1.0);
+        let ink: Vec<u32> = (0..r.height).map(|y| r.row(y).as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count() as u32).collect();
+        let rows: Vec<usize> = (0..ink.len()).filter(|&y| ink[y] > 0).collect();
+        let span = |y: usize| {
+            let row = r.row(y as u32).as_chunks::<4>().0;
+            let lit: Vec<usize> = (0..row.len()).filter(|&x| row[x][3] > 128).collect();
+            lit.last().unwrap() - lit.first().unwrap()
+        };
+        let (top, bottom) = (rows[rows.len() / 5], rows[rows.len() * 4 / 5]);
+        assert!(span(top) + 4 < span(bottom), "a trapezoid narrowing upwards: {} vs {}", span(top), span(bottom));
+    }
+
+    #[test]
+    fn the_frame_covers_a_curved_or_tilted_text() {
+        let mut d = TextDoc::starter("ПО КРУГУ • ПО КРУГУ • ПО КРУГУ •", 1080);
+        let (lw, lh) = (crate::layout(&d).width, crate::layout(&d).height);
+        assert_eq!(frame_size(&d), (lw, lh), "straight: the layout box");
+        d.shape = TextShape::Circle { radius: 150.0, start_deg: 0.0 };
+        let (cw, ch) = frame_size(&d);
+        assert!(ch > 300.0 && cw >= lw.min(300.0), "a circle's frame holds the circle: {cw} × {ch}");
+        let mut t = TextDoc::starter("Наклон", 1080);
+        let flat = frame_size(&t);
+        t.perspective = Some(Perspective { tilt_x: 30.0, tilt_y: 0.0 });
+        let tilted = frame_size(&t);
+        assert!(tilted.0 > flat.0 && tilted.1 < flat.1 + 2.5, "{flat:?} → {tilted:?}");
+    }
+
+    /// TX-R5 for the looks: absurd shadows, glows, curves and tilts are
+    /// clamped — finite bounds of a sane size, a raster drawn without
+    /// panicking or hanging, nothing on its edge.
+    #[test]
+    fn absurd_looks_never_abort() {
+        let base = TextDoc::starter("Абсурд", 1080);
+        let reach = |d: &TextDoc| {
+            let b = TextFrame::new(d, Clock::REST).bounds();
+            assert!([b.x0, b.y0, b.x1, b.y1].iter().all(|v| v.is_finite()), "{b:?}");
+            b.x0.abs().max(b.x1.abs()).max(b.y0.abs()).max(b.y1.abs())
+        };
+        let plain = reach(&base);
+        for (offset, blur) in [(1e12, 1e12), (-1e30, f32::NAN), (f32::INFINITY, f32::NEG_INFINITY), (f32::NAN, 1e9)] {
+            let mut d = base.clone();
+            d.style.shadow = Some(Shadow { colour: Rgba8::BLACK, offset_x: offset, offset_y: offset, blur });
+            assert!(reach(&d) <= plain + 10_000.0 + 3.0 * 500.0 + 2.0, "shadow {offset} {blur}: {}", reach(&d));
+            assert!(nothing_on_the_edge(&TextFrame::new(&d, Clock::REST).raster(0.25)));
+        }
+        for (radius, intensity) in [(1e12, 1.0), (f32::NAN, f32::NAN), (f32::INFINITY, 1e9), (500.0, f32::NAN)] {
+            let mut d = base.clone();
+            d.style.glow = Some(Glow { colour: Rgba8::WHITE, radius, intensity });
+            assert!(reach(&d) <= plain + 3.0 * 500.0 + 2.0, "glow {radius} {intensity}: {}", reach(&d));
+            assert!(nothing_on_the_edge(&TextFrame::new(&d, Clock::REST).raster(0.25)));
+        }
+        for shape in [TextShape::Arc { bend: f32::NAN }, TextShape::Arc { bend: 1e9 }, TextShape::Circle { radius: 1e12, start_deg: f32::INFINITY }, TextShape::Circle { radius: f32::NAN, start_deg: 1e30 }] {
+            let mut d = base.clone();
+            d.shape = shape;
+            assert!(reach(&d) < 50_000.0, "{shape:?}: {}", reach(&d));
+            TextFrame::new(&d, Clock::REST).raster(0.05);
+        }
+        // Near-90° (and absurd) tilts are 60° at most: the picture stays in front of
+        // the camera and its bounds within 4× the flat picture's reach.
+        let mut far = base.clone();
+        far.style.plaque = Some(Plaque { per_line: false, colour: Rgba8::BLACK, radius: 0.0, padding_x: 3000.0, padding_y: 3000.0 });
+        for d in [base.clone(), far] {
+            let flat = reach(&d);
+            for (tx, ty) in [(89.9, 0.0), (-89.9, 89.9), (1e9, -1e9), (f32::NAN, 89.0), (f32::INFINITY, f32::NAN)] {
+                let mut t = d.clone();
+                t.perspective = Some(Perspective { tilt_x: tx, tilt_y: ty });
+                let f = TextFrame::new(&t, Clock::REST);
+                assert!(reach(&t) <= 4.0 * flat + 2.0, "tilt {tx} {ty}: {} vs flat {flat}", reach(&t));
+                let r = f.raster(0.05);
+                assert_eq!((r.width, r.height), ((f.bounds().width() * 0.05).ceil() as u32, (f.bounds().height() * 0.05).ceil() as u32));
+                let (w, h) = frame_size(&t);
+                assert!(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0);
+            }
         }
     }
 
