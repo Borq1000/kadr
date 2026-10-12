@@ -20,6 +20,8 @@ pub struct FramePerf {
     pub decode: Vec<LayerTiming>,
     pub evaluate: Duration,
     pub resolve: Duration,
+    /// Drawing text rasters (titles spec §5.3), within `resolve`.
+    pub text: Duration,
     pub upload: Duration,
     pub composite: Duration,
     pub effects: Duration,

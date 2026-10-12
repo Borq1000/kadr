@@ -616,18 +616,24 @@ fn superseding_u64_max_abandons_later_waits_too() {
     assert!(t0.elapsed() < ms(200), "waited {:?} for a cancelled export's frame", t0.elapsed());
 }
 
-/// A text picture that counts its renders and the scales asked for.
+/// A text picture that counts its renders and the scales asked for; it
+/// may take `delay` to draw, or panic.
 #[derive(Debug)]
 struct Counting {
     key: u64,
     size: Vec2,
     calls: AtomicU64,
     scales: std::sync::Mutex<Vec<f32>>,
+    delay: Duration,
+    panics: bool,
 }
 
 impl Counting {
     fn new(key: u64, w: f32, h: f32) -> Arc<Counting> {
-        Arc::new(Counting { key, size: Vec2::new(w, h), calls: AtomicU64::new(0), scales: Default::default() })
+        Self::with(key, w, h, Duration::ZERO, false)
+    }
+    fn with(key: u64, w: f32, h: f32, delay: Duration, panics: bool) -> Arc<Counting> {
+        Arc::new(Counting { key, size: Vec2::new(w, h), calls: AtomicU64::new(0), scales: Default::default(), delay, panics })
     }
 }
 
@@ -638,6 +644,8 @@ impl TextPicture for Counting {
     fn render(&self, scale: f32, _: &FramePool) -> CpuFrame {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.scales.lock().unwrap().push(scale);
+        std::thread::sleep(self.delay);
+        assert!(!self.panics, "a broken text picture");
         let (w, h) = (((self.size.x * scale).ceil() as u32).max(1), ((self.size.y * scale).ceil() as u32).max(1));
         CpuFrame::from_rgba8(w, h, ColorInfo::WORKING_SDR, vec![255; (w * h * 4) as usize])
     }
@@ -696,4 +704,77 @@ fn a_text_layer_that_draws_nothing_and_prefetch_never_draw_text() {
     assert_eq!((frame_of(&inputs.layers[0]).width, pic.calls.load(Ordering::Relaxed)), (1, 0), "the blank frame, no render");
     r.prefetch(&text_scene(CANVAS, CANVAS, vec![text_layer(&pic, 1.0, CANVAS)]), &source(vec![]));
     assert_eq!(pic.calls.load(Ordering::Relaxed), 0, "prefetch is for decoders only");
+}
+
+fn render_cpu(s: &FrameScene, inputs: &RenderInputs) -> Vec<u8> {
+    let (w, h) = (s.output.size.w, s.output.size.h);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    CpuRenderer::new().render(&PreparedFrame { scene: s, inputs }, &mut RenderTarget::Cpu(CpuTarget::packed(w, h, &mut out))).unwrap();
+    out
+}
+
+/// TX-R2: a picture that panics is isolated — its layer is missing (and
+/// draws nothing), other texts are drawn, and it is never asked again.
+#[test]
+fn a_panicking_text_picture_draws_nothing_and_is_not_asked_again() {
+    let fake = fake(0, 0);
+    let r = resolver(&fake, ResolverConfig::default());
+    let bad = Counting::with(11, 20.0, 8.0, Duration::ZERO, true);
+    let good = Counting::new(12, 10.0, 6.0);
+    let s = text_scene(CANVAS, CANVAS, vec![text_layer(&bad, 1.0, CANVAS), text_layer(&good, 1.0, CANVAS)]);
+    let mut last = None;
+    for _ in 0..3 {
+        let (inputs, _) = prepare(&r, &s, &source(vec![]), Mode::Export);
+        assert!(matches!(inputs.layers[0], LayerInput::Missing(MissingReason::DecodeFailed)), "{:?}", inputs.layers[0]);
+        assert_eq!(frame_of(&inputs.layers[1]).width, 10, "the other text is drawn");
+        last = Some(inputs);
+    }
+    assert_eq!(bad.calls.load(Ordering::Relaxed), 1, "never re-rendered after its panic");
+    assert_eq!(good.calls.load(Ordering::Relaxed), 1);
+    let inputs = last.unwrap();
+    let alone = text_scene(CANVAS, CANVAS, vec![text_layer(&good, 1.0, CANVAS)]);
+    let alone_inputs = RenderInputs { layers: vec![inputs.layers[1].clone()] };
+    assert_eq!(render_cpu(&s, &inputs), render_cpu(&alone, &alone_inputs), "the failed text draws nothing at all");
+}
+
+#[test]
+fn a_text_layer_inside_a_transition_is_drawn_through_the_resolver() {
+    let fake = fake(1, 0);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    let a = AssetId::new();
+    let ma = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = source(vec![(a, ma.clone())]);
+    let r = resolver(&fake, ResolverConfig::default());
+    let pic = Counting::new(21, 20.0, 8.0);
+    let t = TransitionLayer { op: TransitionOp::Dissolve, progress: 0.5, from: vec![media_layer(1, a, &ma, Time::from_secs(2), CANVAS)], to: vec![text_layer(&pic, 1.0, CANVAS)] };
+    let placement = Placement::fill(CANVAS);
+    let tl = Layer { id: LayerId(9), content: LayerContent::Transition(Box::new(t)), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
+    let (inputs, perf) = prepare(&r, &scene(vec![tl]), &src, Mode::Export);
+    let LayerInput::Transition { from, to } = &inputs.layers[0] else { panic!("{:?}", inputs.layers[0]) };
+    assert_eq!(which(&from[0]), (1, 50));
+    let f = frame_of(&to[0]);
+    assert_eq!((f.width, f.height), (20, 8), "the incoming side's text raster");
+    assert_eq!(pic.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(perf.decode.len(), 1, "a text is not a decode");
+}
+
+/// Text is drawn after the decoders have their requests and before waiting
+/// for them (the stream opens meanwhile), and is timed in `perf.text`.
+#[test]
+fn text_is_drawn_while_the_decoders_work_and_is_timed() {
+    let fake = fake(300, 0);
+    fake.add("a.mp4", FakeMedia { tag: 1, ..Default::default() });
+    let a = AssetId::new();
+    let ma = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(60), CANVAS);
+    let src = source(vec![(a, ma.clone())]);
+    let r = resolver(&fake, ResolverConfig::default());
+    let pic = Counting::with(31, 20.0, 8.0, ms(200), false);
+    let s = scene(vec![media_layer(1, a, &ma, Time::ZERO, CANVAS), text_layer(&pic, 1.0, CANVAS)]);
+    let t0 = Instant::now();
+    let (inputs, perf) = prepare(&r, &s, &src, Mode::Export);
+    let spent = t0.elapsed();
+    assert_eq!(which(&inputs.layers[0]), (1, 0));
+    assert_eq!(frame_of(&inputs.layers[1]).width, 20);
+    assert!(perf.text >= ms(200) && perf.text <= perf.resolve, "text {:?}, resolve {:?}", perf.text, perf.resolve);
+    assert!(spent < ms(450), "the 300 ms open overlapped the 200 ms text: {spent:?}");
 }

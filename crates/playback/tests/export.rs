@@ -3,13 +3,13 @@
 //! errors, steady-state allocations), plus one run on real FFmpeg (skipped
 //! without it).
 
-use kadr_core::{AssetId, CancelToken, FrameRate, Time};
+use kadr_core::{AssetId, CancelToken, CpuFrame, FramePool, FrameRate, Time};
 use kadr_media::ffmpeg::FfmpegCli;
 use kadr_media::{EncodeJob, ExportAudio, ExportSettings, FrameEncoder, MediaBackend, MediaError, SourceRequest};
 use kadr_playback::testing::{media_layer, read_fake_pixel, video_source, FakeDecoders, FakeMedia, FnSceneSource};
 use kadr_playback::{export, EncoderFactory, ExportError, ExportRequest, FfmpegDecoders, MediaSource, MissingPolicy, ResolverConfig, SceneSource};
 use kadr_render::MissingReason;
-use kadr_scene::{BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, SizeU, SourceKind, TransitionLayer, TransitionOp};
+use kadr_scene::{BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, SizeU, SourceKind, TextLayer, TextPicture, TransitionLayer, TransitionOp};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -539,4 +539,54 @@ fn exports_a_real_clip_through_ffmpeg() {
     let mean = sum as f64 / n as f64;
     eprintln!("frame 25: mean abs diff {mean:.3}");
     assert!(mean < 3.0, "exported frame 25 differs from the source: mean abs diff {mean:.3}");
+}
+
+/// A title whose picture panics when drawn.
+#[derive(Debug)]
+struct BrokenTitle;
+
+impl TextPicture for BrokenTitle {
+    fn key(&self) -> u64 {
+        41
+    }
+    fn render(&self, _: f32, _: &FramePool) -> CpuFrame {
+        panic!("a broken title")
+    }
+}
+
+/// TX-R2: a title that fails to draw does not vanish silently from an
+/// export: it fails it (or, with placeholders, the export goes on without it).
+/// The title is over the timeline from 1.2 s (frame 30).
+#[test]
+fn a_title_that_fails_to_draw_fails_the_export() {
+    let title = |t: Time| {
+        let placement = Placement::fill(CANVAS);
+        let text = Layer { id: LayerId(70), content: LayerContent::Text(TextLayer { picture: Arc::new(BrokenTitle) }), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
+        (t >= Time::from_millis(1200)).then_some(text)
+    };
+    let source = |tl: Timeline| -> Arc<dyn SceneSource> {
+        let media = [(tl.a, tl.ma.clone()), (tl.b, tl.mb.clone())].into_iter().collect();
+        Arc::new(FnSceneSource {
+            media,
+            rate: RATE,
+            duration: RATE.frame_to_time(FRAMES),
+            canvas: CANVAS,
+            scene: move |t, out: &OutputSpec| {
+                let mut s = tl.scene(t, out);
+                s.layers.extend(title(t));
+                s
+            },
+        })
+    };
+    let rec = Recorder::default();
+    let err = export(ExportRequest::new(source(Timeline::new(b_media())), job(FRAMES)), fake(), &rec, &no_progress(), &CancelToken::new()).expect_err("a broken title fails");
+    assert!(matches!(err, ExportError::TextFailed { layer: LayerId(70), frame: 30, .. }), "{err:?}");
+    assert!(err.to_string().contains("0:01.200"), "{err}");
+    assert!(rec.rec.lock().aborted);
+
+    let rec = Recorder::default();
+    let req = ExportRequest::new(source(Timeline::new(b_media())), job(FRAMES)).with_missing(MissingPolicy::DrawPlaceholder);
+    let stats = export(req, fake(), &rec, &no_progress(), &CancelToken::new()).expect("placeholders allowed");
+    assert_eq!(stats.frames, FRAMES);
+    assert_timeline_frames(&rec.rec.lock().frames);
 }

@@ -17,8 +17,10 @@ use kadr_scene::FrameScene;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Why a media layer has no frame. The renderer draws it as
-/// `Rgba::MISSING` either way; the reason is for telemetry and UI.
+/// Why a layer has no frame. The renderer draws a media layer without one
+/// as `Rgba::MISSING` and a text layer without one as nothing at all,
+/// whatever the reason; the reason is for telemetry and UI (a text layer's
+/// is `DecodeFailed`: its picture failed to draw).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingReason {
     Offline,

@@ -8,11 +8,12 @@ use crate::cache::{FrameCache, FrameKey};
 use crate::decoders::Decoders;
 use crate::session::{Counters, Env, Session, SessionKey, Work};
 use crate::source::{MediaSource, SceneSource};
+use crate::text::{text_scale_step, TextRasters};
 use kadr_core::perf::{FramePerf, LayerTiming};
 use kadr_core::color::AlphaMode;
 use kadr_core::{AssetId, ColorInfo, CpuFrame, FramePool, Time};
 use kadr_render::{LayerInput, MissingReason, RenderInputs};
-use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, Placement, SizeU, SourceKind};
+use kadr_scene::{FrameScene, Layer, LayerContent, LayerId, Placement, SizeU, SourceKind, TextPicture};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +51,9 @@ pub struct ResolverConfig {
     /// A session claimed by a layer this recently is not taken by another
     /// layer (or by prefetch) unless the scene needs it at the same frame.
     pub claim_hold: Duration,
+    /// Text rasters kept (titles spec §5.3, LRU by bytes). A frame's own
+    /// rasters are never evicted for one another, whatever the budget.
+    pub text_cache_bytes: usize,
 }
 
 impl Default for ResolverConfig {
@@ -65,6 +69,7 @@ impl Default for ResolverConfig {
             retry_failed_after: Duration::from_secs(2),
             export_retry_backoff: vec![Duration::from_millis(50), Duration::from_millis(200), Duration::from_millis(500)],
             claim_hold: Duration::from_millis(500),
+            text_cache_bytes: 128 << 20,
         }
     }
 }
@@ -142,6 +147,8 @@ struct Req {
 /// The scene's layer tree with each media layer pointing at its `Req`.
 enum Slot {
     Input(LayerInput),
+    /// A text layer: drawn by `prepare` after the decoders have their requests.
+    Text { picture: Arc<dyn TextPicture>, step: i32 },
     Req { req: usize, layer: LayerId },
     Transition { from: Vec<Slot>, to: Vec<Slot> },
 }
@@ -157,9 +164,6 @@ struct Registry {
 /// re-sent if its session was retired or its target replaced meanwhile).
 const REASSERT: Duration = Duration::from_millis(50);
 
-/// Text rasters kept per resolver (titles spec §5.3).
-const TEXT_CACHE_BYTES: usize = 128 << 20;
-
 pub struct Resolver {
     config: ResolverConfig,
     env: Arc<Env>,
@@ -167,7 +171,7 @@ pub struct Resolver {
     /// The media each asset was last seen as: a change (relink) invalidates it.
     known: Mutex<HashMap<AssetId, Arc<MediaSource>>>,
     last_allocs: AtomicU64,
-    texts: crate::text::TextRasters,
+    texts: TextRasters,
 }
 
 impl Resolver {
@@ -182,8 +186,8 @@ impl Resolver {
             forward_window: config.forward_window,
         });
         Resolver {
+            texts: TextRasters::new(env.pool.clone(), config.text_cache_bytes),
             config,
-            texts: crate::text::TextRasters::new(env.pool.clone(), TEXT_CACHE_BYTES),
             env,
             registry: Mutex::new(Registry { sessions: vec![], retired: vec![], next_id: 0 }),
             known: Mutex::new(HashMap::new()),
@@ -263,8 +267,17 @@ impl Resolver {
     /// export after its retries), not ready when the mode stops waiting →
     /// `Missing(NotReady)`. A media layer that draws nothing whatever its
     /// input (see [`draws_nothing`]) is not decoded: it gets a 1×1
-    /// transparent frame. Fills
-    /// `resolve`, `decode` (per media layer: the time its session spent
+    /// transparent frame.
+    ///
+    /// A text layer (titles spec §5.3) gets its raster, drawn here on the
+    /// calling thread, synchronously, in every mode — never `NotReady` —
+    /// after the decoders have their requests and before waiting for them;
+    /// cached by picture key and scale step ([`text_scale_step`]). A picture
+    /// that panics drawing → `Missing(DecodeFailed)` (it draws nothing). A
+    /// text layer that draws nothing gets the 1×1 transparent frame.
+    ///
+    /// Fills `resolve` (all of it, text included), `text` (drawing text
+    /// rasters), `decode` (per media layer: the time its session spent
     /// producing the frame, reported once), cache hits/misses and
     /// `frame_allocs` (pool buffers allocated since the previous call).
     pub fn prepare(&self, scene: &FrameScene, source: &dyn SceneSource, mode: Mode, perf: &mut FramePerf) -> RenderInputs {
@@ -278,7 +291,7 @@ impl Resolver {
         };
         let reading = !matches!(mode, Mode::Scrub { .. });
         let export = mode == Mode::Export;
-        let (slots, mut reqs) = self.collect_scene(scene, source, Some(&self.texts));
+        let (mut slots, mut reqs) = self.collect_scene(scene, source);
         let mut pending = vec![];
         let fail_seq = {
             let mut b = self.env.cache.lock();
@@ -307,6 +320,12 @@ impl Resolver {
             let hits: Vec<usize> = if reading { (0..reqs.len()).filter(|&i| reqs[i].hit).collect() } else { vec![] };
             self.assign(&reqs, &pending, &hits, generation, false, reading);
         }
+        // Text now: the decoders already work on their requests (a seek is
+        // not delayed by drawing), and nothing waits for them yet.
+        let t0 = Instant::now();
+        let stamp = self.texts.begin();
+        draw_texts(&self.texts, &mut slots, stamp);
+        perf.text += t0.elapsed();
         if !pending.is_empty() {
             self.wait(&mut reqs, pending, mode, generation, fail_seq);
         }
@@ -336,7 +355,7 @@ impl Resolver {
     /// another layer is using, and leaves frames a session can reach by
     /// reading forward to its read-ahead.
     pub fn prefetch(&self, scene: &FrameScene, source: &dyn SceneSource) {
-        let (_, mut reqs) = self.collect_scene(scene, source, None);
+        let (_, mut reqs) = self.collect_scene(scene, source);
         let misses: Vec<usize> = {
             let b = self.env.cache.lock();
             (0..reqs.len())
@@ -352,11 +371,11 @@ impl Resolver {
         }
     }
 
-    fn collect_scene(&self, scene: &FrameScene, source: &dyn SceneSource, texts: Option<&crate::text::TextRasters>) -> (Vec<Slot>, Vec<Req>) {
+    fn collect_scene(&self, scene: &FrameScene, source: &dyn SceneSource) -> (Vec<Slot>, Vec<Req>) {
         let mut medias = HashMap::new();
         let mut reqs = vec![];
         let mut index = HashMap::new();
-        let slots = collect(&scene.layers, scene, source, &mut medias, &mut reqs, &mut index, texts);
+        let slots = collect(&scene.layers, scene, source, &mut medias, &mut reqs, &mut index);
         let changed: Vec<AssetId> = {
             let mut known = self.known.lock();
             let mut changed = vec![];
@@ -720,27 +739,20 @@ fn collect(
     medias: &mut HashMap<AssetId, Option<Arc<MediaSource>>>,
     reqs: &mut Vec<Req>,
     index: &mut HashMap<FrameKey, usize>,
-    texts: Option<&crate::text::TextRasters>,
 ) -> Vec<Slot> {
     let mut out = Vec::with_capacity(layers.len());
     for l in layers {
         out.push(match &l.content {
             LayerContent::Solid(_) | LayerContent::Generator(_) => Slot::Input(LayerInput::None),
             LayerContent::Transition(t) => {
-                let from = collect(&t.from, scene, source, medias, reqs, index, texts);
-                let to = collect(&t.to, scene, source, medias, reqs, index, texts);
+                let from = collect(&t.from, scene, source, medias, reqs, index);
+                let to = collect(&t.to, scene, source, medias, reqs, index);
                 Slot::Transition { from, to }
             }
             LayerContent::Text(_) if draws_nothing(l) => Slot::Input(LayerInput::Cpu(BLANK.clone())),
-            // Titles spec §5.3: drawn by its picture at the output footprint
-            // (prefetch, `None`, is for decoders: text waits for nothing).
-            LayerContent::Text(t) => match texts {
-                Some(texts) => {
-                    let step = crate::text::text_scale_step(&l.placement, scene.canvas, scene.output.size);
-                    Slot::Input(LayerInput::Cpu(texts.get(t.picture.as_ref(), step)))
-                }
-                None => Slot::Input(LayerInput::None),
-            },
+            // Titles spec §5.3: drawn by its picture at the output footprint,
+            // by `prepare` only (prefetch is for decoders).
+            LayerContent::Text(t) => Slot::Text { picture: t.picture.clone(), step: text_scale_step(&l.placement, scene.canvas, scene.output.size) },
             LayerContent::Media { .. } if draws_nothing(l) => Slot::Input(LayerInput::Cpu(BLANK.clone())),
             LayerContent::Media { media, source_time } => {
                 let m = medias.entry(media.media).or_insert_with(|| source.media(media.media).filter(|m| m.online).map(Arc::new)).clone();
@@ -774,11 +786,33 @@ fn collect(
     out
 }
 
+/// Replaces every text slot by its raster, or by `Missing(DecodeFailed)`
+/// when its picture failed to draw (it draws nothing; export reports it).
+fn draw_texts(texts: &TextRasters, slots: &mut [Slot], stamp: u64) {
+    for s in slots {
+        match s {
+            Slot::Text { picture, step } => {
+                let input = match texts.get(picture.as_ref(), *step, stamp) {
+                    Some(f) => LayerInput::Cpu(f),
+                    None => LayerInput::Missing(MissingReason::DecodeFailed),
+                };
+                *s = Slot::Input(input);
+            }
+            Slot::Transition { from, to } => {
+                draw_texts(texts, from, stamp);
+                draw_texts(texts, to, stamp);
+            }
+            Slot::Input(_) | Slot::Req { .. } => {}
+        }
+    }
+}
+
 fn build(slots: Vec<Slot>, reqs: &[Req], reported: &mut [bool], perf: &mut FramePerf) -> Vec<LayerInput> {
     slots
         .into_iter()
         .map(|s| match s {
             Slot::Input(i) => i,
+            Slot::Text { .. } => unreachable!("prepare draws every text slot before building the inputs"),
             Slot::Transition { from, to } => LayerInput::Transition { from: build(from, reqs, reported, perf), to: build(to, reqs, reported, perf) },
             Slot::Req { req, layer } => {
                 let r = &reqs[req];

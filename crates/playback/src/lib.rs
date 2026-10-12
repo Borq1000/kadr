@@ -60,4 +60,4 @@ pub use pace::{pace, Clock, Pace, PlaySchedule, Step, WallClock};
 pub use player::{FrameInfo, FrameSink, PlayerConfig, PreviewPlayer};
 pub use resolver::{decode_size, Mode, Resolver, ResolverConfig, ResolverStats};
 pub use source::{MediaSource, SceneSource};
-pub use text::{step_scale, text_scale_step, TextRasters, MAX_TEXT_SIDE};
+pub use text::{step_scale, text_scale_step, TextRasters, MAX_TEXT_PIXELS, MAX_TEXT_SIDE};

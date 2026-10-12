@@ -88,11 +88,12 @@ impl PreviewController {
         }
     }
 
-    /// The resolver MCP `get_frame` renders with (its own: export mode is never superseded).
+    /// The resolver MCP `get_frame` and effect thumbnails render with (its
+    /// own: export mode is never superseded). Single frames: a small text cache.
     pub fn mcp_resolver(&mut self) -> Option<Arc<Resolver>> {
         if self.mcp_resolver.is_none() {
             let media = self.media.clone()?;
-            let config = ResolverConfig { cache_bytes: 256 << 20, pool_free_bytes: 64 << 20, max_sessions: 4, ..Default::default() };
+            let config = ResolverConfig { cache_bytes: 256 << 20, pool_free_bytes: 64 << 20, max_sessions: 4, text_cache_bytes: 16 << 20, ..Default::default() };
             self.mcp_resolver = Some(Arc::new(Resolver::new(Arc::new(FfmpegDecoders::new(media)), config)));
         }
         self.mcp_resolver.clone()

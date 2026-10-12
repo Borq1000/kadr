@@ -24,7 +24,7 @@ use kadr_core::perf::{FramePerf, Stats};
 use kadr_core::{AssetId, CancelToken, ColorInfo, Time};
 use kadr_media::{EncodeJob, FrameEncoder, MediaBackend, MediaError};
 use kadr_render::{CpuRenderer, CpuTarget, LayerInput, MissingReason, PreparedFrame, RenderError, RenderTarget, Renderer};
-use kadr_scene::{Layer, LayerContent, OutputSpec, RenderQuality, SizeU};
+use kadr_scene::{Layer, LayerContent, LayerId, OutputSpec, RenderQuality, SizeU};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +111,8 @@ pub struct ExportStats {
     pub fast_paths: u64,
     /// Time spent in `Resolver::prepare`, waiting for decoded frames.
     pub decode_wait: Duration,
+    /// Time spent in `Resolver::prepare` drawing text rasters (not in `decode_wait`).
+    pub text: Duration,
     /// Time the renderer waited for a free output buffer (encoder back-pressure).
     pub encoder_wait: Duration,
     /// Time the writer thread spent in `FrameEncoder::write_frame`.
@@ -140,6 +142,15 @@ pub enum ExportError {
         time: Time,
         frame: i64,
     },
+    /// A text layer's picture failed to draw (titles spec §5.3) — it would
+    /// draw nothing ([`MissingPolicy::Fail`]; with `DrawPlaceholder` the
+    /// export goes on without it).
+    TextFailed {
+        layer: LayerId,
+        /// Timeline time and output frame index where it is needed first.
+        time: Time,
+        frame: i64,
+    },
     /// Starting, feeding or finishing the encoder failed.
     Encode(MediaError),
     Render(RenderError),
@@ -164,6 +175,9 @@ impl std::fmt::Display for ExportError {
                     None => write!(f, "{what}: unknown media {media}")?,
                 }
                 write!(f, " (needed at {}, frame {frame})", clock(*time))
+            }
+            ExportError::TextFailed { layer, time, frame } => {
+                write!(f, "a title cannot be drawn (layer {}) (needed at {}, frame {frame})", layer.0, clock(*time))
             }
             ExportError::Encode(e) => write!(f, "encoder: {e}"),
             ExportError::Render(e) => write!(f, "render: {e}"),
@@ -346,7 +360,8 @@ impl Runner<'_> {
 
             let mut perf = FramePerf::default();
             let inputs = self.resolver.prepare(&scene, self.source, Mode::Export, &mut perf);
-            self.stats.decode_wait += perf.resolve;
+            self.stats.decode_wait += perf.resolve.saturating_sub(perf.text);
+            self.stats.text += perf.text;
             if let Some(e) = self.check_missing(&scene.layers, &inputs.layers, t, n) {
                 return Err(e);
             }
@@ -390,8 +405,8 @@ impl Runner<'_> {
     }
 
     /// `NotReady` never happens in export mode unless cancel interrupted a
-    /// wait; offline or undecodable media fails the export unless the
-    /// policy draws the placeholder.
+    /// wait; offline or undecodable media, or a title that failed to draw,
+    /// fails the export unless the policy draws the placeholder.
     fn check_missing(&self, layers: &[Layer], inputs: &[LayerInput], t: Time, n: i64) -> Option<ExportError> {
         let mut first = None;
         let mut not_ready = false;
@@ -404,25 +419,35 @@ impl Runner<'_> {
             });
         }
         match (first, self.missing) {
-            (Some((media, reason)), MissingPolicy::Fail) => {
+            (Some(Missing::Media(media, reason)), MissingPolicy::Fail) => {
                 let path = self.source.media(media).map(|m| m.path);
                 Some(ExportError::MissingMedia { media, path, reason, time: t, frame: n })
             }
+            (Some(Missing::Text(layer)), MissingPolicy::Fail) => Some(ExportError::TextFailed { layer, time: t, frame: n }),
             _ => None,
         }
     }
 }
 
-/// The first offline or undecodable media layer (depth first, bottom to
-/// top), and whether any layer is `NotReady`. `inputs` is parallel to `layers`.
-fn find_missing(layers: &[Layer], inputs: &[LayerInput], first: &mut Option<(AssetId, MissingReason)>, not_ready: &mut bool) {
+/// A layer without its input in an exported frame.
+enum Missing {
+    Media(AssetId, MissingReason),
+    /// A text layer whose picture failed to draw.
+    Text(LayerId),
+}
+
+/// The first offline or undecodable media layer or failed text layer
+/// (depth first, bottom to top), and whether any layer is `NotReady`.
+/// `inputs` is parallel to `layers`.
+fn find_missing(layers: &[Layer], inputs: &[LayerInput], first: &mut Option<Missing>, not_ready: &mut bool) {
     for (layer, input) in layers.iter().zip(inputs) {
         match (&layer.content, input) {
             (_, LayerInput::Missing(MissingReason::NotReady)) => *not_ready = true,
             (LayerContent::Media { media, .. }, LayerInput::Missing(reason)) => {
-                if first.is_none() {
-                    *first = Some((media.media, *reason));
-                }
+                first.get_or_insert(Missing::Media(media.media, *reason));
+            }
+            (LayerContent::Text(_), LayerInput::Missing(_)) => {
+                first.get_or_insert(Missing::Text(layer.id));
             }
             (LayerContent::Transition(t), LayerInput::Transition { from, to }) => {
                 find_missing(&t.from, from, first, not_ready);

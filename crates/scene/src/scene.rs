@@ -183,7 +183,14 @@ pub trait TextPicture: Send + Sync + std::fmt::Debug {
     fn key(&self) -> u64;
     /// The picture's box — the layer's `placement.size`, canvas px — at
     /// `scale` raster px per canvas px: premultiplied RGBA8 in the working
-    /// space, `max(1, ⌈size · scale⌉)` px each way.
+    /// space, `W = max(1, ⌈size.x · scale⌉)` × `H = max(1, ⌈size.y · scale⌉)` px.
+    ///
+    /// The picture FILLS its raster: it draws the box with the per-axis
+    /// scales `W / size.x` and `H / size.y` (not `scale`, which rounding up
+    /// made a little smaller), so the raster's edges are the box's edges —
+    /// the renderer stretches the whole raster over `placement.size`, and
+    /// that stretch is then exact. A panic here is caught by the resolver:
+    /// the layer draws nothing and the picture is not asked again.
     fn render(&self, scale: f32, pool: &kadr_core::FramePool) -> kadr_core::CpuFrame;
 }
 
