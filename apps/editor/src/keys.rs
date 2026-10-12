@@ -152,7 +152,15 @@ impl App {
             // drag Esc does nothing — the drag ends on release as usual and
             // the selection stays. Otherwise Esc closes the topmost overlay
             // first, then ends picking an effect point (effects spec §6.2;
-            // the selection stays), then clears the selection.
+            // the selection stays), then clears the selection. In a title's
+            // text field it first ends the typing (one undo entry) and gives
+            // the keyboard back; the selection stays (titles Review Focus 1).
+            if self.text_field_focused {
+                self.text_field_focused = false;
+                self.commit_text_session();
+                self.ui().invoke_focus_editor();
+                return true;
+            }
             if self.tl.drag.is_some() {
                 return true;
             }

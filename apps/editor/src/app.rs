@@ -99,6 +99,16 @@ pub struct App {
     /// Pre-drag state of the clip a drag changes live (an inspector slider,
     /// a timeline fade handle); see `LiveEdit`.
     pub live_edit: crate::inspector::LiveEdit,
+    /// Typing in a title's text field: live, one undo entry when it ends
+    /// (titles spec §6.3); committed before any other edit.
+    pub text_session: crate::text_ui::TextSession,
+    /// The part of the inspected title the run properties style (`None`:
+    /// the whole text; Task 11 fills it from the field's selection).
+    pub text_scope: Option<std::ops::Range<usize>>,
+    /// The clip `text_scope` belongs to: another inspected clip clears it.
+    pub text_scope_clip: Option<ClipId>,
+    /// The inspector's text field has the keyboard (Esc ends typing there).
+    pub text_field_focused: bool,
     /// The «Эффекты» tab: filters, the hovered card's preview, a card drag.
     pub fx: crate::effects_ui::FxUi,
     /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
@@ -157,6 +167,16 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
     // A headless (MCP) instance reads the user's settings but never writes them.
     settings.read_only = flags.headless;
     kadr_i18n::set_lang(settings.lang());
+    // The fonts are built (and the user's added fonts loaded) off the UI
+    // thread: the first title, the inspector and the font picker find them ready.
+    let fonts_dir = dirs.data.join("fonts");
+    std::thread::Builder::new()
+        .name("kadr-fonts".into())
+        .spawn(move || {
+            let n = kadr_text::fonts().load_user_dir(&fonts_dir);
+            tracing::debug!(n, "user fonts loaded");
+        })
+        .ok();
 
     let ui = AppWindow::new()?;
     wire_translations(&ui);
@@ -208,6 +228,10 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         ai: AiUi::new(Assistant::new(ai_settings)),
         export: ExportUi::default(),
         live_edit: Default::default(),
+        text_session: Default::default(),
+        text_scope: None,
+        text_scope_clip: None,
+        text_field_focused: false,
         fx: Default::default(),
         inspector_refreshed: None,
         library_drag: None,
@@ -442,6 +466,18 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_inspector_sequence, |a| |app: &mut App| app.sequence_action(&a));
     cb!(ui.on_inspector_key, |p, a| |app: &mut App| app.inspector_key(&p, &a));
     cb!(ui.on_inspector_fx, |e, a| |app: &mut App| app.fx_action(&e, &a));
+    cb!(ui.on_text_typed, |s| |app: &mut App| app.text_typed(&s));
+    cb!(ui.on_text_focus, |f| |app: &mut App| app.text_field_focus(f));
+    cb!(ui.on_text_live, |p, v| |app: &mut App| app.text_live(&p, v));
+    cb!(ui.on_text_commit, |p, v| |app: &mut App| app.text_commit(&p, v));
+    cb!(ui.on_text_set, |p, v| |app: &mut App| app.text_set(&p, &v));
+    cb!(ui.on_text_color_live, |p, c| |app: &mut App| app.text_color_live(&p, c));
+    cb!(ui.on_text_color_commit, |p, c| |app: &mut App| app.text_color_commit(&p, c));
+    cb!(ui.on_font_open, | | |app: &mut App| app.font_rows_refresh());
+    cb!(ui.on_font_search_changed, |_s| |app: &mut App| app.font_rows_refresh());
+    cb!(ui.on_font_chosen, |n| |app: &mut App| app.text_set("family", &n));
+    // The native dialog opens on the next turn, after the picker has closed.
+    ui.on_font_add(|| defer(crate::text_ui::add_font_dialog));
 
     cb!(ui.on_ai_send, |t| |app: &mut App| app.ai_send(&t));
     cb!(ui.on_ai_plan_action, |i, a| |app: &mut App| app.ai_plan_action(i as usize, &a));
@@ -513,6 +549,8 @@ impl App {
     }
 
     pub fn execute_as(&mut self, cmd: EditCommand, source: EditSource, action: Option<kadr_core::ActionId>) -> bool {
+        // Typing is recorded first (one entry), never rolled back.
+        self.commit_text_session();
         self.end_live_edit();
         let label = cmd_label(&cmd.label());
         match self.engine.execute_as(&mut self.project, cmd, source, action) {
@@ -553,6 +591,7 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        self.commit_text_session();
         self.end_live_edit();
         match self.engine.undo(&mut self.project) {
             Some(l) => {
@@ -566,6 +605,7 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        self.commit_text_session();
         self.end_live_edit();
         match self.engine.redo(&mut self.project) {
             Some(l) => {

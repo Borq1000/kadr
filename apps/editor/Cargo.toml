@@ -26,6 +26,7 @@ kadr-ai = { path = "../../crates/ai" }
 kadr-effects = { path = "../../crates/effects" }
 kadr-i18n = { path = "../../crates/i18n" }
 kadr-mcp-bridge = { path = "../../crates/mcp-bridge" }
+kadr-text = { path = "../../crates/text" }
 png = "0.17"
 slint = { workspace = true, features = ["unstable-winit-030", "mcp"] }
 serde.workspace = true

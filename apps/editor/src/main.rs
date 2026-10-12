@@ -31,6 +31,7 @@ mod preview_cpu;
 mod scene_source;
 mod settings_ui;
 mod text_add;
+mod text_ui;
 mod timeline_ui;
 mod toasts;
 mod util;

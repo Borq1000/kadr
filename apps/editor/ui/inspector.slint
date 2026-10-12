@@ -3,6 +3,7 @@ import { Tr } from "i18n.slint";
 import { PanelHeader, PropSlider, SectionTitle, EmptyState, Badge, Button, IconButton, Icon, KeyState, AnimRow, BoundSwitch } from "widgets.slint";
 import { FxBlock, FxRow } from "effects.slint";
 import { ScrollView, Switch } from "std-widgets.slint";
+import { TextSection, TextInspectorData, FontRow } from "text_inspector.slint";
 
 export struct MarkerRow {
     index: int,
@@ -23,6 +24,8 @@ export struct ShotRow {
 export struct InspectorData {
     has-clip: bool,
     is-audio: bool,
+    // A title (titles spec §6.3): the «ТЕКСТ» section, no speed, no media.
+    is-text: bool,
     has-video-props: bool,
     name: string,
     source: string,
@@ -97,6 +100,22 @@ export component Inspector inherits Rectangle {
     // first, each time Rust bumps `reveal-seq` (once the block is laid out).
     in property <string> reveal-fx;
     in property <int> reveal-seq;
+    // The «ТЕКСТ» section of a title (text_inspector.slint).
+    in property <TextInspectorData> text;
+    in-out property <string> text-field;
+    in property <[FontRow]> fonts;
+    in-out property <string> font-search;
+    callback text-typed(string);
+    callback text-focus(bool);
+    callback text-live(string, float);
+    callback text-commit(string, float);
+    callback text-set(string, string);
+    callback text-color-live(string, color);
+    callback text-color-commit(string, color);
+    callback font-open();
+    callback font-search-changed(string);
+    callback font-chosen(string);
+    callback font-add();
     background: Theme.bg1;
 
     VerticalLayout {
@@ -168,9 +187,14 @@ export component Inspector inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     Text { text: root.d.name; font-size: Theme.font-md; font-weight: 600; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
-                    Badge { text: root.d.is-audio ? Tr.t("inspector.badge.audio") : Tr.t("inspector.badge.video"); fg: Theme.text-on-accent; bg: root.d.is-audio ? Theme.clip-audio-top : Theme.clip-video-top; }
+                    Badge {
+                        text: root.d.is-text ? Tr.t("inspector.badge.text") : root.d.is-audio ? Tr.t("inspector.badge.audio") : Tr.t("inspector.badge.video");
+                        fg: Theme.text-on-accent;
+                        bg: root.d.is-text ? Theme.clip-text-top : root.d.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
+                    }
                 }
-                Text { text: root.d.source; font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; }
+                // A title has no media file.
+                if !root.d.is-text: Text { text: root.d.source; font-size: Theme.font-xs; color: Theme.text-faint; overflow: elide; }
                 // Wraps: an unbreakable line would widen the panel past its edge.
                 Text { text: root.d.timing; font-size: Theme.font-xs; font-family: Theme.mono; color: Theme.text-faint; wrap: word-wrap; }
                 HorizontalLayout {
@@ -178,6 +202,24 @@ export component Inspector inherits Rectangle {
                     Text { text: Tr.t("inspector.enabled"); font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; horizontal-stretch: 1; }
                     // Follows the clip after a click and Ctrl+Z (a std Switch would not).
                     BoundSwitch { checked: root.d.enabled; toggled => { root.toggle-enabled(); } }
+                }
+
+                if root.d.is-text: TextSection {
+                    d: root.text;
+                    field-text <=> root.text-field;
+                    fonts: root.fonts;
+                    font-search <=> root.font-search;
+                    typed(t) => { root.text-typed(t); }
+                    field-focus(f) => { root.text-focus(f); }
+                    live(p, v) => { root.text-live(p, v); }
+                    commit(p, v) => { root.text-commit(p, v); }
+                    set(p, v) => { root.text-set(p, v); }
+                    color-live(p, c) => { root.text-color-live(p, c); }
+                    color-commit(p, c) => { root.text-color-commit(p, c); }
+                    font-open => { root.font-open(); }
+                    font-search-changed(s) => { root.font-search-changed(s); }
+                    font-chosen(n) => { root.font-chosen(n); }
+                    font-add => { root.font-add(); }
                 }
 
                 if root.d.has-video-props: SectionTitle { text: Tr.t("inspector.transform"); resettable: true; reset => { root.reset("transform"); } }
@@ -194,7 +236,8 @@ export component Inspector inherits Rectangle {
 
                 SectionTitle { text: root.d.has-video-props ? Tr.t("inspector.video") : Tr.t("inspector.timing"); resettable: root.d.has-video-props; reset => { root.reset("color"); } }
                 // Video rows keep the ◀ ◆ ▶ column free so the values line up.
-                HorizontalLayout {
+                // A title has no speed (titles spec §6.3).
+                if !root.d.is-text: HorizontalLayout {
                     padding-right: root.d.has-video-props ? Theme.key-nav : 0px;
                     PropSlider { label: Tr.t("inspector.speed"); value: root.d.speed; minimum: 0.25; maximum: 4; default-value: 1; display-scale: 100; decimals: 0; unit: "%"; changed(v) => { root.live("speed", v); } committed(v) => { root.commit("speed", v); } }
                 }

@@ -8,9 +8,10 @@ import { Timeline, TrackView, ClipView, ClipMark, KeyMark, TickView, MarkerView,
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
 import { ColorUtil } from "color_picker.slint";
+import { TextInspectorData, FontRow } from "text_inspector.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView, ColorUtil }
+export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView, ColorUtil, TextInspectorData, FontRow }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -148,6 +149,24 @@ export component AppWindow inherits Window {
     // An effect just applied: its block scrolls into view on each bump.
     in property <string> inspector-reveal-fx;
     in property <int> inspector-reveal-seq;
+    // The «ТЕКСТ» section of a title: its data, the field's own text (set
+    // by Rust only when the shown text must change: the caret survives
+    // refreshes while typing), the font picker's rows and search.
+    in property <TextInspectorData> text-insp;
+    in-out property <string> text-field;
+    in property <[FontRow]> font-rows;
+    in-out property <string> font-search;
+    callback text-typed(string);
+    callback text-focus(bool);
+    callback text-live(string, float);
+    callback text-commit(string, float);
+    callback text-set(string, string);
+    callback text-color-live(string, color);
+    callback text-color-commit(string, color);
+    callback font-open();
+    callback font-search-changed(string);
+    callback font-chosen(string);
+    callback font-add();
 
     // ---- AI
     in-out property <bool> ai-open: true;
@@ -520,6 +539,22 @@ export component AppWindow inherits Window {
                     shot-clicked(i) => { root.inspector-shot(i); }
                     key-action(p, a) => { root.inspector-key(p, a); root.focus-editor(); }
                     fx-action(id, a) => { root.inspector-fx(id, a); root.focus-editor(); }
+                    text: root.text-insp;
+                    text-field <=> root.text-field;
+                    fonts: root.font-rows;
+                    font-search <=> root.font-search;
+                    // Typing and the field's focus keep the keyboard in the field.
+                    text-typed(t) => { root.text-typed(t); }
+                    text-focus(f) => { root.text-focus(f); }
+                    text-live(p, v) => { root.text-live(p, v); }
+                    text-commit(p, v) => { root.text-commit(p, v); root.focus-editor(); }
+                    text-set(p, v) => { root.text-set(p, v); root.focus-editor(); }
+                    text-color-live(p, c) => { root.text-color-live(p, c); }
+                    text-color-commit(p, c) => { root.text-color-commit(p, c); }
+                    font-open => { root.font-open(); }
+                    font-search-changed(s) => { root.font-search-changed(s); }
+                    font-chosen(n) => { root.font-chosen(n); root.focus-editor(); }
+                    font-add => { root.font-add(); }
                 }
                 if root.ai-open: Splitter {
                     property <length> start;

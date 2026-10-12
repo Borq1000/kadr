@@ -158,6 +158,16 @@ impl App {
     }
 
     pub fn refresh_inspector(&mut self) {
+        // A selection change ends typing: recorded as one entry (its
+        // `execute` refreshes again, nested, and finds no session).
+        if self.text_session.clip().is_some() && self.text_session.clip() != self.inspected() {
+            self.commit_text_session();
+        }
+        // The styled part of a title belongs to the clip it was chosen in.
+        if self.text_scope_clip != self.inspected() {
+            self.text_scope = None;
+            self.text_scope_clip = self.inspected();
+        }
         let ui = self.ui();
         // A pick whose clip is no longer inspected, or whose effect is gone,
         // ends (a selection change, undo, a deleted clip); the preview's
@@ -201,9 +211,11 @@ impl App {
         if let Some((ti, ci)) = self.inspected().and_then(|id| seq.locate_clip(id)) {
             let c = &seq.tracks[ti].clips[ci];
             let is_audio = seq.tracks[ti].kind == TrackKind::Audio;
-            let asset = self.project.asset(c.asset);
+            // A title has no media (its asset is the nil `TEXT_ASSET`).
+            let asset = if c.is_text() { None } else { self.project.asset(c.asset) };
             d.has_clip = true;
             d.is_audio = is_audio;
+            d.is_text = c.is_text();
             d.has_video_props = !is_audio;
             d.name = c.name.clone().into();
             d.source = asset.map(|a| a.path.display().to_string()).unwrap_or_default().into();
@@ -259,12 +271,17 @@ impl App {
             d.enabled = c.enabled;
             if !is_audio {
                 d.fx = self.fx_rows(c, shown.fx);
-                let (rows, graded) = self.inspector_shots(c);
+                let (rows, graded) = if c.is_text() { (vec![], false) } else { self.inspector_shots(c) };
                 d.shots = same_or_new(shown.shots, rows);
                 d.shots_graded = graded;
             }
         }
+        // The text field exists only for a title: no other clip keeps it focused.
+        if !d.is_text {
+            self.text_field_focused = false;
+        }
         ui.set_inspector(d);
+        self.refresh_text_inspector();
         // A selection change, an edit, undo/redo and a language change all
         // pass here: the effect cards follow (fit, hints, the hover preview).
         self.refresh_effects();

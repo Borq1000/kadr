@@ -1,0 +1,253 @@
+import { Theme, Icons } from "theme.slint";
+import { Tr } from "i18n.slint";
+import { PropSlider, SectionTitle, Segmented, BoundSwitch, Button, IconButton, Icon } from "widgets.slint";
+import { ColorSwatch } from "color_picker.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct TextInspectorData {
+    has: bool,
+    locked: bool,
+    scope: string,          // Task 11: "" whole text, else the selected fragment
+    family: string,
+    family-missing: bool,
+    size: float,
+    weight: float,
+    italic: bool,
+    fill: color,
+    letter-spacing: float,
+    outline1: bool,
+    outline1-width: float,
+    outline1-color: color,
+    outline2: bool,
+    outline2-width: float,
+    outline2-color: color,
+    plaque: bool,
+    plaque-per-line: bool,
+    plaque-color: color,
+    plaque-radius: float,
+    plaque-pad-x: float,
+    plaque-pad-y: float,
+    align: int,
+    line-height: float,
+    caps: bool,
+    wrap: bool,
+    wrap-width: float,
+}
+
+export struct FontRow {
+    name: string,
+    header: bool,
+    current: bool,
+    preview: image,
+    has-preview: bool,
+}
+
+/// A label and controls on one line.
+component Row inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 8px;
+    height: 26px;
+    vertical-stretch: 0;
+    Text { text: root.label; width: 96px; font-size: Theme.font-sm; color: Theme.text-dim; vertical-alignment: center; overflow: elide; }
+    @children
+}
+
+/// The text of a text clip (titles spec §6.3): multi-line, wrapping,
+/// growing with its text. Its `text` binds two-way to a property the
+/// inspector refresh never replaces while typing (Global Constraints).
+export component TextField inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> read-only;
+    callback edited(string);
+    callback focus-changed(bool);
+    height: max(32px, ti.preferred-height + 12px);
+    vertical-stretch: 0;
+    border-radius: 4px;
+    background: Theme.bg0;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.accent : Theme.border;
+    ti := TextInput {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: parent.height - 12px;
+        text <=> root.text;
+        read-only: root.read-only;
+        single-line: false;
+        wrap: word-wrap;
+        font-size: Theme.font;
+        color: Theme.text;
+        selection-background-color: Theme.accent.with-alpha(0.45);
+        edited => { root.edited(self.text); }
+        changed has-focus => { root.focus-changed(self.has-focus); }
+    }
+}
+
+/// «ТЕКСТ»: the field and the style of a text clip (titles spec §6.3).
+export component TextSection inherits VerticalLayout {
+    in property <TextInspectorData> d;
+    in-out property <string> field-text;
+    in property <[FontRow]> fonts;
+    in-out property <string> font-search;
+    callback typed(string);
+    callback field-focus(bool);
+    callback live(string, float);
+    callback commit(string, float);
+    callback set(string, string);
+    callback color-live(string, color);
+    callback color-commit(string, color);
+    callback font-open();
+    callback font-search-changed(string);
+    callback font-chosen(string);
+    callback font-add();
+    spacing: 4px;
+
+    SectionTitle { text: Tr.t("inspector.text"); }
+    TextField {
+        text <=> root.field-text;
+        read-only: root.d.locked;
+        edited(t) => { root.typed(t); }
+        focus-changed(f) => { root.field-focus(f); }
+    }
+    font-row := Row {
+        label: Tr.t("text.font");
+        font-button := Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 4px;
+            background: fa.has-hover ? Theme.bg3 : Theme.bg2;
+            border-width: 1px;
+            border-color: Theme.border;
+            Text { x: 8px; width: parent.width - 30px; text: root.d.family; font-size: Theme.font-sm; color: Theme.text; vertical-alignment: center; overflow: elide; }
+            Icon { x: parent.width - 20px; icon: Icons.chevron-down; width: 12px; height: 12px; }
+            fa := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.font-open();
+                    picker.show();
+                }
+            }
+        }
+    }
+    if root.d.family-missing: Text { text: Tr.t1("text.font_missing", root.d.family); font-size: Theme.font-xs; color: Theme.warning; wrap: word-wrap; vertical-stretch: 0; }
+    PropSlider { label: Tr.t("text.size"); value: root.d.size; minimum: 8; maximum: 400; default-value: 97; decimals: 0; unit: " px"; changed(v) => { root.live("size", v); } committed(v) => { root.commit("size", v); } }
+    PropSlider { label: Tr.t("text.weight"); value: root.d.weight; minimum: 100; maximum: 900; default-value: 700; decimals: 0; changed(v) => { root.live("weight", v); } committed(v) => { root.commit("weight", v); } }
+    Row {
+        label: Tr.t("text.italic");
+        BoundSwitch { checked: root.d.italic; toggled => { root.set("italic", root.d.italic ? "0" : "1"); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    Row {
+        label: Tr.t("text.fill");
+        ColorSwatch { value: root.d.fill; tooltip: Tr.t("text.fill"); live(c) => { root.color-live("fill", c); } committed(c) => { root.color-commit("fill", c); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    Row {
+        label: Tr.t("text.outline");
+        BoundSwitch { checked: root.d.outline1; toggled => { root.set("outline1", root.d.outline1 ? "0" : "1"); } }
+        ColorSwatch { enabled: root.d.outline1; value: root.d.outline1-color; tooltip: Tr.t("text.outline"); live(c) => { root.color-live("outline1-color", c); } committed(c) => { root.color-commit("outline1-color", c); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.d.outline1: PropSlider { label: Tr.t("text.thickness"); value: root.d.outline1-width; minimum: 0; maximum: 40; default-value: 4; decimals: 0; unit: " px"; changed(v) => { root.live("outline1-width", v); } committed(v) => { root.commit("outline1-width", v); } }
+    if root.d.outline1: Row {
+        label: Tr.t("text.outline2");
+        BoundSwitch { checked: root.d.outline2; toggled => { root.set("outline2", root.d.outline2 ? "0" : "1"); } }
+        ColorSwatch { enabled: root.d.outline2; value: root.d.outline2-color; tooltip: Tr.t("text.outline2"); live(c) => { root.color-live("outline2-color", c); } committed(c) => { root.color-commit("outline2-color", c); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.d.outline1 && root.d.outline2: PropSlider { label: Tr.t("text.thickness"); value: root.d.outline2-width; minimum: 0; maximum: 40; default-value: 4; decimals: 0; unit: " px"; changed(v) => { root.live("outline2-width", v); } committed(v) => { root.commit("outline2-width", v); } }
+    Row {
+        label: Tr.t("text.plaque");
+        BoundSwitch { checked: root.d.plaque; toggled => { root.set("plaque", root.d.plaque ? "0" : "1"); } }
+        ColorSwatch { enabled: root.d.plaque; value: root.d.plaque-color; tooltip: Tr.t("text.plaque"); live(c) => { root.color-live("plaque-color", c); } committed(c) => { root.color-commit("plaque-color", c); } }
+        // The row is 26 px high: the choice fits in it.
+        if root.d.plaque: Segmented {
+            height: 24px;
+            options: [Tr.t("text.plaque.block"), Tr.t("text.plaque.lines")];
+            current: root.d.plaque-per-line ? 1 : 0;
+            selected(i) => { root.set("plaque-per-line", i == 1 ? "1" : "0"); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.d.plaque: PropSlider { label: Tr.t("text.plaque.radius"); value: root.d.plaque-radius; minimum: 0; maximum: 100; default-value: 12; decimals: 0; unit: " px"; changed(v) => { root.live("plaque-radius", v); } committed(v) => { root.commit("plaque-radius", v); } }
+    if root.d.plaque: PropSlider { label: Tr.t("text.plaque.pad_x"); value: root.d.plaque-pad-x; minimum: 0; maximum: 200; default-value: 29; decimals: 0; unit: " px"; changed(v) => { root.live("plaque-pad-x", v); } committed(v) => { root.commit("plaque-pad-x", v); } }
+    if root.d.plaque: PropSlider { label: Tr.t("text.plaque.pad_y"); value: root.d.plaque-pad-y; minimum: 0; maximum: 200; default-value: 12; decimals: 0; unit: " px"; changed(v) => { root.live("plaque-pad-y", v); } committed(v) => { root.commit("plaque-pad-y", v); } }
+    Row {
+        label: Tr.t("text.align");
+        IconButton { icon: Icons.align-left; tooltip: Tr.t("text.align.left"); active: root.d.align == 0; clicked => { root.set("align", "0"); } }
+        IconButton { icon: Icons.align-center; tooltip: Tr.t("text.align.center"); active: root.d.align == 1; clicked => { root.set("align", "1"); } }
+        IconButton { icon: Icons.align-right; tooltip: Tr.t("text.align.right"); active: root.d.align == 2; clicked => { root.set("align", "2"); } }
+        Rectangle { width: 8px; }
+        IconButton { icon: Icons.caps; tooltip: Tr.t("text.caps"); active: root.d.caps; clicked => { root.set("caps", root.d.caps ? "0" : "1"); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    PropSlider { label: Tr.t("text.line_height"); value: root.d.line-height; minimum: 0.5; maximum: 3; default-value: 1.2; decimals: 2; changed(v) => { root.live("line-height", v); } committed(v) => { root.commit("line-height", v); } }
+    PropSlider { label: Tr.t("text.letter_spacing"); value: root.d.letter-spacing; minimum: -20; maximum: 100; default-value: 0; decimals: 0; unit: " px"; changed(v) => { root.live("letter-spacing", v); } committed(v) => { root.commit("letter-spacing", v); } }
+    Row {
+        label: Tr.t("text.wrap");
+        BoundSwitch { checked: root.d.wrap; toggled => { root.set("wrap", root.d.wrap ? "0" : "1"); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.d.wrap: PropSlider { label: Tr.t("text.wrap_width"); value: root.d.wrap-width; minimum: 100; maximum: 3840; default-value: 800; decimals: 0; unit: " px"; changed(v) => { root.live("wrap-width", v); } committed(v) => { root.commit("wrap-width", v); } }
+
+    // Under the font row, whatever height the text field has grown to.
+    picker := PopupWindow {
+        x: 0;
+        y: font-row.y + font-row.height + 2px;
+        width: root.width;
+        height: 380px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.bg2;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000080;
+        }
+        VerticalLayout {
+            padding: 8px;
+            spacing: 6px;
+            LineEdit {
+                // The fluent LineEdit's minimum height.
+                height: 32px;
+                vertical-stretch: 0;
+                placeholder-text: Tr.t("text.font_search");
+                text <=> root.font-search;
+                edited(t) => { root.font-search-changed(t); }
+            }
+            fsv := ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    width: fsv.visible-width;
+                    alignment: start;
+                    for f in root.fonts: Rectangle {
+                        height: f.header ? 22px : 30px;
+                        background: !f.header && fr.has-hover ? Theme.bg3 : transparent;
+                        border-radius: 4px;
+                        if f.header: Text { x: 6px; text: f.name; font-size: Theme.font-xs; font-weight: 700; color: Theme.text-faint; vertical-alignment: center; }
+                        if !f.header && f.has-preview: Image { x: 8px; height: parent.height - 6px; source: f.preview; image-fit: contain; }
+                        if !f.header && !f.has-preview: Text { x: 8px; width: parent.width - 34px; text: f.name; font-size: Theme.font; color: f.current ? Theme.accent : Theme.text; vertical-alignment: center; overflow: elide; }
+                        if f.current: Icon { x: parent.width - 20px; icon: Icons.check; width: 12px; height: 12px; color: Theme.accent; }
+                        fr := TouchArea {
+                            enabled: !f.header;
+                            mouse-cursor: f.header ? default : pointer;
+                            clicked => {
+                                root.font-chosen(f.name);
+                                picker.close();
+                            }
+                        }
+                    }
+                }
+            }
+            Button {
+                vertical-stretch: 0;
+                icon: Icons.plus;
+                text: Tr.t("text.add_font");
+                clicked => {
+                    root.font-add();
+                    picker.close();
+                }
+            }
+        }
+    }
+}

@@ -2936,6 +2936,7 @@ dependencies = [
  "kadr-project-scenes",
  "kadr-render",
  "kadr-scene",
+ "kadr-text",
  "kadr-timeline",
  "png 0.17.16",
  "rfd",

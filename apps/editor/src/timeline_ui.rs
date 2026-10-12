@@ -1370,7 +1370,8 @@ impl App {
                     y: row.y as f32,
                     width: width as f32,
                     height: row.h as f32,
-                    name: c.text.as_deref().map_or_else(|| c.name.clone(), |d| d.label()).into(),
+                    // A title's name follows its text unless the user renamed it (TX-R9).
+                    name: c.name.clone().into(),
                     is_audio,
                     is_text: c.is_text(),
                     selected: sel.contains(&c.id),

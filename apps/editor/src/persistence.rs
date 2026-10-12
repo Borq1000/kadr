@@ -124,6 +124,8 @@ impl App {
     /// If there are unsaved changes, asks first and returns true (caller
     /// should stop; `then` runs after "Discard").
     pub fn guard_unsaved(&mut self, then: Box<dyn FnOnce(&mut App)>) -> bool {
+        // Typing in progress is an unsaved change too: recorded first.
+        self.commit_text_session();
         if !self.is_dirty() {
             return false;
         }
@@ -198,6 +200,7 @@ impl App {
             self.toast_warn(t("toast.export_running"));
             return true;
         }
+        self.commit_text_session();
         if !self.is_dirty() {
             return false;
         }
@@ -260,6 +263,8 @@ impl App {
     fn set_project(&mut self, project: Project, path: Option<PathBuf>) {
         self.project = project;
         self.live_edit.forget();
+        self.text_session.forget();
+        self.text_scope = None;
         self.fx_reset();
         self.path = path;
         self.engine.clear();
@@ -331,6 +336,8 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
+        // What is saved is what was typed: the session is recorded first.
+        self.commit_text_session();
         let path = if path.extension().is_none() { path.with_extension(io::EXTENSION) } else { path };
         if self.path.is_none() {
             if let Some(stem) = path.file_stem() {
