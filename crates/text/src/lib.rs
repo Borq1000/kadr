@@ -14,7 +14,7 @@ pub mod shape;
 
 pub use anim::{Clock, FrameAnim, GlyphAnim};
 pub use fonts::{fonts, Family, FontError, FontSource, BUNDLED_FAMILIES, DEFAULT_FAMILY};
-pub use frame::{frame_size, Bounds, TextFrame};
+pub use frame::{frame_box, frame_size, Bounds, TextFrame};
 pub use layout::{layout, Laid};
 
 /// Tests that compare layouts or keys across calls hold this while the

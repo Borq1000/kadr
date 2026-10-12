@@ -47,54 +47,155 @@ pub(crate) fn tilt(doc: &TextDoc) -> Option<Perspective> {
     doc.perspective.map(|p| Perspective { tilt_x: deg(p.tilt_x), tilt_y: deg(p.tilt_y) }).filter(|p| p.tilt_x != 0.0 || p.tilt_y != 0.0)
 }
 
-/// Three box blurs of radius `b` ≈ a Gaussian of σ = `r` raster px
-/// (`(2b + 1)² = 4r² + 1`); edges read as transparent; under half a pixel
-/// nothing happens. Its cost does not depend on `r`.
+/// A Gaussian blur of σ = `r` raster px that spreads by `r` from half a
+/// pixel up (Task 9 review, Minor 4), so a title blurs alike at every
+/// output scale: under [`TAPS_BELOW`] a sampled Gaussian whose taps spread
+/// by exactly `r`; from there three extended box blurs (Gwosdek et al.
+/// 2011: a box plus a fraction of the next pixel on each side) whose
+/// spreads add up to exactly `r`, at a box blur's cost whatever `r`.
+/// Edges read as transparent; under half a pixel nothing happens. Rows
+/// are filtered one by one, columns [`BAND`] at a time row by row
+/// (Minor 5: row-major, no strided walk down each column); the passes of
+/// an axis run back to back (the two axes' filters commute).
 pub(crate) fn blur(m: &mut Mask, r: f32) {
-    if !r.is_finite() || r <= 0.5 {
+    if !r.is_finite() || r < 0.5 {
         return;
     }
     let (w, h) = (m.w, m.h);
     // A box wider than the mask averages it whole: no wider box is needed.
-    let b = (((4.0 * r * r + 1.0).sqrt() - 1.0) / 2.0).round().clamp(1.0, w.max(h) as f32) as usize;
-    let mut tmp = vec![0.0f32; w.max(h)];
-    let mut col = vec![0.0f32; h];
-    for _ in 0..3 {
-        for row in m.a.chunks_exact_mut(w) {
-            box_line(row, b, &mut tmp);
+    let r = r.min(w.max(h) as f32);
+    let passes: Vec<Pass> = if r < TAPS_BELOW { vec![Pass::Taps(gaussian_taps(r))] } else { vec![extended_box(r / 3f32.sqrt()); 3] };
+    // Rows: each a line of one lane.
+    let (mut a, mut b) = (vec![0.0f32; w], vec![0.0f32; w]);
+    for row in m.a.chunks_exact_mut(w) {
+        a.copy_from_slice(row);
+        for p in &passes {
+            p.run(&a, &mut b, 1);
+            std::mem::swap(&mut a, &mut b);
         }
-        for x in 0..w {
-            for (y, v) in col.iter_mut().enumerate() {
-                *v = m.a[y * w + x];
+        row.copy_from_slice(&a);
+    }
+    // Columns: a band of up to BAND of them at a time, gathered row by row.
+    let (mut a, mut b) = (vec![0.0f32; h * BAND.min(w)], vec![0.0f32; h * BAND.min(w)]);
+    for x0 in (0..w).step_by(BAND) {
+        let lanes = BAND.min(w - x0);
+        let (a, b) = (&mut a[..h * lanes], &mut b[..h * lanes]);
+        for (y, dst) in a.chunks_exact_mut(lanes).enumerate() {
+            dst.copy_from_slice(&m.a[y * w + x0..y * w + x0 + lanes]);
+        }
+        let mut swapped = false;
+        for p in &passes {
+            if swapped { p.run(b, a, lanes) } else { p.run(a, b, lanes) }
+            swapped = !swapped;
+        }
+        let out = if swapped { &*b } else { &*a };
+        for (y, src) in out.chunks_exact(lanes).enumerate() {
+            m.a[y * w + x0..y * w + x0 + lanes].copy_from_slice(src);
+        }
+    }
+}
+
+/// Under this σ (raster px) the blur is a sampled Gaussian, from it three
+/// extended boxes. Where a scale-1 and a scale-2 raster of one title
+/// straddle it (σ 0.75–1.5 at scale 1) the kernels differ in shape; there
+/// a pixel grid is too coarse for either to match the finer raster anyway.
+const TAPS_BELOW: f32 = 1.5;
+/// Columns blurred together (row-major within the band).
+const BAND: usize = 32;
+
+/// One pass of a blur along a line: an extended box — the `2l + 1` steps
+/// about a step and `alpha` (0..1) of the next one on each side, over
+/// their weight `2l + 1 + 2·alpha` — or symmetric taps (the centre's
+/// first).
+#[derive(Clone)]
+enum Pass {
+    Box { l: usize, alpha: f32 },
+    Taps(Vec<f32>),
+}
+
+impl Pass {
+    /// The pass along a line of `src.len() / lanes` steps, each step
+    /// `lanes` values side by side (lane `c` of step `i` at `i·lanes + c`),
+    /// into `dst`; zero outside the line.
+    fn run(&self, src: &[f32], dst: &mut [f32], lanes: usize) {
+        let n = src.len() / lanes;
+        let step = |i: usize| &src[i * lanes..(i + 1) * lanes];
+        match self {
+            Pass::Box { l, alpha } => {
+                let (l, alpha) = (*l, *alpha);
+                let k = 1.0 / (2.0 * l as f32 + 1.0 + 2.0 * alpha);
+                // The running sum of each lane over the steps within `l` of `i`.
+                let mut sum = vec![0.0f32; lanes];
+                for i in 0..=l.min(n - 1) {
+                    sum.iter_mut().zip(step(i)).for_each(|(s, v)| *s += v);
+                }
+                for i in 0..n {
+                    let out = &mut dst[i * lanes..(i + 1) * lanes];
+                    out.iter_mut().zip(&sum).for_each(|(d, s)| *d = s * k);
+                    if alpha > 0.0 {
+                        let ka = k * alpha;
+                        for s in [i.checked_sub(l + 1), Some(i + l + 1).filter(|&s| s < n)].into_iter().flatten() {
+                            out.iter_mut().zip(step(s)).for_each(|(d, v)| *d += v * ka);
+                        }
+                    }
+                    if i + l + 1 < n {
+                        sum.iter_mut().zip(step(i + l + 1)).for_each(|(s, v)| *s += v);
+                    }
+                    if i >= l {
+                        sum.iter_mut().zip(step(i - l)).for_each(|(s, v)| *s -= v);
+                    }
+                }
             }
-            box_line(&mut col, b, &mut tmp);
-            for (y, v) in col.iter().enumerate() {
-                m.a[y * w + x] = *v;
+            Pass::Taps(taps) => {
+                for i in 0..n {
+                    let out = &mut dst[i * lanes..(i + 1) * lanes];
+                    out.iter_mut().zip(step(i)).for_each(|(d, v)| *d = v * taps[0]);
+                    for (j, &t) in taps.iter().enumerate().skip(1) {
+                        for s in [i.checked_sub(j), Some(i + j).filter(|&s| s < n)].into_iter().flatten() {
+                            out.iter_mut().zip(step(s)).for_each(|(d, v)| *d += v * t);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/// One box blur of width `2b + 1` along a line (zero outside it).
-fn box_line(line: &mut [f32], b: usize, tmp: &mut [f32]) {
-    let n = line.len();
-    let k = 1.0 / (2 * b + 1) as f32;
-    let mut sum: f32 = line.iter().take(b + 1).sum();
-    for i in 0..n {
-        tmp[i] = sum * k;
-        if i + b + 1 < n {
-            sum += line[i + b + 1];
-        }
-        if i >= b {
-            sum -= line[i - b];
-        }
+/// The taps (centre first, then ±1, ±2, …) of a sampled Gaussian whose
+/// spread — the taps' standard deviation — is `r` (0.5 ≤ `r` <
+/// [`TAPS_BELOW`]): the sampled curve is narrower than its σ below a pixel
+/// or so, so σ is tuned until the taps spread by `r`.
+fn gaussian_taps(r: f32) -> Vec<f32> {
+    let sampled = |s: f32| {
+        let n = (3.0 * s).ceil() as usize + 1;
+        let mut t: Vec<f32> = (0..=n).map(|i| (-((i * i) as f32) / (2.0 * s * s)).exp()).collect();
+        let total = t[0] + 2.0 * t[1..].iter().sum::<f32>();
+        t.iter_mut().for_each(|v| *v /= total);
+        t
+    };
+    let spread = |t: &[f32]| (2.0 * t.iter().enumerate().map(|(i, v)| (i * i) as f32 * v).sum::<f32>()).sqrt();
+    let mut s = r;
+    for _ in 0..6 {
+        s *= r / spread(&sampled(s)).max(1e-6);
     }
-    line.copy_from_slice(&tmp[..n]);
+    sampled(s)
+}
+
+/// The extended box that spreads by exactly `s` (Gwosdek, Grewenig, Bruhn
+/// and Weickert 2011): the widest whole box `2l + 1` that spreads by at
+/// most `s` (a box of width `w` spreads by `√((w² − 1) / 12)`), and the
+/// fraction `alpha` of the next step on each side that makes up the rest.
+fn extended_box(s: f32) -> Pass {
+    let v = s * s;
+    let l = (0.5 * (12.0 * v + 1.0).sqrt() - 0.5).floor().max(0.0);
+    let alpha = (2.0 * l + 1.0) * (v - l * (l + 1.0) / 3.0) / (2.0 * ((l + 1.0) * (l + 1.0) - v));
+    Pass::Box { l: l as usize, alpha: alpha.clamp(0.0, 1.0) }
 }
 
 /// The paint of a fill at a raster pixel: its colour, or its gradient
 /// across the text block `b` (raster px `[x0, y0, x1, y1]`) at its angle
-/// (0° left → right, 90° top → bottom), stops mixed premultiplied.
+/// (0° left → right, 90° top → bottom), stops mixed premultiplied. Not
+/// dithered: a gentle gradient over a tall block may band in 8 bits.
 pub(crate) enum Paint {
     Solid([f32; 4]),
     Gradient { stops: Vec<(f32, [f32; 4])>, cx: f32, cy: f32, ux: f32, uy: f32, len: f32 },
@@ -148,7 +249,10 @@ pub(crate) fn camera_distance(laid: &crate::layout::Laid) -> f32 {
 /// about its vertical axis by `tilt_y` (the right side recedes) and its
 /// horizontal axis by `tilt_x` (the top recedes), each clamped to
 /// ±[`MAX_TILT`], then project from distance `d`: `[X·w, Y·w, w] = M ·
-/// [x, y, 1]`. The centre stays where it is.
+/// [x, y, 1]`. The centre stays where it is. Both axes at once are the
+/// two turns side by side (each foreshortens its own axis, both recede),
+/// not one true 3D rotation — no shear between the axes; close enough at
+/// the tilts titles use.
 pub(crate) fn homography(p: Perspective, d: f32) -> [[f32; 3]; 3] {
     let c = |deg: f32| finite(deg).clamp(-MAX_TILT, MAX_TILT).to_radians();
     let (tx, ty) = (c(p.tilt_x), c(p.tilt_y));
@@ -227,7 +331,10 @@ pub(crate) fn project_bounds(flat: Bounds, p: Perspective, d: f32) -> Bounds {
 /// The flat raster `src` (it fills `flat`, TX-R3) seen tilted, written to
 /// every pixel of `dst` (it fills `out`): each output pixel centre maps
 /// back through the inverse homography and is sampled bilinearly
-/// (premultiplied); a point behind the camera has nothing.
+/// (premultiplied); a point behind the camera has nothing. One sample per
+/// pixel: where a steep tilt shrinks the far side more than 2× it can
+/// alias (Task 9 review, Minor 7: supersampling there would cost 4× the
+/// warp — measured and decided in Task 14).
 pub(crate) fn warp(src: &Canvas, flat: Bounds, out: Bounds, p: Perspective, d: f32, dst: &mut CpuFrame) {
     let per_axis = |n: usize, extent: f32| if extent > 0.0 { n as f32 / extent } else { 1.0 };
     let (sfx, sfy) = (per_axis(src.w, flat.width()), per_axis(src.h, flat.height()));
@@ -279,6 +386,61 @@ mod tests {
         none.a[12] = 1.0;
         blur(&mut none, 0.2);
         assert_eq!(none.a[12], 1.0, "under half a pixel: untouched");
+    }
+
+    /// The spread of a blurred impulse along x and y, raster px.
+    fn spread(m: &Mask) -> (f32, f32) {
+        let (cx, cy) = ((m.w / 2) as f32, (m.h / 2) as f32);
+        let total: f32 = m.a.iter().sum();
+        let (mut vx, mut vy) = (0.0, 0.0);
+        for (i, a) in m.a.iter().enumerate() {
+            let (x, y) = ((i % m.w) as f32, (i / m.w) as f32);
+            (vx, vy) = (vx + (x - cx).powi(2) * a, vy + (y - cy).powi(2) * a);
+        }
+        ((vx / total).sqrt(), (vy / total).sqrt())
+    }
+
+    /// Minor 4: the blur spreads by the asked σ within ±10 % from half a
+    /// raster px up — small radii (a shadow at a small preview) included.
+    #[test]
+    fn the_blur_spreads_by_the_asked_sigma() {
+        for r in [0.5, 0.6, 0.75, 1.0, 1.3, 1.5, 2.0, 2.5, 2.99, 3.0, 3.5, 4.0, 5.0, 6.3, 8.0, 10.0, 17.0, 25.0, 60.0] {
+            let n = (8.0 * r) as usize * 2 + 21;
+            let mut m = Mask::new(n, n);
+            m.a[(n / 2) * n + n / 2] = 1.0;
+            blur(&mut m, r);
+            let (sx, sy) = spread(&m);
+            assert!((sx / r - 1.0).abs() <= 0.1 && (sy / r - 1.0).abs() <= 0.1, "σ {r}: spread {sx} × {sy}");
+            assert!((m.a.iter().sum::<f32>() - 1.0).abs() < 1e-3, "σ {r}: the mass is kept");
+        }
+    }
+
+    /// Minor 5: columns (blurred a band at a time) and rows are the same
+    /// filter — a mask's blur is its transpose's blur transposed, across
+    /// band edges and with a ragged last band.
+    #[test]
+    fn columns_blur_like_rows() {
+        let (w, h) = (75, 53);
+        let mut m = Mask::new(w, h);
+        for (i, a) in m.a.iter_mut().enumerate() {
+            *a = ((i * 7919 + 13) % 101) as f32 / 100.0 * (((i % w) / 9 + (i / w) / 5) % 2) as f32;
+        }
+        let mut t = Mask::new(h, w);
+        for y in 0..h {
+            for x in 0..w {
+                t.a[x * h + y] = m.a[y * w + x];
+            }
+        }
+        for r in [1.2, 4.5] {
+            let (mut a, mut b) = (m.clone(), t.clone());
+            blur(&mut a, r);
+            blur(&mut b, r);
+            for y in 0..h {
+                for x in 0..w {
+                    assert!((a.a[y * w + x] - b.a[x * h + y]).abs() < 1e-5, "σ {r} at ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]

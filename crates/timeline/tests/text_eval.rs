@@ -232,6 +232,36 @@ fn motion_effects_move_the_text_block_and_the_layer_stays_anchored_at_its_centre
     }
 }
 
+/// TX-R15: a curved title's motion picture is its own block (its placed
+/// glyphs and centre, `TextFrame::block_box`), not the straight layout
+/// strip — a zoom's point is a fraction of the arc as drawn — and the
+/// layer stays anchored at the layout centre.
+#[test]
+fn motion_effects_move_a_curved_titles_own_block() {
+    let mut doc = TextDoc::starter("Текст по дуге вверх", 1080);
+    doc.shape = TextShape::Arc { bend: 0.6 };
+    let (mut p, _) = project(doc.clone());
+    let tr = &mut p.sequence_mut().tracks[0].clips[0].transform;
+    (tr.x, tr.y, tr.scale) = (120.0, -60.0, 0.8);
+    with_effect(&mut p, "smooth_zoom", &[("strength", ParamValue::Number(1.0)), ("point", ParamValue::Point { x: 0.1, y: 0.95 })]);
+    let t = Time::from_millis(3700);
+    let l = layer_at(&p, t).remove(0);
+    let f = kadr_text::TextFrame::new(&doc, kadr_text::Clock::REST);
+    let (b, k, lh) = (f.bounds(), f.block_box(), f.layout_size().1);
+    assert!(k.y1 - k.y0 > lh + 100.0 && (k.y0 + k.y1).abs() > 50.0, "the arc's block is taller than the strip and not centred on it: {k:?}");
+    assert_eq!(l.placement.anchor, Vec2::new(-b.x0 / b.width(), -b.y0 / b.height()), "anchored at the layout centre");
+    let c = &p.sequence().tracks[0].clips[0];
+    let (kw, kh) = (k.width(), k.height());
+    let block = Placement { size: Vec2::new(kw, kh), anchor: Vec2::new(-k.x0 / kw, -k.y0 / kh), position: Vec2::new(960.0 + 120.0, 540.0 - 60.0), scale: Vec2::new(0.8, 0.8), rotation: 0.0 };
+    let moved = kadr_timeline::fx::place_with_effects(c, t, SizeU::new(1920, 1080), block);
+    assert!(moved.scale.x > 0.82, "zoomed: {moved:?}");
+    for (x, y) in [(0.0, 0.0), (b.width(), b.height()), (-b.x0, -b.y0), (40.0, 7.5)] {
+        let got = l.placement.to_canvas().apply(x as f64, y as f64);
+        let want = moved.to_canvas().apply((x + b.x0 - k.x0) as f64, (y + b.y0 - k.y0) as f64);
+        assert!((got.0 - want.0).abs() < 1e-2 && (got.1 - want.1).abs() < 1e-2, "({x}, {y}): {got:?} vs {want:?}");
+    }
+}
+
 /// TX-R7: what lies around the block (a plaque here) does not change how
 /// the block moves.
 #[test]

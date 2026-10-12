@@ -4,9 +4,9 @@
 //! text — its fill (a colour or a gradient) with outline 1 round it and
 //! outline 2 round that, one layer, each outline knocked out of what is
 //! inside it (TX-R5). The text layer is drawn first and the passes below
-//! it under it. Colour emoji (COLR / colour bitmaps) draw their own
-//! colours. A tilted text is that flat picture seen in perspective
-//! (`effects::warp`).
+//! it under it; the shadow and the glow are made of its alpha (TX-R13).
+//! Colour emoji (COLR / colour bitmaps) draw their own colours. A tilted
+//! text is that flat picture seen in perspective (`effects::warp`).
 //!
 //! The picture fills its raster (the `TextPicture` contract, ruling TX-R3):
 //! a raster of `W × H = ⌈bounds · scale⌉` px draws the bounds with the
@@ -16,11 +16,12 @@
 //! Memory (TX-R5): drawing a raster of N px holds the float canvas (16 B
 //! per px) and at most two coverage masks at a time (4 B per px each), or
 //! the canvas and the RGBA8 result (4 B per px) at the end — about 24 B
-//! per raster px at the peak (a tilt: the flat canvas and the tilted
-//! RGBA8 result, whose sizes differ by at most the tilt's magnification),
-//! so the resolver's
-//! 16 Mpx cap (`kadr_playback::MAX_TEXT_PIXELS`) peaks near 400 MB, not
-//! the 64 MB of the finished raster. Past [`MAX_RASTER_PIXELS`] nothing is
+//! per raster px at the peak, so the resolver's 16 Mpx cap
+//! (`kadr_playback::MAX_TEXT_PIXELS`) peaks near 400 MB, not the 64 MB of
+//! the finished raster. A tilted text draws its flat picture in a canvas
+//! of at most max(N, [`TILT_FLAT_PIXELS`]) px (Task 9 review, Minor 8) and
+//! then holds it with the N px RGBA8 result: at most 24 B × max(N, 4 Mpx).
+//! The blur's scratch is a few rows. Past [`MAX_RASTER_PIXELS`] nothing is
 //! allocated: the picture is a 1×1 transparent raster. Glyph images are
 //! cached up to [`GLYPH_CACHE_BYTES`].
 
@@ -94,21 +95,19 @@ impl Canvas {
         }
     }
 
-    /// [`Canvas::under_mask`] of the mask shifted by whole pixels `(dx, dy)`.
-    pub fn under_mask_at(&mut self, m: &Mask, dx: i32, dy: i32, c: [f32; 4]) {
-        // In i64: a shift near i32's ends never overflows.
-        let (dx, dy) = (dx as i64, dy as i64);
-        let ys = 0.max(dy)..(self.h as i64).min(m.h as i64 + dy);
-        let xs = 0.max(dx)..(self.w as i64).min(m.w as i64 + dx);
-        for y in ys {
-            let (row, src) = (y as usize * self.w, (y - dy) as usize * m.w);
+    /// The canvas's alpha shifted by whole pixels `(dx, dy)`, as a mask of
+    /// its size (what is shifted out is gone, what comes in is 0).
+    pub fn alpha_at(&self, dx: i64, dy: i64) -> Mask {
+        let mut m = Mask::new(self.w, self.h);
+        let (w, h) = (self.w as i64, self.h as i64);
+        let xs = 0.max(dx)..w.min(w + dx);
+        for y in 0.max(dy)..h.min(h + dy) {
+            let (dst, src) = (y as usize * self.w, (y - dy) as usize * self.w);
             for x in xs.clone() {
-                let cov = m.a[src + (x - dx) as usize];
-                if cov > 0.0 {
-                    self.under(row + x as usize, c, cov);
-                }
+                m.a[dst + x as usize] = self.px[src + (x - dx) as usize][3];
             }
         }
+        m
     }
 
     /// RGBA8 in the working space (see [`rgba8`]).
@@ -201,7 +200,9 @@ impl Mask {
 }
 
 /// A glyph as drawn: pen origin (layout px), rotation (radians, clockwise),
-/// scale, opacity, blur (canvas px) and the colour replacing its fill.
+/// scale, opacity, blur (canvas px) and the colour replacing its fill;
+/// `still` when the animation neither turns nor scales it (its turn is
+/// the shape's, the same every frame).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Final {
     pub x: f32,
@@ -211,6 +212,7 @@ pub(crate) struct Final {
     pub opacity: f32,
     pub blur: f32,
     pub colour: Option<Rgba8>,
+    pub still: bool,
 }
 
 /// The glyph's centre relative to its pen origin, unrotated: half its
@@ -250,6 +252,7 @@ pub(crate) fn finals(laid: &Laid, placed: &[Placed], anim: &FrameAnim) -> Vec<Fi
                 opacity: (a.opacity * b.opacity).clamp(0.0, 1.0),
                 blur: a.blur.max(b.blur),
                 colour: a.colour,
+                still: a.rotation + b.rotation == 0.0 && a.scale * b.scale == 1.0,
             }
         })
         .collect()
@@ -294,12 +297,16 @@ pub(crate) fn outline_reach(doc: &TextDoc) -> f32 {
 }
 
 /// What the flat picture (before any tilt) may cover, in canvas px about
-/// the layout box centre: the layout box, every glyph's em box as placed
-/// (a line's last letter without the letter spacing after it), the
-/// plaque, room for the outlines and ink beyond the em box, the shadow
-/// (shifted, 3 σ of blur round it) and the glow (3 × its radius round it).
-pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
-    let mut b = Bounds { x0: 0.0, y0: 0.0, x1: laid.width, y1: laid.height };
+/// the layout box centre: the text block (`block`, [`crate::shape::block`]:
+/// the layout box, or a curved text's glyphs as placed — TX-R15), every
+/// glyph's em box as drawn (a line's last letter without the letter
+/// spacing after it), the plaque, room for the outlines and ink beyond the
+/// em box — the text — then the glow round the text (3 × its radius) and
+/// the shadow (the text shifted, 3 σ of blur round it; the glow is not
+/// in the shadow).
+pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final]) -> Bounds {
+    let (cx, cy) = (laid.width / 2.0, laid.height / 2.0);
+    let mut b = Bounds { x0: block.x0 + cx, y0: block.y0 + cy, x1: block.x1 + cx, y1: block.y1 + cy };
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, _)| g.visible) {
         let advance = laid.lines.get(g.line).map_or(g.advance, |l| g.advance.min(l.right - g.x).max(0.0));
         for corner in [(0.0, -g.size), (advance, -g.size), (advance, 0.35 * g.size), (0.0, 0.35 * g.size)] {
@@ -311,14 +318,15 @@ pub(crate) fn bounds(doc: &TextDoc, laid: &Laid, finals: &[Final]) -> Bounds {
         b = b.union(Bounds { x0, y0, x1, y1 });
     }
     let margin = outline_reach(doc) + 0.15 * laid.max_size + 2.0;
-    let mut b = b.grow(margin);
-    if let Some((_, dx, dy, blur)) = crate::effects::shadow(doc) {
-        b = b.union(Bounds { x0: b.x0 + dx, y0: b.y0 + dy, x1: b.x1 + dx, y1: b.y1 + dy }.grow(3.0 * blur + 1.0));
-    }
+    let text = b.grow(margin);
+    let mut b = text;
     if let Some((_, radius, _)) = crate::effects::glow(doc) {
-        b = b.grow(3.0 * radius + 1.0);
+        b = text.grow(3.0 * radius + 1.0);
     }
-    Bounds { x0: b.x0 - laid.width / 2.0, y0: b.y0 - laid.height / 2.0, x1: b.x1 - laid.width / 2.0, y1: b.y1 - laid.height / 2.0 }
+    if let Some((_, dx, dy, blur)) = crate::effects::shadow(doc) {
+        b = b.union(Bounds { x0: text.x0 + dx, y0: text.y0 + dy, x1: text.x1 + dx, y1: text.y1 + dy }.grow(3.0 * blur + 1.0));
+    }
+    Bounds { x0: b.x0 - cx, y0: b.y0 - cy, x1: b.x1 - cx, y1: b.y1 - cy }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -329,6 +337,7 @@ struct GlyphKey {
     id: u16,
     size: i32,
     frac: u8,
+    frac_y: u8,
     stroke: i32,
     embolden: bool,
     skew: u32,
@@ -345,8 +354,9 @@ pub(crate) const MAX_CACHED_SIDE: u32 = 512;
 const ENTRY_BYTES: usize = 192;
 
 /// Glyph images by what draws them, within a byte budget: an entry that
-/// would pass it empties the cache first. Animated glyphs (turned or
-/// scaled) and large images are never kept — each would be used once.
+/// would pass it empties the cache first. Glyphs the animation turns or
+/// scales and large images are never kept — each would be used once; a
+/// curved text's still glyphs are (their turn is part of the key).
 pub(crate) struct GlyphCache {
     map: HashMap<GlyphKey, Option<Arc<Image>>>,
     bytes: usize,
@@ -402,41 +412,64 @@ thread_local! {
     static SCALE: RefCell<ScaleContext> = RefCell::new(ScaleContext::new());
 }
 
-/// A glyph's image from swash, cached: `size` px; a centred stroke of
+/// How a glyph image is drawn, raster px: its size; a centred stroke of
 /// `stroke` px with round joins when `stroke > 0` (outlines only); turned
 /// by `rotation` (radians, clockwise on screen) and scaled by `scale`
 /// about the pen origin, then stretched horizontally by `stretch` (the
-/// raster's x scale over its y scale, TX-R3); shifted right by `frac`
-/// (0..1, in quarters). It is drawn with exactly the quantised values it
-/// is cached by, so a cache hit is the same pixels as a miss.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn glyph_image(face: &Face, id: u16, size: f32, frac: f32, stroke: f32, rotation: f32, scale: f32, stretch: f32) -> Option<Arc<Image>> {
-    glyph_image_in(&GLYPHS, face, id, size, frac, stroke, rotation, scale, stretch)
+/// raster's x scale over its y scale, TX-R3); shifted right by `frac.0`
+/// and down by `frac.1` (0..1, in quarters); `still` when the animation
+/// neither turns nor scales it (then it is cached, its turn in the key).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlyphDraw {
+    pub size: f32,
+    pub frac: (f32, f32),
+    pub stroke: f32,
+    pub rotation: f32,
+    pub scale: f32,
+    pub stretch: f32,
+    pub still: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn glyph_image_in(cache: &Mutex<GlyphCache>, face: &Face, id: u16, size: f32, frac: f32, stroke: f32, rotation: f32, scale: f32, stretch: f32) -> Option<Arc<Image>> {
+impl GlyphDraw {
+    /// An upright, unscaled, still glyph of `size` px.
+    #[cfg(test)]
+    pub fn plain(size: f32) -> GlyphDraw {
+        GlyphDraw { size, frac: (0.0, 0.0), stroke: 0.0, rotation: 0.0, scale: 1.0, stretch: 1.0, still: true }
+    }
+}
+
+/// A glyph's image from swash, cached (see [`GlyphDraw`]). It is drawn
+/// with exactly the quantised values it is cached by, so a cache hit is
+/// the same pixels as a miss.
+pub(crate) fn glyph_image(face: &Face, id: u16, d: GlyphDraw) -> Option<Arc<Image>> {
+    glyph_image_in(&GLYPHS, face, id, d)
+}
+
+pub(crate) fn glyph_image_in(cache: &Mutex<GlyphCache>, face: &Face, id: u16, d: GlyphDraw) -> Option<Arc<Image>> {
     let q = |v: f32| if v.is_finite() { (v * 64.0).round().clamp(-1e9, 1e9) as i32 } else { 0 };
-    let frac = if frac.is_finite() { ((frac * 4.0).floor() as i32).clamp(0, 3) as u8 } else { 0 };
+    let quarters = |f: f32, round: bool| if f.is_finite() { ((if round { (f * 4.0).round() } else { (f * 4.0).floor() }) as i32).clamp(0, 3) as u8 } else { 0 };
     let key = GlyphKey {
         blob: face.data.id(),
         index: face.index,
         coords: face.coords_hash,
         id,
-        size: q(size),
-        frac,
-        stroke: q(stroke),
+        size: q(d.size),
+        frac: quarters(d.frac.0, false),
+        frac_y: quarters(d.frac.1, true),
+        stroke: q(d.stroke),
         embolden: face.embolden,
         skew: face.skew.map_or(0, f32::to_bits),
-        rotation: q(rotation * 16.0),
-        scale: q(scale * 16.0),
-        stretch: q(stretch * 16.0),
+        rotation: q(d.rotation * 16.0),
+        scale: q(d.scale * 16.0),
+        stretch: q(d.stretch * 16.0),
     };
-    // Only still glyphs are kept: an animated one is turned or scaled anew each frame.
-    let keep = key.rotation == 0 && key.scale == 1024;
+    // Glyphs the animation turns or scales are not kept: each is drawn anew
+    // every frame. A still glyph's turn (a curve's) is in its key (Minor 6).
+    let keep = d.still && key.scale == 1024;
     if keep && let Some(hit) = cache.lock().get(&key) {
         return hit;
     }
+    let frac = key.frac;
     let (size, stroke) = (key.size as f32 / 64.0, key.stroke as f32 / 64.0);
     let (rotation, scale, stretch) = (key.rotation as f32 / 1024.0, key.scale as f32 / 1024.0, key.stretch as f32 / 1024.0);
     let img = SCALE.with(|scx| {
@@ -446,7 +479,8 @@ pub(crate) fn glyph_image_in(cache: &Mutex<GlyphCache>, face: &Face, id: u16, si
         let colour = [Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline];
         let plain = [Source::Outline];
         let mut r = Render::new(if stroke > 0.0 { &plain } else { &colour });
-        r.format(Format::Alpha).offset(Vector::new(frac as f32 / 4.0, 0.0)).default_color([255, 255, 255, 255]);
+        // The outline's y points up: a shift down is a negative y.
+        r.format(Format::Alpha).offset(Vector::new(frac as f32 / 4.0, -(key.frac_y as f32) / 4.0)).default_color([255, 255, 255, 255]);
         if face.embolden {
             r.embolden(size / 48.0);
         }
@@ -513,12 +547,23 @@ impl Place {
         v * self.sy
     }
 
-    /// The glyph's image and its top-left in raster px.
+    /// The glyph's image and its top-left in raster px. An upright glyph
+    /// sits on its line's baseline rounded to the pixel (the whole line
+    /// alike); a turned one (a curve's) keeps its place below a pixel
+    /// vertically too, in quarters (Minor 11) — its neighbours sit at
+    /// other heights, so rounding would make the curve wobble.
     pub fn image(&self, laid: &Laid, g: &Glyph, f: &Final, stroke: f32) -> Option<(Arc<Image>, i32, i32)> {
         let (px, py) = self.point(f.x, f.y);
         let ix = px.floor();
-        let img = glyph_image(&laid.faces[g.face], g.id, self.len(g.size), px - ix, self.len(stroke), f.rotation, f.scale, self.sx / self.sy)?;
-        let (x0, y0) = (ix as i32 + img.placement.left, py.round() as i32 - img.placement.top);
+        let (iy, fy) = if f.rotation != 0.0 {
+            let q = (py * 4.0).round() / 4.0;
+            (q.floor(), q - q.floor())
+        } else {
+            (py.round(), 0.0)
+        };
+        let draw = GlyphDraw { size: self.len(g.size), frac: (px - ix, fy), stroke: self.len(stroke), rotation: f.rotation, scale: f.scale, stretch: self.sx / self.sy, still: f.still };
+        let img = glyph_image(&laid.faces[g.face], g.id, draw)?;
+        let (x0, y0) = (ix as i32 + img.placement.left, iy as i32 - img.placement.top);
         Some((img, x0, y0))
     }
 }
@@ -582,17 +627,50 @@ pub(crate) const MAX_RASTER_PIXELS: u64 = 64 << 20;
 /// Logged once per process: the first raster past [`MAX_RASTER_PIXELS`].
 static TOO_LARGE: AtomicBool = AtomicBool::new(false);
 
+/// A tilt's flat canvas is drawn at the output's scale unless it would
+/// hold more pixels than the larger of the tilted raster and this (4 Mpx):
+/// then at a scale that gives it that many (Minor 8). A tilt that shrinks
+/// the picture (steep, or on both axes) has a flat picture larger than
+/// its image; so memory stays within the bound in the module's doc, and
+/// only a large title (an export) can be drawn that little coarser — its
+/// near edge, which the warp magnifies, a touch softer.
+pub(crate) const TILT_FLAT_PIXELS: f64 = (4 << 20) as f64;
+
+/// The scale of a tilt's flat canvas for `flat` bounds at `scale` with a
+/// tilted raster of `out_pixels` (see [`TILT_FLAT_PIXELS`]).
+pub(crate) fn tilt_flat_scale(flat: Bounds, scale: f32, out_pixels: f64) -> f32 {
+    let pixels = |s: f32| (flat.width() * s).ceil().max(1.0) as f64 * (flat.height() * s).ceil().max(1.0) as f64;
+    let allowed = out_pixels.max(TILT_FLAT_PIXELS);
+    let have = pixels(scale);
+    if have.is_nan() || have <= allowed {
+        return scale;
+    }
+    // ⌈⌉ adds up to a pixel per side: shrink until it fits.
+    let mut s = scale * (allowed / have).sqrt() as f32;
+    while s > 0.0 && pixels(s) > allowed {
+        s *= 0.999;
+    }
+    s
+}
+
 /// The raster of a text at `scale` (titles spec §5.1): `⌈bounds · scale⌉`
 /// px, the bounds filling it (TX-R3) — the flat picture of `flat`, or for
-/// a tilted text that picture seen tilted (`bounds` its projection); 1×1
-/// and transparent when either raster would pass [`MAX_RASTER_PIXELS`].
-/// A tilt holds the flat float canvas and the RGBA8 result, never two
-/// float canvases.
+/// a tilted text that picture seen tilted (`bounds` its projection; the
+/// flat canvas at most [`TILT_FLAT_PIXELS`] or the tilted raster's size);
+/// 1×1 and transparent when either raster would pass
+/// [`MAX_RASTER_PIXELS`]. A tilt holds the flat float canvas and the RGBA8
+/// result, never two float canvases.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, flat: Bounds, bounds: Bounds, scale: f32, pool: &FramePool) -> CpuFrame {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let tilt = crate::effects::tilt(doc);
-    let flat_at = Place::fill(laid, flat, scale);
-    let out = if tilt.is_some() { Place::fill(laid, bounds, scale).map(|(w, h, _)| (w, h)) } else { flat_at.as_ref().map(|(w, h, _)| (*w, *h)) };
+    let out = tilt.and_then(|_| Place::fill(laid, bounds, scale).map(|(w, h, _)| (w, h)));
+    let flat_scale = match out {
+        Some((ow, oh)) => tilt_flat_scale(flat, scale, ow as f64 * oh as f64),
+        None => scale,
+    };
+    let flat_at = Place::fill(laid, flat, flat_scale);
+    let out = if tilt.is_some() { out } else { flat_at.as_ref().map(|(w, h, _)| (*w, *h)) };
     let (Some((w, h, at)), Some((ow, oh))) = (flat_at, out) else {
         if !TOO_LARGE.swap(true, Ordering::Relaxed) {
             tracing::warn!(width = bounds.width(), height = bounds.height(), scale, "a text raster would pass 64 Mpx: drawn as nothing");
@@ -612,24 +690,31 @@ pub(crate) fn render(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Frame
 
 /// The flat picture (before any tilt) in a `w × h` raster placed by `at`:
 /// the text layer, then under it, top down, the glow, the shadow and the
-/// plaque.
+/// plaque. The glow and the shadow are of the text layer as drawn — its
+/// alpha (TX-R13): a hollow text (a transparent fill in its outline) casts
+/// a hollow shadow, a half-transparent one a half shadow, a transparent
+/// outline none. The shadow is shifted, then blurred (TX-R14): the bounds
+/// hold the shifted text and its 3 σ, so nothing of its fringe is cut.
+/// Holds the canvas and at most two masks at a time.
 pub(crate) fn compose(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &FrameAnim, at: &Place, w: usize, h: usize) -> Canvas {
     let finals = finals(laid, placed, anim);
-    let (mut canvas, silhouette) = text_layer(doc, laid, &finals, at, w, h);
-    // The glow (neon): the silhouette blurred by its radius, times its intensity.
+    let block = crate::shape::block(doc, laid, placed);
+    let mut canvas = text_layer(doc, laid, block, &finals, at, w, h);
+    // The shadow's mask is taken before the glow goes under the text.
+    let shadow = crate::effects::shadow(doc).map(|(colour, dx, dy, blur)| {
+        let mut m = canvas.alpha_at((dx * at.sx).round() as i64, (dy * at.sy).round() as i64);
+        crate::effects::blur(&mut m, at.len(blur));
+        (m, premul(colour, 1.0))
+    });
+    // The glow (neon): the text blurred by its radius, times its intensity.
     if let Some((colour, radius, k)) = crate::effects::glow(doc) {
-        let mut m = silhouette.clone();
+        let mut m = canvas.alpha_at(0, 0);
         crate::effects::blur(&mut m, at.len(radius));
         m.a.iter_mut().for_each(|a| *a = (*a * k).min(1.0));
         canvas.under_mask(&m, premul(colour, 1.0));
     }
-    // The shadow: the silhouette (the letters with their outlines), blurred, shifted.
-    if let Some((colour, dx, dy, blur)) = crate::effects::shadow(doc) {
-        let mut m = silhouette;
-        crate::effects::blur(&mut m, at.len(blur));
-        canvas.under_mask_at(&m, (dx * at.sx).round() as i32, (dy * at.sy).round() as i32, premul(colour, 1.0));
-    } else {
-        drop(silhouette);
+    if let Some((m, colour)) = shadow {
+        canvas.under_mask(&m, colour);
     }
     // The plaque, at the bottom.
     if let Some(p) = doc.style.plaque.filter(|p| p.colour.0[3] > 0) {
@@ -651,18 +736,25 @@ pub(crate) fn compose(doc: &TextDoc, laid: &Laid, placed: &[Placed], anim: &Fram
 /// with outline 1 ⊆ `D₂`) and band `k` is added with the coverage `Dₖ −
 /// Dₖ₋₁` the inner region leaves of the pixel, so at an anti-aliased edge
 /// the fill and the bands sum to the silhouette's coverage: no dark seam.
-/// Returns the layer and the silhouette (`D` of the outermost outline).
 /// Holds the canvas and at most two masks at a time.
-fn text_layer(doc: &TextDoc, laid: &Laid, finals: &[Final], at: &Place, w: usize, h: usize) -> (Canvas, Mask) {
+fn text_layer(doc: &TextDoc, laid: &Laid, block: Bounds, finals: &[Final], at: &Place, w: usize, h: usize) -> Canvas {
     let mut canvas = Canvas::new(w, h);
     let mut inside = Mask::new(w, h);
-    // The fill paints through its colour or its gradient across the layout box (raster px).
-    let ((bx0, by0), (bx1, by1)) = (at.point(0.0, 0.0), at.point(laid.width, laid.height));
+    // The fill paints through its colour or its gradient across the text
+    // block (raster px; a curved text's own block, TX-R15) — each run's
+    // paint made once (Minor 14); runs past the document's paint as its base.
+    let (cx, cy) = (laid.width / 2.0, laid.height / 2.0);
+    let ((bx0, by0), (bx1, by1)) = (at.point(cx + block.x0, cy + block.y0), at.point(cx + block.x1, cy + block.y1));
+    let paints: Vec<crate::effects::Paint> = (0..=doc.runs.len()).map(|run| crate::effects::Paint::of(fill_of(doc, run), [bx0, by0, bx1, by1])).collect();
     for (g, f) in laid.glyphs.iter().zip(finals).filter(|(g, f)| g.visible && f.opacity > 0.0) {
         if let Some((img, x0, y0)) = at.image(laid, g, f, 0.0) {
+            let solid;
             let paint = match f.colour {
-                Some(c) => crate::effects::Paint::Solid(premul(c, 1.0)),
-                None => crate::effects::Paint::of(fill_of(doc, g.run), [bx0, by0, bx1, by1]),
+                Some(c) => {
+                    solid = crate::effects::Paint::Solid(premul(c, 1.0));
+                    &solid
+                }
+                None => &paints[g.run.min(doc.runs.len())],
             };
             paint_glyph(&mut canvas, &mut inside, &img, x0, y0, |x, y| paint.at(x, y), f.opacity);
         }
@@ -687,7 +779,7 @@ fn text_layer(doc: &TextDoc, laid: &Laid, finals: &[Final], at: &Place, w: usize
         }
         inside = grown;
     }
-    (canvas, inside)
+    canvas
 }
 
 #[cfg(test)]
@@ -706,13 +798,15 @@ mod tests {
         let (face, id) = zhe();
         let small = Mutex::new(GlyphCache::new(256 << 10));
         for size in 8..=400 {
-            assert!(glyph_image_in(&small, &face, id, size as f32, 0.0, 0.0, 0.0, 1.0, 1.0).is_some());
+            assert!(glyph_image_in(&small, &face, id, GlyphDraw::plain(size as f32)).is_some());
             let bytes = small.lock().bytes();
             assert!(bytes <= 256 << 10, "{bytes} bytes at size {size}");
         }
         assert!(small.lock().len() > 0, "it still keeps what fits");
         for size in (8..=500).step_by(3) {
-            glyph_image(&face, id, size as f32, 0.5, 2.0, 0.0, 1.0, 1.0);
+            glyph_image(&face, id, GlyphDraw { frac: (0.5, 0.0), stroke: 2.0, ..GlyphDraw::plain(size as f32) });
+            // A curve's still glyphs are kept too, each turn its own entry.
+            glyph_image(&face, id, GlyphDraw { rotation: size as f32 / 100.0, frac: (0.5, 0.25), ..GlyphDraw::plain(size as f32) });
         }
         assert!(GLYPHS.lock().bytes() <= GLYPH_CACHE_BYTES);
     }
@@ -721,27 +815,67 @@ mod tests {
     fn animated_and_large_glyphs_are_drawn_but_not_kept() {
         let (face, id) = zhe();
         let cache = Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES));
-        assert!(glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.3, 1.0, 1.0).is_some(), "turned");
-        assert!(glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.0, 1.5, 1.0).is_some(), "scaled");
-        let big = glyph_image_in(&cache, &face, id, 900.0, 0.0, 0.0, 0.0, 1.0, 1.0).expect("drawn");
+        let moving = GlyphDraw { still: false, ..GlyphDraw::plain(40.0) };
+        assert!(glyph_image_in(&cache, &face, id, GlyphDraw { rotation: 0.3, ..moving }).is_some(), "turned");
+        assert!(glyph_image_in(&cache, &face, id, GlyphDraw { scale: 1.5, ..moving }).is_some(), "scaled");
+        let big = glyph_image_in(&cache, &face, id, GlyphDraw::plain(900.0)).expect("drawn");
         assert!(big.placement.width > MAX_CACHED_SIDE || big.placement.height > MAX_CACHED_SIDE);
         assert_eq!(cache.lock().len(), 0);
-        glyph_image_in(&cache, &face, id, 40.0, 0.0, 0.0, 0.0, 1.0, 1.0002);
+        glyph_image_in(&cache, &face, id, GlyphDraw { stretch: 1.0002, ..GlyphDraw::plain(40.0) });
         assert_eq!(cache.lock().len(), 1, "a still glyph (the raster's stretch included) is kept");
     }
 
+    /// Minor 6: a curved text's glyphs are still when the animation leaves
+    /// them alone — kept, the shape's turn part of the key.
     #[test]
-    fn a_cache_hit_is_the_same_pixels_as_a_miss() {
+    fn a_curves_still_glyphs_are_kept_by_their_turn() {
         let (face, id) = zhe();
-        // Two requests that differ below the cache's resolution share an entry.
-        let (a, b) = ((40.004, 0.26, 3.004, 1.0004), (40.001, 0.49, 3.001, 1.0001));
-        let first = Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES));
-        let miss = glyph_image_in(&first, &face, id, a.0, a.1, a.2, 0.0, 1.0, a.3).unwrap();
-        let hit = glyph_image_in(&first, &face, id, b.0, b.1, b.2, 0.0, 1.0, b.3).unwrap();
-        assert!(Arc::ptr_eq(&miss, &hit), "the second request is a hit");
-        let fresh = glyph_image_in(&Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES)), &face, id, b.0, b.1, b.2, 0.0, 1.0, b.3).unwrap();
-        let at = |i: &Image| (i.placement.left, i.placement.top, i.placement.width, i.placement.height);
-        assert_eq!((at(&hit), &hit.data), (at(&fresh), &fresh.data), "drawn afresh: the same pixels");
+        let cache = Mutex::new(GlyphCache::new(GLYPH_CACHE_BYTES));
+        let on_curve = |rotation: f32| GlyphDraw { rotation, ..GlyphDraw::plain(40.0) };
+        let a = glyph_image_in(&cache, &face, id, on_curve(0.3)).unwrap();
+        let b = glyph_image_in(&cache, &face, id, on_curve(0.6)).unwrap();
+        assert_eq!(cache.lock().len(), 2, "one entry per turn");
+        assert!(Arc::ptr_eq(&a, &glyph_image_in(&cache, &face, id, on_curve(0.3)).unwrap()), "the same turn is a hit");
+        assert_ne!((a.placement.width, a.placement.height, &a.data), (b.placement.width, b.placement.height, &b.data));
+        // `finals`: still where the animation neither turns nor scales a glyph.
+        let d = TextDoc { shape: kadr_project::TextShape::Circle { radius: 150.0, start_deg: 0.0 }, ..TextDoc::new("круг") };
+        let l = crate::layout::layout(&d);
+        let placed = crate::shape::place(&d, &l);
+        let mut anim = FrameAnim::rest(l.glyphs.len());
+        assert!(finals(&l, &placed, &anim).iter().all(|f| f.still && f.rotation != 0.0));
+        anim.glyphs[1].rotation = 0.2;
+        anim.glyphs[2].scale = 1.1;
+        let f = finals(&l, &placed, &anim);
+        assert_eq!(f.iter().map(|f| f.still).collect::<Vec<_>>(), [true, false, false, true]);
+        anim.glyphs[1].rotation = 0.0;
+        anim.block.rotation = 0.1;
+        assert!(finals(&l, &placed, &anim).iter().all(|f| !f.still), "the whole block turning");
+    }
+
+    /// Minor 11: a turned glyph keeps its place below a pixel vertically
+    /// (an upright one sits on its rounded baseline, the line alike).
+    #[test]
+    fn a_turned_glyph_keeps_its_sub_pixel_height() {
+        let l = crate::layout::layout(&TextDoc::new("Ж"));
+        let g = &l.glyphs[0];
+        let at = Place { sx: 1.0, sy: 1.0, ox: 0.0, oy: 0.0 };
+        // The ink's centroid height in raster px.
+        let centre = |f: &Final| {
+            let (img, _, y0) = at.image(&l, g, f, 0.0).unwrap();
+            let w = img.placement.width as usize;
+            let (mut sum, mut moment) = (0.0, 0.0);
+            for (i, &a) in img.data.iter().enumerate() {
+                (sum, moment) = (sum + a as f32, moment + a as f32 * (y0 as f32 + (i / w) as f32 + 0.5));
+            }
+            moment / sum
+        };
+        let base = Final { x: 20.0, y: 50.0, rotation: 0.4, scale: 1.0, opacity: 1.0, blur: 0.0, colour: None, still: true };
+        for dy in [0.25, 0.5, 0.75] {
+            let moved = centre(&Final { y: 50.0 + dy, ..base }) - centre(&base);
+            assert!((moved - dy).abs() < 0.06, "turned, {dy} px lower: the ink moves {moved}");
+        }
+        let upright = Final { rotation: 0.0, ..base };
+        assert_eq!(centre(&Final { y: 50.25, ..upright }), centre(&upright), "upright: on the rounded baseline");
     }
 
     /// Thick capitals in `fill` with `outlines` (width, colour), inner first.
@@ -807,5 +941,161 @@ mod tests {
         for &i in &edge {
             assert!(both[i][3] >= 254, "a seam at {i}: {:?} (the fill alone {:?})", both[i], fill[i]);
         }
+    }
+
+    /// The raster at scale 1 with its width.
+    fn raster(d: &TextDoc) -> (usize, Vec<[u8; 4]>) {
+        let r = crate::TextFrame::new(d, crate::Clock::REST).raster(1.0);
+        (r.width as usize, (0..r.height).flat_map(|y| r.row(y).as_chunks::<4>().0.to_vec()).collect())
+    }
+
+    /// Pixels at least `depth` px inside the letters of `opaque` (every
+    /// pixel within `depth` of them is the opaque fill `inner`).
+    fn deep_inside(w: usize, opaque: &[[u8; 4]], inner: [u8; 4], depth: usize) -> Vec<usize> {
+        let h = opaque.len() / w;
+        let d = depth as i64;
+        (0..opaque.len())
+            .filter(|&i| {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                (-d..=d).all(|dy| (-d..=d).all(|dx| {
+                    let (xx, yy) = (x + dx, y + dy);
+                    xx >= 0 && yy >= 0 && xx < w as i64 && yy < h as i64 && opaque[(yy * w as i64 + xx) as usize] == inner
+                }))
+            })
+            .collect()
+    }
+
+    /// TX-R13: the shadow is cast by the text as drawn — a hollow text (a
+    /// transparent fill in a 3 px outline) casts a hollow shadow, so with
+    /// no offset and no blur the inside of a thick stem stays clear.
+    #[test]
+    fn a_hollow_text_casts_a_hollow_shadow() {
+        let mut d = outlined(Rgba8::WHITE, &[(3.0, Rgba8::BLACK)]);
+        d.style.font = kadr_project::FontRef::new("Montserrat", 900, false);
+        d.style.shadow = Some(kadr_project::Shadow { colour: Rgba8::rgba(255, 0, 0, 255), offset_x: 0.0, offset_y: 0.0, blur: 0.0 });
+        let (w, opaque) = raster(&d);
+        let deep = deep_inside(w, &opaque, [255, 255, 255, 255], 4);
+        assert!(deep.len() > 200, "{} pixels deep inside the stems", deep.len());
+        d.style.fill = Fill::solid(Rgba8::rgba(255, 255, 255, 0));
+        let (_, hollow) = raster(&d);
+        for &i in &deep {
+            assert_eq!(hollow[i][3], 0, "the shadow shows inside the hollow letters at {i}: {:?}", hollow[i]);
+        }
+        assert!(hollow.iter().filter(|p| **p == [0, 0, 0, 255]).count() > 500, "the outline is drawn");
+    }
+
+    /// TX-R13: so is the glow — round the outline, not filling the stems.
+    #[test]
+    fn a_hollow_text_glows_round_its_outline_only() {
+        let mut d = outlined(Rgba8::WHITE, &[(3.0, Rgba8::BLACK)]);
+        d.style.font = kadr_project::FontRef::new("Montserrat", 900, false);
+        d.style.glow = Some(kadr_project::Glow { colour: Rgba8::rgba(0, 255, 0, 255), radius: 1.5, intensity: 1.0 });
+        let (w, opaque) = raster(&d);
+        let deep = deep_inside(w, &opaque, [255, 255, 255, 255], 7);
+        assert!(deep.len() > 50, "{} pixels deep inside the stems", deep.len());
+        d.style.fill = Fill::solid(Rgba8::rgba(255, 255, 255, 0));
+        let (_, hollow) = raster(&d);
+        for &i in &deep {
+            assert!(hollow[i][3] <= 2, "the glow fills the hollow letters at {i}: {:?}", hollow[i]);
+        }
+    }
+
+    /// TX-R13: a half-transparent fill casts a half shadow, and a
+    /// transparent outline does not fatten it.
+    #[test]
+    fn the_shadow_is_as_opaque_and_as_wide_as_the_text_drawn() {
+        let shadowed = |fill: Rgba8, outline: f32| {
+            let mut d = outlined(fill, &[(outline, Rgba8::rgba(255, 0, 0, 0))]);
+            d.style.shadow = Some(kadr_project::Shadow { colour: Rgba8::BLACK, offset_x: 300.0, offset_y: 0.0, blur: 0.0 });
+            raster(&d).1
+        };
+        // The shadow lies clear of the letters: its pixels are black (r = 0).
+        let shadow = |px: &[[u8; 4]]| px.iter().filter(|p| p[0] == 0 && p[3] > 0).map(|p| p[3]).collect::<Vec<u8>>();
+        let half = shadow(&shadowed(Rgba8::rgba(255, 255, 255, 128), 0.0));
+        assert!(half.len() > 1000 && half.iter().all(|&a| a <= 129), "a half fill: a half shadow ({} px, max {:?})", half.len(), half.iter().max());
+        let (thin, fat) = (shadow(&shadowed(Rgba8::WHITE, 0.0)).len(), shadow(&shadowed(Rgba8::WHITE, 12.0)).len());
+        assert!((fat as f32 / thin as f32 - 1.0).abs() < 0.02, "a transparent outline widens the shadow: {thin} → {fat} px");
+    }
+
+    /// TX-R14: the shadow is shifted, then blurred — an offset beyond 3 σ
+    /// plus the margin leaves no hard step where the unshifted picture's
+    /// edge was: the fringe falls off smoothly all round.
+    #[test]
+    fn a_far_shadow_keeps_its_whole_fringe() {
+        let mut d = TextDoc::new("Тень");
+        d.style.size = 97.0;
+        d.style.shadow = Some(kadr_project::Shadow { colour: Rgba8::BLACK, offset_x: 100.0, offset_y: 100.0, blur: 20.0 });
+        let (w, px) = raster(&d);
+        let h = px.len() / w;
+        let shadow_only = |i: usize| px[i][0] == 0;
+        let mut worst = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                for j in [(x + 1 < w).then_some(i + 1), (y + 1 < h).then_some(i + w)].into_iter().flatten() {
+                    if shadow_only(i) && shadow_only(j) {
+                        worst = worst.max(px[i][3].abs_diff(px[j][3]));
+                    }
+                }
+            }
+        }
+        assert!(worst <= 8, "a step of {worst} LSB in the shadow's fringe");
+        assert!(px.iter().any(|p| p[0] == 0 && p[3] > 100), "the shadow is drawn");
+    }
+
+    /// Minor 4: a shadow's or a glow's blur is as wide at scale 1 as at
+    /// scale 2 (a preview and an export of one title). The text's
+    /// silhouette at scale 2 and the same averaged down to scale 1 (one
+    /// shape, no glyph placed apart by rounding), blurred by σ and 2σ: the
+    /// scale-2 blur averaged down agrees within 2.5 LSB from σ = 1.5
+    /// canvas px. Below, a pixel grid cannot hold an edge's blur finer than
+    /// a pixel, so the scales part whatever the kernel (a true Gaussian at
+    /// both: 20, 9, 5, 3 LSB at σ 0.5, 0.75, 1, 1.25); the bounds there are
+    /// that floor with some room (the blur before this fix: 104, 79, 22, 22).
+    #[test]
+    fn a_blur_looks_alike_at_scale_1_and_2() {
+        let mut d = TextDoc::new("Мягко");
+        d.style.size = 30.0;
+        let r = crate::TextFrame::new(&d, crate::Clock::REST).raster(2.0);
+        // Room round the text for the widest blur.
+        let pad = 30;
+        let (w, h) = ((r.width / 2) as usize + 2 * pad, (r.height / 2) as usize + 2 * pad);
+        let mut two = Mask::new(2 * w, 2 * h);
+        for y in 0..(r.height as usize / 2) * 2 {
+            for x in 0..(r.width as usize / 2) * 2 {
+                two.a[(y + 2 * pad) * 2 * w + x + 2 * pad] = r.row(y as u32)[x * 4 + 3] as f32 / 255.0;
+            }
+        }
+        let down = |m: &Mask| {
+            let mut one = Mask::new(w, h);
+            for (i, a) in one.a.iter_mut().enumerate() {
+                let (x, y) = (2 * (i % w), 2 * (i / w));
+                *a = (m.a[y * 2 * w + x] + m.a[y * 2 * w + x + 1] + m.a[(y + 1) * 2 * w + x] + m.a[(y + 1) * 2 * w + x + 1]) / 4.0;
+            }
+            one
+        };
+        let one = down(&two);
+        for (sigma, bound) in [(0.5, 21.0), (0.75, 11.5), (1.0, 6.5), (1.25, 6.5), (1.5, 2.5), (2.0, 2.5), (2.5, 2.5), (3.0, 2.5), (4.0, 2.5), (6.0, 2.5)] {
+            let (mut a, mut b) = (one.clone(), two.clone());
+            crate::effects::blur(&mut a, sigma);
+            crate::effects::blur(&mut b, 2.0 * sigma);
+            let worst = a.a.iter().zip(&down(&b).a).map(|(p, q)| (p - q).abs() * 255.0).fold(0.0f32, f32::max);
+            assert!(worst <= bound, "σ {sigma}: scale 1 and 2 differ by {worst} LSB");
+        }
+    }
+
+    /// Minor 10: the glow's room is round the text, the shadow's round
+    /// the shifted text — the glow does not grow the shadow's side.
+    #[test]
+    fn the_glow_room_is_round_the_text_not_its_shadow() {
+        let b = |glow: bool, shadow: bool| {
+            let mut d = TextDoc::new("Неон");
+            d.style.glow = glow.then_some(kadr_project::Glow { colour: Rgba8::WHITE, radius: 10.0, intensity: 1.0 });
+            d.style.shadow = shadow.then_some(kadr_project::Shadow { colour: Rgba8::BLACK, offset_x: 200.0, offset_y: 0.0, blur: 0.0 });
+            crate::TextFrame::new(&d, crate::Clock::REST).bounds()
+        };
+        let (both, glow, shadow) = (b(true, true), b(true, false), b(false, true));
+        assert_eq!((both.x0, both.y0, both.y1), (glow.x0, glow.y0, glow.y1), "the glow's side");
+        assert_eq!(both.x1, shadow.x1, "the shadow's side: no glow room past it");
     }
 }

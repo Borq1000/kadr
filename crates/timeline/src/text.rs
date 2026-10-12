@@ -3,8 +3,8 @@
 //! bounds, anchored at the text block's centre (so `Transform.x/y` place
 //! that centre and growing text stays centred), placed, faded, keyframed,
 //! corrected and filtered by effects exactly like a media clip — the
-//! motion effects moving the text block (the layout box), not the room
-//! around it.
+//! motion effects moving the text block (`TextFrame::block_box`: the
+//! layout box, or a curved text's own block), not the room around it.
 
 use kadr_core::Time;
 use kadr_project::{Clip, TextDoc, Transform};
@@ -44,12 +44,13 @@ pub(crate) fn text_layer(clip: &Clip, doc: &TextDoc, t: Time, canvas: SizeU, fra
     // widens the bounds does not move the crop's edges.
     let rest = if doc.is_animated() { kadr_text::TextFrame::new(doc, kadr_text::Clock::REST).bounds() } else { b };
     let crop = text_crop(&st.transform, b, rest)?;
-    // The motion effects move the text block — the layout box, about the
+    // The motion effects move the text block — the layout box, or a
+    // curved text's placed glyphs with its centre (TX-R15), about the
     // layout centre; the crop's visible part of it is their window — so a
     // shadow, a plaque or an animated glyph never shifts a zoom's point or
     // scales a shake (TX-R7).
-    let (lw, lh) = picture.layout_size();
-    let block = if lw > 0.0 && lh > 0.0 { Bounds { x0: -lw / 2.0, y0: -lh / 2.0, x1: lw / 2.0, y1: lh / 2.0 } } else { b };
+    let block = picture.block_box();
+    let block = if block.width() > 0.0 && block.height() > 0.0 { block } else { b };
     let (bw, bh) = (block.width(), block.height());
     let mut base = crate::scene::placement_of(&st.transform, Vec2::new(bw, bh), canvas);
     base.anchor = Vec2::new(-block.x0 / bw, -block.y0 / bh);

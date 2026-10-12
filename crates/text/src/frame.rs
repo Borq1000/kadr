@@ -44,6 +44,8 @@ pub struct TextFrame {
     laid: Arc<Laid>,
     placed: Vec<Placed>,
     anim: FrameAnim,
+    /// The text block at rest, before any tilt (TX-R15).
+    block: Bounds,
     /// What the flat picture covers (before any tilt).
     flat: Bounds,
     /// What the picture covers: `flat`, or its projection when tilted.
@@ -69,14 +71,15 @@ impl TextFrame {
         let placed = crate::shape::place(doc, &laid);
         let anim = crate::anim::animate(doc, &laid, clock);
         let finals = crate::raster::finals(&laid, &placed, &anim);
-        let flat = crate::raster::bounds(doc, &laid, &finals);
+        let block = crate::shape::block(doc, &laid, &placed);
+        let flat = crate::raster::bounds(doc, &laid, block, &finals);
         let bounds = match crate::effects::tilt(doc) {
             Some(p) => crate::effects::project_bounds(flat, p, crate::effects::camera_distance(&laid)),
             None => flat,
         };
         // The paint hash holds the style (shadow, glow), the shape and the perspective.
         let key = crate::hash_of(&(shape, paint_hash(doc), anim.key(), generation));
-        TextFrame { doc: doc.clone(), laid, placed, anim, flat, bounds, key }
+        TextFrame { doc: doc.clone(), laid, placed, anim, block, flat, bounds, key }
     }
 
     /// What the picture may cover, canvas px about the layout box centre.
@@ -84,9 +87,18 @@ impl TextFrame {
         self.bounds
     }
 
-    /// The text block (what the preview's handles frame), canvas px.
+    /// The layout box (the lines as laid out, straight), canvas px.
     pub fn layout_size(&self) -> (f32, f32) {
         (self.laid.width, self.laid.height)
+    }
+
+    /// The text block, canvas px about the layout box centre, before any
+    /// tilt (TX-R15): the layout box for a straight text; for a curved one
+    /// the box of its glyphs as placed at rest (not animated) and the
+    /// centre — not the straight layout strip, and not made symmetric.
+    /// The motion effects move it (TX-R7) and a gradient spans it.
+    pub fn block_box(&self) -> Bounds {
+        self.block
     }
 
     pub fn missing_fonts(&self) -> &[String] {
@@ -107,32 +119,26 @@ impl TextFrame {
     }
 }
 
-/// The block the preview's handles frame (canvas px, centred on the
-/// layout box centre): the layout box, widened to a curved text's glyphs
-/// (their em boxes as placed, at rest) and then to its tilted image.
-pub fn frame_size(doc: &TextDoc) -> (f32, f32) {
+/// The block the preview's handles frame, canvas px about the layout box
+/// centre (the anchor): [`TextFrame::block_box`] at rest — the layout box,
+/// or a curved text's placed glyphs and its centre (TX-R15) — seen
+/// tilted (cut where it would come too near the camera, TX-R5). It is not
+/// symmetric about the anchor for a curved or tilted text.
+pub fn frame_box(doc: &TextDoc) -> Bounds {
     let laid = crate::layout::layout(doc);
-    let (bx, by) = (laid.width / 2.0, laid.height / 2.0);
-    let (mut hw, mut hh) = (bx, by);
-    if doc.shape != kadr_project::TextShape::Straight {
-        let placed = crate::shape::place(doc, &laid);
-        let finals = crate::raster::finals(&laid, &placed, &FrameAnim::rest(laid.glyphs.len()));
-        for (g, f) in laid.glyphs.iter().zip(&finals).filter(|(g, _)| g.visible) {
-            for (x, y) in [(0.0, -g.size), (g.advance, -g.size), (g.advance, 0.3 * g.size), (0.0, 0.3 * g.size)] {
-                let (s, c) = f.rotation.sin_cos();
-                let (px, py) = (f.x + x * c - y * s, f.y + x * s + y * c);
-                if px.is_finite() && py.is_finite() {
-                    (hw, hh) = (hw.max((px - bx).abs()), hh.max((py - by).abs()));
-                }
-            }
-        }
+    let block = crate::shape::block(doc, &laid, &crate::shape::place(doc, &laid));
+    match crate::effects::tilt(doc) {
+        Some(p) => crate::effects::project_bounds(block, p, crate::effects::camera_distance(&laid)),
+        None => block,
     }
-    if let Some(p) = crate::effects::tilt(doc) {
-        // The projected box, cut where it would come too near the camera (TX-R5).
-        let b = crate::effects::project_bounds(Bounds { x0: -hw, y0: -hh, x1: hw, y1: hh }, p, crate::effects::camera_distance(&laid));
-        (hw, hh) = (b.x0.abs().max(b.x1.abs()), b.y0.abs().max(b.y1.abs()));
-    }
-    (2.0 * hw, 2.0 * hh)
+}
+
+/// The smallest box centred on the anchor that holds [`frame_box`]: the
+/// layout box for a straight, untilted text. A curved text's frame is
+/// not symmetric about its anchor — frame it by [`frame_box`] to fit it.
+pub fn frame_size(doc: &TextDoc) -> (f32, f32) {
+    let b = frame_box(doc);
+    (2.0 * b.x0.abs().max(b.x1.abs()), 2.0 * b.y0.abs().max(b.y1.abs()))
 }
 
 impl kadr_scene::TextPicture for TextFrame {
@@ -193,7 +199,12 @@ mod tests {
             assert!(nothing_on_the_edge(&r), "{:?}: something touches the raster's edge", d.plain());
             let (lw, lh) = f.layout_size();
             if d.perspective.is_none() {
-                assert!(b.x0 <= -lw / 2.0 && b.x1 >= lw / 2.0 && b.y0 <= -lh / 2.0 && b.y1 >= lh / 2.0, "the layout box is inside");
+                // The text block is inside: the layout box, or a curved text's own block (TX-R15).
+                let k = f.block_box();
+                assert!(b.x0 <= k.x0 && b.x1 >= k.x1 && b.y0 <= k.y0 && b.y1 >= k.y1, "{:?}: the block is inside", d.plain());
+                if d.shape == TextShape::Straight {
+                    assert_eq!(k, Bounds { x0: -lw / 2.0, y0: -lh / 2.0, x1: lw / 2.0, y1: lh / 2.0 }, "straight: the layout box");
+                }
             }
             assert!((0..r.height).any(|y| r.row(y).as_chunks::<4>().0.iter().any(|p| p[3] > 0)) || d.plain().is_empty(), "{:?} draws", d.plain());
         }
@@ -229,14 +240,124 @@ mod tests {
         let mut d = TextDoc::starter("ПО КРУГУ • ПО КРУГУ • ПО КРУГУ •", 1080);
         let (lw, lh) = (crate::layout(&d).width, crate::layout(&d).height);
         assert_eq!(frame_size(&d), (lw, lh), "straight: the layout box");
+        assert_eq!(frame_box(&d), Bounds { x0: -lw / 2.0, y0: -lh / 2.0, x1: lw / 2.0, y1: lh / 2.0 });
         d.shape = TextShape::Circle { radius: 150.0, start_deg: 0.0 };
         let (cw, ch) = frame_size(&d);
-        assert!(ch > 300.0 && cw >= lw.min(300.0), "a circle's frame holds the circle: {cw} × {ch}");
+        // TX-R15: the circle and its letters, not the straight strip (far wider than the circle).
+        assert!(lw > 1000.0 && ch > 300.0 && cw > 300.0 && cw < 2.0 * (150.0 + lh), "a circle's frame is the circle: {cw} × {ch} (strip {lw})");
+        assert_eq!(frame_box(&d), TextFrame::new(&d, Clock::REST).block_box());
         let mut t = TextDoc::starter("Наклон", 1080);
         let flat = frame_size(&t);
         t.perspective = Some(Perspective { tilt_x: 30.0, tilt_y: 0.0 });
         let tilted = frame_size(&t);
         assert!(tilted.0 > flat.0 && tilted.1 < flat.1 + 2.5, "{flat:?} → {tilted:?}");
+        let b = frame_box(&t);
+        assert!(b.y1 > -b.y0 + 1.0, "the near (bottom) half is the larger: {b:?}");
+        assert_eq!(frame_size(&t), (2.0 * b.x0.abs().max(b.x1), 2.0 * b.y1), "the size is the box centred on the anchor round it");
+    }
+
+    /// TX-R15: a curved text's block is its glyphs as placed and its
+    /// centre — an arc's not made symmetric (Minor 9) — and a bend of 0 is
+    /// the straight layout box again.
+    #[test]
+    fn a_curved_texts_block_is_its_placed_glyphs() {
+        let mut d = TextDoc::starter("Текст по дуге вверх", 1080);
+        d.shape = TextShape::Arc { bend: 0.6 };
+        let f = TextFrame::new(&d, Clock::REST);
+        let (k, (lw, lh)) = (f.block_box(), f.layout_size());
+        assert!(k.y1 > lh, "the ends drop well below the line: {k:?}");
+        assert!(k.y0 > -lh, "and the top stays near the line's: {k:?}");
+        assert!(k.x0 <= 0.0 && k.x1 >= 0.0 && k.y0 <= 0.0 && k.y1 >= 0.0, "the centre is in it");
+        let laid = f.laid();
+        let placed = crate::shape::place(&d, laid);
+        for (g, p) in laid.glyphs.iter().zip(&placed).filter(|(g, _)| g.visible) {
+            let (x, y) = (p.x - lw / 2.0, p.y - lh / 2.0);
+            assert!(x >= k.x0 - 0.01 && x <= k.x1 + 0.01 && y >= k.y0 - 0.01 && y <= k.y1 + 0.01, "{g:?} at ({x}, {y}) outside {k:?}");
+        }
+        d.shape = TextShape::Arc { bend: 0.0 };
+        assert_eq!(TextFrame::new(&d, Clock::REST).block_box(), Bounds { x0: -lw / 2.0, y0: -lh / 2.0, x1: lw / 2.0, y1: lh / 2.0 }, "bend 0: straight");
+    }
+
+    /// The box where ink is (alpha > 0) in a raster: (width, height).
+    fn ink_box(r: &kadr_core::CpuFrame) -> (u32, u32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..r.height {
+            for x in 0..r.width {
+                if alpha_at(r, x, y) > 0 {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                }
+            }
+        }
+        (x1.saturating_sub(x0), y1.saturating_sub(y0))
+    }
+
+    /// TX-R15: a full-circle title is rastered round its ink, not round
+    /// the straight strip its letters would make laid out in a line.
+    #[test]
+    fn a_full_circle_title_is_rastered_round_its_ink() {
+        let mut d = TextDoc::new("ПО КРУГУ • ПО КРУГУ • ПО КРУГУ • ПО КРУГУ •");
+        d.style.size = 28.0;
+        d.shape = TextShape::Circle { radius: 110.0, start_deg: 0.0 };
+        let f = TextFrame::new(&d, Clock::REST);
+        let r = f.raster(1.0);
+        let (iw, ih) = ink_box(&r);
+        assert!(iw > 200 && ih > 200, "the circle is drawn: {iw} × {ih}");
+        assert!(f.layout_size().0 > 2.0 * iw as f32, "the strip is far wider than the circle: {:?}", f.layout_size());
+        assert!(r.width as f32 <= 1.3 * iw as f32 && r.height as f32 <= 1.3 * ih as f32, "{} × {} raster round {iw} × {ih} of ink", r.width, r.height);
+    }
+
+    /// TX-R15: a gradient spans a curved text's own block — a 90° one runs
+    /// from the circle's top to its bottom, not across the strip's height.
+    #[test]
+    fn a_gradient_on_a_circle_spans_the_whole_circle() {
+        let red = Rgba8::rgba(255, 0, 0, 255);
+        let blue = Rgba8::rgba(0, 0, 255, 255);
+        let mut d = TextDoc::new("ПО КРУГУ • ПО КРУГУ • ПО КРУГУ •");
+        d.style.size = 28.0;
+        d.shape = TextShape::Circle { radius: 110.0, start_deg: 0.0 };
+        d.style.fill = kadr_project::Fill { colour: red, gradient: Some(kadr_project::GradientFill::new(vec![kadr_project::GradientStop { pos: 0.0, colour: red }, kadr_project::GradientStop { pos: 1.0, colour: blue }], 90.0)), extra: Default::default() };
+        let r = TextFrame::new(&d, Clock::REST).raster(1.0);
+        // The share of blue in the opaque ink of a band of rows round `at` (0 top, 1 bottom of the ink).
+        let rows: Vec<u32> = (0..r.height).filter(|&y| (0..r.width).any(|x| alpha_at(&r, x, y) == 255)).collect();
+        let (top, bottom) = (rows[0] as f32, *rows.last().unwrap() as f32);
+        let blue_share = |at: f32| {
+            let y0 = (top + at * (bottom - top)) as u32;
+            let (mut rs, mut bs) = (0.0, 0.0);
+            for y in y0.saturating_sub(3)..(y0 + 4).min(r.height) {
+                for p in r.row(y).as_chunks::<4>().0.iter().filter(|p| p[3] == 255) {
+                    (rs, bs) = (rs + p[0] as f32, bs + p[2] as f32);
+                }
+            }
+            bs / (rs + bs)
+        };
+        let (a, b, c) = (blue_share(0.02), blue_share(0.25), blue_share(0.75));
+        assert!(a < 0.1, "the top is red: {a}");
+        assert!(b > 0.1 && b < 0.4, "a quarter down: mostly red, some blue: {b}");
+        assert!(c > 0.6 && c < 0.9, "three quarters down: mostly blue: {c}");
+        assert!(blue_share(0.98) > 0.9, "the bottom is blue");
+    }
+
+    /// Minor 8: a tilt's flat canvas never holds more pixels than the
+    /// larger of the tilted raster and 4 Mpx; below that it is drawn at
+    /// the output's scale.
+    #[test]
+    fn a_tilts_flat_canvas_is_capped() {
+        let flat = Bounds { x0: -1000.0, y0: -300.0, x1: 1000.0, y1: 300.0 };
+        assert_eq!(crate::raster::tilt_flat_scale(flat, 1.0, 1e6), 1.0, "1.2 Mpx: under 4 Mpx");
+        assert_eq!(crate::raster::tilt_flat_scale(flat, 2.0, 6e6), 2.0, "4.8 Mpx: under the output's 6");
+        for (scale, out) in [(3.0, 2e6), (3.0, 5e6), (8.0, 16e6)] {
+            let s = crate::raster::tilt_flat_scale(flat, scale, out);
+            let px = (2000.0 * s).ceil() as f64 * (600.0 * s).ceil() as f64;
+            let allowed = out.max(crate::raster::TILT_FLAT_PIXELS);
+            assert!(s < scale && px <= allowed && px > 0.99 * allowed, "scale {scale}, out {out}: {s} → {px} px");
+        }
+        // A steep tilt of a large title at a large scale: drawn, at the tilted raster's size.
+        let mut d = TextDoc::starter("Наклон", 1080);
+        d.perspective = Some(Perspective { tilt_x: 60.0, tilt_y: 60.0 });
+        let f = TextFrame::new(&d, Clock::REST);
+        let r = f.raster(10.0);
+        assert_eq!((r.width, r.height), ((f.bounds().width() * 10.0).ceil() as u32, (f.bounds().height() * 10.0).ceil() as u32));
+        assert!((0..r.height).step_by(7).any(|y| r.row(y).as_chunks::<4>().0.iter().any(|p| p[3] > 128)), "drawn");
     }
 
     /// TX-R5 for the looks: absurd shadows, glows, curves and tilts are
