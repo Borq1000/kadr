@@ -2,11 +2,11 @@
 
 use crossbeam_channel::{Receiver, Sender};
 use kadr_core::perf::PerfRing;
-use kadr_core::{AssetId, FrameRate, Time};
-use kadr_playback::testing::{media_layer, read_fake_pixel, video_source, FakeDecoders, FakeMedia, FnSceneSource};
+use kadr_core::{AssetId, ColorInfo, CpuFrame, FramePool, FrameRate, Time};
+use kadr_playback::testing::{fake_pixel, media_layer, read_fake_pixel, video_source, FakeDecoders, FakeMedia, FnSceneSource};
 use kadr_playback::{FrameInfo, FrameSink, MediaSource, PlayerConfig, PreviewPlayer, Resolver, ResolverConfig, SceneSource, WallClock};
 use kadr_render::{CpuRenderer, CpuTarget};
-use kadr_scene::{FrameScene, OutputSpec, RenderQuality, SizeU};
+use kadr_scene::{BlendMode, FrameScene, Layer, LayerContent, LayerId, OutputSpec, Placement, RenderQuality, SizeU, TextLayer, TextPicture, Vec2};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -641,4 +641,61 @@ fn a_play_uses_a_source_queued_right_after_it() {
             break;
         }
     }
+}
+
+/// An animated title: a new picture every frame, drawn over the whole
+/// canvas in the colour [`fake_pixel`] gives its frame (tag 9).
+#[derive(Debug)]
+struct Title(i64);
+
+impl TextPicture for Title {
+    fn key(&self) -> u64 {
+        self.0 as u64
+    }
+    fn render(&self, scale: f32, _: &FramePool) -> CpuFrame {
+        let (w, h) = (((CANVAS.w as f32 * scale).ceil() as u32).max(1), ((CANVAS.h as f32 * scale).ceil() as u32).max(1));
+        CpuFrame::from_rgba8(w, h, ColorInfo::WORKING_SDR, fake_pixel(9, self.0).repeat((w * h) as usize))
+    }
+}
+
+/// Titles review (Task 2, minor 5): a video decoded slower than real time
+/// shows older frames; an animated title over it still moves on every
+/// frame — its new picture is newer content, so the frame is presented
+/// instead of dropped (a still title keeps its key and does not count).
+#[test]
+fn an_animated_title_over_a_lagging_video_keeps_moving() {
+    let fake = Arc::new(FakeDecoders::new(ms(5), ms(250)));
+    fake.add("a.mp4", FakeMedia { tag: 6, ..Default::default() });
+    let a = AssetId::new();
+    let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
+    let r = rig(fake, PlayerConfig::default());
+    let video = m.clone();
+    let scene: SceneFn = Box::new(move |t, out| {
+        let frame = FrameRate::FPS_25.time_to_frame(t);
+        let placement = Placement { size: Vec2::new(CANVAS.w as f32, CANVAS.h as f32), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(CANVAS.w as f32 / 2.0, CANVAS.h as f32 / 2.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
+        let title = Layer { id: LayerId(2), content: LayerContent::Text(TextLayer { picture: Arc::new(Title(frame)) }), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
+        FrameScene { layers: vec![media_layer(1, a, &video, t, CANVAS), title], ..FrameScene::empty(t, CANVAS, *out) }
+    });
+    let duration = Time::from_secs(2);
+    r.player.set_source(source(vec![(a, m)], duration, scene));
+    r.clock.start(Time::ZERO);
+    let g = r.player.play(Time::ZERO);
+    let mut shown = vec![];
+    loop {
+        match next_event(&r.events, ms(3000)).expect("playback finishes") {
+            Event::Presented { generation, time, pixel, .. } => {
+                assert_eq!(generation, g);
+                shown.push((time, read_fake_pixel(&pixel)));
+            }
+            Event::Finished(_) => break,
+            Event::Ready(_) => panic!("no pre-roll with the clock running"),
+        }
+    }
+    let total = 50;
+    eprintln!("animated title over slow video: {} of {total} frames presented", shown.len());
+    for (time, (tag, frame)) in &shown {
+        assert_eq!((*tag, *frame), (9, FrameRate::FPS_25.time_to_frame(*time)), "the title of the frame's own time");
+    }
+    // The video alone presents a frame per decoded one (~4 a second: 7 of 50 here).
+    assert!(shown.len() * 100 >= total * 40, "{} of {total} frames presented", shown.len());
 }

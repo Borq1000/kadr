@@ -34,9 +34,11 @@
 //! its decoder already produced (at most [`PlayerConfig::max_behind`]
 //! earlier), so the picture keeps moving at whatever rate decoding allows
 //! instead of freezing. A frame is presented only if some layer shows newer
-//! content than the frame before it; otherwise it is dropped (the picture
-//! on screen is the same). Presented frames stay within one frame of the
-//! clock; only their content lags.
+//! content than the frame before it — a later source frame, or another
+//! picture of a text layer (an animated title keeps moving over a lagging
+//! video); otherwise it is dropped (the picture on screen is the same).
+//! Presented frames stay within one frame of the clock; only their content
+//! lags.
 //!
 //! # Pre-roll
 //!
@@ -384,7 +386,27 @@ struct Prerolled {
     t0: Instant,
     source: Arc<dyn SceneSource>,
     output: OutputSpec,
-    shows: Vec<(LayerId, i64)>,
+    shows: Vec<(LayerId, Shown)>,
+}
+
+/// What a layer showed in a presented frame: a media layer its source
+/// frame, a text layer its picture's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    Frame(i64),
+    Text(u64),
+}
+
+impl Shown {
+    /// Newer content than `before`, what the layer showed last (`None`:
+    /// nothing yet): a later source frame, or another text picture.
+    fn is_newer_than(self, before: Option<&Shown>) -> bool {
+        match (self, before) {
+            (Shown::Frame(f), Some(Shown::Frame(b))) => f > *b,
+            (Shown::Text(k), Some(Shown::Text(b))) => k != *b,
+            _ => true,
+        }
+    }
 }
 
 /// A play in progress.
@@ -394,8 +416,8 @@ struct Play {
     /// queued right after the `Play` counts).
     sched: Option<PlaySchedule>,
     preroll: Preroll,
-    /// Per media layer, the source frame last presented.
-    shown: HashMap<LayerId, i64>,
+    /// Per media layer the source frame last presented, per text layer its picture's key.
+    shown: HashMap<LayerId, Shown>,
     /// The media (and decode sizes) of the last prefetched lookahead scene,
     /// and frames since that prefetch.
     prefetched: Vec<(AssetId, SizeU)>,
@@ -672,9 +694,10 @@ impl Worker {
     /// Playback inputs made presentable: a media layer not decoded in time
     /// gets the newest frame of its media (at its decode size) already in
     /// the cache, at most `max_behind` earlier. Returns the source frame each
-    /// media layer shows, or `None` when a layer has nothing to show or when
-    /// a substitute was needed and no layer shows anything newer than `shown`.
-    fn fill_behind(&self, scene: &FrameScene, source: &dyn SceneSource, inputs: &mut [LayerInput], shown: &HashMap<LayerId, i64>) -> Option<Vec<(LayerId, i64)>> {
+    /// media layer shows (and the picture key of each drawn text layer), or
+    /// `None` when a layer has nothing to show or when a substitute was
+    /// needed and no layer shows anything newer than `shown`.
+    fn fill_behind(&self, scene: &FrameScene, source: &dyn SceneSource, inputs: &mut [LayerInput], shown: &HashMap<LayerId, Shown>) -> Option<Vec<(LayerId, Shown)>> {
         let mut shows = vec![];
         let mut substituted = false;
         let mut missing = false;
@@ -682,7 +705,7 @@ impl Worker {
         if missing {
             return None;
         }
-        if substituted && !shows.iter().any(|(id, f)| shown.get(id).is_none_or(|s| f > s)) {
+        if substituted && !shows.iter().any(|(id, s)| s.is_newer_than(shown.get(id))) {
             return None;
         }
         Some(shows)
@@ -777,7 +800,7 @@ fn fill(
     source: &dyn SceneSource,
     layers: &[Layer],
     inputs: &mut [LayerInput],
-    shows: &mut Vec<(LayerId, i64)>,
+    shows: &mut Vec<(LayerId, Shown)>,
     substituted: &mut bool,
     missing: &mut bool,
 ) {
@@ -792,7 +815,7 @@ fn fill(
                 let size = decode_size(&l.placement, scene.canvas, scene.output.size, m.display_size);
                 let want = m.frame_at(*source_time);
                 match input {
-                    LayerInput::Cpu(_) => shows.push((l.id, want)),
+                    LayerInput::Cpu(_) => shows.push((l.id, Shown::Frame(want))),
                     LayerInput::Missing(MissingReason::NotReady) => {
                         let behind = if m.rate.num > 0 && m.rate.den > 0 { m.rate.time_to_frame(w.config.max_behind).max(1) } else { 1 };
                         let cache = w.resolver.cache();
@@ -800,7 +823,7 @@ fn fill(
                         match found {
                             Some((frame, f)) => {
                                 *input = LayerInput::Cpu(f);
-                                shows.push((l.id, frame));
+                                shows.push((l.id, Shown::Frame(frame)));
                                 *substituted = true;
                             }
                             None => *missing = true,
@@ -809,6 +832,8 @@ fn fill(
                     _ => {}
                 }
             }
+            // A drawn title (the resolver draws text in time, never late).
+            (LayerContent::Text(t), LayerInput::Cpu(_)) => shows.push((l.id, Shown::Text(t.picture.key()))),
             _ => {}
         }
     }
@@ -832,4 +857,18 @@ fn any_not_ready(layers: &[LayerInput]) -> bool {
         LayerInput::Transition { from, to } => any_not_ready(from) || any_not_ready(to),
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shown;
+
+    #[test]
+    fn newer_content_is_a_later_frame_or_another_title_picture() {
+        assert!(Shown::Frame(5).is_newer_than(None) && Shown::Text(1).is_newer_than(None), "nothing shown yet");
+        assert!(Shown::Frame(5).is_newer_than(Some(&Shown::Frame(4))));
+        assert!(!Shown::Frame(5).is_newer_than(Some(&Shown::Frame(5))) && !Shown::Frame(4).is_newer_than(Some(&Shown::Frame(5))));
+        assert!(Shown::Text(7).is_newer_than(Some(&Shown::Text(3))), "an animated title: another picture");
+        assert!(!Shown::Text(7).is_newer_than(Some(&Shown::Text(7))), "a still title is the same picture");
+    }
 }
