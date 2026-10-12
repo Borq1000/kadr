@@ -87,6 +87,21 @@ fn fade_slot(c: &mut Clip, is_audio: bool, edge: FadeEdge) -> &mut Time {
     }
 }
 
+/// The first media clip sets the sequence format (like most NLEs). A title
+/// has no format of its own: one placed first doesn't count.
+pub fn no_media_yet(seq: &Sequence) -> bool {
+    !seq.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.is_text())
+}
+
+/// The sequence takes `v`'s size (even, at least 2) and its rate when declared.
+pub fn adopt_format(seq: &mut Sequence, v: &kadr_core::VideoInfo) {
+    seq.width = v.width.max(2) & !1;
+    seq.height = v.height.max(2) & !1;
+    if let Some(fr) = v.frame_rate {
+        seq.frame_rate = fr;
+    }
+}
+
 /// A plain click on a clip inside a larger selection narrows the selection
 /// to that clip when released without dragging (the selection stays whole
 /// while it may still become a group move).
@@ -885,6 +900,7 @@ impl App {
                 self.toast(if self.tl.ripple { t("toast.ripple_on") } else { t("toast.ripple_off") });
             }
             "marker" => self.add_marker(),
+            "add-text" => self.add_text_at_playhead(),
             "zoom-in" => {
                 let x = self.time_to_x(self.playhead).clamp(0.0, self.lanes_size().0);
                 self.zoom_at(x, 1.5);
@@ -983,7 +999,8 @@ impl App {
                 }
             }
             "reveal-media" => {
-                if let Some(c) = self.tl.selection.first().and_then(|id| self.project.sequence().clip(*id)) {
+                // A title has no media to reveal.
+                if let Some(c) = self.tl.selection.first().and_then(|id| self.project.sequence().clip(*id)).filter(|c| !c.is_text()) {
                     self.selected_asset = Some(c.asset);
                     self.show_media_tab();
                     self.bin_filter = None;
@@ -1154,18 +1171,13 @@ impl App {
                 None => return self.toast_warn(t("err.audio_tracks_locked")),
             }
         }
-        let was_empty = self.project.sequence().duration() == Time::ZERO;
-        // The first clip defines the sequence format (like most NLEs).
-        if was_empty {
-            if let Some(v) = asset.info.video.as_ref().filter(|_| asset.kind() == MediaKind::Video) {
-                let seq = self.project.sequence_mut();
-                seq.width = v.width.max(2) & !1;
-                seq.height = v.height.max(2) & !1;
-                if let Some(fr) = v.frame_rate {
-                    seq.frame_rate = fr;
-                }
-                self.meta_dirty = true;
-            }
+        let was_empty = no_media_yet(self.project.sequence());
+        // The first media clip defines the sequence format (a title before it doesn't).
+        if was_empty
+            && let Some(v) = asset.info.video.as_ref().filter(|_| asset.kind() == MediaKind::Video)
+        {
+            adopt_format(self.project.sequence_mut(), v);
+            self.meta_dirty = true;
         }
         let label = match mode {
             InsertMode::Insert => tf("cmd.insert_named", &[("name", &asset.name)]),
@@ -1358,8 +1370,9 @@ impl App {
                     y: row.y as f32,
                     width: width as f32,
                     height: row.h as f32,
-                    name: c.name.clone().into(),
+                    name: c.text.as_deref().map_or_else(|| c.name.clone(), |d| d.label()).into(),
                     is_audio,
+                    is_text: c.is_text(),
                     selected: sel.contains(&c.id),
                     enabled: c.enabled,
                     linked: c.link.is_some(),
@@ -1528,6 +1541,37 @@ fn zoom_label(pps: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title added first has no format of its own: the first media clip
+    /// still sets the sequence's size and rate (a phone clip after a title
+    /// makes the sequence vertical); after it, nothing else does.
+    #[test]
+    fn a_title_placed_first_leaves_the_format_to_the_first_media_clip() {
+        use kadr_core::{AssetId, FrameRate, VideoInfo};
+        let mut p = kadr_project::Project::new("t");
+        (p.sequence_mut().width, p.sequence_mut().height, p.sequence_mut().frame_rate) = (1920, 1080, FrameRate::FPS_25);
+        let title = crate::text_add::new_text_clip(p.sequence(), Time::ZERO, "Привет");
+        kadr_timeline::EditEngine::new().execute(&mut p, EditCommand::AddText { clip: title, track: None }).unwrap();
+        assert!(p.sequence().duration() > Time::ZERO, "the title is on the timeline");
+        assert!(no_media_yet(p.sequence()), "a title is not media");
+        let phone = VideoInfo {
+            width: 1080,
+            height: 1920,
+            frame_rate: Some(FrameRate::FPS_30),
+            variable_frame_rate: false,
+            codec: "h264".into(),
+            pixel_format: "yuv420p".into(),
+            rotation: 0,
+            sar: (1, 1),
+            color: None,
+        };
+        adopt_format(p.sequence_mut(), &phone);
+        let seq = p.sequence();
+        assert_eq!((seq.width, seq.height, seq.frame_rate), (1080, 1920, FrameRate::FPS_30), "the clip's format");
+        let v = seq.tracks.iter().position(|t| t.kind == TrackKind::Video).unwrap();
+        p.sequence_mut().tracks[v].clips.push(Clip::new(AssetId::new(), "phone", TimeRange::new(Time::ZERO, Time::from_secs(5)), Time::from_secs(10)));
+        assert!(!no_media_yet(p.sequence()), "the format is set once");
+    }
 
     #[test]
     fn a_plain_click_inside_a_multi_selection_narrows_it_on_release() {

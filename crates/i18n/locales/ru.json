@@ -869,5 +869,9 @@
   "err.edit.transition_not_found": "переход не найден",
   "cmd.add_text": "Добавление текста",
   "color.recent": "Недавние",
-  "export.err.text_failed": "Не удалось нарисовать текст (на {time})"
+  "export.err.text_failed": "Не удалось нарисовать текст (на {time})",
+  "text.default": "Ваш текст",
+  "tl.tip.add_text": "Добавить текст (Ctrl+T)",
+  "menu.edit.add_text": "Добавить текст",
+  "keys.add_text": "Добавить текст"
 }

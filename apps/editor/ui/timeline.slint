@@ -43,6 +43,8 @@ export struct ClipView {
     height: length,
     name: string,
     is-audio: bool,
+    // A title (text clip): purple, a «Т» mark, its text in the body.
+    is-text: bool,
     selected: bool,
     enabled: bool,
     linked: bool,
@@ -204,11 +206,11 @@ component ClipRect inherits Rectangle {
     height: root.cv.height - 4px;
     border-radius: 4px;
     clip: true;
-    background: root.cv.offline ? #5a2a2a : !root.cv.enabled ? Theme.clip-disabled : root.cv.is-audio ? Theme.clip-audio : Theme.clip-video;
+    background: root.cv.offline ? #5a2a2a : !root.cv.enabled ? Theme.clip-disabled : root.cv.is-text ? Theme.clip-text : root.cv.is-audio ? Theme.clip-audio : Theme.clip-video;
     Rectangle {
         y: 0;
         height: 16px;
-        background: root.cv.offline ? #7a3434 : !root.cv.enabled ? #44474e : root.cv.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
+        background: root.cv.offline ? #7a3434 : !root.cv.enabled ? #44474e : root.cv.is-text ? Theme.clip-text-top : root.cv.is-audio ? Theme.clip-audio-top : Theme.clip-video-top;
     }
     if root.cv.has-thumb && root.cv.width > 40px: Image {
         x: 0;
@@ -218,6 +220,18 @@ component ClipRect inherits Rectangle {
         source: root.cv.thumb;
         image-fit: cover;
         opacity: root.cv.enabled ? 0.9 : 0.4;
+    }
+    if root.cv.is-text && root.cv.width > 40px: Text {
+        x: 6px;
+        y: 18px;
+        width: parent.width - 12px;
+        height: parent.height - 20px;
+        text: root.cv.name;
+        font-size: Theme.font-sm;
+        color: #ffffffb0;
+        wrap: word-wrap;
+        overflow: elide;
+        vertical-alignment: top;
     }
     if root.cv.has-wave: Image {
         x: root.cv.wave-x;
@@ -255,6 +269,7 @@ component ClipRect inherits Rectangle {
         padding-left: root.cv.show-fade-in-handle && (root.cv.fade-in > 0 || root.cv.selected) ? max(6px, root.cv.fade-in-handle-x + 7px) : 6px;
         padding-right: root.cv.fx-label != "" ? root.cv.width - root.cv.fx-x + 4px : root.cv.show-fade-out-handle && (root.cv.fade-out > 0 || root.cv.selected) ? max(6px, root.cv.width - root.cv.fade-out-handle-x + 7px) : 6px;
         spacing: 4px;
+        if root.cv.is-text: Icon { y: 2px; icon: Icons.text; width: 11px; height: 11px; color: #ffffffd0; }
         if root.cv.linked: Icon { y: 2px; icon: Icons.link; width: 11px; height: 11px; color: #ffffffb0; }
         Text {
             text: root.cv.offline ? Tr.t1("tl.clip.offline", root.cv.name) : root.cv.name;
@@ -450,6 +465,7 @@ export component Timeline inherits Rectangle {
                 VerticalLayout { alignment: center; IconButton { icon: Icons.magnet; tooltip: Tr.t("tl.tip.snap"); active: root.snapping; clicked => { root.tool("snap"); } } }
                 VerticalLayout { alignment: center; IconButton { icon: Icons.ripple; tooltip: Tr.t("tl.tip.ripple"); active: root.ripple-mode; clicked => { root.tool("ripple"); } } }
                 VerticalLayout { alignment: center; IconButton { icon: Icons.marker; tooltip: Tr.t("tl.tip.marker"); clicked => { root.tool("marker"); } } }
+                VerticalLayout { alignment: center; IconButton { icon: Icons.text; tooltip: Tr.t("tl.tip.add_text"); clicked => { root.tool("add-text"); } } }
                 Rectangle { width: 1px; background: Theme.border; }
                 VerticalLayout { alignment: center; IconButton { icon: Icons.trash; tooltip: Tr.t("tl.tip.delete"); enabled: root.has-selection; clicked => { root.context-action("delete"); } } }
                 if root.blade-mode: VerticalLayout {

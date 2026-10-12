@@ -57,7 +57,8 @@ pub const SAMPLE_AT: Time = Time::from_secs(5);
 const DEMO_EFFECT_ID: &str = "6b616472-0000-4000-8000-0000000000fe";
 
 /// What the thumbnails show now: the inspected video clip at the playhead
-/// (its middle when the playhead is off it), or the sample.
+/// (its middle when the playhead is off it), or the sample — also for a
+/// title (no media of its own to show the effect on).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThumbBase {
     pub clip: Option<ClipId>,
@@ -71,7 +72,7 @@ pub struct ThumbBase {
 
 pub fn thumb_base(project: &Project, inspected: Option<ClipId>, playhead: Time) -> ThumbBase {
     let seq = project.sequence();
-    let video = inspected.and_then(|id| seq.locate_clip(id)).filter(|(ti, _)| seq.tracks[*ti].kind == TrackKind::Video);
+    let video = inspected.and_then(|id| seq.locate_clip(id)).filter(|&(ti, ci)| seq.tracks[ti].kind == TrackKind::Video && !seq.tracks[ti].clips[ci].is_text());
     match video {
         Some((ti, ci)) => {
             let c = &seq.tracks[ti].clips[ci];
@@ -772,6 +773,10 @@ mod tests {
         assert_ne!(b.state, 0, "the clip's look is part of the key");
         assert_eq!(thumb_base(&p, Some(id), Time::from_secs(3)).at, Time::from_secs(15), "playhead off the clip: its middle");
         assert_eq!(thumb_base(&p, Some(aid), Time::ZERO).clip, None, "a sound clip has no picture: the sample");
+        let title = Clip::new_text(kadr_project::TextDoc::starter("Привет", 1080), Time::from_secs(40), Time::from_secs(5));
+        let tid = title.id;
+        p.sequence_mut().tracks[0].clips.push(title);
+        assert_eq!(thumb_base(&p, Some(tid), Time::from_secs(41)).clip, None, "a title has no media: the sample");
         assert_eq!(thumb_base(&p, None, Time::ZERO), ThumbBase { clip: None, at: SAMPLE_AT, frame: SAMPLE_AT, state: 0 });
     }
 

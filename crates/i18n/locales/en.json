@@ -840,5 +840,9 @@
   "err.edit.transition_not_found": "transition not found",
   "cmd.add_text": "Add text",
   "color.recent": "Recent",
-  "export.err.text_failed": "Couldn't draw the text (at {time})"
+  "export.err.text_failed": "Couldn't draw the text (at {time})",
+  "text.default": "Your text",
+  "tl.tip.add_text": "Add text (Ctrl+T)",
+  "menu.edit.add_text": "Add text",
+  "keys.add_text": "Add text"
 }

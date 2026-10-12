@@ -86,6 +86,7 @@ impl App {
                 self.refresh_status();
             }
             "marker" => self.add_marker(),
+            "add-text" => self.add_text_at_playhead(),
             "add-video-track" => {
                 self.execute(EditCommand::AddTrack { kind: kadr_project::TrackKind::Video });
             }

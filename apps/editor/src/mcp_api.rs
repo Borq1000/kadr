@@ -212,6 +212,7 @@ const UI_MENU_ALLOWED: &[&str] = &[
     "select-all",
     "deselect",
     "marker",
+    "add-text",
     "add-video-track",
     "add-audio-track",
     "toggle-ai",
@@ -860,7 +861,7 @@ mod tests {
 
     #[test]
     fn ui_menu_allowed_lets_dialog_free_ids_through() {
-        for id in ["undo", "redo", "split", "delete", "select-all", "marker", "settings"] {
+        for id in ["undo", "redo", "split", "delete", "select-all", "marker", "add-text", "settings"] {
             assert!(ui_menu_allowed(id).is_ok(), "{id} should be allowed");
         }
     }

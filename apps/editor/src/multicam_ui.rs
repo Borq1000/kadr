@@ -351,16 +351,12 @@ impl App {
             cmds.push(EditCommand::InsertClip { track: atrack, clip: a, mode });
         }
         cmds.insert(0, EditCommand::InsertClip { track: vtrack, clip: v, mode });
-        if self.project.sequence().duration() == Time::ZERO {
-            if let Some(info) = self.project.asset(first).and_then(|a| a.info.video.clone()) {
-                let seq = self.project.sequence_mut();
-                seq.width = info.width.max(2) & !1;
-                seq.height = info.height.max(2) & !1;
-                if let Some(fr) = info.frame_rate {
-                    seq.frame_rate = fr;
-                }
-                self.meta_dirty = true;
-            }
+        // The first media clip sets the format; a title placed before it doesn't count.
+        if crate::timeline_ui::no_media_yet(self.project.sequence())
+            && let Some(info) = self.project.asset(first).and_then(|a| a.info.video.clone())
+        {
+            crate::timeline_ui::adopt_format(self.project.sequence_mut(), &info);
+            self.meta_dirty = true;
         }
         let label = match mode {
             InsertMode::Insert => tf("cmd.insert_named", &[("name", &group.name)]),
