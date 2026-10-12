@@ -28,6 +28,7 @@ mod multicam_ui;
 mod persistence;
 mod preview;
 mod preview_cpu;
+mod preview_edit;
 mod scene_source;
 mod seq_format;
 mod settings_ui;

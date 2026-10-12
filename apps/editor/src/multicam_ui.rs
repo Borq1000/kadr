@@ -126,6 +126,10 @@ impl App {
     }
 
     fn mc_refresh_dialog(&mut self, open: bool) {
+        if open {
+            // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+            self.give_keyboard_to_editor();
+        }
         let ui = self.ui();
         let Some(d) = &self.mc.dialog else {
             ui.set_mc_open(false);

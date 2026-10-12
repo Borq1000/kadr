@@ -112,6 +112,19 @@ impl App {
             return false;
         }
         if ctrl {
+            // Ctrl+Enter finishes typing — on the frame or in the
+            // inspector's field — like Esc; the selection stays (Enter alone
+            // is a new line there).
+            if is(text, Key::Return) || text == "\r" {
+                if self.preview_edit.typing.is_some() {
+                    self.finish_inline_typing();
+                    return true;
+                }
+                if self.text_field_focused {
+                    self.end_field_typing();
+                    return true;
+                }
+            }
             let k = latin_key(text);
             match (k.as_str(), shift) {
                 ("z", false) => self.undo(),
@@ -148,22 +161,15 @@ impl App {
         } else if is(text, Key::Delete) || is(text, Key::Backspace) {
             self.delete_selection(shift || self.tl.ripple);
         } else if is(text, Key::Escape) {
-            // No drag is cancelled by Esc in V1 (spec §6.2): during a timeline
-            // drag Esc does nothing — the drag ends on release as usual and
-            // the selection stays. Otherwise Esc closes the topmost overlay
-            // first, then ends picking an effect point (effects spec §6.2;
-            // the selection stays), then clears the selection. In a title's
-            // text field it first ends the typing (one undo entry) and gives
-            // the keyboard back; the selection stays (titles Review Focus 1).
-            if self.text_field_focused {
-                self.text_field_focused = false;
-                self.commit_text_session();
-                self.ui().invoke_focus_editor();
-                return true;
-            }
-            if self.tl.drag.is_some() {
-                return true;
-            }
+            // Esc closes the topmost dialog first (TX-R20). Then, typing in a
+            // title — on the frame or in its inspector field — it ends the
+            // typing (one undo entry) and gives the keyboard back; the
+            // selection stays (titles Review Focus 1). No drag is cancelled
+            // by Esc in V1 (spec §6.2): during a timeline or preview drag Esc
+            // does nothing — the drag ends on release as usual and the
+            // selection stays. Otherwise Esc ends picking an effect point
+            // (effects spec §6.2; the selection stays), then clears the
+            // selection.
             let ui = self.ui();
             if ui.get_confirm_open() {
                 self.confirm_answer(false);
@@ -187,6 +193,17 @@ impl App {
             }
             if ui.get_welcome_open() {
                 ui.set_welcome_open(false);
+                return true;
+            }
+            if self.preview_edit.typing.is_some() {
+                self.finish_inline_typing();
+                return true;
+            }
+            if self.text_field_focused {
+                self.end_field_typing();
+                return true;
+            }
+            if self.tl.drag.is_some() || self.preview_edit.dragging() {
                 return true;
             }
             if self.fx.picking.is_some() {
@@ -240,6 +257,14 @@ impl App {
             }
         }
         true
+    }
+
+    /// The inspector's text field gives the keyboard back: its typing is
+    /// recorded (one entry); the selection stays.
+    fn end_field_typing(&mut self) {
+        self.text_field_focused = false;
+        self.commit_text_session();
+        self.ui().invoke_focus_editor();
     }
 
     pub fn set_in_out(&mut self, is_in: bool) {

@@ -3,7 +3,7 @@
 //! drop point) on the topmost video track when it is free there and not V1
 //! (the footage's, TX-R11), else on a new track above
 //! (`EditCommand::AddText`), one undo entry; the clip is selected, brought
-//! into view and inline typing starts (`text_added`, Task 8).
+//! into view and typing on the frame starts (`text_added`).
 
 use crate::app::App;
 use kadr_core::{ClipId, Time, TrackId};
@@ -54,8 +54,11 @@ impl App {
         Some(id)
     }
 
-    /// After a text was added (Task 8: starts inline typing with the text selected).
-    pub fn text_added(&mut self, _id: ClipId) {}
+    /// After a text was added: typing on the frame starts with the text
+    /// selected — just type to replace it (titles spec §1).
+    pub fn text_added(&mut self, id: ClipId) {
+        self.begin_inline_typing(id);
+    }
 }
 
 #[cfg(test)]

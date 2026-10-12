@@ -141,6 +141,7 @@ impl App {
             ui.set_preview_clip("".into());
             ui.set_preview_has_frame(false);
             ui.set_preview_loading(false);
+            ui.set_frame_shown(false);
             return;
         }
         let t = self.playhead.min((seq.duration() - seq.frame_rate.frame_duration()).max(Time::ZERO));
@@ -157,6 +158,8 @@ impl App {
         // The focused effect's point in this frame (its zoom, crop, the
         // playhead) — in the scene just evaluated, not evaluated again.
         self.fx_update_marker_in(Some(&scene));
+        // And the selected clip's frame and handles (titles spec §6.2).
+        self.refresh_preview_frame(Some(&scene));
     }
 
     /// The snapshot the preview shows (taken now if the project changed),
@@ -226,6 +229,10 @@ impl App {
         if dur == Time::ZERO {
             return;
         }
+        // The preview is not edited while playing: a drag in progress is
+        // recorded as it was last shown, typing on the frame ends.
+        self.finish_preview_drag();
+        self.finish_inline_typing();
         if self.playhead >= dur - seq.frame_rate.frame_duration() {
             self.playhead = Time::ZERO;
         }

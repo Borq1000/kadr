@@ -952,5 +952,8 @@
   "text.unit.letter": "Letters",
   "text.unit.word": "Words",
   "text.unit.line": "Lines",
-  "text.unit.block": "Whole"
+  "text.unit.block": "Whole",
+  "cmd.preview_move": "Move",
+  "cmd.preview_scale": "Scale",
+  "cmd.preview_rotate": "Rotate"
 }

@@ -16,7 +16,7 @@ use kadr_timeline::{ClipProperty, EditCommand};
 use slint::{Model, ModelRc, VecModel};
 use std::collections::BTreeMap;
 
-fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
+pub(crate) fn apply(c: &mut Clip, prop: &str, v: f64, frame: Time) {
     // Fade durations from a slider: seconds → whole frames (rounded).
     let frames = |secs: f64| anim_ui::whole_frames(Time::from_secs_f64(secs.max(0.0)), frame);
     let t = &mut c.transform;
@@ -287,6 +287,9 @@ impl App {
         self.refresh_effects();
         // And the focused effect's point on the preview (spec §6.2).
         self.fx_update_marker();
+        // And the selected clip's frame (titles spec §6.2): a selection made
+        // between frames moves it; typing on another title's frame ends.
+        self.preview_frame_follow();
     }
 
     pub fn inspector_live(&mut self, prop: &str, v: f32) {

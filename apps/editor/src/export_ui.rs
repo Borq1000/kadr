@@ -51,6 +51,8 @@ impl App {
         if self.project.sequence().duration() == Time::ZERO {
             return self.toast_warn(t("toast.nothing_to_export"));
         }
+        // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+        self.give_keyboard_to_editor();
         if self.export.job.is_none() {
             self.export.done = false;
             self.export.failed = false;

@@ -88,6 +88,8 @@ impl App {
     }
 
     pub fn open_settings(&mut self, tab: i32) {
+        // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+        self.give_keyboard_to_editor();
         self.settings.settings_tab = tab;
         self.refresh_settings();
         self.ui().set_settings_open(true);

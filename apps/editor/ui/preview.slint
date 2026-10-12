@@ -16,6 +16,24 @@ export struct DevRow {
     value: string,
 }
 
+/// A handle of the selected clip's frame (titles spec §6.2): canvas
+/// fractions; the rotation handle stands 24 px off that point along
+/// (`dx`, `dy`) — a unit vector, the same on the canvas and on screen —
+/// so it keeps its distance at any zoom.
+export struct HandleView {
+    x: float,
+    y: float,
+    rotate: bool,
+    dx: float,
+    dy: float,
+}
+
+/// A snapping guide: a canvas fraction across the whole canvas.
+export struct GuideView {
+    vertical: bool,
+    at: float,
+}
+
 export component Preview inherits Rectangle {
     in property <image> frame;
     in property <bool> has-frame;
@@ -49,6 +67,28 @@ export component Preview inherits Rectangle {
     in property <float> point-x;
     in property <float> point-y;
     callback point-picked(float, float);
+    // Editing on the preview (titles spec §1, §6.2): the selected clip's
+    // frame and handles, the snapping guides, typing on the frame.
+    in property <bool> frame-shown;
+    in property <string> frame-path;          // "M x y L … Z" in a 1000 × 1000 canvas box
+    in property <[HandleView]> handles;       // none for a clip on a locked track
+    in property <[GuideView]> guides;
+    in property <bool> typing;
+    in property <float> type-x;
+    in property <float> type-y;
+    in property <float> type-w;
+    in property <float> type-font;            // the text's size, a fraction of the canvas height
+    in-out property <string> type-text;
+    // 0 down, 1 move, 2 up or cancel; canvas fractions, Shift, the canvas width in px.
+    callback edit-pointer(int, float, float, bool, float);
+    callback edit-double(float, float, float);
+    callback type-edited(string);
+    callback type-done();
+    /// Typing on the frame starts: the field takes the keyboard, its whole text selected.
+    public function begin-typing() {
+        tin.focus();
+        tin.select-all();
+    }
     callback transport(string);
     callback set-quality(int);
     callback set-zoom(int);
@@ -134,6 +174,39 @@ export component Preview inherits Rectangle {
                     drop-shadow-color: #000000a0;
                     Rectangle { width: 4px; height: 4px; border-radius: 2px; background: #ffffff; }
                 }
+                // The selected clip's frame: a thin line round its turned box,
+                // 8 px corner handles, a round rotation handle above the top
+                // edge (none while playing).
+                if root.frame-shown && !root.playing: Path {
+                    width: parent.width;
+                    height: parent.height;
+                    viewbox-width: 1000;
+                    viewbox-height: 1000;
+                    fit: fill;
+                    commands: root.frame-path;
+                    stroke: #ffffff;
+                    stroke-width: 1px;
+                    fill: transparent;
+                }
+                for h in root.handles: Rectangle {
+                    visible: root.frame-shown && !root.playing;
+                    x: parent.width * h.x + h.dx * 24px - self.width / 2;
+                    y: parent.height * h.y + h.dy * 24px - self.height / 2;
+                    width: h.rotate ? 10px : 8px;
+                    height: h.rotate ? 10px : 8px;
+                    border-radius: h.rotate ? 5px : 1px;
+                    background: #ffffff;
+                    border-width: 1px;
+                    border-color: #00000090;
+                }
+                for g in root.guides: Rectangle {
+                    visible: !root.playing;
+                    x: g.vertical ? parent.width * g.at : 0;
+                    y: g.vertical ? 0 : parent.height * g.at;
+                    width: g.vertical ? 1px : parent.width;
+                    height: g.vertical ? parent.height : 1px;
+                    background: #ff4fd8;
+                }
             }
             // Pick mode: the whole viewport takes the click — one in the
             // margin round the frame is a miss, and says so — reported as
@@ -141,6 +214,57 @@ export component Preview inherits Rectangle {
             if root.picking: TouchArea {
                 mouse-cursor: crosshair;
                 clicked => { root.point-picked((self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height); }
+            }
+            // Editing on the preview: a press selects the clip under it or
+            // grabs the selected one's handle; a drag moves, scales or turns
+            // it; a double-click on a title types into it.
+            if !root.picking && !root.playing && root.has-frame: TouchArea {
+                mouse-cursor: root.frame-shown && root.handles.length > 0 ? move : default;
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                        root.edit-pointer(0, (self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height, e.modifiers.shift, canvas.width / 1px);
+                    }
+                    if (e.kind == PointerEventKind.move && self.pressed) {
+                        root.edit-pointer(1, (self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height, e.modifiers.shift, canvas.width / 1px);
+                    }
+                    if ((e.button == PointerEventButton.left && e.kind == PointerEventKind.up) || e.kind == PointerEventKind.cancel) {
+                        root.edit-pointer(2, (self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height, e.modifiers.shift, canvas.width / 1px);
+                    }
+                }
+                double-clicked => { root.edit-double((self.mouse-x - canvas.x) / canvas.width, (self.mouse-y - canvas.y) / canvas.height, canvas.width / 1px); }
+            }
+            // Typing on the frame: the field over the text block (interface
+            // font, a dark backdrop); the real text redraws beneath it.
+            Rectangle {
+                visible: root.typing;
+                x: canvas.x + root.type-x * canvas.width;
+                y: canvas.y + root.type-y * canvas.height;
+                width: max(80px, root.type-w * canvas.width);
+                height: max(30px, tin.preferred-height + 10px);
+                border-radius: 4px;
+                background: #000000a8;
+                border-width: 1px;
+                border-color: Theme.accent;
+                tin := TextInput {
+                    x: 5px;
+                    y: 5px;
+                    width: parent.width - 10px;
+                    height: parent.height - 10px;
+                    text <=> root.type-text;
+                    single-line: false;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    color: #ffffff;
+                    font-size: clamp(root.type-font * canvas.height, 13px, 64px);
+                    selection-background-color: Theme.accent.with-alpha(0.5);
+                    edited => { root.type-edited(self.text); }
+                    // Focus elsewhere (a click on the timeline, the inspector) finishes typing.
+                    changed has-focus => {
+                        if (!self.has-focus && root.typing) {
+                            root.type-done();
+                        }
+                    }
+                }
             }
             if root.clip-name != "" && root.empty-kind == 0: Rectangle {
                 x: 10px; y: 10px;

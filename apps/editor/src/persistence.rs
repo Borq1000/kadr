@@ -134,6 +134,8 @@ impl App {
     }
 
     pub fn ask(&mut self, title: &str, msg: &str, ok: &str, alt: &str, danger: bool, c: Confirm) {
+        // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+        self.give_keyboard_to_editor();
         let ui = self.ui();
         ui.set_confirm_title(title.into());
         ui.set_confirm_message(msg.into());
@@ -211,6 +213,8 @@ impl App {
     // ------------------------------------------------------------ prompt
 
     pub fn prompt(&mut self, title: &str, label: &str, value: &str, p: Prompt) {
+        // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+        self.give_keyboard_to_editor();
         let ui = self.ui();
         ui.set_prompt_title(title.into());
         ui.set_prompt_label(label.into());
@@ -264,6 +268,11 @@ impl App {
         self.project = project;
         self.live_edit.forget();
         self.text_session.forget();
+        // A drag or typing on the frame belonged to the project that was.
+        if std::mem::take(&mut self.preview_edit).typing.is_some() {
+            self.ui().set_typing(false);
+            self.ui().invoke_focus_editor();
+        }
         self.text_scope = None;
         self.fx_reset();
         self.path = path;
@@ -375,6 +384,8 @@ impl App {
     }
 
     pub fn show_welcome(&mut self) {
+        // A dialog takes the keyboard: typing in a title is recorded first (TX-R20).
+        self.give_keyboard_to_editor();
         self.refresh_welcome();
         self.ui().set_welcome_open(true);
     }

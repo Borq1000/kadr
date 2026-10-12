@@ -3,7 +3,7 @@ import { Tr } from "i18n.slint";
 import { Icon, IconButton, Splitter, Badge, ProgressBar, MenuButton, MenuEntry, ToastCard, ToastView, Button, Tooltip, KeyState } from "widgets.slint";
 import { MediaLibrary, AssetView, BinView } from "media.slint";
 import { EffectsPanel, FxCategoryView, FxCardView, FxRow, FxParamRow } from "effects.slint";
-import { Preview, AngleView, DevRow } from "preview.slint";
+import { Preview, AngleView, DevRow, HandleView, GuideView } from "preview.slint";
 import { Timeline, TrackView, ClipView, ClipMark, KeyMark, TickView, MarkerView, TransitionView } from "timeline.slint";
 import { Inspector, InspectorData, MarkerRow, ShotRow } from "inspector.slint";
 import { AiPanel, ChatMsg, PlanView, PlanItemView, OfferView } from "ai.slint";
@@ -11,7 +11,7 @@ import { ColorUtil } from "color_picker.slint";
 import { TextInspectorData, FontRow } from "text_inspector.slint";
 import { MulticamDialog, McAngleRow, ExportDialog, ExportState, SettingsDialog, SettingsState, ProviderRow, ShortcutRow, ConfirmDialog, PromptDialog, JobsPopup, JobView, WelcomeScreen, RecentView } from "dialogs.slint";
 
-export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView, ColorUtil, TextInspectorData, FontRow }
+export { ShotRow, ClipMark, KeyMark, McAngleRow, AngleView, DevRow, HandleView, GuideView, Tr, AssetView, BinView, FxCategoryView, FxCardView, FxRow, FxParamRow, TrackView, ClipView, TickView, MarkerView, TransitionView, InspectorData, MarkerRow, KeyState, ChatMsg, PlanView, PlanItemView, OfferView, ExportState, SettingsState, ProviderRow, ShortcutRow, JobView, ToastView, MenuEntry, RecentView, ColorUtil, TextInspectorData, FontRow }
 
 export component AppWindow inherits Window {
     title: (root.dirty ? "● " : "") + root.project-name + " — Kadr";
@@ -85,6 +85,22 @@ export component AppWindow inherits Window {
     in property <bool> fx-point-shown;
     in property <float> fx-point-x;
     in property <float> fx-point-y;
+    // Editing on the preview (titles spec §1, §6.2): the selected clip's
+    // frame and handles, the snapping guides, typing on the frame.
+    in property <bool> frame-shown;
+    in property <string> frame-path;
+    in property <[HandleView]> handles;
+    in property <[GuideView]> guides;
+    in property <bool> typing;
+    in property <float> type-x;
+    in property <float> type-y;
+    in property <float> type-w;
+    in property <float> type-font;
+    in-out property <string> type-text;
+    callback edit-pointer(int, float, float, bool, float);
+    callback edit-double(float, float, float);
+    callback type-edited(string);
+    callback type-done();
     in property <[AngleView]> angles;
     in property <int> active-angle;
     callback angle-clicked(int);
@@ -297,6 +313,8 @@ export component AppWindow inherits Window {
     callback open-recent(int);
 
     public function focus-editor() { keys.focus(); }
+    /// Typing on the frame starts (the field is placed and shown first).
+    public function begin-inline-typing() { preview-pane.begin-typing(); }
 
     keys := FocusScope {
         width: 100%;
@@ -481,7 +499,7 @@ export component AppWindow inherits Window {
                     moved(d) => { root.library-width = clamp(self.start + d, 220px, 560px); }
                     released => { root.layout-changed(); }
                 }
-                Preview {
+                preview-pane := Preview {
                     horizontal-stretch: 1;
                     min-width: 380px;
                     max-height: 100000px;
@@ -517,6 +535,21 @@ export component AppWindow inherits Window {
                     point-x: root.fx-point-x;
                     point-y: root.fx-point-y;
                     point-picked(x, y) => { root.preview-point(x, y); root.focus-editor(); }
+                    frame-shown: root.frame-shown;
+                    frame-path: root.frame-path;
+                    handles: root.handles;
+                    guides: root.guides;
+                    typing: root.typing;
+                    type-x: root.type-x;
+                    type-y: root.type-y;
+                    type-w: root.type-w;
+                    type-font: root.type-font;
+                    type-text <=> root.type-text;
+                    // A press gives the keyboard back to the editor (Rust, TX-R20).
+                    edit-pointer(k, x, y, s, w) => { root.edit-pointer(k, x, y, s, w); }
+                    edit-double(x, y, w) => { root.edit-double(x, y, w); }
+                    type-edited(t) => { root.type-edited(t); }
+                    type-done => { root.type-done(); }
                 }
                 Splitter {
                     property <length> start;

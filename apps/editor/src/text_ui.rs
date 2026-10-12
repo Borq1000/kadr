@@ -360,7 +360,7 @@ impl App {
 
     /// The inspector's header follows an auto-named title's name while
     /// typing (the rest of the inspector waits for the session's end).
-    fn show_typed_name(&mut self, id: ClipId) {
+    pub(crate) fn show_typed_name(&mut self, id: ClipId) {
         let Some(name) = self.project.sequence().clip(id).map(|c| c.name.clone()) else { return };
         let ui = self.ui();
         let mut d = ui.get_inspector();

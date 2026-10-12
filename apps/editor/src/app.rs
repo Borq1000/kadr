@@ -109,6 +109,8 @@ pub struct App {
     pub text_scope_clip: Option<ClipId>,
     /// The inspector's text field has the keyboard (Esc ends typing there).
     pub text_field_focused: bool,
+    /// Editing on the preview: a handle drag, typing on the frame (titles spec §1, §6.2).
+    pub preview_edit: crate::preview_edit::PreviewEdit,
     /// The «Эффекты» tab: filters, the hovered card's preview, a card drag.
     pub fx: crate::effects_ui::FxUi,
     /// Last inspector refresh driven by the moving playhead (~10 Hz while playing).
@@ -232,6 +234,7 @@ pub fn run(dirs: AppDirs, mut settings: AppSettings, flags: crate::mcp_env::Flag
         text_scope: None,
         text_scope_clip: None,
         text_field_focused: false,
+        preview_edit: Default::default(),
         fx: Default::default(),
         inspector_refreshed: None,
         library_drag: None,
@@ -446,6 +449,10 @@ fn wire_callbacks(ui: &AppWindow) {
     cb!(ui.on_set_zoom, |z| |app: &mut App| app.set_preview_zoom(z));
     cb!(ui.on_scrub, |f| |app: &mut App| app.scrub(f));
     cb!(ui.on_preview_point, |x, y| |app: &mut App| app.fx_point_picked(x, y));
+    cb!(ui.on_edit_pointer, |k, x, y, s, w| |app: &mut App| app.preview_pointer(k, x, y, s, w));
+    cb!(ui.on_edit_double, |x, y, w| |app: &mut App| app.preview_double(x, y, w));
+    cb!(ui.on_type_edited, |t| |app: &mut App| app.inline_typed(&t));
+    cb!(ui.on_type_done, | | |app: &mut App| app.inline_typing_left());
 
     cb!(ui.on_tl_pointer, |k, x, y, b, s, c, a| |app: &mut App| app.tl_pointer(k, x, y, b, s, c, a));
     cb!(ui.on_tl_scroll, |dx, dy, c, s| |app: &mut App| app.tl_scroll(dx, dy, c, s));

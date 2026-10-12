@@ -981,5 +981,8 @@
   "text.unit.letter": "Буквы",
   "text.unit.word": "Слова",
   "text.unit.line": "Строки",
-  "text.unit.block": "Целиком"
+  "text.unit.block": "Целиком",
+  "cmd.preview_move": "Перемещение",
+  "cmd.preview_scale": "Масштаб",
+  "cmd.preview_rotate": "Поворот"
 }
