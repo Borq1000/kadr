@@ -1,11 +1,14 @@
 //! Text clips end to end (titles spec §5, §9): project → evaluator →
 //! resolver (the text picture draws itself) → CPU renderer. The preview's
 //! frame equals the export's; a 4K export is drawn at 4K, not upscaled; a
-//! font this machine lacks still renders and is kept.
+//! font this machine lacks still renders and is kept; the text block's
+//! centre lands where the transform puts it; what is not text shows what
+//! lies below. Goldens hold bundled fonts only (system emoji vary by
+//! machine: they get a tolerant check).
 
 use kadr_core::perf::FramePerf;
-use kadr_core::{FrameRate, Time};
-use kadr_playback::testing::FakeDecoders;
+use kadr_core::{FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
+use kadr_playback::testing::{FakeDecoders, FakeMedia};
 use kadr_playback::{Mode, Resolver, ResolverConfig, SceneSource};
 use kadr_project::*;
 use kadr_project_scenes::ProjectScenes;
@@ -22,9 +25,27 @@ fn project(doc: TextDoc, w: u32, h: u32) -> Project {
     p
 }
 
+/// A 60 s 1080p video (a temporary file, so it is online) on a new
+/// bottom video track, decoded by the fake as a flat colour (R = 70, G =
+/// the frame index, B = 0).
+fn with_background(p: &mut Project, dir: &tempfile::TempDir) {
+    let path = dir.path().join("bg.mp4");
+    std::fs::write(&path, b"x").unwrap();
+    let v = VideoInfo { width: 1920, height: 1080, frame_rate: Some(FrameRate::FPS_25), variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation: 0, sar: (1, 1), color: None };
+    let a = MediaAsset::new(path, MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(60), container: "mp4".into(), size_bytes: 0, video: Some(v), audio: None, timecode: None });
+    let seq = p.sequence_mut();
+    seq.tracks.insert(0, Track::new(TrackKind::Video, "V0"));
+    seq.tracks[0].clips.push(Clip::new(a.id, "bg", TimeRange::new(Time::ZERO, Time::from_secs(5)), Time::ZERO));
+    p.assets.push(a);
+}
+
 fn render(p: &Project, bypass: bool, out: SizeU, mode: Mode) -> Vec<u8> {
     let scenes = ProjectScenes::new(p, bypass);
-    let r = Resolver::new(Arc::new(FakeDecoders::new(Duration::ZERO, Duration::ZERO)), ResolverConfig::default());
+    let fake = FakeDecoders::new(Duration::ZERO, Duration::ZERO);
+    for a in &p.assets {
+        fake.add(&a.path, FakeMedia { tag: 70, ..Default::default() });
+    }
+    let r = Resolver::new(Arc::new(fake), ResolverConfig::default());
     let quality = if mode == Mode::Export { RenderQuality::Export } else { RenderQuality::PreviewHigh };
     let scene = scenes.scene_at(Time::from_secs(1), &OutputSpec::new(out, quality));
     let inputs = r.prepare(&scene, &scenes, mode, &mut FramePerf::default());
@@ -35,6 +56,23 @@ fn render(p: &Project, bypass: bool, out: SizeU, mode: Mode) -> Vec<u8> {
 
 fn lit(px: &[u8]) -> usize {
     px.as_chunks::<4>().0.iter().filter(|p| p[0] > 128).count()
+}
+
+fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * w + x) * 4) as usize;
+    [px[i], px[i + 1], px[i + 2], px[i + 3]]
+}
+
+/// The bounding box `(x0, y0, x1, y1)` (ends exclusive) of the pixels `f` picks.
+fn bbox(px: &[u8], w: u32, f: impl Fn(&[u8; 4]) -> bool) -> (u32, u32, u32, u32) {
+    let mut b = (u32::MAX, u32::MAX, 0, 0);
+    for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
+        if f(p) {
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            b = (b.0.min(x), b.1.min(y), b.2.max(x + 1), b.3.max(y + 1));
+        }
+    }
+    b
 }
 
 /// Σ of squared horizontal steps of the red channel: a sharper edge of
@@ -64,12 +102,69 @@ fn upscale2(px: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 #[test]
 fn a_title_renders_and_the_preview_matches_the_export() {
-    let p = project(TextDoc::starter("Привет, мир! 🎉", 1080), 1920, 1080);
+    let p = project(TextDoc::starter("Привет, мир! Hello", 1080), 1920, 1080);
     let out = SizeU::new(480, 270);
     let preview = render(&p, false, out, Mode::Scrub { generation: 1 });
     assert!(lit(&preview) > 200, "white letters on black");
     assert_eq!(preview, render(&p, false, out, Mode::Export), "one picture: preview and export");
     golden::check("text_title_quarter", &preview, out);
+}
+
+/// Colour emoji come from the system's emoji font (titles spec §5.1), so
+/// they are checked loosely, not by a golden: in colour, after the word.
+#[test]
+fn an_emoji_draws_in_colour() {
+    let p = project(TextDoc::starter("Гол 🎉", 1080), 1920, 1080);
+    let out = SizeU::new(480, 270);
+    let px = render(&p, false, out, Mode::Export);
+    assert_eq!(px, render(&p, false, out, Mode::Scrub { generation: 1 }), "preview = export");
+    let colourful = |p: &[u8; 4]| p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 80;
+    let count = px.as_chunks::<4>().0.iter().filter(|p| colourful(p)).count();
+    assert!(count > 40, "coloured pixels: {count}");
+    let (x0, _, x1, _) = bbox(&px, out.w, |p| p[0] > 128 || colourful(p));
+    let (cx0, _, cx1, _) = bbox(&px, out.w, colourful);
+    assert!(cx0 > (x0 + x1) / 2 && cx1 <= x1, "the colour is the emoji's, after the word: {cx0}..{cx1} in {x0}..{x1}");
+}
+
+/// M1: the text block — framed here by a block plaque — is centred on the
+/// canvas centre + (x, y), whatever its lines; a wrapped left- or
+/// right-aligned block keeps its box (the wrap width) there, its lines
+/// flush with the box's edge.
+#[test]
+fn the_text_block_lands_where_the_transform_puts_it() {
+    let (px, py) = (30.0f32, 12.0f32);
+    let plaque = Plaque { per_line: false, colour: Rgba8::rgba(0, 80, 255, 255), radius: 0.0, padding_x: px, padding_y: py };
+    let wrapped = |align: Align| {
+        let mut d = TextDoc::starter("Длинный заголовок на несколько строк подряд", 720);
+        (d.paragraph.wrap, d.paragraph.align) = (Some(500.0), align);
+        d
+    };
+    let cases = [
+        ("one line", TextDoc::starter("Гол", 720), None),
+        ("two lines", TextDoc::starter("Гол\nи ещё строка", 720), None),
+        ("left", wrapped(Align::Left), Some(Align::Left)),
+        ("right", wrapped(Align::Right), Some(Align::Right)),
+    ];
+    for (name, mut doc, align) in cases {
+        doc.style.plaque = Some(plaque);
+        let mut p = project(doc.clone(), 1280, 720);
+        let tr = &mut p.sequence_mut().tracks[0].clips[0].transform;
+        (tr.x, tr.y) = (150.0, -100.0);
+        let out = SizeU::new(1280, 720);
+        let frame = render(&p, false, out, Mode::Export);
+        let b = bbox(&frame, out.w, |p| p[0] < 100 && p[2] > 128);
+        let (cx, cy) = (640.0 + 150.0, 360.0 - 100.0);
+        let lh = kadr_text::layout(&doc).height as f64;
+        let near = |a: f64, b: f64| (a - b).abs() <= 1.0;
+        // The plaque spans the block and its padding (± its anti-aliased rows).
+        assert!(near((b.1 + b.3) as f64 / 2.0, cy) && ((b.3 - b.1) as f64 - (lh + 2.0 * py as f64)).abs() <= 3.0, "{name}: rows {}..{} (the block is {lh} px high)", b.1, b.3);
+        let ok = match align {
+            None => near((b.0 + b.2) as f64 / 2.0, cx),
+            Some(Align::Left) => near(b.0 as f64, cx - 250.0 - px as f64),
+            _ => near(b.2 as f64, cx + 250.0 + px as f64),
+        };
+        assert!(ok, "{name}: columns {}..{} (centre {cx})", b.0, b.2);
+    }
 }
 
 #[test]
@@ -111,14 +206,33 @@ fn before_view_keeps_the_text_and_drops_its_effects() {
     assert_eq!(scenes.top_clip(&scene), Some(p.sequence().tracks[0].clips[0].id), "the preview names the text clip");
 }
 
+/// Rich runs, a coloured outline and the shadow over a picture: between
+/// the letters the picture below shows (the raster is transparent there).
 #[test]
 fn rich_text_full_resolution_golden() {
     let mut doc = TextDoc::starter("Счёт 2:1 — победа!", 1080);
     doc.style_range(9..12, &RunStyle { fill: Some(Fill::solid(Rgba8::rgba(255, 210, 0, 255))), size: Some(130.0), ..Default::default() });
-    doc.style.outlines = vec![Outline { width: 5.0, colour: Rgba8::BLACK }];
-    let p = project(doc, 1920, 1080);
+    doc.style.outlines = vec![Outline { width: 5.0, colour: Rgba8::rgba(0, 80, 255, 255) }];
+    let mut p = project(doc.clone(), 1920, 1080);
+    let dir = tempfile::tempdir().unwrap();
+    with_background(&mut p, &dir);
     let out = SizeU::new(960, 540);
-    golden::check("text_rich_full", &render(&p, false, out, Mode::Export), out);
+    let px = render(&p, false, out, Mode::Export);
+    let bg = pixel(&px, out.w, 5, 5);
+    assert!(bg[0] > 40 && bg[1] > 10 && bg[2] < 10, "the picture below: {bg:?}");
+    // The middle of the widest gap between two glyphs of the line, half
+    // way down the line: inside the text's bounds, outside its ink.
+    let laid = kadr_text::layout(&doc);
+    let mut boxes: Vec<(f32, f32)> = laid.glyphs.iter().filter(|g| g.visible).map(|g| (g.x, g.x + g.advance)).collect();
+    boxes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let gap = boxes.windows(2).map(|w| (w[0].1, w[1].0)).max_by(|a, b| (a.1 - a.0).total_cmp(&(b.1 - b.0))).unwrap();
+    assert!(gap.1 - gap.0 > 15.0, "a word gap: {gap:?}");
+    let line = &laid.lines[0];
+    let (gx, gy) = ((gap.0 + gap.1) / 2.0 - laid.width / 2.0, (line.top + line.bottom) / 2.0 - laid.height / 2.0);
+    let (x, y) = (((960.0 + gx) / 2.0) as u32, ((540.0 + gy) / 2.0) as u32);
+    let between = pixel(&px, out.w, x, y);
+    assert!(between.iter().zip(bg).all(|(a, b)| a.abs_diff(b) <= 12), "between the letters at ({x}, {y}): {between:?}, the picture: {bg:?}");
+    golden::check("text_rich_full", &px, out);
 }
 
 mod golden {

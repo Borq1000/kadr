@@ -33,12 +33,13 @@
 //! A media layer not decoded by its frame's deadline shows the newest frame
 //! its decoder already produced (at most [`PlayerConfig::max_behind`]
 //! earlier), so the picture keeps moving at whatever rate decoding allows
-//! instead of freezing. A frame is presented only if some layer shows newer
-//! content than the frame before it — a later source frame, or another
-//! picture of a text layer (an animated title keeps moving over a lagging
-//! video); otherwise it is dropped (the picture on screen is the same).
-//! Presented frames stay within one frame of the clock; only their content
-//! lags.
+//! instead of freezing. A frame is presented only if its content differs
+//! from the frame presented before it — a layer shows a later source frame,
+//! a text layer looks different (another picture, place, crop, opacity or
+//! colour: an animated or fading title keeps moving over a lagging video),
+//! a layer appeared or one is gone (a title that ends disappears on time);
+//! otherwise it is dropped (the picture on screen is the same). Presented
+//! frames stay within one frame of the clock; only their content lags.
 //!
 //! # Pre-roll
 //!
@@ -390,7 +391,7 @@ struct Prerolled {
 }
 
 /// What a layer showed in a presented frame: a media layer its source
-/// frame, a text layer its picture's key.
+/// frame, a text layer its look ([`text_look`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shown {
     Frame(i64),
@@ -398,8 +399,9 @@ enum Shown {
 }
 
 impl Shown {
-    /// Newer content than `before`, what the layer showed last (`None`:
-    /// nothing yet): a later source frame, or another text picture.
+    /// Newer content than `before`, what the layer showed in the last
+    /// presented frame (`None`: it was not there): a later source frame, or
+    /// a text layer that looks different.
     fn is_newer_than(self, before: Option<&Shown>) -> bool {
         match (self, before) {
             (Shown::Frame(f), Some(Shown::Frame(b))) => f > *b,
@@ -409,6 +411,32 @@ impl Shown {
     }
 }
 
+/// Whether a frame whose layers show `shows` differs from the frame
+/// presented last (`shown`): a layer shows newer content or appeared, or a
+/// layer of that frame is gone.
+fn shows_newer(shows: &[(LayerId, Shown)], shown: &HashMap<LayerId, Shown>) -> bool {
+    shows.iter().any(|(id, s)| s.is_newer_than(shown.get(id))) || shown.keys().any(|id| !shows.iter().any(|(i, _)| i == id))
+}
+
+/// A text layer's look: a hash of its picture's key and of everything else
+/// the layer carries that changes its pixels — placement, crop, opacity,
+/// blend and colour operations (`Debug` prints every number exactly).
+fn text_look(l: &Layer, picture_key: u64) -> u64 {
+    use std::fmt::Write as _;
+    use std::hash::Hasher as _;
+    struct Feed(std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for Feed {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut feed = Feed(std::collections::hash_map::DefaultHasher::new());
+    feed.0.write_u64(picture_key);
+    let _ = write!(feed, "{:?}{:?}{:?}{:?}{:?}", l.placement, l.crop, l.opacity, l.blend, l.effects);
+    feed.0.finish()
+}
+
 /// A play in progress.
 struct Play {
     from: Time,
@@ -416,7 +444,8 @@ struct Play {
     /// queued right after the `Play` counts).
     sched: Option<PlaySchedule>,
     preroll: Preroll,
-    /// Per media layer the source frame last presented, per text layer its picture's key.
+    /// What each layer of the frame presented last showed (a media layer
+    /// its source frame, a text layer its look).
     shown: HashMap<LayerId, Shown>,
     /// The media (and decode sizes) of the last prefetched lookahead scene,
     /// and frames since that prefetch.
@@ -569,7 +598,7 @@ impl Worker {
                 // The picture it holds is out of date: render the frame again.
                 self.dropped(perf, t0);
             } else if self.pace_and_present(generation, &mut sched, 0, play.from, perf, t0) {
-                play.shown.extend(shows);
+                play.shown = shows.into_iter().collect();
             }
             None
         } else {
@@ -687,16 +716,17 @@ impl Worker {
         }
         self.render_estimate = (self.render_estimate * 3 + perf.composite + perf.effects) / 4;
         if self.pace_and_present(generation, sched, index, time, perf, t0) {
-            play.shown.extend(shows);
+            play.shown = shows.into_iter().collect();
         }
     }
 
     /// Playback inputs made presentable: a media layer not decoded in time
     /// gets the newest frame of its media (at its decode size) already in
     /// the cache, at most `max_behind` earlier. Returns the source frame each
-    /// media layer shows (and the picture key of each drawn text layer), or
-    /// `None` when a layer has nothing to show or when a substitute was
-    /// needed and no layer shows anything newer than `shown`.
+    /// media layer shows (and the look of each drawn text layer), or `None`
+    /// when a layer has nothing to show or when a substitute was needed and
+    /// the frame shows nothing newer than `shown`, the frame presented last
+    /// ([`shows_newer`]).
     fn fill_behind(&self, scene: &FrameScene, source: &dyn SceneSource, inputs: &mut [LayerInput], shown: &HashMap<LayerId, Shown>) -> Option<Vec<(LayerId, Shown)>> {
         let mut shows = vec![];
         let mut substituted = false;
@@ -705,7 +735,7 @@ impl Worker {
         if missing {
             return None;
         }
-        if substituted && !shows.iter().any(|(id, s)| s.is_newer_than(shown.get(id))) {
+        if substituted && !shows_newer(&shows, shown) {
             return None;
         }
         Some(shows)
@@ -833,7 +863,7 @@ fn fill(
                 }
             }
             // A drawn title (the resolver draws text in time, never late).
-            (LayerContent::Text(t), LayerInput::Cpu(_)) => shows.push((l.id, Shown::Text(t.picture.key()))),
+            (LayerContent::Text(t), LayerInput::Cpu(_)) => shows.push((l.id, Shown::Text(text_look(l, t.picture.key())))),
             _ => {}
         }
     }
@@ -861,14 +891,63 @@ fn any_not_ready(layers: &[LayerInput]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Shown;
+    use super::*;
+    use kadr_scene::{BlendMode, Placement, SizeU, TextLayer, TextPicture};
 
     #[test]
-    fn newer_content_is_a_later_frame_or_another_title_picture() {
+    fn newer_content_is_a_later_frame_or_another_title_look() {
         assert!(Shown::Frame(5).is_newer_than(None) && Shown::Text(1).is_newer_than(None), "nothing shown yet");
         assert!(Shown::Frame(5).is_newer_than(Some(&Shown::Frame(4))));
         assert!(!Shown::Frame(5).is_newer_than(Some(&Shown::Frame(5))) && !Shown::Frame(4).is_newer_than(Some(&Shown::Frame(5))));
-        assert!(Shown::Text(7).is_newer_than(Some(&Shown::Text(3))), "an animated title: another picture");
-        assert!(!Shown::Text(7).is_newer_than(Some(&Shown::Text(7))), "a still title is the same picture");
+        assert!(Shown::Text(7).is_newer_than(Some(&Shown::Text(3))), "an animated title: another look");
+        assert!(!Shown::Text(7).is_newer_than(Some(&Shown::Text(7))), "a still title looks the same");
+    }
+
+    /// TX-R8: a layer of the frame presented last that is gone is newer
+    /// content too (a title ending over a lagging video disappears).
+    #[test]
+    fn a_frame_is_newer_when_a_layer_appeared_or_is_gone() {
+        let (video, title) = (LayerId(1), LayerId(2));
+        let last: HashMap<LayerId, Shown> = [(video, Shown::Frame(10)), (title, Shown::Text(5))].into();
+        assert!(!shows_newer(&[(video, Shown::Frame(9)), (title, Shown::Text(5))], &last), "an older substitute under the same title");
+        assert!(shows_newer(&[(video, Shown::Frame(11)), (title, Shown::Text(5))], &last));
+        assert!(shows_newer(&[(video, Shown::Frame(10)), (title, Shown::Text(6))], &last));
+        assert!(shows_newer(&[(video, Shown::Frame(10))], &last), "the title is gone");
+        assert!(shows_newer(&[(video, Shown::Frame(10)), (title, Shown::Text(5)), (LayerId(3), Shown::Text(1))], &last), "another title appeared");
+    }
+
+    #[derive(Debug)]
+    struct Pic;
+
+    impl TextPicture for Pic {
+        fn key(&self) -> u64 {
+            42
+        }
+        fn render(&self, _: f32, _: &kadr_core::FramePool) -> kadr_core::CpuFrame {
+            unreachable!()
+        }
+    }
+
+    /// TX-R8: the same picture moved, cropped, faded or coloured looks different.
+    #[test]
+    fn a_titles_look_is_its_picture_and_everything_the_layer_does_to_it() {
+        let placement = Placement::fill(SizeU::new(64, 36));
+        let base = Layer { id: LayerId(2), content: LayerContent::Text(TextLayer { picture: std::sync::Arc::new(Pic) }), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
+        let look = text_look(&base, 42);
+        assert_eq!(look, text_look(&base.clone(), 42), "the same layer: the same look");
+        assert_ne!(look, text_look(&base, 43), "another picture");
+        let mut moved = base.clone();
+        moved.placement.position.x += 0.25;
+        let mut cropped = base.clone();
+        cropped.crop.x1 -= 1.0;
+        let mut faded = base.clone();
+        faded.opacity = 0.99;
+        let mut blended = base.clone();
+        blended.blend = BlendMode::Screen;
+        let mut coloured = base.clone();
+        coloured.effects.push(kadr_scene::Effect::ColorAdjust(kadr_scene::ColorAdjust { exposure: 0.1, contrast: 1.0, saturation: 1.0, temperature: 0.0, tint: 0.0 }));
+        for (what, l) in [("moved", moved), ("cropped", cropped), ("faded", faded), ("blended", blended), ("coloured", coloured)] {
+            assert_ne!(text_look(&l, 42), look, "{what}");
+        }
     }
 }

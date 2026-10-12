@@ -19,7 +19,8 @@ fn ms(v: u64) -> Duration {
 
 #[derive(Debug)]
 enum Event {
-    Presented { generation: u64, time: Time, pixel: [u8; 4], playing: bool, cache_hits: u32 },
+    /// `pixel`: the top left one; `corner`: the bottom right one.
+    Presented { generation: u64, time: Time, pixel: [u8; 4], corner: [u8; 4], playing: bool, cache_hits: u32 },
     Finished(u64),
     Ready(u64),
 }
@@ -36,7 +37,9 @@ impl FrameSink for Sink {
     }
     fn present(&mut self, info: &mut FrameInfo) {
         let pixel = [self.buf[0], self.buf[1], self.buf[2], self.buf[3]];
-        let _ = self.tx.send(Event::Presented { generation: info.generation, time: info.time, pixel, playing: info.playing, cache_hits: info.perf.cache_hits });
+        let n = self.buf.len();
+        let corner = [self.buf[n - 4], self.buf[n - 3], self.buf[n - 2], self.buf[n - 1]];
+        let _ = self.tx.send(Event::Presented { generation: info.generation, time: info.time, pixel, corner, playing: info.playing, cache_hits: info.perf.cache_hits });
     }
     fn finished(&mut self, generation: u64, _at: Time) {
         let _ = self.tx.send(Event::Finished(generation));
@@ -643,8 +646,8 @@ fn a_play_uses_a_source_queued_right_after_it() {
     }
 }
 
-/// An animated title: a new picture every frame, drawn over the whole
-/// canvas in the colour [`fake_pixel`] gives its frame (tag 9).
+/// A title picture filling its raster with the colour [`fake_pixel`]
+/// gives frame `.0` of tag 9 (its key is `.0`: equal keys, equal pictures).
 #[derive(Debug)]
 struct Title(i64);
 
@@ -653,49 +656,107 @@ impl TextPicture for Title {
         self.0 as u64
     }
     fn render(&self, scale: f32, _: &FramePool) -> CpuFrame {
-        let (w, h) = (((CANVAS.w as f32 * scale).ceil() as u32).max(1), ((CANVAS.h as f32 * scale).ceil() as u32).max(1));
+        let (w, h) = (((CANVAS.w as f32 / 2.0 * scale).ceil() as u32).max(1), ((CANVAS.h as f32 * scale).ceil() as u32).max(1));
         CpuFrame::from_rgba8(w, h, ColorInfo::WORKING_SDR, fake_pixel(9, self.0).repeat((w * h) as usize))
     }
 }
 
-/// Titles review (Task 2, minor 5): a video decoded slower than real time
-/// shows older frames; an animated title over it still moves on every
-/// frame — its new picture is newer content, so the frame is presented
-/// instead of dropped (a still title keeps its key and does not count).
-#[test]
-fn an_animated_title_over_a_lagging_video_keeps_moving() {
-    let fake = Arc::new(FakeDecoders::new(ms(5), ms(250)));
+/// A title over the right half of the canvas (the sink's `corner` pixel);
+/// the video below shows in the left half (its `pixel`).
+fn title_layer(picture: i64, opacity: f32) -> Layer {
+    let placement = Placement {
+        size: Vec2::new(CANVAS.w as f32 / 2.0, CANVAS.h as f32),
+        anchor: Vec2::new(0.5, 0.5),
+        position: Vec2::new(CANVAS.w as f32 * 0.75, CANVAS.h as f32 / 2.0),
+        scale: Vec2::new(1.0, 1.0),
+        rotation: 0.0,
+    };
+    Layer { id: LayerId(2), content: LayerContent::Text(TextLayer { picture: Arc::new(Title(picture)) }), crop: placement.full_crop(), placement, opacity, blend: BlendMode::Normal, effects: vec![] }
+}
+
+/// A frame presented over the slow video: its time, the video's (tag,
+/// frame) and the title side's pixel.
+type Shot = (Time, (u8, i64), [u8; 4]);
+
+/// Plays 2 s of a video decoded at `frame_delay` a frame (4 a second at
+/// 250 ms: slower than real time) under `title(t)`.
+fn over_slow_video(frame_delay: Duration, config: PlayerConfig, title: impl Fn(Time) -> Option<Layer> + Send + Sync + 'static) -> Vec<Shot> {
+    let fake = Arc::new(FakeDecoders::new(ms(5), frame_delay));
     fake.add("a.mp4", FakeMedia { tag: 6, ..Default::default() });
     let a = AssetId::new();
     let m = video_source("a.mp4", FrameRate::FPS_25, Time::from_secs(600), CANVAS);
-    let r = rig(fake, PlayerConfig::default());
+    let r = rig(fake, config);
     let video = m.clone();
-    let scene: SceneFn = Box::new(move |t, out| {
-        let frame = FrameRate::FPS_25.time_to_frame(t);
-        let placement = Placement { size: Vec2::new(CANVAS.w as f32, CANVAS.h as f32), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(CANVAS.w as f32 / 2.0, CANVAS.h as f32 / 2.0), scale: Vec2::new(1.0, 1.0), rotation: 0.0 };
-        let title = Layer { id: LayerId(2), content: LayerContent::Text(TextLayer { picture: Arc::new(Title(frame)) }), crop: placement.full_crop(), placement, opacity: 1.0, blend: BlendMode::Normal, effects: vec![] };
-        FrameScene { layers: vec![media_layer(1, a, &video, t, CANVAS), title], ..FrameScene::empty(t, CANVAS, *out) }
-    });
-    let duration = Time::from_secs(2);
-    r.player.set_source(source(vec![(a, m)], duration, scene));
+    let scene: SceneFn = Box::new(move |t, out| FrameScene { layers: [Some(media_layer(1, a, &video, t, CANVAS)), title(t)].into_iter().flatten().collect(), ..FrameScene::empty(t, CANVAS, *out) });
+    r.player.set_source(source(vec![(a, m)], Time::from_secs(2), scene));
     r.clock.start(Time::ZERO);
     let g = r.player.play(Time::ZERO);
     let mut shown = vec![];
     loop {
         match next_event(&r.events, ms(3000)).expect("playback finishes") {
-            Event::Presented { generation, time, pixel, .. } => {
+            Event::Presented { generation, time, pixel, corner, .. } => {
                 assert_eq!(generation, g);
-                shown.push((time, read_fake_pixel(&pixel)));
+                shown.push((time, read_fake_pixel(&pixel), corner));
             }
             Event::Finished(_) => break,
             Event::Ready(_) => panic!("no pre-roll with the clock running"),
         }
     }
-    let total = 50;
-    eprintln!("animated title over slow video: {} of {total} frames presented", shown.len());
-    for (time, (tag, frame)) in &shown {
-        assert_eq!((*tag, *frame), (9, FrameRate::FPS_25.time_to_frame(*time)), "the title of the frame's own time");
+    shown
+}
+
+const TOTAL: usize = 50;
+
+/// Titles review (Task 2, minor 5): a video decoded slower than real time
+/// shows older frames; an animated title over it still moves on every
+/// frame — its new picture is newer content, so the frame is presented
+/// instead of dropped.
+#[test]
+fn an_animated_title_over_a_lagging_video_keeps_moving() {
+    let fd = FrameRate::FPS_25;
+    let shown = over_slow_video(ms(250), PlayerConfig::default(), move |t| Some(title_layer(fd.time_to_frame(t), 1.0)));
+    eprintln!("animated title over slow video: {} of {TOTAL} frames presented", shown.len());
+    for (time, _, corner) in &shown {
+        assert_eq!(read_fake_pixel(corner), (9, fd.time_to_frame(*time)), "the title of the frame's own time");
     }
     // The video alone presents a frame per decoded one (~4 a second: 7 of 50 here).
-    assert!(shown.len() * 100 >= total * 40, "{} of {total} frames presented", shown.len());
+    assert!(shown.len() * 100 >= TOTAL * 40, "{} of {TOTAL} frames presented", shown.len());
+}
+
+/// TX-R8: a still title is no newer content — over a lagging video only
+/// the video's own new frames are presented (as without the title).
+#[test]
+fn a_still_title_over_a_lagging_video_never_forces_a_frame() {
+    let shown = over_slow_video(ms(250), PlayerConfig::default(), |_| Some(title_layer(1, 1.0)));
+    eprintln!("still title over slow video: {} of {TOTAL} frames presented", shown.len());
+    assert!(shown.iter().all(|s| read_fake_pixel(&s.2) == (9, 1)), "the title is drawn");
+    assert!(shown.windows(2).all(|w| w[0].1.1 < w[1].1.1), "every frame presented shows a newer video frame: {shown:?}");
+    assert!(shown.len() <= 15, "about one a decoded frame (2 s at 250 ms a frame): {}", shown.len());
+}
+
+/// TX-R8: a title fading in over a lagging video looks different on every
+/// frame — the frames are presented, the fade moves on.
+#[test]
+fn a_title_fading_in_over_a_lagging_video_moves_on_every_frame() {
+    let shown = over_slow_video(ms(250), PlayerConfig::default(), |t| Some(title_layer(255, (t.as_secs_f64() / 2.0) as f32)));
+    eprintln!("fading title over slow video: {} of {TOTAL} frames presented", shown.len());
+    assert!(shown.len() * 100 >= TOTAL * 40, "{} of {TOTAL} frames presented", shown.len());
+    let (first, last) = (shown.first().unwrap().2[1], shown.last().unwrap().2[1]);
+    assert!(last > first + 150, "the title faded in: green {first} → {last}");
+}
+
+/// TX-R8: a title that ends while the video is stuck behind disappears on
+/// time — its absence is newer content. (Decoding takes 1 s a frame: the
+/// first frame arrives at about 1 s, the next at about 2 s — none near
+/// the title's end at 1.5 s.)
+#[test]
+fn a_title_ending_over_a_stuck_video_disappears_on_time() {
+    let end = Time::from_millis(1500);
+    let config = PlayerConfig { max_behind: Time::from_secs(3), ..PlayerConfig::default() };
+    let shown = over_slow_video(ms(1000), config, move |t| (t < end).then(|| title_layer(1, 1.0)));
+    let after: Vec<&Shot> = shown.iter().filter(|s| s.0 >= end).collect();
+    let first = after.first().unwrap_or_else(|| panic!("nothing presented after the title ended: {shown:?}"));
+    assert!(first.0 < end + FrameRate::FPS_25.frame_to_time(4), "presented at {:?}", first.0);
+    assert_eq!(read_fake_pixel(&first.2).0, 6, "the video, no title: {first:?}");
+    assert!(shown.windows(2).all(|w| w[0].1.1 < w[1].1.1 || (w[0].2 != w[1].2)), "no frame presented twice the same: {shown:?}");
 }

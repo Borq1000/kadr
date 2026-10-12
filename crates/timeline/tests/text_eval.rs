@@ -7,6 +7,7 @@ use kadr_core::{FrameRate, MediaInfo, MediaKind, Time, TimeRange, VideoInfo};
 use kadr_project::*;
 use kadr_scene::*;
 use kadr_timeline::scene::evaluate;
+use std::sync::Arc;
 
 fn s(x: i64) -> Time {
     Time::from_secs(x)
@@ -56,18 +57,6 @@ fn a_text_clip_is_a_text_layer_sized_by_its_bounds_and_anchored_at_its_centre() 
 }
 
 #[test]
-fn growing_text_keeps_its_centre() {
-    let centre = |text: &str| {
-        let (p, _) = project(TextDoc::starter(text, 1080));
-        let l = layer_at(&p, s(1)).remove(0);
-        let a = l.placement.anchor;
-        l.placement.to_canvas().apply((a.x * l.placement.size.x) as f64, (a.y * l.placement.size.y) as f64)
-    };
-    let (a, b) = (centre("Гол"), centre("Гол!!!!!!!!\nи ещё строка"));
-    assert!((a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3, "{a:?} vs {b:?}");
-}
-
-#[test]
 fn keyframes_fades_colour_and_effects_apply_as_to_media() {
     let (mut p, _) = project(TextDoc::starter("Матч", 1080));
     let c = &mut p.sequence_mut().tracks[0].clips[0];
@@ -108,14 +97,163 @@ fn a_still_text_is_one_picture_and_an_edit_is_another() {
     assert_ne!(text_of(&layer_at(&p, s(1))[0]), text_of(&a));
 }
 
+fn frame() -> Time {
+    FrameRate::FPS_25.frame_duration()
+}
+
+fn clock(c: &Clip, t: Time) -> kadr_text::Clock {
+    kadr_timeline::text::text_clock(c, c.text.as_deref().unwrap(), t, frame())
+}
+
+/// TX-R6: clip-bound like the fades — the last visible frame (one frame
+/// before the out-point) has `until_out` 0, so a disappearance finishes.
 #[test]
 fn the_clock_runs_from_the_visible_edges_and_the_source() {
     let (mut p, _) = project(TextDoc::new("x"));
     let c = &mut p.sequence_mut().tracks[0].clips[0];
     (c.timeline_in, c.timeline_out, c.source_in, c.source_out) = (s(2), s(6), s(-1), s(3));
-    let doc = c.text.as_deref().unwrap().clone();
-    let k = kadr_timeline::text::text_clock(c, &doc, s(3));
-    assert_eq!((k.since_in, k.until_out, k.source), (s(1), s(3), s(0)));
-    let edge = kadr_timeline::text::text_clock(c, &doc, s(9));
-    assert_eq!((edge.since_in, edge.until_out), (s(4), Time::ZERO), "past the end: the end's state");
+    let k = clock(c, s(3));
+    assert_eq!((k.since_in, k.until_out, k.source), (s(1), s(3) - frame(), s(0)));
+    let last = clock(c, s(6) - frame());
+    assert_eq!((last.since_in, last.until_out), (s(4) - frame(), Time::ZERO), "the last frame: the disappearance is over");
+    let edge = clock(c, s(9));
+    assert_eq!((edge.since_in, edge.until_out, edge.source), (s(4) - frame(), Time::ZERO, s(6)), "past the end: the last frame's state, the source runs on");
+    let before = clock(c, s(1));
+    assert_eq!((before.since_in, before.until_out, before.source), (Time::ZERO, s(4) - frame(), s(-2)), "before the start: the first frame's state, the source extrapolated");
+}
+
+/// M5: the highlight runs over its span from in to out, held beyond.
+#[test]
+fn the_highlight_runs_over_its_span() {
+    let mut doc = TextDoc::new("раз два три");
+    doc.anim.highlight = Some(Highlight { colour: Rgba8::rgba(255, 210, 0, 255), scale: 1.0, span: (0.2, 0.8), extra: Default::default() });
+    let (p, _) = project(doc);
+    let c = &p.sequence().tracks[0].clips[0];
+    let at = |t: Time| clock(c, t).highlight;
+    assert!((at(Time::from_millis(2500)) - 0.5).abs() < 1e-12, "mid-clip");
+    assert_eq!((at(s(0)), at(s(9)), at(s(-3))), (0.2, 0.8, 0.2), "the span's ends at and beyond the edges");
+    assert_eq!(clock(&Clip::new_text(TextDoc::new("x"), s(0), s(5)), s(1)).highlight, 0.0, "no highlight: 0");
+}
+
+/// M5: another speed changes the source time only — the reveals run on
+/// the timeline.
+#[test]
+fn a_speed_change_moves_the_source_time_only() {
+    let (mut p, _) = project(TextDoc::new("x"));
+    let normal = clock(&p.sequence().tracks[0].clips[0], s(2));
+    let c = &mut p.sequence_mut().tracks[0].clips[0];
+    c.source_out = s(10); // twice as fast over the same five seconds
+    let fast = clock(c, s(2));
+    assert_eq!((normal.source, fast.source), (s(2), s(4)));
+    assert_eq!((fast.since_in, fast.until_out), (normal.since_in, normal.until_out));
+}
+
+/// M5: a text clip on either side of a transition draws at the handle
+/// with its edge's clock — the incoming one as at its first frame, the
+/// outgoing one as at its last.
+#[test]
+fn text_on_both_sides_of_a_transition_holds_its_edge_state() {
+    let (mut p, a) = project(TextDoc::starter("Первый", 1080));
+    let second = Clip::new_text(TextDoc::starter("Второй", 1080), s(5), s(5));
+    let b = second.id;
+    p.sequence_mut().tracks[0].clips.push(second);
+    p.sequence_mut().transitions.push(Transition::legacy(TransitionKind::CrossDissolve, a, b, s(2)));
+    let (ca, cb) = (p.sequence().tracks[0].clips[0].clone(), p.sequence().tracks[0].clips[1].clone());
+    let t = Time::from_millis(4500); // in the window, before the cut: the incoming clip's handle
+    assert_eq!(clock(&cb, t).since_in, Time::ZERO, "incoming: its first frame");
+    let late = Time::from_millis(5500); // after the cut: the outgoing clip's handle
+    assert_eq!(clock(&ca, late).until_out, Time::ZERO, "outgoing: its last frame");
+    for at in [t, late] {
+        let layers = layer_at(&p, at);
+        let LayerContent::Transition(tr) = &layers[0].content else { panic!("a transition at {at:?}: {layers:?}") };
+        let side = |c: &Clip| TextLayer { picture: Arc::new(kadr_text::TextFrame::new(c.text.as_deref().unwrap(), clock(c, at))) };
+        assert_eq!((tr.from.len(), tr.to.len()), (1, 1));
+        assert_eq!((text_of(&tr.from[0]), text_of(&tr.to[0])), (&side(&ca), &side(&cb)), "both titles, at their clamped clocks");
+    }
+}
+
+fn with_effect(p: &mut Project, id: &str, params: &[(&str, ParamValue)]) {
+    let mut e = AppliedEffect::new(id, 1, Default::default());
+    for (k, v) in params {
+        e.params.insert((*k).into(), v.clone());
+    }
+    p.sequence_mut().tracks[0].clips[0].effects.push(e);
+}
+
+/// Where the layer draws the layout box centre (local `(−x0, −y0)`).
+fn layout_centre(l: &Layer) -> (f64, f64) {
+    let (a, s) = (l.placement.anchor, l.placement.size);
+    l.placement.to_canvas().apply((a.x * s.x) as f64, (a.y * s.y) as f64)
+}
+
+/// TX-R7: a centred zoom scales the text block about its own centre —
+/// the layout box's, wherever the room for ink, outlines and plaque lies.
+#[test]
+fn a_centred_zoom_keeps_the_text_blocks_centre_in_place() {
+    let mut doc = TextDoc::starter("Гол\nи ещё строка", 1080);
+    doc.style.outlines = vec![Outline { width: 12.0, colour: Rgba8::BLACK }];
+    let (mut p, _) = project(doc.clone());
+    let tr = &mut p.sequence_mut().tracks[0].clips[0].transform;
+    (tr.x, tr.y, tr.rotation_deg) = (300.0, 150.0, 15.0);
+    with_effect(&mut p, "smooth_zoom", &[("strength", ParamValue::Number(1.0))]);
+    let l = layer_at(&p, s(4)).remove(0);
+    assert!(l.placement.scale.x > 1.05, "zooming: {}", l.placement.scale.x);
+    let b = kadr_text::TextFrame::new(&doc, kadr_text::Clock::REST).bounds();
+    assert!((b.x0 + b.x1).abs() > 1.0 || (b.y0 + b.y1).abs() > 1.0, "the bounds are not centred on the block: {b:?}");
+    let (cx, cy) = layout_centre(&l);
+    assert!((cx - 1260.0).abs() < 1e-3 && (cy - 690.0).abs() < 1e-3, "({cx}, {cy})");
+}
+
+/// TX-R7: the motion effects move the layout box as the picture (window
+/// = the block, point = a fraction of the block), and the layer is
+/// anchored at the block's centre again — drawing exactly where the moved
+/// block says.
+#[test]
+fn motion_effects_move_the_text_block_and_the_layer_stays_anchored_at_its_centre() {
+    let doc = TextDoc::starter("Гол!", 1080);
+    let (mut p, _) = project(doc.clone());
+    let tr = &mut p.sequence_mut().tracks[0].clips[0].transform;
+    (tr.x, tr.y, tr.scale, tr.rotation_deg) = (-250.0, 80.0, 1.3, -7.0);
+    with_effect(&mut p, "smooth_zoom", &[("strength", ParamValue::Number(1.0)), ("point", ParamValue::Point { x: 0.2, y: 0.9 })]);
+    with_effect(&mut p, "handheld", &[("strength", ParamValue::Number(1.0))]);
+    let t = Time::from_millis(3300);
+    let l = layer_at(&p, t).remove(0);
+    let f = kadr_text::TextFrame::new(&doc, kadr_text::Clock::REST);
+    let (b, (lw, lh)) = (f.bounds(), f.layout_size());
+    assert_eq!(l.placement.anchor, Vec2::new(-b.x0 / b.width(), -b.y0 / b.height()), "anchored at the layout centre");
+    let c = &p.sequence().tracks[0].clips[0];
+    let block = Placement { size: Vec2::new(lw, lh), anchor: Vec2::new(0.5, 0.5), position: Vec2::new(960.0 - 250.0, 540.0 + 80.0), scale: Vec2::new(1.3, 1.3), rotation: (-7f32).to_radians() };
+    let moved = kadr_timeline::fx::place_with_effects(c, t, SizeU::new(1920, 1080), block);
+    assert!(moved.scale.x > 1.4 && moved.rotation != block.rotation, "zoomed and shaken: {moved:?}");
+    for (x, y) in [(0.0, 0.0), (b.width(), 0.0), (0.0, b.height()), (b.width(), b.height()), (-b.x0, -b.y0), (17.0, 3.5)] {
+        let got = l.placement.to_canvas().apply(x as f64, y as f64);
+        let want = moved.to_canvas().apply((x + b.x0 + lw / 2.0) as f64, (y + b.y0 + lh / 2.0) as f64);
+        assert!((got.0 - want.0).abs() < 1e-2 && (got.1 - want.1).abs() < 1e-2, "({x}, {y}): {got:?} vs {want:?}");
+    }
+}
+
+/// TX-R7: what lies around the block (a plaque here) does not change how
+/// the block moves.
+#[test]
+fn a_plaque_does_not_change_how_the_text_moves() {
+    let doc = TextDoc::starter("Гол", 1080);
+    let mut boxed = doc.clone();
+    boxed.style.plaque = Some(Plaque { per_line: false, colour: Rgba8::rgba(0, 80, 255, 255), radius: 0.0, padding_x: 120.0, padding_y: 10.0 });
+    let state = |doc: &TextDoc| {
+        let (mut p, _) = project(doc.clone());
+        with_effect(&mut p, "smooth_zoom", &[("strength", ParamValue::Number(1.0))]);
+        with_effect(&mut p, "handheld", &[("strength", ParamValue::Number(1.0))]);
+        let id = p.sequence().tracks[0].clips[0].effects[1].id;
+        (p, id)
+    };
+    let (pa, shake) = state(&doc);
+    let (mut pb, _) = state(&boxed);
+    pb.sequence_mut().tracks[0].clips[0].effects[1].id = shake; // the same noise
+    for ms in [700, 2100, 4400] {
+        let (a, b) = (layer_at(&pa, Time::from_millis(ms)).remove(0), layer_at(&pb, Time::from_millis(ms)).remove(0));
+        assert!(b.placement.size.x > a.placement.size.x + 200.0, "the plaque widens the bounds");
+        let (ca, cb) = (layout_centre(&a), layout_centre(&b));
+        assert!((ca.0 - cb.0).abs() < 1e-3 && (ca.1 - cb.1).abs() < 1e-3, "{ms} ms: {ca:?} vs {cb:?}");
+        assert_eq!((a.placement.scale, a.placement.rotation), (b.placement.scale, b.placement.rotation), "{ms} ms");
+    }
 }
