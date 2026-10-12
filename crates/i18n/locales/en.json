@@ -182,7 +182,7 @@
   "inspector.seq.format": "Format",
   "inspector.seq.duration": "Duration",
   "inspector.seq.contents": "Contents",
-  "inspector.seq.format_hint": "The format is taken from the first video clip placed on an empty timeline.",
+  "inspector.seq.format_hint": "The format comes from the first video clip on the timeline; titles, images and audio don't count.",
   "inspector.seq.clips.one": "{n} clip",
   "inspector.seq.clips.other": "{n} clips",
   "inspector.seq.vtracks.one": "{n} video track",
@@ -882,5 +882,7 @@
   "text.wrap": "Wrap",
   "text.wrap_width": "Width",
   "cmd.text_named": "Text: {name}",
-  "cmd.text_edit": "Edit text"
+  "cmd.text_edit": "Edit text",
+  "toast.title_no_media": "A title has no media file",
+  "toast.seq_format_from": "Sequence format: {w}×{h} · {fps} fps — from “{clip}”"
 }

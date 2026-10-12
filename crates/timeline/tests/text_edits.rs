@@ -52,6 +52,27 @@ fn add_text_goes_on_the_topmost_video_track_or_a_new_one_above() {
     assert!(p.sequence().clip(b.id).is_none());
 }
 
+/// TX-R11: V1 is for footage. A title added to a project with V1 alone —
+/// empty or not — goes on a new V2, so the footage placed later lies under
+/// it instead of pushing it away, cutting it or following it.
+#[test]
+fn add_text_never_takes_the_bottom_video_track() {
+    let mut p = Project::new("t");
+    let mut e = EditEngine::new();
+    assert_eq!(p.sequence().tracks_of(TrackKind::Video).count(), 1);
+    let a = title(0, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: a.clone(), track: None }).unwrap();
+    assert_eq!(track_of(&p, a.id), "V2", "an empty V1 is left to the footage");
+    let b = title(10, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: b.clone(), track: None }).unwrap();
+    assert_eq!(track_of(&p, b.id), "V2", "V2 is the topmost now and free at 10 s");
+    assert_eq!(p.sequence().tracks_of(TrackKind::Video).count(), 2);
+    let v1 = p.sequence().tracks[0].id;
+    let c = title(20, 5);
+    e.execute(&mut p, EditCommand::AddText { clip: c.clone(), track: Some(v1) }).unwrap();
+    assert_eq!(track_of(&p, c.id), "V1", "asked for by name: allowed");
+}
+
 #[test]
 fn add_text_on_a_given_track_checks_it() {
     let (mut p, mut e) = setup();

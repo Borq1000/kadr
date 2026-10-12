@@ -517,11 +517,13 @@ impl TextDoc {
         uuid::Uuid::new_v4().as_u64_pair().0
     }
 
-    /// A new title (titles spec §2.3): Montserrat 700 at 9 % of the frame
-    /// height, white, a soft shadow, centred.
-    pub fn starter(text: &str, canvas_height: u32) -> TextDoc {
+    /// A new title (titles spec §2.3): Montserrat 700 at 9 % of
+    /// `canvas_side` — the frame's shorter side (TX-R10: a vertical frame's
+    /// height would make it wider than the frame) — white, a soft shadow,
+    /// centred.
+    pub fn starter(text: &str, canvas_side: u32) -> TextDoc {
         let mut d = TextDoc::new(text);
-        let size = (canvas_height as f32 * 0.09).round().max(8.0);
+        let size = (canvas_side as f32 * 0.09).round().max(8.0);
         d.style.size = size;
         d.style.shadow = Some(Shadow { colour: Rgba8::rgba(0, 0, 0, 153), offset_x: 0.0, offset_y: (size * 0.03).round(), blur: (size * 0.06).round() });
         d

@@ -328,9 +328,9 @@ impl App {
     /// Places a whole group: angle 1 on a video track plus its audio, linked.
     pub fn place_group(&mut self, id: MulticamId, at: Time, mode: InsertMode, prefer_row: Option<usize>) {
         let Some(group) = self.project.multicam_groups.iter().find(|g| g.id == id).cloned() else { return };
-        let Some(mut v) = group_clip(&group, 0, &self.project.assets, self.project.sequence().frame_rate.snap(at)) else {
+        if group_clip(&group, 0, &self.project.assets, Time::ZERO).is_none() {
             return self.toast_error(t("mc.no_overlap"));
-        };
+        }
         let seq = self.project.sequence();
         let rs = crate::timeline_ui::rows(seq, self.tl.scroll_y);
         let pref = prefer_row.and_then(|r| rs.get(r)).map(|r| r.track);
@@ -341,9 +341,18 @@ impl App {
         };
         let Some(vtrack) = pick(TrackKind::Video) else { return self.toast_warn(t("err.video_tracks_locked")) };
         let first = group.angles[0].asset;
+        let atrack = if self.project.asset(first).is_some_and(|a| a.has_audio()) {
+            let Some(track) = pick(TrackKind::Audio) else { return self.toast_warn(t("err.audio_tracks_locked")) };
+            Some(track)
+        } else {
+            None
+        };
+        // The first video sets the format (TX-R12) before `at` snaps to its rate.
+        let format_toast = self.project.asset(first).cloned().and_then(|a| self.adopt_first_format(&a, &group.name));
+        let at = self.project.sequence().frame_rate.snap(at);
+        let Some(mut v) = group_clip(&group, 0, &self.project.assets, at) else { return };
         let mut cmds = vec![];
-        if self.project.asset(first).is_some_and(|a| a.has_audio()) {
-            let Some(atrack) = pick(TrackKind::Audio) else { return self.toast_warn(t("err.audio_tracks_locked")) };
+        if let Some(atrack) = atrack {
             let link = LinkId::new();
             v.link = Some(link);
             let mut a = Clip::new(first, format!("{} · {}", group.name, group.angles[0].label), v.source_range(), v.timeline_in);
@@ -351,19 +360,17 @@ impl App {
             cmds.push(EditCommand::InsertClip { track: atrack, clip: a, mode });
         }
         cmds.insert(0, EditCommand::InsertClip { track: vtrack, clip: v, mode });
-        // The first media clip sets the format; a title placed before it doesn't count.
-        if crate::timeline_ui::no_media_yet(self.project.sequence())
-            && let Some(info) = self.project.asset(first).and_then(|a| a.info.video.clone())
-        {
-            crate::timeline_ui::adopt_format(self.project.sequence_mut(), &info);
-            self.meta_dirty = true;
-        }
         let label = match mode {
             InsertMode::Insert => tf("cmd.insert_named", &[("name", &group.name)]),
             InsertMode::Overwrite => tf("cmd.overwrite_named", &[("name", &group.name)]),
         };
-        if self.execute(EditCommand::Batch { label, commands: cmds }) && !kadr_timeline::scene::has_video_at(&self.project, self.project.sequence(), self.playhead) {
-            self.set_playhead(at);
+        if self.execute(EditCommand::Batch { label, commands: cmds }) {
+            if let Some(msg) = format_toast {
+                self.toast(msg);
+            }
+            if !kadr_timeline::scene::has_video_at(&self.project, self.project.sequence(), self.playhead) {
+                self.set_playhead(at);
+            }
         }
         self.refresh_library();
     }

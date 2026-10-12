@@ -330,10 +330,11 @@ impl App {
         self.meta_dirty = true;
     }
 
-    /// "Оцени кадры": the selected media, else what's on the timeline, else all.
+    /// "Оцени кадры": the selected media, else what's on the timeline (titles
+    /// have none), else all.
     pub fn grade_shots(&mut self) {
         let on_timeline: Vec<AssetId> = {
-            let mut v: Vec<AssetId> = self.project.sequence().tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.asset)).collect();
+            let mut v: Vec<AssetId> = self.project.sequence().tracks.iter().flat_map(|t| &t.clips).filter(|c| !c.is_text()).map(|c| c.asset).collect();
             v.sort();
             v.dedup();
             v

@@ -97,9 +97,11 @@ pub enum EditCommand {
     InsertClip { track: TrackId, clip: Clip, mode: InsertMode },
     /// A text clip (titles spec §7, refinement 11): on `track` (a video
     /// track, unlocked, free over the clip's frame-snapped range), or —
-    /// `None` — on the topmost video track when it is unlocked, shown (not
-    /// muted) and free there, else on a new video track above all. One
-    /// undo entry. The document is normalised and must be finite
+    /// `None` — on the topmost video track when it is not the bottom one
+    /// (V1 is for footage: a title placed first must not be pushed away,
+    /// cut or followed by the footage placed after it, TX-R11), unlocked,
+    /// shown (not muted) and free there, else on a new video track above
+    /// all. One undo entry. The document is normalised and must be finite
     /// (`InvalidRange`); the clip's asset becomes `TEXT_ASSET`.
     AddText { clip: Clip, track: Option<TrackId> },
     /// Moves clips (and their linked partners) by `delta`; clips named in
@@ -1108,9 +1110,11 @@ fn add_text(seq: &mut Sequence, clip: &Clip, track: Option<TrackId>) -> Result<(
         }
         None => {
             // Video tracks are stored V1 (bottom) first: the topmost is the
-            // last. A locked or hidden (muted) one is not used.
+            // last. The bottom one is the footage's (TX-R11); a locked or
+            // hidden (muted) one is not used either.
+            let bottom = seq.tracks.iter().position(|t| t.kind == TrackKind::Video);
             let top = seq.tracks.iter().rposition(|t| t.kind == TrackKind::Video);
-            match top.filter(|&i| !seq.tracks[i].locked && !seq.tracks[i].muted && free(&seq.tracks[i])) {
+            match top.filter(|&i| Some(i) != bottom && !seq.tracks[i].locked && !seq.tracks[i].muted && free(&seq.tracks[i])) {
                 Some(ti) => ti,
                 None => {
                     let n = seq.tracks_of(TrackKind::Video).count() + 1;

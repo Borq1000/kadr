@@ -292,6 +292,7 @@ mod layout_tests {
         assert_eq!((latin_key("и"), latin_key("ь")), ("b".into(), "m".into()));
         assert_eq!((latin_key("ш"), latin_key("щ")), ("i".into(), "o".into()));
         assert_eq!((latin_key("б"), latin_key("ю")), (",".into(), ".".into()));
+        assert_eq!((latin_key("е"), latin_key("Е")), ("t".into(), "t".into()), "Ctrl+T adds a title");
         assert_eq!(latin_key("u"), "u");
         assert_eq!(latin_key(" "), " ");
     }

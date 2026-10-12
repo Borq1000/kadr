@@ -45,6 +45,8 @@ export struct ClipView {
     is-audio: bool,
     // A title (text clip): purple, a «Т» mark, its text in the body.
     is-text: bool,
+    // A title's text (line breaks kept); "" for media.
+    body: string,
     selected: bool,
     enabled: bool,
     linked: bool,
@@ -226,9 +228,10 @@ component ClipRect inherits Rectangle {
         y: 18px;
         width: parent.width - 12px;
         height: parent.height - 20px;
-        text: root.cv.name;
+        text: root.cv.body;
         font-size: Theme.font-sm;
         color: #ffffffb0;
+        opacity: root.cv.enabled ? 1 : 0.4;
         wrap: word-wrap;
         overflow: elide;
         vertical-alignment: top;

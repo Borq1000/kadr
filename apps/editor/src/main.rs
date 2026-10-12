@@ -29,6 +29,7 @@ mod persistence;
 mod preview;
 mod preview_cpu;
 mod scene_source;
+mod seq_format;
 mod settings_ui;
 mod text_add;
 mod text_ui;

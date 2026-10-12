@@ -186,7 +186,7 @@
   "inspector.seq.format": "Формат",
   "inspector.seq.duration": "Длительность",
   "inspector.seq.contents": "Содержимое",
-  "inspector.seq.format_hint": "Формат берётся из первого видеоклипа, положенного на пустой таймлайн.",
+  "inspector.seq.format_hint": "Формат берётся из первого видеоклипа на таймлайне; титры, картинки и звук не в счёт.",
   "inspector.seq.clips.one": "{n} клип",
   "inspector.seq.clips.few": "{n} клипа",
   "inspector.seq.clips.many": "{n} клипов",
@@ -911,5 +911,7 @@
   "text.wrap": "Перенос по ширине",
   "text.wrap_width": "Ширина",
   "cmd.text_named": "Текст: {name}",
-  "cmd.text_edit": "Правка текста"
+  "cmd.text_edit": "Правка текста",
+  "toast.title_no_media": "У текста нет медиафайла",
+  "toast.seq_format_from": "Формат последовательности: {w}×{h} · {fps} к/с — как у «{clip}»"
 }

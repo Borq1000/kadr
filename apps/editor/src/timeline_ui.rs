@@ -7,7 +7,7 @@ use crate::app::App;
 use crate::util::{fmt_ruler, fmt_secs, rgb};
 use crate::{ClipMark, ClipView, KeyMark, MarkerView, TickView, TrackView, TransitionView};
 use kadr_core::{ClipId, LinkId, MediaKind, Time, TimeRange, TrackId};
-use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, Sequence, SourceTime, TrackKind};
+use kadr_project::{Clip, Ease, EdgeFades, FadeEdge, MediaAsset, Sequence, SourceTime, TrackKind};
 use kadr_timeline::snap::{snap, snap_move, snap_points};
 use kadr_timeline::{ClipProperty, EditCommand, InsertMode, TrackFlag, TrimEdge};
 use kadr_i18n::{t, tf};
@@ -87,19 +87,70 @@ fn fade_slot(c: &mut Clip, is_audio: bool, edge: FadeEdge) -> &mut Time {
     }
 }
 
-/// The first media clip sets the sequence format (like most NLEs). A title
-/// has no format of its own: one placed first doesn't count.
+/// No media clip yet — titles don't count: the first one placed fits the
+/// timeline to the view.
 pub fn no_media_yet(seq: &Sequence) -> bool {
     !seq.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.is_text())
 }
 
-/// The sequence takes `v`'s size (even, at least 2) and its rate when declared.
-pub fn adopt_format(seq: &mut Sequence, v: &kadr_core::VideoInfo) {
-    seq.width = v.width.max(2) & !1;
-    seq.height = v.height.max(2) & !1;
-    if let Some(fr) = v.frame_rate {
-        seq.frame_rate = fr;
-    }
+/// Where «Добавить в конец таймлайна» and a double-click append: after
+/// the last media clip. Titles don't count, so footage appended after a
+/// title lies under it.
+pub fn append_time(seq: &Sequence) -> Time {
+    seq.tracks.iter().flat_map(|t| &t.clips).filter(|c| !c.is_text()).map(|c| c.timeline_out).max().unwrap_or(Time::ZERO)
+}
+
+/// The tracks placing `asset` takes (its picture's, its sound's): the
+/// track `pref` (an index) when it is of the kind and unlocked, else the
+/// first unlocked one of the kind — V1 before the titles' tracks above it.
+/// `Err`: the message key when every track of a needed kind is locked.
+pub fn placement_tracks(seq: &Sequence, asset: &MediaAsset, pref: Option<usize>) -> Result<(Option<TrackId>, Option<TrackId>), &'static str> {
+    let pick = |kind: TrackKind| -> Option<TrackId> {
+        if let Some(i) = pref.filter(|&i| seq.tracks.get(i).is_some_and(|t| t.kind == kind && !t.locked)) {
+            return Some(seq.tracks[i].id);
+        }
+        seq.tracks.iter().find(|t| t.kind == kind && !t.locked).map(|t| t.id)
+    };
+    let video = if asset.kind() != MediaKind::Audio { Some(pick(TrackKind::Video).ok_or("err.video_tracks_locked")?) } else { None };
+    let audio = if asset.has_audio() { Some(pick(TrackKind::Audio).ok_or("err.audio_tracks_locked")?) } else { None };
+    Ok((video, audio))
+}
+
+/// The commands placing the whole of `asset` at `at` on `tracks`
+/// ([`placement_tracks`]), picture and sound linked.
+pub fn placement_commands(asset: &MediaAsset, tracks: (Option<TrackId>, Option<TrackId>), at: Time, mode: InsertMode) -> Vec<EditCommand> {
+    let range = TimeRange::new(Time::ZERO, asset.duration());
+    let link = (asset.has_video() && asset.has_audio()).then(LinkId::new);
+    [tracks.0, tracks.1]
+        .into_iter()
+        .flatten()
+        .map(|track| {
+            let mut c = Clip::new(asset.id, &asset.name, range, at);
+            c.link = link;
+            EditCommand::InsertClip { track, clip: c, mode }
+        })
+        .collect()
+}
+
+/// A title's text as its clip's body shows it: line breaks kept, the first
+/// few hundred characters (the body elides the rest anyway).
+fn clip_body(doc: &kadr_project::TextDoc) -> String {
+    doc.plain().chars().take(300).collect()
+}
+
+/// The scroll (in the view's units) that brings `[a, b)` into a view of
+/// `len` scrolled to `scroll`, `margin` clear of its edges: unchanged when
+/// it is in view already, else the least move (its start first when it is
+/// longer than the view); never below 0.
+fn scroll_to_show(scroll: f64, len: f64, a: f64, b: f64, margin: f64) -> f64 {
+    let s = if a - margin < scroll || b - a + 2.0 * margin > len {
+        a - margin
+    } else if b + margin > scroll + len {
+        b + margin - len
+    } else {
+        scroll
+    };
+    s.max(0.0)
 }
 
 /// A plain click on a clip inside a larger selection narrows the selection
@@ -999,8 +1050,11 @@ impl App {
                 }
             }
             "reveal-media" => {
-                // A title has no media to reveal.
-                if let Some(c) = self.tl.selection.first().and_then(|id| self.project.sequence().clip(*id)).filter(|c| !c.is_text()) {
+                let clip = self.tl.selection.first().and_then(|id| self.project.sequence().clip(*id));
+                if clip.is_some_and(|c| c.is_text()) {
+                    return self.toast(t("toast.title_no_media"));
+                }
+                if let Some(c) = clip {
                     self.selected_asset = Some(c.asset);
                     self.show_media_tab();
                     self.bin_filter = None;
@@ -1133,57 +1187,28 @@ impl App {
     /// Places an asset on the timeline (linked A/V when it has both).
     pub fn place_asset(&mut self, asset_id: kadr_core::AssetId, at: Time, mode: InsertMode, prefer_row: Option<usize>) {
         let Some(asset) = self.project.asset(asset_id).cloned() else { return };
-        let seq = self.project.sequence();
-        let rs = rows(seq, self.tl.scroll_y);
-        let pref_track = prefer_row.and_then(|r| rs.get(r)).map(|r| r.track);
-        let pick = |kind: TrackKind| -> Option<TrackId> {
-            if let Some(i) = pref_track.filter(|&i| seq.tracks[i].kind == kind && !seq.tracks[i].locked) {
-                return Some(seq.tracks[i].id);
-            }
-            seq.tracks.iter().find(|t| t.kind == kind && !t.locked).map(|t| t.id)
-        };
-        let dur = asset.duration();
-        if dur <= Time::ZERO {
+        if asset.duration() <= Time::ZERO {
             self.toast_error(t("err.media_no_duration"));
             return;
         }
-        let range = TimeRange::new(Time::ZERO, dur);
-        let at = seq.frame_rate.snap(at);
-        let link = (asset.has_video() && asset.has_audio()).then(LinkId::new);
-        let mut cmds = vec![];
-        if asset.kind() != MediaKind::Audio {
-            match pick(TrackKind::Video) {
-                Some(track) => {
-                    let mut c = Clip::new(asset.id, &asset.name, range, at);
-                    c.link = link;
-                    cmds.push(EditCommand::InsertClip { track, clip: c, mode });
-                }
-                None => return self.toast_warn(t("err.video_tracks_locked")),
-            }
-        }
-        if asset.has_audio() {
-            match pick(TrackKind::Audio) {
-                Some(track) => {
-                    let mut c = Clip::new(asset.id, &asset.name, range, at);
-                    c.link = link;
-                    cmds.push(EditCommand::InsertClip { track, clip: c, mode });
-                }
-                None => return self.toast_warn(t("err.audio_tracks_locked")),
-            }
-        }
-        let was_empty = no_media_yet(self.project.sequence());
-        // The first media clip defines the sequence format (a title before it doesn't).
-        if was_empty
-            && let Some(v) = asset.info.video.as_ref().filter(|_| asset.kind() == MediaKind::Video)
-        {
-            adopt_format(self.project.sequence_mut(), v);
-            self.meta_dirty = true;
-        }
+        let seq = self.project.sequence();
+        let pref = prefer_row.and_then(|r| rows(seq, self.tl.scroll_y).get(r).map(|r| r.track));
+        let tracks = match placement_tracks(seq, &asset, pref) {
+            Ok(tracks) => tracks,
+            Err(key) => return self.toast_warn(t(key)),
+        };
+        let was_empty = no_media_yet(seq);
+        // The first video sets the format (TX-R12) before `at` snaps to its rate.
+        let format_toast = self.adopt_first_format(&asset, &asset.name);
+        let at = self.project.sequence().frame_rate.snap(at);
         let label = match mode {
             InsertMode::Insert => tf("cmd.insert_named", &[("name", &asset.name)]),
             InsertMode::Overwrite => tf("cmd.overwrite_named", &[("name", &asset.name)]),
         };
-        if self.execute(EditCommand::Batch { label, commands: cmds }) {
+        if self.execute(EditCommand::Batch { label, commands: placement_commands(&asset, tracks, at, mode) }) {
+            if let Some(msg) = format_toast {
+                self.toast(msg);
+            }
             let ids: Vec<ClipId> = {
                 let seq = self.project.sequence();
                 seq.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.asset == asset_id && c.timeline_in == at).map(|c| c.id).collect()
@@ -1374,6 +1399,7 @@ impl App {
                     name: c.name.clone().into(),
                     is_audio,
                     is_text: c.is_text(),
+                    body: c.text.as_deref().map(clip_body).unwrap_or_default().into(),
                     selected: sel.contains(&c.id),
                     enabled: c.enabled,
                     linked: c.link.is_some(),
@@ -1502,6 +1528,20 @@ impl App {
         self.refresh_playhead();
     }
 
+    /// Scrolls `id`'s row and its time into view (a title just added).
+    pub fn reveal_clip(&mut self, id: ClipId) {
+        let seq = self.project.sequence();
+        let Some((ti, ci)) = seq.locate_clip(id) else { return };
+        let c = &seq.tracks[ti].clips[ci];
+        let (w, h) = self.lanes_size();
+        let (a, b) = (c.timeline_in.as_secs_f64(), c.timeline_out.as_secs_f64());
+        self.tl.scroll = scroll_to_show(self.tl.scroll, w / self.tl.pps, a, b, 20.0 / self.tl.pps);
+        if let Some(r) = rows(seq, 0.0).into_iter().find(|r| r.track == ti) {
+            let max = (self.content_height() - h + 20.0).max(0.0);
+            self.tl.scroll_y = scroll_to_show(self.tl.scroll_y, h, r.y, r.y + r.h, 0.0).min(max);
+        }
+    }
+
     /// Keeps the playhead visible during playback (page-style follow).
     pub fn follow_playhead(&mut self) {
         let (w, _) = self.lanes_size();
@@ -1543,35 +1583,44 @@ fn zoom_label(pps: f64, fps: f64) -> String {
 mod tests {
     use super::*;
 
-    /// A title added first has no format of its own: the first media clip
-    /// still sets the sequence's size and rate (a phone clip after a title
-    /// makes the sequence vertical); after it, nothing else does.
+    /// TX-R11: footage placed after a title — by insert, overwrite or
+    /// append at the playhead or the end — lies under it: the title keeps
+    /// its track above V1 and its time.
     #[test]
-    fn a_title_placed_first_leaves_the_format_to_the_first_media_clip() {
-        use kadr_core::{AssetId, FrameRate, VideoInfo};
-        let mut p = kadr_project::Project::new("t");
-        (p.sequence_mut().width, p.sequence_mut().height, p.sequence_mut().frame_rate) = (1920, 1080, FrameRate::FPS_25);
-        let title = crate::text_add::new_text_clip(p.sequence(), Time::ZERO, "Привет");
-        kadr_timeline::EditEngine::new().execute(&mut p, EditCommand::AddText { clip: title, track: None }).unwrap();
-        assert!(p.sequence().duration() > Time::ZERO, "the title is on the timeline");
-        assert!(no_media_yet(p.sequence()), "a title is not media");
-        let phone = VideoInfo {
-            width: 1080,
-            height: 1920,
-            frame_rate: Some(FrameRate::FPS_30),
-            variable_frame_rate: false,
-            codec: "h264".into(),
-            pixel_format: "yuv420p".into(),
-            rotation: 0,
-            sar: (1, 1),
-            color: None,
-        };
-        adopt_format(p.sequence_mut(), &phone);
-        let seq = p.sequence();
-        assert_eq!((seq.width, seq.height, seq.frame_rate), (1080, 1920, FrameRate::FPS_30), "the clip's format");
-        let v = seq.tracks.iter().position(|t| t.kind == TrackKind::Video).unwrap();
-        p.sequence_mut().tracks[v].clips.push(Clip::new(AssetId::new(), "phone", TimeRange::new(Time::ZERO, Time::from_secs(5)), Time::from_secs(10)));
-        assert!(!no_media_yet(p.sequence()), "the format is set once");
+    fn footage_placed_after_a_title_goes_under_it() {
+        use kadr_core::{FrameRate, MediaInfo, VideoInfo};
+        let video = VideoInfo { width: 1920, height: 1080, frame_rate: Some(FrameRate::FPS_25), variable_frame_rate: false, codec: "h264".into(), pixel_format: "yuv420p".into(), rotation: 0, sar: (1, 1), color: None };
+        let audio = kadr_core::AudioInfo { sample_rate: 48_000, channels: 2, codec: "aac".into(), channel_layout: "stereo".into() };
+        let asset = MediaAsset::new("m.mp4", MediaInfo { kind: MediaKind::Video, duration: Time::from_secs(60), container: "mp4".into(), size_bytes: 0, video: Some(video), audio: Some(audio), timecode: None });
+        for (mode, append) in [(InsertMode::Insert, false), (InsertMode::Overwrite, false), (InsertMode::Insert, true)] {
+            let mut p = kadr_project::Project::new("t");
+            p.sequence_mut().frame_rate = FrameRate::FPS_25;
+            p.assets.push(asset.clone());
+            let mut e = kadr_timeline::EditEngine::new();
+            let title = crate::text_add::new_text_clip(p.sequence(), Time::from_secs(1), "Привет");
+            let id = title.id;
+            e.execute(&mut p, EditCommand::AddText { clip: title, track: None }).unwrap();
+            let at = if append { append_time(p.sequence()) } else { Time::ZERO };
+            assert_eq!(at, Time::ZERO, "nothing but a title: append at the start");
+            let tracks = placement_tracks(p.sequence(), &asset, None).unwrap();
+            e.execute(&mut p, EditCommand::Batch { label: "place".into(), commands: placement_commands(&asset, tracks, at, mode) }).unwrap();
+            let seq = p.sequence();
+            let c = seq.clip(id).unwrap();
+            assert_eq!(c.timeline_range(), TimeRange::new(Time::from_secs(1), Time::from_secs(6)), "{mode:?} append {append}: the title keeps its time");
+            let (title_track, _) = seq.locate_clip(id).unwrap();
+            let footage = seq.tracks.iter().position(|t| t.kind == TrackKind::Video && t.clips.iter().any(|c| c.asset == asset.id)).unwrap();
+            assert!(footage < title_track, "{mode:?}: the footage is on a lower video track");
+            assert!(seq.tracks[footage].clip_at(Time::from_secs(3)).is_some(), "{mode:?}: under the title");
+        }
+    }
+
+    #[test]
+    fn scroll_to_show_moves_only_as_far_as_needed() {
+        assert_eq!(scroll_to_show(10.0, 20.0, 12.0, 15.0, 1.0), 10.0, "already in view");
+        assert_eq!(scroll_to_show(10.0, 20.0, 5.0, 8.0, 1.0), 4.0, "before the view: its start");
+        assert_eq!(scroll_to_show(10.0, 20.0, 35.0, 40.0, 1.0), 21.0, "after the view: its end");
+        assert_eq!(scroll_to_show(10.0, 20.0, 35.0, 80.0, 1.0), 34.0, "longer than the view: its start");
+        assert_eq!(scroll_to_show(10.0, 20.0, 0.0, 3.0, 1.0), 0.0, "never below 0");
     }
 
     #[test]

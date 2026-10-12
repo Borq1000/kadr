@@ -312,7 +312,7 @@ impl App {
 
     pub fn asset_activated(&mut self, id: &str) {
         if let Some(item) = LibItem::parse(id) {
-            let end = self.project.sequence().duration();
+            let end = crate::timeline_ui::append_time(self.project.sequence());
             self.place_item(item, end, InsertMode::Insert, None);
         }
     }
@@ -337,7 +337,7 @@ impl App {
             "insert" => self.place_asset(aid, self.playhead, InsertMode::Insert, None),
             "overwrite" => self.place_asset(aid, self.playhead, InsertMode::Overwrite, None),
             "append" => {
-                let end = self.project.sequence().duration();
+                let end = crate::timeline_ui::append_time(self.project.sequence());
                 self.place_asset(aid, end, InsertMode::Insert, None);
             }
             "to-bin" => match self.bin_filter {
@@ -382,7 +382,7 @@ impl App {
     }
 
     fn group_action(&mut self, g: MulticamId, action: &str) {
-        let end = self.project.sequence().duration();
+        let end = crate::timeline_ui::append_time(self.project.sequence());
         match action {
             "insert" => self.place_group(g, self.playhead, InsertMode::Insert, None),
             "overwrite" => self.place_group(g, self.playhead, InsertMode::Overwrite, None),
