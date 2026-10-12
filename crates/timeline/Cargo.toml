@@ -9,6 +9,7 @@ kadr-core = { path = "../core" }
 kadr-effects = { path = "../effects" }
 kadr-project = { path = "../project" }
 kadr-scene = { path = "../scene" }
+kadr-text = { path = "../text" }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

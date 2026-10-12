@@ -11,6 +11,7 @@ pub mod multicam;
 pub mod ops;
 pub mod scene;
 pub mod snap;
+pub mod text;
 
 pub use commands::{editable_keys_at, track_def, ClipProperty, EditCommand, EditError, InsertMode, TrackFlag, TrimEdge};
 pub use engine::{EditEngine, HistoryEntry};

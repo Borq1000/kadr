@@ -16,6 +16,7 @@ kadr-playback = { path = "../playback" }
 kadr-effects = { path = "../effects" }
 kadr-media = { path = "../media" }
 kadr-render = { path = "../render" }
+kadr-text = { path = "../text" }
 png = "0.17"
 serde_json.workspace = true
 tempfile.workspace = true

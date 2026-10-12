@@ -217,6 +217,10 @@ pub fn fade_at(clip: &Clip, t: Time, frame: Time) -> f64 {
 /// `frame` is the sequence's frame duration (the fade-out ends one frame
 /// before the clip's out-point).
 pub fn clip_layer(project: &Project, clip: &Clip, t: Time, canvas: SizeU, frame: Time) -> Option<Layer> {
+    // Titles spec §5.2: a text clip draws its text, not media.
+    if let Some(doc) = clip.text.as_deref() {
+        return crate::text::text_layer(clip, doc, t, canvas, frame);
+    }
     let asset = project.asset(clip.asset)?;
     let kind = match asset.info.kind {
         MediaKind::Video => SourceKind::Video,
@@ -270,7 +274,7 @@ pub fn fit_contain(src: SizeU, canvas: SizeU) -> Vec2 {
 }
 
 /// The clip `Transform` (offset from centre, uniform scale, degrees) as a placement.
-fn placement_of(tr: &Transform, size: Vec2, canvas: SizeU) -> Placement {
+pub(crate) fn placement_of(tr: &Transform, size: Vec2, canvas: SizeU) -> Placement {
     Placement {
         size,
         anchor: Vec2::new(0.5, 0.5),
@@ -281,13 +285,13 @@ fn placement_of(tr: &Transform, size: Vec2, canvas: SizeU) -> Placement {
 }
 
 /// Crop fractions → rectangle in local pixels; `None` when nothing is left.
-fn crop_of(tr: &Transform, size: Vec2) -> Option<RectF> {
+pub(crate) fn crop_of(tr: &Transform, size: Vec2) -> Option<RectF> {
     let f = |v: f64| v.clamp(0.0, 1.0) as f32;
     let r = RectF::new(f(tr.crop_left) * size.x, f(tr.crop_top) * size.y, (1.0 - f(tr.crop_right)) * size.x, (1.0 - f(tr.crop_bottom)) * size.y);
     (!r.is_empty()).then_some(r)
 }
 
-fn color_of(c: &ClipColor) -> ColorAdjust {
+pub(crate) fn color_of(c: &ClipColor) -> ColorAdjust {
     ColorAdjust { exposure: c.exposure as f32, contrast: c.contrast as f32, saturation: c.saturation as f32, temperature: c.temperature as f32, tint: 0.0 }
 }
 
